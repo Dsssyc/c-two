@@ -28,7 +28,7 @@ requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
 
 [tool.maturin]
-manifest-path = "../../core/bridge/c2-ffi/Cargo.toml"
+manifest-path = "native/Cargo.toml"
 module-name = "c_two._native"
 python-source = "src"
 features = ["pyo3/extension-module"]
@@ -45,6 +45,9 @@ timeout = 30
 package = true
 cache-keys = [
     { file = "pyproject.toml" },
+    { file = "native/Cargo.toml" },
+    { file = "native/Cargo.lock" },
+    { file = "native/**/*.rs" },
     { file = "../../core/**/*.rs" },
     { file = "../../core/**/Cargo.toml" },
 ]

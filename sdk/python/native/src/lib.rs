@@ -1,13 +1,8 @@
-//! C-Two native extensions — unified PyO3 entry point.
+//! C-Two Python SDK native extension.
 //!
-//! This crate exposes the memory pool and the HTTP relay
-//! as a single Python extension module: `c_two._native`.
-//!
-//! Python usage:
-//! ```python
-//! from c_two._native import MemPool, PoolConfig   # memory pool
-//! from c_two._native import NativeRelay            # relay
-//! ```
+//! This crate exposes the Rust runtime to Python as `c_two._native`.
+//! It is intentionally owned by `sdk/python`, not `core`, because it uses
+//! PyO3 and Python-specific buffer, exception, and module semantics.
 
 #[cfg(feature = "python")]
 mod client_ffi;

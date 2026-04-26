@@ -28,6 +28,9 @@ package = false
 cache-keys = [
     { file = "pyproject.toml" },
     { file = "sdk/python/pyproject.toml" },
+    { file = "sdk/python/native/Cargo.toml" },
+    { file = "sdk/python/native/Cargo.lock" },
+    { file = "sdk/python/native/**/*.rs" },
     { file = "core/**/*.rs" },
     { file = "core/**/Cargo.toml" },
 ]
