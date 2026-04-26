@@ -29,13 +29,12 @@ uv run pytest sdk/python/tests/unit/test_wire.py -q
 # Run a single test class or function
 uv run pytest sdk/python/tests/unit/test_transferable.py::TestTransferableDecorator::test_hello_data_round_trip -q
 
-# Rust type-check (no PyO3 link needed)
-cd core && cargo check --workspace
+# Rust core tests
+cargo test --manifest-path core/Cargo.toml --workspace
 
-# Rust unit tests (pure Rust, no Python linkage)
-cd core && cargo test -p c2-mem -p c2-wire
-
-# Note: c2-ffi tests need Python linkage — use `cargo check` not `cargo test`
+# Python SDK native extension and tests
+uv sync --reinstall-package c-two
+C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30
 
 # Run example (single-process, thread preference)
 uv run python examples/python/local.py
@@ -116,9 +115,11 @@ The transport layer is a thin Python orchestration shell around a Rust-native co
 
 **Relay priority:** `cc.set_relay()` > `C2_RELAY_ADDRESS` env var > none (standalone mode).
 
-### 5. Rust Native Layer (`core/`)
+### 5. Rust Native Layer (`core/`, `sdk/python/native/`)
 
-A Cargo workspace of 7 crates organized in 4 layers, compiled into a single `c_two._native` Python extension module:
+`core/` is a language-neutral Cargo workspace of 7 crates organized in 3 layers.
+The Python SDK owns its PyO3 extension crate under `sdk/python/native/`, which
+builds the `c_two._native` Python extension module.
 
 | Layer | Crate | Purpose |
 |-------|-------|---------|
@@ -128,7 +129,7 @@ A Cargo workspace of 7 crates organized in 4 layers, compiled into a single `c_t
 | transport | `c2-ipc` | Async IPC client (UDS + SHM), chunked transfer |
 | transport | `c2-server` | Tokio-based UDS server with per-connection state and peer SHM lazy-open |
 | transport | `c2-http` | HTTP client for relay transport + HTTP relay server (axum → IPC, behind `relay` feature) |
-| bridge | `c2-ffi` | PyO3 bindings: `mem_ffi`, `wire_ffi`, `ipc_ffi`, `server_ffi`, `client_ffi`, `relay_ffi`, `http_ffi` |
+| sdk/python/native | `c2-python-native` | PyO3 bindings for Python package module `c_two._native` |
 
 **Memory subsystem (`c2-mem`):**
 - Three-tier allocation: (1) Buddy SHM for small/medium, (2) Dedicated SHM for oversized, (3) File-spill for RAM-scarce fallback.

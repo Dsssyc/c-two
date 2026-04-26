@@ -7,12 +7,16 @@ The Python SDK does not own the `c3` CLI. `c3` is built from the repository root
 
 ## Development
 
-From the repository root:
+From the repository root, rebuild the Python native extension and install
+Python development dependencies:
 
 ```bash
-uv sync
 uv sync --reinstall-package c-two
-cargo build --manifest-path cli/Cargo.toml
+```
+
+Run Python SDK tests:
+
+```bash
 C2_RELAY_ADDRESS= uv run pytest sdk/python/tests -q --timeout=30
 ```
 
@@ -23,10 +27,11 @@ python tools/dev/c3_tool.py --build --link
 c3 --version
 ```
 
-Run Rust checks from the repository root:
+Run repository-level Rust checks separately:
 
 ```bash
-cd core && cargo check --workspace
+cargo test --manifest-path core/Cargo.toml --workspace
+cargo test --manifest-path cli/Cargo.toml
 ```
 
 ## Examples

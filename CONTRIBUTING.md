@@ -9,7 +9,7 @@ Thanks for your interest in contributing! C-Two is a resource-oriented RPC frame
 ```bash
 git clone https://github.com/world-in-progress/c-two.git
 cd c-two
-uv sync  # installs dependencies and compiles the Rust native extension
+uv sync  # installs dependencies and builds the Python SDK native extension
 ```
 
 To force-rebuild after Rust source changes:
@@ -28,11 +28,12 @@ C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30
 uv run pytest sdk/python/tests/unit/test_wire.py -q
 uv run pytest sdk/python/tests/unit/test_transferable.py::TestTransferableDecorator::test_hello_data_round_trip -q
 
-# Rust type-check
-cd core && cargo check --workspace
+# Rust core tests
+cargo test --manifest-path core/Cargo.toml --workspace
 
-# Rust unit tests (pure Rust crates only — c2-ffi needs Python linkage)
-cd core && cargo test -p c2-mem -p c2-wire
+# Python SDK native extension and tests
+uv sync --reinstall-package c-two
+C2_RELAY_ADDRESS= uv run pytest sdk/python/tests -q --timeout=30
 ```
 
 All new code **must** include tests. Ensure the full suite passes before opening a PR.
@@ -71,7 +72,8 @@ refactor: simplify MethodTable index lookup
 ### Rust
 
 - Code lives in `core/` (a Cargo workspace of 7 crates).
-- Run `cargo check --workspace` and `cargo test -p c2-mem -p c2-wire` before submitting.
+- Run `cargo test --manifest-path core/Cargo.toml --workspace` before submitting core changes.
+- The Python SDK native extension lives in `sdk/python/native/`; rebuild it with `uv sync --reinstall-package c-two` before submitting Python SDK native changes.
 - Prefer zero-copy and single-allocation patterns in wire/transport code.
 
 ## Project Structure
@@ -80,14 +82,16 @@ refactor: simplify MethodTable index lookup
 core/
 ├── foundation/
 ├── protocol/
-├── transport/
-└── bridge/
+└── transport/
+cli/
+└── src/          # Native c3 CLI
 sdk/python/src/c_two/
 ├── crm/          # CRM contracts, @transferable, decorators
 ├── transport/    # Registry, proxy, server bridge, scheduler
 ├── config/       # Settings (pydantic), IPC config
-├── mem/          # Python wrappers for Rust memory subsystem
-└── cli.py        # `c3` CLI entry point
+└── mem/          # Python wrappers for Rust memory subsystem
+sdk/python/native/
+└── src/          # PyO3 extension crate for c_two._native
 sdk/python/tests/
 ├── unit/
 ├── integration/

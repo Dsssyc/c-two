@@ -67,7 +67,7 @@ jobs:
           workspaces: core -> target
 
       - name: Test Rust core
-        run: cargo test --manifest-path core/Cargo.toml --workspace --exclude c2-ffi
+        run: cargo test --manifest-path core/Cargo.toml --workspace
 
   cli:
     needs: changes
