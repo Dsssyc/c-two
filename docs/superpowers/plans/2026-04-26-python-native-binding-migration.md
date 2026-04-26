@@ -500,7 +500,7 @@ workspace-equivalent command `cargo fmt --manifest-path core/Cargo.toml --all --
 cli/Cargo.toml -- --check` reports pre-existing CLI rustfmt drift outside this
 migration's changed file set.
 
-- [ ] **Step 7: Final commit if needed**
+- [x] **Step 7: Final commit if needed**
 
 If any verification-only fixes were required:
 
