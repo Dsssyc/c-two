@@ -27,7 +27,7 @@ def test_cli_release_builds_canonical_platform_artifacts():
 
     assert "name: CLI Release" in text
     assert "workflow_dispatch:" in text
-    assert "tags:" in text
+    assert "branches: [main]" in text
     assert "x86_64-unknown-linux-gnu" in text
     assert "aarch64-unknown-linux-gnu" in text
     assert "aarch64-apple-darwin" in text
@@ -36,12 +36,26 @@ def test_cli_release_builds_canonical_platform_artifacts():
     assert '(cd cli-dist && shasum -a 256 "c3-${{ matrix.target }}" > "c3-${{ matrix.target }}.sha256")' in text
 
 
-def test_cli_release_publishes_github_release_assets_on_tags():
+def test_cli_release_auto_detects_new_cli_versions_on_main_push():
+    text = _workflow_text()
+
+    assert "branches: [main]" in text
+    assert "version-check:" in text
+    assert "python .github/scripts/check_cli_release.py" in text
+    assert "should_release: ${{ steps.check.outputs.should_release }}" in text
+    assert "tag: ${{ steps.check.outputs.tag }}" in text
+    assert "needs.version-check.outputs.should_release == 'true'" in text
+
+
+def test_cli_release_publishes_github_release_assets_for_detected_tag():
     text = _workflow_text()
 
     assert "contents: write" in text
     assert "pattern: cli-*" in text
     assert "softprops/action-gh-release@" in text
+    assert "tag_name: ${{ needs.version-check.outputs.tag }}" in text
+    assert "target_commitish: ${{ github.sha }}" in text
+    assert "name: c3 ${{ needs.version-check.outputs.version }}" in text
     assert "files: dist/c3-*" in text
 
 
@@ -90,6 +104,7 @@ def test_ci_keeps_workflow_policy_tests_lightweight():
     assert "uv run --no-project" in ci_text
     assert "--with pytest" in ci_text
     assert "sdk/python/tests/unit/test_check_version.py::TestCheckVersion" in ci_text
+    assert "sdk/python/tests/unit/test_check_cli_release.py" in ci_text
     assert "uv run pytest sdk/python/tests -q --timeout=30" in ci_text
 
 

@@ -119,6 +119,7 @@ jobs:
           sdk/python/tests/unit/test_cli_release_workflow.py
           sdk/python/tests/unit/test_python_package_release_workflow.py
           sdk/python/tests/unit/test_check_version.py::TestCheckVersion
+          sdk/python/tests/unit/test_check_cli_release.py
           sdk/python/tests/unit/test_c3_tool.py
           -q --timeout=30
 
