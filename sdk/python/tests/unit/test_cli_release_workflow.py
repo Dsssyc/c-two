@@ -51,6 +51,46 @@ def test_ci_runs_cli_rust_tests():
     )
 
     assert "cargo test --manifest-path cli/Cargo.toml" in ci_text
+    assert (
+        "cargo test --manifest-path core/Cargo.toml --workspace --exclude c2-ffi"
+        in ci_text
+    )
+
+
+def test_ci_routes_tests_by_changed_domain():
+    ci_text = (_repo_root() / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "changes:" in ci_text
+    assert "dorny/paths-filter@" in ci_text
+    assert "pull-requests: read" in ci_text
+    assert "sdk/python/**" in ci_text
+    assert "core/**" in ci_text
+    assert "cli/**" in ci_text
+    assert "tools/dev/**" in ci_text
+    assert ".github/dependabot.yml" in ci_text
+    assert ".github/workflows/cli-release.yml" in ci_text
+    assert "github.event_name == 'merge_group'" in ci_text
+    assert "needs.changes.outputs.sdk == 'true'" in ci_text
+    assert "needs.changes.outputs.core == 'true'" in ci_text
+    assert "needs.changes.outputs.ci == 'true'" in ci_text
+    assert "needs.changes.outputs.cli == 'true'" in ci_text
+    assert "Skip full Python tests for unrelated changes" in ci_text
+    assert "this change does not touch sdk/python, examples/python, core, or CI" in ci_text
+
+
+def test_ci_keeps_workflow_policy_tests_lightweight():
+    ci_text = (_repo_root() / ".github" / "workflows" / "ci.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "workflow-policy:" in ci_text
+    assert "sdk/python/tests/unit/test_cli_release_workflow.py" in ci_text
+    assert "uv run --no-project" in ci_text
+    assert "--with pytest" in ci_text
+    assert "sdk/python/tests/unit/test_check_version.py::TestCheckVersion" in ci_text
+    assert "uv run pytest sdk/python/tests -q --timeout=30" in ci_text
 
 
 def test_cli_enables_graceful_termination_signal_handling():
