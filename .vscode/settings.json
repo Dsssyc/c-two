@@ -1,5 +1,6 @@
 {
   "rust-analyzer.linkedProjects": [
-    "src/c_two/_native/Cargo.toml",
+    "core/Cargo.toml",
+    "cli/Cargo.toml"
   ]
 }

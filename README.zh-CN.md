@@ -569,7 +569,7 @@ cd c-two
 cp .env.example .env               # 配置环境变量（可选）
 uv sync                            # 安装依赖 + 编译 Rust 扩展
 uv sync --group examples           # 安装示例依赖（pandas、pyarrow）
-cargo build --manifest-path cli/Cargo.toml  # 在源码检出中构建原生 c3 CLI
+python tools/dev/c3_tool.py --build --link  # 在源码检出中构建并链接原生 c3 CLI
 uv run pytest                      # 运行测试套件
 ```
 

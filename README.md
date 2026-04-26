@@ -570,7 +570,7 @@ cd c-two
 cp .env.example .env               # configure environment (optional)
 uv sync                            # install dependencies + compile Rust extensions
 uv sync --group examples           # install examples dependencies (pandas, pyarrow)
-cargo build --manifest-path cli/Cargo.toml  # build the native c3 CLI in source checkouts
+python tools/dev/c3_tool.py --build --link  # build and link native c3 for source checkouts
 uv run pytest                      # run the test suite
 ```
 

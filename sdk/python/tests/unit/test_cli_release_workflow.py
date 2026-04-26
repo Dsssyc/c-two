@@ -66,7 +66,7 @@ def test_ci_runs_cli_rust_tests():
 
     assert "cargo test --manifest-path cli/Cargo.toml" in ci_text
     assert "cargo test --manifest-path core/Cargo.toml --workspace" in ci_text
-    assert "--exclude c2-ffi" not in ci_text
+    assert "--exclude " + "c2-ffi" not in ci_text
 
 
 def test_ci_routes_tests_by_changed_domain():
