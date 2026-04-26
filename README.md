@@ -495,7 +495,7 @@ stats = cc.hold_stats()
 In scientific computation, resources encapsulating complex state and domain-specific operations need to be organized into cohesive units. We call the contracts describing these resources **Core Resource Models (CRMs)**. Applications care more about *how to interact* with resources than *where they are located*. C-Two provides location transparency and uniform resource access, so any **client** can interact with a resource as if it were a local object.
 
 <p align="center">
-  <img src="docs/images/architecture.svg" alt="C-Two architecture diagram" width="100%">
+  <img src="docs/images/architecture.png" alt="C-Two architecture diagram" width="100%">
 </p>
 
 ### Client Layer

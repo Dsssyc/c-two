@@ -3,17 +3,19 @@ mod relay;
 mod version;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 const BANNER: &str = include_str!("../assets/banner_unicode.txt");
+const BANNER_COLOR: &str = "\x1b[38;2;102;237;173m";
+const RESET_COLOR: &str = "\x1b[0m";
 
 #[derive(Debug, Parser)]
 #[command(
     name = "c3",
     version = version::VERSION,
     about = "C-Two command-line interface",
-    before_help = BANNER,
 )]
 struct Cli {
     #[command(subcommand)]
@@ -30,11 +32,33 @@ enum Commands {
 
 fn main() -> Result<()> {
     load_env_file();
-    let cli = Cli::parse();
+    let matches = Cli::command().before_help(render_banner()).get_matches();
+    let cli = Cli::from_arg_matches(&matches)?;
     match cli.command {
         Commands::Relay(args) => relay::run(args),
         Commands::Registry(args) => registry::run(args),
     }
+}
+
+fn render_banner() -> String {
+    if should_color_banner() {
+        format!("{BANNER_COLOR}{BANNER}{RESET_COLOR}")
+    } else {
+        BANNER.to_string()
+    }
+}
+
+fn should_color_banner() -> bool {
+    if std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    if matches!(std::env::var("CLICOLOR").as_deref(), Ok("0")) {
+        return false;
+    }
+    if std::env::var_os("CLICOLOR_FORCE").is_some() {
+        return true;
+    }
+    std::io::stdout().is_terminal()
 }
 
 fn load_env_file() {

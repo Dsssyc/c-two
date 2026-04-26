@@ -494,7 +494,7 @@ stats = cc.hold_stats()
 在科学计算中，封装复杂状态和领域特定操作的资源需要被组织为内聚的单元。我们称描述这些资源的契约为 **核心资源模型（CRM）**。应用程序更关心的是 *如何与资源交互*，而非 *资源在哪里*。C-Two 提供位置透明和统一的资源访问，使任何 **client** 都能像访问本地对象一样与资源交互。
 
 <p align="center">
-  <img src="docs/images/architecture.svg" alt="C-Two 架构图" width="100%">
+  <img src="docs/images/architecture.png" alt="C-Two 架构图" width="100%">
 </p>
 
 ### 客户端层

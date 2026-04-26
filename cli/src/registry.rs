@@ -49,8 +49,7 @@ fn get_json(relay: &str, path: &str) -> Result<Value> {
         relay.trim_end_matches('/'),
         path.trim_start_matches('/')
     );
-    let builder =
-        reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(5));
+    let builder = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(5));
     let builder = if c2_http::relay_use_proxy() {
         builder
     } else {

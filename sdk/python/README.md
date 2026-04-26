@@ -7,14 +7,25 @@ The Python SDK does not own the `c3` CLI. `c3` is built from the repository root
 
 ## Development
 
-From the repository root, rebuild the Python native extension and install
-Python development dependencies:
+Run Python SDK development commands from the repository root. The repository
+does not pin a local `.python-version`; use any supported Python interpreter
+from the package metadata, with Python 3.12 as the recommended baseline for
+local development.
+
+Install workspace dependencies and build the Python native extension:
+
+```bash
+uv sync
+```
+
+After changing Rust code under `core/` or `sdk/python/native/`, force uv to
+rebuild the Python package:
 
 ```bash
 uv sync --reinstall-package c-two
 ```
 
-Run Python SDK tests:
+Run the Python SDK tests:
 
 ```bash
 C2_RELAY_ADDRESS= uv run pytest sdk/python/tests -q --timeout=30
