@@ -8,19 +8,19 @@
 //! (called from `spawn_blocking` inside tokio). All blocking `PyServer`
 //! methods release the GIL via `py.detach()`.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
-use parking_lot::Mutex;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyTuple};
 
-use c2_mem::MemPool;
 use c2_config::{BaseIpcConfig, ServerIpcConfig};
+use c2_mem::MemPool;
+use c2_server::Server;
 use c2_server::dispatcher::{CrmCallback, CrmError, CrmRoute, RequestData, ResponseMeta};
 use c2_server::scheduler::{AccessLevel, ConcurrencyMode, Scheduler};
-use c2_server::Server;
 
 use crate::mem_ffi::PyMemPool;
 use crate::shm_buffer::PyShmBuffer;
@@ -125,30 +125,51 @@ impl PyServer {
     ))]
     fn new(
         address: &str,
-        shm_threshold: u64, pool_enabled: bool,
-        pool_segment_size: u64, max_pool_segments: u32, max_pool_memory: u64,
-        reassembly_segment_size: u64, reassembly_max_segments: u32,
-        max_frame_size: u64, max_payload_size: u64, max_pending_requests: u32,
-        pool_decay_seconds: f64, heartbeat_interval: f64, heartbeat_timeout: f64,
-        max_total_chunks: u32, chunk_gc_interval: f64, chunk_threshold_ratio: f64,
-        chunk_assembler_timeout: f64, max_reassembly_bytes: u64, chunk_size: u64,
+        shm_threshold: u64,
+        pool_enabled: bool,
+        pool_segment_size: u64,
+        max_pool_segments: u32,
+        max_pool_memory: u64,
+        reassembly_segment_size: u64,
+        reassembly_max_segments: u32,
+        max_frame_size: u64,
+        max_payload_size: u64,
+        max_pending_requests: u32,
+        pool_decay_seconds: f64,
+        heartbeat_interval: f64,
+        heartbeat_timeout: f64,
+        max_total_chunks: u32,
+        chunk_gc_interval: f64,
+        chunk_threshold_ratio: f64,
+        chunk_assembler_timeout: f64,
+        max_reassembly_bytes: u64,
+        chunk_size: u64,
     ) -> PyResult<Self> {
         let config = ServerIpcConfig {
             base: BaseIpcConfig {
-                pool_enabled, pool_segment_size, max_pool_segments, max_pool_memory,
-                reassembly_segment_size, reassembly_max_segments, max_total_chunks,
+                pool_enabled,
+                pool_segment_size,
+                max_pool_segments,
+                max_pool_memory,
+                reassembly_segment_size,
+                reassembly_max_segments,
+                max_total_chunks,
                 chunk_gc_interval_secs: chunk_gc_interval,
                 chunk_threshold_ratio,
                 chunk_assembler_timeout_secs: chunk_assembler_timeout,
-                max_reassembly_bytes, chunk_size,
+                max_reassembly_bytes,
+                chunk_size,
             },
-            shm_threshold, max_frame_size, max_payload_size, max_pending_requests,
+            shm_threshold,
+            max_frame_size,
+            max_payload_size,
+            max_pending_requests,
             pool_decay_seconds,
             heartbeat_interval_secs: heartbeat_interval,
             heartbeat_timeout_secs: heartbeat_timeout,
         };
-        let server = Server::new(address, config)
-            .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
+        let server =
+            Server::new(address, config).map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
         Ok(Self {
             inner: Arc::new(server),
             rt: Mutex::new(None),
@@ -356,31 +377,31 @@ fn parse_response_meta(py: Python<'_>, result: Py<PyAny>) -> Result<ResponseMeta
             )));
         }
         let seg_idx: u16 = tup
-                .get_item(0)
-                .map_err(|e| CrmError::InternalError(format!("bad seg_idx: {e}")))?
-                .extract()
-                .map_err(|e| CrmError::InternalError(format!("bad seg_idx: {e}")))?;
-            let offset: u32 = tup
-                .get_item(1)
-                .map_err(|e| CrmError::InternalError(format!("bad offset: {e}")))?
-                .extract()
-                .map_err(|e| CrmError::InternalError(format!("bad offset: {e}")))?;
-            let data_size: u32 = tup
-                .get_item(2)
-                .map_err(|e| CrmError::InternalError(format!("bad data_size: {e}")))?
-                .extract()
-                .map_err(|e| CrmError::InternalError(format!("bad data_size: {e}")))?;
-            let is_dedicated: bool = tup
-                .get_item(3)
-                .map_err(|e| CrmError::InternalError(format!("bad is_dedicated: {e}")))?
-                .extract()
-                .map_err(|e| CrmError::InternalError(format!("bad is_dedicated: {e}")))?;
+            .get_item(0)
+            .map_err(|e| CrmError::InternalError(format!("bad seg_idx: {e}")))?
+            .extract()
+            .map_err(|e| CrmError::InternalError(format!("bad seg_idx: {e}")))?;
+        let offset: u32 = tup
+            .get_item(1)
+            .map_err(|e| CrmError::InternalError(format!("bad offset: {e}")))?
+            .extract()
+            .map_err(|e| CrmError::InternalError(format!("bad offset: {e}")))?;
+        let data_size: u32 = tup
+            .get_item(2)
+            .map_err(|e| CrmError::InternalError(format!("bad data_size: {e}")))?
+            .extract()
+            .map_err(|e| CrmError::InternalError(format!("bad data_size: {e}")))?;
+        let is_dedicated: bool = tup
+            .get_item(3)
+            .map_err(|e| CrmError::InternalError(format!("bad is_dedicated: {e}")))?
+            .extract()
+            .map_err(|e| CrmError::InternalError(format!("bad is_dedicated: {e}")))?;
         return Ok(ResponseMeta::ShmAlloc {
-                seg_idx,
-                offset,
-                data_size,
-                is_dedicated,
-            });
+            seg_idx,
+            offset,
+            data_size,
+            is_dedicated,
+        });
     }
 
     Err(CrmError::InternalError(

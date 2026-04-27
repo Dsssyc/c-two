@@ -4,8 +4,8 @@
 //! encode/decode functions plus all flag and signal constants
 //! to Python as part of `c_two._native`.
 
-use pyo3::prelude::*;
 use pyo3::exceptions::PyValueError;
+use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
 // ── Error conversion ────────────────────────────────────────────────────
@@ -163,9 +163,7 @@ fn decode_call_control(data: &[u8], offset: usize) -> PyResult<(String, u16, usi
 fn encode_reply_control(status: u8, error_data: Option<&[u8]>) -> Vec<u8> {
     let ctrl = match status {
         c2_wire::control::STATUS_SUCCESS => c2_wire::control::ReplyControl::Success,
-        _ => c2_wire::control::ReplyControl::Error(
-            error_data.unwrap_or(&[]).to_vec(),
-        ),
+        _ => c2_wire::control::ReplyControl::Error(error_data.unwrap_or(&[]).to_vec()),
     };
     c2_wire::control::encode_reply_control(&ctrl)
 }
@@ -174,10 +172,7 @@ fn encode_reply_control(status: u8, error_data: Option<&[u8]>) -> Vec<u8> {
 ///
 /// Returns `(status, error_data_or_none, bytes_consumed)`.
 #[pyfunction]
-fn decode_reply_control(
-    data: &[u8],
-    offset: usize,
-) -> PyResult<(u8, Option<Vec<u8>>, usize)> {
+fn decode_reply_control(data: &[u8], offset: usize) -> PyResult<(u8, Option<Vec<u8>>, usize)> {
     let (ctrl, consumed) =
         c2_wire::control::decode_reply_control(data, offset).map_err(decode_err)?;
     match ctrl {
@@ -194,12 +189,7 @@ fn decode_reply_control(
 
 /// Encode buddy SHM pointer: `[2B seg_idx][4B offset][4B size][1B flags]`.
 #[pyfunction]
-fn encode_buddy_payload(
-    seg_idx: u16,
-    offset: u32,
-    data_size: u32,
-    is_dedicated: bool,
-) -> Vec<u8> {
+fn encode_buddy_payload(seg_idx: u16, offset: u32, data_size: u32, is_dedicated: bool) -> Vec<u8> {
     let bp = c2_wire::buddy::BuddyPayload {
         seg_idx,
         offset,
@@ -238,12 +228,7 @@ fn decode_chunk_header(data: &[u8], offset: usize) -> PyResult<(u16, u16, usize)
 
 /// Encode `CTRL_SEGMENT_ANNOUNCE`.
 #[pyfunction]
-fn encode_ctrl_segment_announce(
-    direction: u8,
-    index: u8,
-    size: u32,
-    name: &str,
-) -> Vec<u8> {
+fn encode_ctrl_segment_announce(direction: u8, index: u8, size: u32, name: &str) -> Vec<u8> {
     c2_wire::ctrl::encode_ctrl_segment_announce(direction, index, size, name)
 }
 
@@ -324,12 +309,7 @@ fn encode_server_handshake(
             }
         })
         .collect();
-    c2_wire::handshake::encode_server_handshake(
-        &segments,
-        capability_flags,
-        &rust_routes,
-        prefix,
-    )
+    c2_wire::handshake::encode_server_handshake(&segments, capability_flags, &rust_routes, prefix)
 }
 
 /// Decode handshake payload (both client and server directions).
@@ -459,8 +439,14 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // ── Signal bytes ────────────────────────────────────────────────
     let py = m.py();
-    m.add("PING_BYTES", PyBytes::new(py, &c2_wire::msg_type::PING_BYTES))?;
-    m.add("PONG_BYTES", PyBytes::new(py, &c2_wire::msg_type::PONG_BYTES))?;
+    m.add(
+        "PING_BYTES",
+        PyBytes::new(py, &c2_wire::msg_type::PING_BYTES),
+    )?;
+    m.add(
+        "PONG_BYTES",
+        PyBytes::new(py, &c2_wire::msg_type::PONG_BYTES),
+    )?;
     m.add(
         "SHUTDOWN_CLIENT_BYTES",
         PyBytes::new(py, &c2_wire::msg_type::SHUTDOWN_CLIENT_BYTES),
@@ -480,7 +466,10 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("SIGNAL_SIZE", c2_wire::msg_type::SIGNAL_SIZE)?;
 
     // ── Control message constants ───────────────────────────────────
-    m.add("CTRL_SEGMENT_ANNOUNCE", c2_wire::ctrl::CTRL_SEGMENT_ANNOUNCE)?;
+    m.add(
+        "CTRL_SEGMENT_ANNOUNCE",
+        c2_wire::ctrl::CTRL_SEGMENT_ANNOUNCE,
+    )?;
     m.add("CTRL_CONSUMED", c2_wire::ctrl::CTRL_CONSUMED)?;
     m.add("CTRL_BUDDY_ANNOUNCE", c2_wire::ctrl::CTRL_BUDDY_ANNOUNCE)?;
     m.add("POOL_DIR_OUTBOUND", c2_wire::ctrl::POOL_DIR_OUTBOUND)?;

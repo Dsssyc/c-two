@@ -39,12 +39,14 @@ impl RouteTable {
 
     /// Remove a specific route by (name, relay_id).
     pub fn unregister_route(&mut self, name: &str, relay_id: &str) -> Option<RouteEntry> {
-        self.routes.remove(&(name.to_string(), relay_id.to_string()))
+        self.routes
+            .remove(&(name.to_string(), relay_id.to_string()))
     }
 
     /// Check if a LOCAL route with this name exists.
     pub fn has_local_route(&self, name: &str) -> bool {
-        self.routes.contains_key(&(name.to_string(), self.relay_id.clone()))
+        self.routes
+            .contains_key(&(name.to_string(), self.relay_id.clone()))
     }
 
     /// Resolve a name → ordered list of RouteInfo.
@@ -202,19 +204,18 @@ impl RouteTable {
             if ps.relay_id == self.relay_id {
                 continue; // Don't add ourselves.
             }
-            self.peers.entry(ps.relay_id.clone())
+            self.peers
+                .entry(ps.relay_id.clone())
                 .and_modify(|existing| {
                     existing.url = ps.url.clone();
                     existing.route_count = ps.route_count;
                 })
-                .or_insert_with(|| {
-                    PeerInfo {
-                        relay_id: ps.relay_id,
-                        url: ps.url,
-                        route_count: ps.route_count,
-                        last_heartbeat: Instant::now(),
-                        status: PeerStatus::Alive,
-                    }
+                .or_insert_with(|| PeerInfo {
+                    relay_id: ps.relay_id,
+                    url: ps.url,
+                    route_count: ps.route_count,
+                    last_heartbeat: Instant::now(),
+                    status: PeerStatus::Alive,
                 });
         }
     }

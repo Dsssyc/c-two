@@ -87,9 +87,14 @@ pub struct PeerSnapshot {
 impl From<crate::relay::peer::DigestDiffEntry> for RouteEntry {
     fn from(d: crate::relay::peer::DigestDiffEntry) -> Self {
         Self {
-            name: d.name, relay_id: d.relay_id, relay_url: d.relay_url,
-            ipc_address: d.ipc_address, crm_ns: d.crm_ns, crm_ver: d.crm_ver,
-            locality: Locality::Peer, registered_at: d.registered_at,
+            name: d.name,
+            relay_id: d.relay_id,
+            relay_url: d.relay_url,
+            ipc_address: d.ipc_address,
+            crm_ns: d.crm_ns,
+            crm_ver: d.crm_ver,
+            locality: Locality::Peer,
+            registered_at: d.registered_at,
         }
     }
 }

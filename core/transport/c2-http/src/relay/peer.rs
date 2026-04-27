@@ -25,28 +25,15 @@ pub enum PeerMessage {
         registered_at: f64,
     },
     /// A CRM route was unregistered.
-    RouteWithdraw {
-        name: String,
-        relay_id: String,
-    },
+    RouteWithdraw { name: String, relay_id: String },
     /// A relay wants to join the mesh.
-    RelayJoin {
-        relay_id: String,
-        url: String,
-    },
+    RelayJoin { relay_id: String, url: String },
     /// A relay is gracefully leaving the mesh.
-    RelayLeave {
-        relay_id: String,
-    },
+    RelayLeave { relay_id: String },
     /// Periodic heartbeat.
-    Heartbeat {
-        relay_id: String,
-        route_count: u32,
-    },
+    Heartbeat { relay_id: String, route_count: u32 },
     /// Anti-entropy digest exchange (request or response).
-    DigestExchange {
-        digest: Vec<DigestEntry>,
-    },
+    DigestExchange { digest: Vec<DigestEntry> },
     /// Anti-entropy diff: entries the sender has that recipient was missing.
     DigestDiff {
         entries: Vec<DigestDiffEntry>,

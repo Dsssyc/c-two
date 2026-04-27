@@ -2,9 +2,9 @@
 
 use std::sync::Arc;
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 
-use crate::relay::peer::{PeerEnvelope, PeerMessage, PROTOCOL_VERSION};
+use crate::relay::peer::{PROTOCOL_VERSION, PeerEnvelope, PeerMessage};
 use crate::relay::state::RelayState;
 use crate::relay::types::*;
 
@@ -29,8 +29,13 @@ pub async fn handle_peer_announce(
     }
     match envelope.message {
         PeerMessage::RouteAnnounce {
-            name, relay_id, relay_url, ipc_address: _,
-            crm_ns, crm_ver, registered_at,
+            name,
+            relay_id,
+            relay_url,
+            ipc_address: _,
+            crm_ns,
+            crm_ver,
+            registered_at,
         } => {
             if relay_id == state.relay_id() {
                 return StatusCode::OK;
@@ -39,9 +44,12 @@ pub async fn handle_peer_announce(
             // sending relay; never store it in our PEER routes regardless of
             // what the wire said.
             state.register_peer_route(RouteEntry {
-                name, relay_id, relay_url,
+                name,
+                relay_id,
+                relay_url,
                 ipc_address: None,
-                crm_ns, crm_ver,
+                crm_ns,
+                crm_ver,
                 locality: Locality::Peer,
                 registered_at,
             });
@@ -51,7 +59,10 @@ pub async fn handle_peer_announce(
         }
         _ => {
             if matches!(envelope.message, PeerMessage::Unknown) {
-                eprintln!("[relay] Ignoring unknown message type from {}", envelope.sender_relay_id);
+                eprintln!(
+                    "[relay] Ignoring unknown message type from {}",
+                    envelope.sender_relay_id
+                );
             }
         }
     }
@@ -64,7 +75,11 @@ pub async fn handle_peer_join(
     Json(envelope): Json<PeerEnvelope>,
 ) -> impl IntoResponse {
     if !check_protocol_version(&envelope) {
-        return (StatusCode::OK, Json(serde_json::json!({"status": "ignored"}))).into_response();
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "ignored"})),
+        )
+            .into_response();
     }
     if let PeerMessage::RelayJoin { relay_id, url } = envelope.message {
         if relay_id == state.relay_id() {
@@ -98,9 +113,7 @@ pub async fn handle_peer_join(
 }
 
 /// GET /_peer/sync — return full route table + peer list
-pub async fn handle_peer_sync(
-    State(state): State<Arc<RelayState>>,
-) -> impl IntoResponse {
+pub async fn handle_peer_sync(State(state): State<Arc<RelayState>>) -> impl IntoResponse {
     Json(state.full_snapshot())
 }
 
@@ -112,7 +125,11 @@ pub async fn handle_peer_heartbeat(
     if !check_protocol_version(&envelope) {
         return StatusCode::OK;
     }
-    if let PeerMessage::Heartbeat { relay_id, route_count } = envelope.message {
+    if let PeerMessage::Heartbeat {
+        relay_id,
+        route_count,
+    } = envelope.message
+    {
         state.with_route_table_mut(|rt| {
             if let Some(peer) = rt.get_peer_mut(&relay_id) {
                 peer.last_heartbeat = std::time::Instant::now();
@@ -170,7 +187,8 @@ pub async fn handle_peer_digest(
                     Some(peer_hash) if peer_hash == our_hash => {}
                     _ => {
                         // We have this route and peer doesn't, or hashes differ.
-                        if let Some(entry) = all_routes.iter()
+                        if let Some(entry) = all_routes
+                            .iter()
                             .find(|e| e.name == key.0 && e.relay_id == key.1)
                         {
                             // Strip ipc_address — it's a local-only path on

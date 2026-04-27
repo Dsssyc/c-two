@@ -3,18 +3,18 @@
 use std::sync::Arc;
 
 use axum::{
+    Json, Router,
     body::Bytes,
     extract::{DefaultBodyLimit, Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
 };
 
-use c2_ipc::IpcClient;
-use crate::relay::state::RelayState;
 use crate::relay::peer::{PeerEnvelope, PeerMessage};
 use crate::relay::peer_handlers;
+use crate::relay::state::RelayState;
+use c2_ipc::IpcClient;
 
 /// Build the relay axum router with control-plane and data-plane endpoints.
 pub fn build_router(state: Arc<RelayState>) -> Router {
@@ -27,7 +27,10 @@ pub fn build_router(state: Arc<RelayState>) -> Router {
         .route("/_peer/announce", post(peer_handlers::handle_peer_announce))
         .route("/_peer/join", post(peer_handlers::handle_peer_join))
         .route("/_peer/sync", get(peer_handlers::handle_peer_sync))
-        .route("/_peer/heartbeat", post(peer_handlers::handle_peer_heartbeat))
+        .route(
+            "/_peer/heartbeat",
+            post(peer_handlers::handle_peer_heartbeat),
+        )
         .route("/_peer/leave", post(peer_handlers::handle_peer_leave))
         .route("/_peer/digest", post(peer_handlers::handle_peer_digest))
         .route("/health", get(handle_health))
@@ -55,8 +58,16 @@ async fn handle_register(
         Some(a) => a.to_string(),
         None => return (StatusCode::BAD_REQUEST, "Missing \"address\"").into_response(),
     };
-    let crm_ns = body.get("crm_ns").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let crm_ver = body.get("crm_ver").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let crm_ns = body
+        .get("crm_ns")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let crm_ver = body
+        .get("crm_ver")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
     // Check for duplicate LOCAL route.
     if state.has_local_route(&name) {
@@ -75,7 +86,8 @@ async fn handle_register(
                                 "name": name,
                                 "existing_address": old_addr,
                             })),
-                        ).into_response();
+                        )
+                            .into_response();
                     }
                     // Not connected → fall through to upsert.
                 }
@@ -117,7 +129,11 @@ async fn handle_register(
     let peers = state.list_peers();
     state.disseminator().broadcast(envelope, &peers);
 
-    (StatusCode::CREATED, Json(serde_json::json!({"registered": name}))).into_response()
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({"registered": name})),
+    )
+        .into_response()
 }
 
 /// `POST /_unregister` — remove a CRM upstream.
@@ -157,12 +173,17 @@ async fn handle_unregister(
             let peers = state.list_peers();
             state.disseminator().broadcast(envelope, &peers);
 
-            (StatusCode::OK, Json(serde_json::json!({"unregistered": name}))).into_response()
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"unregistered": name})),
+            )
+                .into_response()
         }
         None => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": format!("Route name not registered: '{name}'")})),
-        ).into_response(),
+        )
+            .into_response(),
     }
 }
 
@@ -172,19 +193,22 @@ async fn handle_unregister(
 /// reachable by anyone who can hit the relay's HTTP port, and the local UDS
 /// path is filesystem-private to the owning host.
 async fn handle_list_routes(State(state): State<Arc<RelayState>>) -> impl IntoResponse {
-    let routes: Vec<serde_json::Value> = state.list_routes()
+    let routes: Vec<serde_json::Value> = state
+        .list_routes()
         .into_iter()
-        .map(|r| serde_json::json!({
-            "name": r.name,
-            "relay_id": r.relay_id,
-            "relay_url": r.relay_url,
-            "locality": match r.locality {
-                crate::relay::types::Locality::Local => "local",
-                crate::relay::types::Locality::Peer => "peer",
-            },
-            "crm_ns": r.crm_ns,
-            "crm_ver": r.crm_ver,
-        }))
+        .map(|r| {
+            serde_json::json!({
+                "name": r.name,
+                "relay_id": r.relay_id,
+                "relay_url": r.relay_url,
+                "locality": match r.locality {
+                    crate::relay::types::Locality::Local => "local",
+                    crate::relay::types::Locality::Peer => "peer",
+                },
+                "crm_ns": r.crm_ns,
+                "crm_ver": r.crm_ver,
+            })
+        })
         .collect();
     Json(serde_json::json!({"routes": routes}))
 }
@@ -207,17 +231,19 @@ async fn handle_resolve(
 ) -> impl IntoResponse {
     let routes = state.resolve(&name);
     if routes.is_empty() {
-        return (StatusCode::NOT_FOUND, Json(serde_json::json!({
-            "error": "ResourceNotFound", "name": name,
-        }))).into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "ResourceNotFound", "name": name,
+            })),
+        )
+            .into_response();
     }
     Json(routes).into_response()
 }
 
 /// `GET /_peers` — list known peer relays.
-async fn handle_peers(
-    State(state): State<Arc<RelayState>>,
-) -> impl IntoResponse {
+async fn handle_peers(State(state): State<Arc<RelayState>>) -> impl IntoResponse {
     Json(state.list_peers()).into_response()
 }
 
@@ -251,7 +277,8 @@ async fn call_handler(
                     Json(serde_json::json!({
                         "error": format!("No upstream registered for route: '{route_name}'")
                     })),
-                ).into_response();
+                )
+                    .into_response();
             }
         },
     };
@@ -259,15 +286,15 @@ async fn call_handler(
     match client.call(&route_name, &method_name, &body).await {
         Ok(result) => {
             state.touch_connection(&route_name);
-            let bytes = result.into_bytes_with_pool(
-                client.server_pool_arc(),
-                &client.reassembly_pool_arc(),
-            ).unwrap_or_default();
+            let bytes = result
+                .into_bytes_with_pool(client.server_pool_arc(), &client.reassembly_pool_arc())
+                .unwrap_or_default();
             (
                 StatusCode::OK,
                 [("content-type", "application/octet-stream")],
                 bytes,
-            ).into_response()
+            )
+                .into_response()
         }
         Err(c2_ipc::IpcError::CrmError(err_bytes)) => {
             state.touch_connection(&route_name);
@@ -275,7 +302,8 @@ async fn call_handler(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 [("content-type", "application/octet-stream")],
                 err_bytes,
-            ).into_response()
+            )
+                .into_response()
         }
         Err(e) => {
             // Evict dead client so next request triggers reconnect.
@@ -284,7 +312,8 @@ async fn call_handler(
                 StatusCode::BAD_GATEWAY,
                 [("content-type", "text/plain")],
                 format!("relay error: {e}"),
-            ).into_response()
+            )
+                .into_response()
         }
     }
 }

@@ -15,8 +15,8 @@ fn error_registry(py: Python<'_>) -> PyResult<Py<PyAny>> {
 
 #[pyfunction]
 fn decode_error_legacy(py: Python<'_>, data: &[u8]) -> PyResult<Option<Py<PyAny>>> {
-    let Some(err) = C2Error::from_legacy_bytes(data)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?
+    let Some(err) =
+        C2Error::from_legacy_bytes(data).map_err(|e| PyValueError::new_err(e.to_string()))?
     else {
         return Ok(None);
     };

@@ -7,12 +7,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use parking_lot::RwLock;
-use c2_ipc::IpcClient;
 use c2_config::RelayConfig;
+use c2_ipc::IpcClient;
+use parking_lot::RwLock;
 
-use crate::relay::route_table::RouteTable;
 use crate::relay::conn_pool::ConnectionPool;
+use crate::relay::route_table::RouteTable;
 use crate::relay::types::*;
 
 pub struct RelayState {
@@ -23,7 +23,10 @@ pub struct RelayState {
 }
 
 impl RelayState {
-    pub fn new(config: Arc<RelayConfig>, disseminator: Arc<dyn crate::relay::disseminator::Disseminator>) -> Self {
+    pub fn new(
+        config: Arc<RelayConfig>,
+        disseminator: Arc<dyn crate::relay::disseminator::Disseminator>,
+    ) -> Self {
         Self {
             route_table: RwLock::new(RouteTable::new(config.relay_id.clone())),
             conn_pool: RwLock::new(ConnectionPool::new()),
@@ -36,15 +39,22 @@ impl RelayState {
         &self.disseminator
     }
 
-    pub fn config(&self) -> &RelayConfig { &self.config }
-    pub fn relay_id(&self) -> &str { &self.config.relay_id }
+    pub fn config(&self) -> &RelayConfig {
+        &self.config
+    }
+    pub fn relay_id(&self) -> &str {
+        &self.config.relay_id
+    }
 
     // -- Transactional: route + connection together --
 
     /// Register a LOCAL upstream CRM.
     pub fn register_upstream(
-        &self, name: String, address: String,
-        crm_ns: String, crm_ver: String,
+        &self,
+        name: String,
+        address: String,
+        crm_ns: String,
+        crm_ver: String,
         client: Arc<IpcClient>,
     ) -> RouteEntry {
         let entry = RouteEntry {
@@ -52,7 +62,8 @@ impl RelayState {
             relay_id: self.config.relay_id.clone(),
             relay_url: self.config.effective_advertise_url(),
             ipc_address: Some(address.clone()),
-            crm_ns, crm_ver,
+            crm_ns,
+            crm_ver,
             locality: Locality::Local,
             registered_at: now_secs(),
         };
@@ -105,7 +116,13 @@ impl RelayState {
     pub fn evict_idle(&self, idle_timeout_ms: u64) -> Vec<(String, Option<Arc<IpcClient>>)> {
         let mut cp = self.conn_pool.write();
         let names = cp.idle_entries(idle_timeout_ms);
-        names.into_iter().map(|n| { let c = cp.evict(&n); (n, c) }).collect()
+        names
+            .into_iter()
+            .map(|n| {
+                let c = cp.evict(&n);
+                (n, c)
+            })
+            .collect()
     }
 
     pub fn evict_connection(&self, name: &str) -> Option<Arc<IpcClient>> {
@@ -152,10 +169,17 @@ impl RelayState {
     }
 
     pub fn list_peers(&self) -> Vec<PeerSnapshot> {
-        self.route_table.read().list_peers().into_iter().map(|p| PeerSnapshot {
-            relay_id: p.relay_id.clone(), url: p.url.clone(),
-            route_count: p.route_count, status: p.status,
-        }).collect()
+        self.route_table
+            .read()
+            .list_peers()
+            .into_iter()
+            .map(|p| PeerSnapshot {
+                relay_id: p.relay_id.clone(),
+                url: p.url.clone(),
+                route_count: p.route_count,
+                status: p.status,
+            })
+            .collect()
     }
 
     pub fn local_route_count(&self) -> u32 {
@@ -164,19 +188,29 @@ impl RelayState {
 
     // -- Snapshot operations --
 
-    pub fn full_snapshot(&self) -> FullSync { self.route_table.read().full_snapshot() }
+    pub fn full_snapshot(&self) -> FullSync {
+        self.route_table.read().full_snapshot()
+    }
 
-    pub fn merge_snapshot(&self, sync: FullSync) { self.route_table.write().merge_snapshot(sync); }
+    pub fn merge_snapshot(&self, sync: FullSync) {
+        self.route_table.write().merge_snapshot(sync);
+    }
 
     pub fn route_digest(&self) -> HashMap<(String, String), u64> {
         self.route_table.read().route_digest()
     }
 
-    pub fn with_route_table<F, R>(&self, f: F) -> R where F: FnOnce(&RouteTable) -> R {
+    pub fn with_route_table<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&RouteTable) -> R,
+    {
         f(&self.route_table.read())
     }
 
-    pub fn with_route_table_mut<F, R>(&self, f: F) -> R where F: FnOnce(&mut RouteTable) -> R {
+    pub fn with_route_table_mut<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut RouteTable) -> R,
+    {
         f(&mut self.route_table.write())
     }
 }
@@ -194,7 +228,11 @@ mod tests {
 
     struct NullDisseminator;
     impl crate::relay::disseminator::Disseminator for NullDisseminator {
-        fn broadcast(&self, _envelope: crate::relay::peer::PeerEnvelope, _peers: &[PeerSnapshot]) -> Option<tokio::task::JoinHandle<()>> {
+        fn broadcast(
+            &self,
+            _envelope: crate::relay::peer::PeerEnvelope,
+            _peers: &[PeerSnapshot],
+        ) -> Option<tokio::task::JoinHandle<()>> {
             None
         }
     }
@@ -215,8 +253,13 @@ mod tests {
     fn register_and_resolve_upstream() {
         let state = RelayState::new(test_config(), null_disseminator());
         let client = Arc::new(IpcClient::new("ipc://grid"));
-        state.register_upstream("grid".into(), "ipc://grid".into(),
-            "test.ns".into(), "0.1.0".into(), client);
+        state.register_upstream(
+            "grid".into(),
+            "ipc://grid".into(),
+            "test.ns".into(),
+            "0.1.0".into(),
+            client,
+        );
         let routes = state.resolve("grid");
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].ipc_address.as_deref(), Some("ipc://grid"));
@@ -226,8 +269,13 @@ mod tests {
     fn unregister_upstream() {
         let state = RelayState::new(test_config(), null_disseminator());
         let client = Arc::new(IpcClient::new("ipc://grid"));
-        state.register_upstream("grid".into(), "ipc://grid".into(),
-            "test.ns".into(), "0.1.0".into(), client);
+        state.register_upstream(
+            "grid".into(),
+            "ipc://grid".into(),
+            "test.ns".into(),
+            "0.1.0".into(),
+            client,
+        );
         assert!(state.unregister_upstream("grid").is_some());
         assert!(state.resolve("grid").is_empty());
     }
@@ -236,10 +284,14 @@ mod tests {
     fn peer_route_operations() {
         let state = RelayState::new(test_config(), null_disseminator());
         state.register_peer_route(RouteEntry {
-            name: "remote".into(), relay_id: "peer-1".into(),
-            relay_url: "http://peer-1:8080".into(), ipc_address: None,
-            crm_ns: "ns".into(), crm_ver: "0.1.0".into(),
-            locality: Locality::Peer, registered_at: 1000.0,
+            name: "remote".into(),
+            relay_id: "peer-1".into(),
+            relay_url: "http://peer-1:8080".into(),
+            ipc_address: None,
+            crm_ns: "ns".into(),
+            crm_ver: "0.1.0".into(),
+            locality: Locality::Peer,
+            registered_at: 1000.0,
         });
         assert_eq!(state.resolve("remote").len(), 1);
         state.unregister_peer_route("remote", "peer-1");
@@ -254,20 +306,32 @@ mod tests {
         // route (without ipc_address) and break local IPC dispatch.
         let state = RelayState::new(test_config(), null_disseminator());
         let client = Arc::new(IpcClient::new("ipc://grid"));
-        state.register_upstream("grid".into(), "ipc://grid".into(),
-            "test.ns".into(), "0.1.0".into(), client);
+        state.register_upstream(
+            "grid".into(),
+            "ipc://grid".into(),
+            "test.ns".into(),
+            "0.1.0".into(),
+            client,
+        );
 
         // Echo of our own route arriving via DigestDiff with our relay_id.
         state.register_peer_route(RouteEntry {
-            name: "grid".into(), relay_id: "test-relay".into(),
-            relay_url: "http://elsewhere:8080".into(), ipc_address: None,
-            crm_ns: "test.ns".into(), crm_ver: "0.1.0".into(),
-            locality: Locality::Peer, registered_at: 1000.0,
+            name: "grid".into(),
+            relay_id: "test-relay".into(),
+            relay_url: "http://elsewhere:8080".into(),
+            ipc_address: None,
+            crm_ns: "test.ns".into(),
+            crm_ver: "0.1.0".into(),
+            locality: Locality::Peer,
+            registered_at: 1000.0,
         });
 
         let routes = state.resolve("grid");
         assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].ipc_address.as_deref(), Some("ipc://grid"),
-            "echoed peer route must not overwrite our LOCAL route");
+        assert_eq!(
+            routes[0].ipc_address.as_deref(),
+            Some("ipc://grid"),
+            "echoed peer route must not overwrite our LOCAL route"
+        );
     }
 }

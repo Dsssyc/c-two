@@ -9,12 +9,12 @@
 use c2_mem::handle::MemHandle;
 use c2_mem::{MemPool, PoolAllocation, PoolConfig};
 use c2_wire::assembler::ChunkAssembler;
+use parking_lot::{Mutex, RwLock};
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::sync::Arc;
-use parking_lot::{Mutex, RwLock};
 
 /// Python-visible pool configuration.
 #[pyclass(name = "PoolConfig", frozen, skip_from_py_object)]
@@ -73,13 +73,19 @@ impl PyPoolConfig {
             return Err(PyValueError::new_err("segment_size must be a power of 2"));
         }
         if dedicated_crash_timeout_secs.is_nan() {
-            return Err(PyValueError::new_err("dedicated_crash_timeout_secs must not be NaN"));
+            return Err(PyValueError::new_err(
+                "dedicated_crash_timeout_secs must not be NaN",
+            ));
         }
         if buddy_idle_decay_secs.is_nan() {
-            return Err(PyValueError::new_err("buddy_idle_decay_secs must not be NaN"));
+            return Err(PyValueError::new_err(
+                "buddy_idle_decay_secs must not be NaN",
+            ));
         }
         if spill_threshold < 0.0 || spill_threshold > 1.0 || spill_threshold.is_nan() {
-            return Err(PyValueError::new_err("spill_threshold must be in [0.0, 1.0]"));
+            return Err(PyValueError::new_err(
+                "spill_threshold must be in [0.0, 1.0]",
+            ));
         }
         Ok(Self {
             segment_size,
@@ -96,8 +102,12 @@ impl PyPoolConfig {
     fn __repr__(&self) -> String {
         format!(
             "PoolConfig(segment_size={}, min_block={}, max_seg={}, max_ded={}, spill_threshold={}, spill_dir='{}')",
-            self.segment_size, self.min_block_size, self.max_segments, self.max_dedicated_segments,
-            self.spill_threshold, self.spill_dir
+            self.segment_size,
+            self.min_block_size,
+            self.max_segments,
+            self.max_dedicated_segments,
+            self.spill_threshold,
+            self.spill_dir
         )
     }
 }
@@ -229,9 +239,9 @@ impl PyMemPool {
     /// directly into the SHM block — zero intermediate copies.
     fn alloc_ptr(&self, size: usize) -> PyResult<(PyPoolAlloc, usize)> {
         let mut pool = self.pool.write();
-        let alloc = pool.alloc(size)
-            .map_err(|e| PyRuntimeError::new_err(e))?;
-        let ptr = pool.data_ptr(&alloc)
+        let alloc = pool.alloc(size).map_err(|e| PyRuntimeError::new_err(e))?;
+        let ptr = pool
+            .data_ptr(&alloc)
             .map_err(|e| PyRuntimeError::new_err(e))?;
         Ok((PyPoolAlloc::from(alloc), ptr as usize))
     }
@@ -241,7 +251,8 @@ impl PyMemPool {
     /// Returns the usize pointer that Python can pass to ctypes.memmove.
     fn data_addr(&self, seg_idx: u32, offset: u32, is_dedicated: bool) -> PyResult<usize> {
         let pool = self.pool.read();
-        let ptr = pool.data_ptr_at(seg_idx, offset, is_dedicated)
+        let ptr = pool
+            .data_ptr_at(seg_idx, offset, is_dedicated)
             .map_err(|e| PyRuntimeError::new_err(e))?;
         Ok(ptr as usize)
     }
@@ -265,8 +276,7 @@ impl PyMemPool {
             level: alloc.level,
             is_dedicated: alloc.is_dedicated,
         };
-        pool.free(&pa)
-            .map_err(|e| PyRuntimeError::new_err(e))?;
+        pool.free(&pa).map_err(|e| PyRuntimeError::new_err(e))?;
         Ok(())
     }
 
@@ -291,7 +301,12 @@ impl PyMemPool {
     }
 
     /// Read data from an allocated block as bytes.
-    fn read<'py>(&self, py: Python<'py>, alloc: &PyPoolAlloc, size: usize) -> PyResult<Bound<'py, PyBytes>> {
+    fn read<'py>(
+        &self,
+        py: Python<'py>,
+        alloc: &PyPoolAlloc,
+        size: usize,
+    ) -> PyResult<Bound<'py, PyBytes>> {
         let pool = self.pool.read();
         let pa = PoolAllocation {
             seg_idx: alloc.seg_idx,
@@ -310,7 +325,12 @@ impl PyMemPool {
 
     /// Write data from a Python buffer (bytes-like) into an allocated block.
     /// Uses buffer protocol for zero-copy from Python side.
-    fn write_from_buffer(&self, py: Python<'_>, data: PyBuffer<u8>, alloc: &PyPoolAlloc) -> PyResult<()> {
+    fn write_from_buffer(
+        &self,
+        py: Python<'_>,
+        data: PyBuffer<u8>,
+        alloc: &PyPoolAlloc,
+    ) -> PyResult<()> {
         let pool = self.pool.read();
         let pa = PoolAllocation {
             seg_idx: alloc.seg_idx,
@@ -344,7 +364,8 @@ impl PyMemPool {
         is_dedicated: bool,
     ) -> PyResult<Bound<'py, PyBytes>> {
         let pool = self.pool.read();
-        let ptr = pool.data_ptr_at(seg_idx, offset, is_dedicated)
+        let ptr = pool
+            .data_ptr_at(seg_idx, offset, is_dedicated)
             .map_err(|e| PyRuntimeError::new_err(e))?;
         let slice = unsafe { std::slice::from_raw_parts(ptr, size) };
         Ok(PyBytes::new(py, slice))
@@ -363,7 +384,8 @@ impl PyMemPool {
         is_dedicated: bool,
     ) -> PyResult<()> {
         let mut pool = self.pool.write();
-        let _ = pool.free_at(seg_idx, offset, data_size, is_dedicated)
+        let _ = pool
+            .free_at(seg_idx, offset, data_size, is_dedicated)
             .map_err(|e| PyRuntimeError::new_err(e))?;
         Ok(())
     }
@@ -425,7 +447,8 @@ impl PyMemPool {
     /// memoryview from this instead of per-request ctypes arrays.
     fn seg_data_info(&self, seg_idx: u32) -> PyResult<(usize, usize)> {
         let pool = self.pool.read();
-        let (ptr, size) = pool.seg_data_info(seg_idx)
+        let (ptr, size) = pool
+            .seg_data_info(seg_idx)
             .map_err(|e| PyRuntimeError::new_err(e))?;
         Ok((ptr as usize, size))
     }
@@ -484,11 +507,7 @@ impl PyMemHandle {
     #[getter]
     fn is_buddy(&self) -> bool {
         let state = self.state.lock();
-        state
-            .handle
-            .as_ref()
-            .map(|h| h.is_buddy())
-            .unwrap_or(false)
+        state.handle.as_ref().map(|h| h.is_buddy()).unwrap_or(false)
     }
 
     #[getter]
@@ -513,9 +532,7 @@ impl PyMemHandle {
         if offset + data.len() > h.len() {
             return Err(PyRuntimeError::new_err("write_at out of bounds"));
         }
-        let pool = inner
-            .pool
-            .read();
+        let pool = inner.pool.read();
         pool.handle_slice_mut(h)[offset..offset + data.len()].copy_from_slice(data);
         Ok(())
     }
@@ -528,9 +545,7 @@ impl PyMemHandle {
             .handle
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("handle released"))?;
-        let pool = state
-            .pool
-            .read();
+        let pool = state.pool.read();
         let slice = pool.handle_slice(h);
         Ok((slice.as_ptr() as usize, slice.len()))
     }
@@ -539,9 +554,7 @@ impl PyMemHandle {
     fn release(&self) -> PyResult<()> {
         let mut state = self.state.lock();
         if let Some(h) = state.handle.take() {
-            let mut pool = state
-                .pool
-                .write();
+            let mut pool = state.pool.write();
             pool.release_handle(h);
         }
         Ok(())
@@ -596,21 +609,18 @@ struct AssemblerInner {
 #[pymethods]
 impl PyChunkAssembler {
     #[new]
-    fn new(
-        pool_handle: &PyMemPool,
-        total_chunks: usize,
-        chunk_size: usize,
-    ) -> PyResult<Self> {
+    fn new(pool_handle: &PyMemPool, total_chunks: usize, chunk_size: usize) -> PyResult<Self> {
         let pool_arc = pool_handle.pool_arc();
         let asm = {
-            let mut pool = pool_arc
-                .write();
+            let mut pool = pool_arc.write();
             ChunkAssembler::new(
-                &mut pool, total_chunks, chunk_size,
-                512, // TODO: pass from config
+                &mut pool,
+                total_chunks,
+                chunk_size,
+                512,           // TODO: pass from config
                 8 * (1 << 30), // TODO: pass from config
             )
-                .map_err(|e| PyRuntimeError::new_err(e))?
+            .map_err(|e| PyRuntimeError::new_err(e))?
         };
         Ok(Self {
             state: Mutex::new(AssemblerInner {
@@ -662,9 +672,7 @@ impl PyChunkAssembler {
             .inner
             .as_mut()
             .ok_or_else(|| PyRuntimeError::new_err("consumed"))?;
-        let pool = inner
-            .pool
-            .read();
+        let pool = inner.pool.read();
         asm.feed_chunk(&pool, chunk_idx, data)
             .map_err(|e| PyRuntimeError::new_err(e))
     }
@@ -705,9 +713,7 @@ impl PyChunkAssembler {
     fn abort(&self) -> PyResult<()> {
         let mut state = self.state.lock();
         if let Some(asm) = state.inner.take() {
-            let mut pool = state
-                .pool
-                .write();
+            let mut pool = state.pool.write();
             asm.abort(&mut pool);
         }
         Ok(())

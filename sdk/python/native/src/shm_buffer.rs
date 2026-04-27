@@ -4,9 +4,9 @@
 //! or inline bytes (Inline) and exposes them via `__getbuffer__`
 //! for `memoryview()` zero-copy access.
 
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
 use parking_lot::{Mutex, RwLock};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use pyo3::exceptions::{PyBufferError, PyValueError};
 use pyo3::ffi;
@@ -133,7 +133,6 @@ impl PyShmBuffer {
         self.exports.load(Ordering::Acquire)
     }
 
-
     /// Free the underlying SHM block.
     ///
     /// Raises `BufferError` if memoryviews are still active.
@@ -154,7 +153,11 @@ impl PyShmBuffer {
         }
         match guard.take() {
             Some(ShmBufferInner::PeerShm {
-                pool, seg_idx, offset, data_size, is_dedicated,
+                pool,
+                seg_idx,
+                offset,
+                data_size,
+                is_dedicated,
             }) => {
                 let mut p = pool.write();
                 let _ = p.free_at(seg_idx as u32, offset, data_size, is_dedicated);
@@ -178,14 +181,18 @@ impl PyShmBuffer {
     ) -> PyResult<()> {
         let this = slf.borrow();
         let guard = this.inner.lock();
-        let inner = guard.as_ref().ok_or_else(|| {
-            PyBufferError::new_err("buffer already released")
-        })?;
+        let inner = guard
+            .as_ref()
+            .ok_or_else(|| PyBufferError::new_err("buffer already released"))?;
 
         let (ptr, len) = match inner {
             ShmBufferInner::Inline(vec) => (vec.as_ptr(), vec.len()),
             ShmBufferInner::PeerShm {
-                pool, seg_idx, offset, data_size, is_dedicated,
+                pool,
+                seg_idx,
+                offset,
+                data_size,
+                is_dedicated,
             } => {
                 let pool_guard = pool.read();
                 let raw_ptr = pool_guard
@@ -253,7 +260,11 @@ impl Drop for PyShmBuffer {
         if let Some(inner) = guard.take() {
             match inner {
                 ShmBufferInner::PeerShm {
-                    pool, seg_idx, offset, data_size, is_dedicated,
+                    pool,
+                    seg_idx,
+                    offset,
+                    data_size,
+                    is_dedicated,
                 } => {
                     let mut p = pool.write();
                     let _ = p.free_at(seg_idx as u32, offset, data_size, is_dedicated);

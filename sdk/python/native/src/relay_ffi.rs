@@ -14,8 +14,8 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyType};
 
-use c2_http::relay::server::{RelayControlError, RelayServer};
 use c2_config::RelayConfig;
+use c2_http::relay::server::{RelayControlError, RelayServer};
 
 struct ServerState {
     config: RelayConfig,
@@ -90,7 +90,10 @@ impl PyNativeRelay {
             ..Default::default()
         };
         Self {
-            state: Mutex::new(ServerState { config, server: None }),
+            state: Mutex::new(ServerState {
+                config,
+                server: None,
+            }),
         }
     }
 

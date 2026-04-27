@@ -7,9 +7,9 @@
 //! `py.detach()`. `#[pyclass(frozen)]` ensures thread-safety
 //! for free-threading builds.
 
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
 use parking_lot::{Mutex, RwLock};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use pyo3::exceptions::{PyBufferError, PyRuntimeError, PyValueError};
 use pyo3::ffi;
@@ -69,12 +69,22 @@ impl PyResponseBuffer {
         let data_len = data.len();
         let inner = match data {
             ResponseData::Inline(vec) => ResponseBufferInner::Inline(vec),
-            ResponseData::Shm { seg_idx, offset, data_size, is_dedicated } => {
-                ResponseBufferInner::Shm { pool, seg_idx, offset, data_size, is_dedicated }
-            }
-            ResponseData::Handle(handle) => {
-                ResponseBufferInner::Handle { handle, pool: reassembly_pool }
-            }
+            ResponseData::Shm {
+                seg_idx,
+                offset,
+                data_size,
+                is_dedicated,
+            } => ResponseBufferInner::Shm {
+                pool,
+                seg_idx,
+                offset,
+                data_size,
+                is_dedicated,
+            },
+            ResponseData::Handle(handle) => ResponseBufferInner::Handle {
+                handle,
+                pool: reassembly_pool,
+            },
         };
         Self {
             inner: Mutex::new(Some(inner)),
@@ -100,14 +110,23 @@ impl PyResponseBuffer {
         let guard = self.inner.lock();
         match guard.as_ref() {
             Some(ResponseBufferInner::Inline(vec)) => Ok(PyBytes::new(py, vec)),
-            Some(ResponseBufferInner::Shm { pool, seg_idx, offset, data_size, is_dedicated }) => {
+            Some(ResponseBufferInner::Shm {
+                pool,
+                seg_idx,
+                offset,
+                data_size,
+                is_dedicated,
+            }) => {
                 let mut pool_guard = pool.lock();
-                let state = pool_guard.as_mut().ok_or_else(|| {
-                    PyRuntimeError::new_err("server pool not initialised")
-                })?;
-                state.ensure_segment(*seg_idx, *data_size, *is_dedicated)
+                let state = pool_guard
+                    .as_mut()
+                    .ok_or_else(|| PyRuntimeError::new_err("server pool not initialised"))?;
+                state
+                    .ensure_segment(*seg_idx, *data_size, *is_dedicated)
                     .map_err(|e| PyRuntimeError::new_err(format!("SHM lazy-open: {e}")))?;
-                let ptr = state.pool.data_ptr_at(*seg_idx as u32, *offset, *is_dedicated)
+                let ptr = state
+                    .pool
+                    .data_ptr_at(*seg_idx as u32, *offset, *is_dedicated)
                     .map_err(|e| PyRuntimeError::new_err(format!("SHM read: {e}")))?;
                 let slice = unsafe { std::slice::from_raw_parts(ptr, *data_size as usize) };
                 Ok(PyBytes::new(py, slice))
@@ -140,11 +159,19 @@ impl PyResponseBuffer {
             ));
         }
         match guard.take() {
-            Some(ResponseBufferInner::Shm { pool, seg_idx, offset, data_size, is_dedicated }) => {
+            Some(ResponseBufferInner::Shm {
+                pool,
+                seg_idx,
+                offset,
+                data_size,
+                is_dedicated,
+            }) => {
                 let mut pool_guard = pool.lock();
                 if let Some(state) = pool_guard.as_mut() {
                     let _ = state.ensure_segment(seg_idx, data_size, is_dedicated);
-                    let _ = state.pool.free_at(seg_idx as u32, offset, data_size, is_dedicated);
+                    let _ = state
+                        .pool
+                        .free_at(seg_idx as u32, offset, data_size, is_dedicated);
                 }
                 Ok(())
             }
@@ -166,20 +193,29 @@ impl PyResponseBuffer {
     ) -> PyResult<()> {
         let this = slf.borrow();
         let guard = this.inner.lock();
-        let inner = guard.as_ref().ok_or_else(|| {
-            PyBufferError::new_err("buffer already released")
-        })?;
+        let inner = guard
+            .as_ref()
+            .ok_or_else(|| PyBufferError::new_err("buffer already released"))?;
 
         let (ptr, len) = match inner {
             ResponseBufferInner::Inline(vec) => (vec.as_ptr(), vec.len()),
-            ResponseBufferInner::Shm { pool, seg_idx, offset, data_size, is_dedicated } => {
+            ResponseBufferInner::Shm {
+                pool,
+                seg_idx,
+                offset,
+                data_size,
+                is_dedicated,
+            } => {
                 let mut pool_guard = pool.lock();
-                let state = pool_guard.as_mut().ok_or_else(|| {
-                    PyBufferError::new_err("server pool not initialised")
-                })?;
-                state.ensure_segment(*seg_idx, *data_size, *is_dedicated)
+                let state = pool_guard
+                    .as_mut()
+                    .ok_or_else(|| PyBufferError::new_err("server pool not initialised"))?;
+                state
+                    .ensure_segment(*seg_idx, *data_size, *is_dedicated)
                     .map_err(|e| PyBufferError::new_err(format!("SHM lazy-open: {e}")))?;
-                let raw_ptr = state.pool.data_ptr_at(*seg_idx as u32, *offset, *is_dedicated)
+                let raw_ptr = state
+                    .pool
+                    .data_ptr_at(*seg_idx as u32, *offset, *is_dedicated)
                     .map_err(|e| PyBufferError::new_err(format!("SHM access: {e}")))?;
                 (raw_ptr as *const u8, *data_size as usize)
             }
@@ -233,14 +269,18 @@ impl Drop for PyResponseBuffer {
         let mut guard = self.inner.lock();
         match guard.take() {
             Some(ResponseBufferInner::Shm {
-                pool, seg_idx, offset, data_size, is_dedicated,
+                pool,
+                seg_idx,
+                offset,
+                data_size,
+                is_dedicated,
             }) => {
                 let mut pool_guard = pool.lock();
                 if let Some(state) = pool_guard.as_mut() {
                     let _ = state.ensure_segment(seg_idx, data_size, is_dedicated);
-                    let _ = state.pool.free_at(
-                        seg_idx as u32, offset, data_size, is_dedicated,
-                    );
+                    let _ = state
+                        .pool
+                        .free_at(seg_idx as u32, offset, data_size, is_dedicated);
                 }
             }
             Some(ResponseBufferInner::Handle { handle, pool }) => {
@@ -319,13 +359,13 @@ impl PyRustClient {
         let client = py.detach(move || {
             let mut pc = c2_mem::PoolConfig::default();
             pc.segment_size = seg_size;
-            let pool = Arc::new(parking_lot::Mutex::new(
-                c2_mem::MemPool::new(pc),
-            ));
+            let pool = Arc::new(parking_lot::Mutex::new(c2_mem::MemPool::new(pc)));
             SyncClient::connect(&addr, Some(pool), config)
                 .map_err(|e| PyRuntimeError::new_err(format!("{e}")))
         })?;
-        Ok(Self { inner: Arc::new(client) })
+        Ok(Self {
+            inner: Arc::new(client),
+        })
     }
 
     /// Call a CRM method synchronously.
@@ -353,15 +393,16 @@ impl PyRustClient {
             match inner.pool_alloc_and_write(data) {
                 Ok(alloc) => {
                     let data_size = data.len();
-                    let result = py.detach(move || {
-                        inner.call_prealloc(&route, &method, &alloc, data_size)
-                    });
+                    let result =
+                        py.detach(move || inner.call_prealloc(&route, &method, &alloc, data_size));
                     return match result {
                         Ok(response_data) => {
                             let pool = self.inner.server_pool_arc();
                             let reassembly = self.inner.reassembly_pool_arc();
                             Ok(PyResponseBuffer::from_response_data(
-                                response_data, pool, reassembly,
+                                response_data,
+                                pool,
+                                reassembly,
                             ))
                         }
                         Err(IpcError::CrmError(err_bytes)) => {
@@ -393,7 +434,9 @@ impl PyRustClient {
                 let pool = self.inner.server_pool_arc();
                 let reassembly = self.inner.reassembly_pool_arc();
                 Ok(PyResponseBuffer::from_response_data(
-                    response_data, pool, reassembly,
+                    response_data,
+                    pool,
+                    reassembly,
                 ))
             }
             Err(IpcError::CrmError(err_bytes)) => {

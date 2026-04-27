@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use c2_ipc::IpcClient;
@@ -29,16 +29,21 @@ pub struct ConnectionPool {
 
 impl ConnectionPool {
     pub fn new() -> Self {
-        Self { entries: HashMap::new() }
+        Self {
+            entries: HashMap::new(),
+        }
     }
 
     /// Insert a pre-connected client for a route name.
     pub fn insert(&mut self, name: String, address: String, client: Arc<IpcClient>) {
-        self.entries.insert(name, ConnectionEntry {
-            address,
-            client: Some(client),
-            last_activity: AtomicU64::new(now_millis()),
-        });
+        self.entries.insert(
+            name,
+            ConnectionEntry {
+                address,
+                client: Some(client),
+                last_activity: AtomicU64::new(now_millis()),
+            },
+        );
     }
 
     /// Get a connected client for a route name.
@@ -46,7 +51,11 @@ impl ConnectionPool {
     pub fn get(&self, name: &str) -> Option<Arc<IpcClient>> {
         let entry = self.entries.get(name)?;
         let client = entry.client.as_ref()?;
-        if client.is_connected() { Some(client.clone()) } else { None }
+        if client.is_connected() {
+            Some(client.clone())
+        } else {
+            None
+        }
     }
 
     /// Check if an entry exists (even if evicted).
@@ -69,7 +78,8 @@ impl ConnectionPool {
     /// Names of entries to evict (dead or idle beyond timeout_ms).
     pub fn idle_entries(&self, idle_timeout_ms: u64) -> Vec<String> {
         let cutoff = now_millis().saturating_sub(idle_timeout_ms);
-        self.entries.iter()
+        self.entries
+            .iter()
             .filter(|(_, e)| {
                 if let Some(ref client) = e.client {
                     !client.is_connected() || e.last_activity.load(Ordering::Relaxed) < cutoff
@@ -101,7 +111,10 @@ impl ConnectionPool {
 
     /// List route names with addresses.
     pub fn list_connections(&self) -> Vec<(String, String)> {
-        self.entries.iter().map(|(n, e)| (n.clone(), e.address.clone())).collect()
+        self.entries
+            .iter()
+            .map(|(n, e)| (n.clone(), e.address.clone()))
+            .collect()
     }
 }
 
