@@ -57,3 +57,11 @@ for path in sorted(root.rglob("*.py")):
     )
 
     assert result.returncode == 0, result.stderr
+
+
+def test_python_sdk_does_not_export_embedded_native_relay():
+    import importlib.util
+    import c_two._native as native
+
+    assert not hasattr(native, "NativeRelay")
+    assert importlib.util.find_spec("c_two.relay") is None

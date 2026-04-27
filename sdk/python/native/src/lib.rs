@@ -15,8 +15,6 @@ mod http_ffi;
 #[cfg(feature = "python")]
 mod mem_ffi;
 #[cfg(feature = "python")]
-mod relay_ffi;
-#[cfg(feature = "python")]
 mod server_ffi;
 #[cfg(feature = "python")]
 pub(crate) mod shm_buffer;
@@ -28,8 +26,8 @@ use pyo3::prelude::*;
 
 /// The unified `c_two._native` Python module.
 ///
-/// Registers all memory pool classes + relay classes at the
-/// top level of the module (flat namespace, not submodules).
+/// Registers all native classes and helpers at the top level of the
+/// module (flat namespace, not submodules).
 #[cfg(feature = "python")]
 #[pymodule(name = "_native", gil_used = false)]
 fn c2_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -38,7 +36,6 @@ fn c2_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     client_ffi::register_module(m)?;
     http_ffi::register_module(m)?;
     mem_ffi::register_module(m)?;
-    relay_ffi::register_module(m)?;
     server_ffi::register_module(m)?;
     shm_buffer::register_module(m)?;
     wire_ffi::register_module(m)?;
