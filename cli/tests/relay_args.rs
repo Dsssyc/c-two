@@ -80,6 +80,24 @@ fn relay_dry_run_uses_canonical_idle_timeout_default() {
 }
 
 #[test]
+fn relay_help_hides_skip_ipc_validation() {
+    let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.args(["relay", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--skip-ipc-validation").not());
+}
+
+#[test]
+fn relay_dry_run_accepts_hidden_skip_ipc_validation_for_tests() {
+    let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.env("C2_ENV_FILE", "")
+        .args(["relay", "--skip-ipc-validation", "--dry-run"])
+        .assert()
+        .success();
+}
+
+#[test]
 fn relay_dry_run_respects_custom_env_file() {
     let tempdir = tempfile::tempdir().unwrap();
     let env_file = tempdir.path().join("relay.env");
