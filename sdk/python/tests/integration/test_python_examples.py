@@ -3,46 +3,16 @@ from __future__ import annotations
 
 import os
 import signal
-import socket
 import subprocess
 import sys
 import time
-import urllib.request
 from pathlib import Path
 
 import pytest
 
-import c_two as cc
-from c_two._native import NativeRelay
-
-pytestmark = pytest.mark.skipif(
-    not hasattr(cc._native, "NativeRelay"),
-    reason="relay feature not compiled",
-)
-
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[4]
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
-def _wait_for_relay(url: str, timeout: float = 5.0) -> None:
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            with opener.open(f"{url}/health", timeout=0.5) as resp:
-                if resp.status == 200:
-                    return
-        except Exception:
-            pass
-        time.sleep(0.1)
-    raise TimeoutError(f"Relay at {url} not ready after {timeout}s")
 
 
 def _wait_for_stdout(proc: subprocess.Popen[str], text: str, timeout: float = 20.0) -> str:
@@ -86,16 +56,13 @@ def _example_env() -> dict[str, str]:
     return env
 
 
-def test_relay_client_workflow_uses_explicit_relay_url():
+def test_relay_client_workflow_uses_explicit_relay_url(start_c3_relay):
     pytest.importorskip("pandas", reason="Python grid examples require examples dependencies")
     pytest.importorskip("pyarrow", reason="Python grid examples require examples dependencies")
 
     root = _repo_root()
-    port = _free_port()
-    relay_url = f"http://127.0.0.1:{port}"
-    relay = NativeRelay(f"127.0.0.1:{port}")
-    relay.start()
-    _wait_for_relay(relay_url)
+    relay = start_c3_relay()
+    relay_url = relay.url
 
     crm_proc: subprocess.Popen[str] | None = None
     try:
@@ -134,19 +101,15 @@ def test_relay_client_workflow_uses_explicit_relay_url():
     finally:
         if crm_proc is not None:
             _stop_process(crm_proc)
-        relay.stop()
 
 
-def test_general_client_uses_relay_without_ipc_address():
+def test_general_client_uses_relay_without_ipc_address(start_c3_relay):
     pytest.importorskip("pandas", reason="Python grid examples require examples dependencies")
     pytest.importorskip("pyarrow", reason="Python grid examples require examples dependencies")
 
     root = _repo_root()
-    port = _free_port()
-    relay_url = f"http://127.0.0.1:{port}"
-    relay = NativeRelay(f"127.0.0.1:{port}")
-    relay.start()
-    _wait_for_relay(relay_url)
+    relay = start_c3_relay()
+    relay_url = relay.url
 
     crm_proc: subprocess.Popen[str] | None = None
     try:
@@ -186,7 +149,6 @@ def test_general_client_uses_relay_without_ipc_address():
     finally:
         if crm_proc is not None:
             _stop_process(crm_proc)
-        relay.stop()
 
 
 def test_general_client_requires_address_without_relay():
