@@ -13,6 +13,12 @@ Install the examples dependency group (includes pandas, numpy, pyarrow):
 uv sync --group examples
 ```
 
+Build and link `c3` once from a source checkout:
+
+```bash
+python tools/dev/c3_tool.py --build --link
+```
+
 ## Architecture
 
 ```
@@ -34,7 +40,7 @@ The resource and client use `http://127.0.0.1:8300` by default. Set
 
 ```bash
 # Terminal 1 — start the relay server
-c3 relay -b 0.0.0.0:8300
+c3 relay --bind 127.0.0.1:8300
 
 # Terminal 2 — start the Grid CRM (auto-registers with the default relay)
 uv run python examples/python/relay_mesh/resource.py

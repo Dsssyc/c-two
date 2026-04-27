@@ -43,7 +43,7 @@ exact `export PATH=...` command. Linking to a persistent PATH directory such as
 Start the relay:
 
 ```bash
-c3 relay -b 127.0.0.1:8300
+c3 relay --bind 127.0.0.1:8300
 ```
 
 Start the CRM process and register it with the relay:
