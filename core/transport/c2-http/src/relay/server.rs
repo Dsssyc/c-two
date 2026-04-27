@@ -1,4 +1,4 @@
-//! Embeddable relay server — can be driven from Python via PyO3.
+//! Relay server runtime used by the `c3 relay` CLI and Rust callers.
 //!
 //! Runs axum + tokio in a background thread. Provides synchronous
 //! control methods (start, stop, register_upstream, etc.) that send
@@ -23,7 +23,7 @@ use crate::relay::state::RelayState;
 use c2_config::RelayConfig;
 use c2_ipc::IpcClient;
 
-/// Errors from the embeddable relay control API.
+/// Errors from the relay control API.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelayControlError {
     DuplicateRoute { name: String },
@@ -86,7 +86,7 @@ enum Command {
     },
 }
 
-/// Embeddable relay server with a synchronous control API.
+/// Relay server with a synchronous control API.
 #[allow(dead_code)]
 pub struct RelayServer {
     cmd_tx: Option<mpsc::Sender<Command>>,

@@ -160,7 +160,7 @@ Python.
 The root README still frames C-Two as a Python framework and roadmap item:
 
 - tagline: "A resource-oriented RPC framework for Python"
-- roadmap: "Unified config architecture (Python SSOT)"
+- roadmap previously named Python as the unified configuration owner
 - bottom tagline: "Built for scientific Python. Powered by Rust."
 
 This may be accurate for the currently implemented SDK, but it conflicts with
@@ -177,7 +177,8 @@ the product identity from the current Python SDK status.
 - Should the root README describe C-Two as a language-neutral resource RPC
   runtime with Python as the first SDK?
 - Should Python-specific examples remain dominant until another SDK exists?
-- Should the roadmap rename "Python SSOT" before config ownership is fixed?
+- Should roadmap wording continue to track the Rust resolver as the
+  configuration owner once migration work lands?
 
 ## Verification Notes
 
@@ -201,10 +202,12 @@ limitation, not as a cross-language architecture finding.
 ## Proposed Discussion Order
 
 1. Decide configuration authority (`c2-config` vs SDK-owned defaults).
-2. Align relay idle-timeout defaults.
-3. Move root/CLI workflow-policy tests out of the Python SDK tree.
-4. Rewrite Python-first core comments into language-neutral docs.
-5. Reposition root README language once the desired product framing is clear.
+2. Move root/CLI workflow-policy tests out of the Python SDK tree.
+3. Rewrite Python-first core comments into language-neutral docs.
+4. Reposition root README language once the desired product framing is clear.
+
+Relay idle-timeout defaults were resolved separately: the canonical default is
+60 seconds, and `0` explicitly disables time-based eviction.
 
 ## Issue Drafts
 
@@ -376,7 +379,7 @@ Python.
 The root README still frames C-Two as Python-first:
 
 - tagline: "A resource-oriented RPC framework for Python"
-- roadmap item: "Unified config architecture (Python SSOT)"
+- roadmap item previously named Python as the unified configuration owner
 - footer: "Built for scientific Python. Powered by Rust."
 
 This may be accurate for the currently implemented SDK, but it conflicts with
@@ -393,7 +396,8 @@ product identity from current Python SDK status.
 - Should the root README describe C-Two as a language-neutral resource RPC
   runtime with Python as the first SDK?
 - Should Python-specific examples remain dominant until another SDK exists?
-- Should the roadmap rename "Python SSOT" before config ownership is fixed?
+- Should roadmap wording continue to track the Rust resolver as the
+  configuration owner once migration work lands?
 
 #### Candidate acceptance criteria
 

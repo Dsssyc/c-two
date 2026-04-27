@@ -591,7 +591,7 @@ uv run pytest                      # run the test suite
 | Chunked streaming (payloads > 256 MB) | ✅ Stable |
 | Heartbeat & connection management | ✅ Stable |
 | Read/write concurrency control | ✅ Stable |
-| Unified config architecture (Python SSOT) | ✅ Stable |
+| Unified config architecture (Rust resolver SSOT) | ✅ Stable |
 | CI/CD & multi-platform PyPI publishing | ✅ Stable |
 | Disk spill for extreme payloads | ✅ Stable |
 | Hold mode with `from_buffer` zero-copy | ✅ Stable |

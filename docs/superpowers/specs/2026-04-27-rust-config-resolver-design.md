@@ -346,8 +346,7 @@ Docs:
 
 ## Open Decisions
 
-1. Should canonical `RelayConfig::idle_timeout_secs` remain `0`, or should the project change the canonical runtime default to `300`?
-2. Should the first implementation preserve Python's silent `pool_segment_size <= max_payload_size` clamp as compatibility behavior, or convert it immediately to validation error?
-3. Should `C2_HOLD_WARN_SECONDS` remain Python SDK-only for now, or should it be renamed/moved into a broader Rust-owned diagnostics config?
-4. Should CLI registry subcommands accept `C2_RELAY_ADDRESS` as a default relay URL in the first resolver migration, or remain explicit `--relay` only?
-5. Should `max_reassembly_bytes` be split into separate total and per-request limits before implementation, or kept as one field during the resolver migration?
+1. Should the first implementation preserve Python's silent `pool_segment_size <= max_payload_size` clamp as compatibility behavior, or convert it immediately to validation error?
+2. Should `C2_HOLD_WARN_SECONDS` remain Python SDK-only for now, or should it be renamed/moved into a broader Rust-owned diagnostics config?
+3. Should CLI registry subcommands accept `C2_RELAY_ADDRESS` as a default relay URL in the first resolver migration, or remain explicit `--relay` only?
+4. Should `max_reassembly_bytes` be split into separate total and per-request limits before implementation, or kept as one field during the resolver migration?
