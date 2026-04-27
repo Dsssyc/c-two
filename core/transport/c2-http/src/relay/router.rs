@@ -247,6 +247,28 @@ async fn handle_peers(State(state): State<Arc<RelayState>>) -> impl IntoResponse
     Json(state.list_peers()).into_response()
 }
 
+struct RelayRequestGuard {
+    state: Arc<RelayState>,
+    route_name: String,
+    generation: u64,
+}
+
+impl RelayRequestGuard {
+    fn new(state: Arc<RelayState>, route_name: String, generation: u64) -> Self {
+        Self {
+            state,
+            route_name,
+            generation,
+        }
+    }
+}
+
+impl Drop for RelayRequestGuard {
+    fn drop(&mut self) {
+        self.state.end_request(&self.route_name, self.generation);
+    }
+}
+
 /// `POST /{route_name}/{method_name}` — relay CRM call to upstream.
 ///
 /// If the upstream was evicted by the idle sweeper, attempts a lazy
@@ -256,36 +278,63 @@ async fn call_handler(
     Path((route_name, method_name)): Path<(String, String)>,
     body: Bytes,
 ) -> Response {
-    let client = state.get_client(&route_name);
+    let client = state.begin_request(&route_name);
 
-    let client = match client {
-        Some(c) => c,
+    let (client, request_guard) = match client {
+        Some((c, generation)) => {
+            let guard = RelayRequestGuard::new(state.clone(), route_name.clone(), generation);
+            (c, guard)
+        }
         None => match try_reconnect(&state, &route_name).await {
-            Some(c) => c,
-            None => {
-                let has = state.has_connection(&route_name);
-                if has {
+            Some(_) => match state.begin_request(&route_name) {
+                Some((c, generation)) => {
+                    let guard =
+                        RelayRequestGuard::new(state.clone(), route_name.clone(), generation);
+                    (c, guard)
+                }
+                None => {
                     return (
                         StatusCode::BAD_GATEWAY,
                         Json(serde_json::json!({
                             "error": format!("Upstream '{route_name}' is registered but unreachable")
                         })),
-                    ).into_response();
+                    )
+                        .into_response();
                 }
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({
-                        "error": format!("No upstream registered for route: '{route_name}'")
-                    })),
-                )
-                    .into_response();
-            }
+            },
+            None => match state.begin_request(&route_name) {
+                Some((c, generation)) => {
+                    let guard =
+                        RelayRequestGuard::new(state.clone(), route_name.clone(), generation);
+                    (c, guard)
+                }
+                None => {
+                    let has = state.has_connection(&route_name);
+                    if has {
+                        return (
+                                StatusCode::BAD_GATEWAY,
+                                Json(serde_json::json!({
+                                    "error": format!("Upstream '{route_name}' is registered but unreachable")
+                                })),
+                            )
+                                .into_response();
+                    }
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({
+                            "error": format!("No upstream registered for route: '{route_name}'")
+                        })),
+                    )
+                        .into_response();
+                }
+            },
         },
     };
+    let request_generation = request_guard.generation;
+    let _request_guard = request_guard;
 
     match client.call(&route_name, &method_name, &body).await {
         Ok(result) => {
-            state.touch_connection(&route_name);
             let bytes = result
                 .into_bytes_with_pool(client.server_pool_arc(), &client.reassembly_pool_arc())
                 .unwrap_or_default();
@@ -296,18 +345,15 @@ async fn call_handler(
             )
                 .into_response()
         }
-        Err(c2_ipc::IpcError::CrmError(err_bytes)) => {
-            state.touch_connection(&route_name);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                [("content-type", "application/octet-stream")],
-                err_bytes,
-            )
-                .into_response()
-        }
+        Err(c2_ipc::IpcError::CrmError(err_bytes)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [("content-type", "application/octet-stream")],
+            err_bytes,
+        )
+            .into_response(),
         Err(e) => {
             // Evict dead client so next request triggers reconnect.
-            state.evict_connection(&route_name);
+            state.evict_connection_generation(&route_name, request_generation);
             (
                 StatusCode::BAD_GATEWAY,
                 [("content-type", "text/plain")],
@@ -320,14 +366,17 @@ async fn call_handler(
 
 /// Attempt to reconnect an evicted upstream.
 async fn try_reconnect(state: &RelayState, route_name: &str) -> Option<Arc<IpcClient>> {
-    let address = state.get_address(route_name)?;
+    let (address, generation) = state.reconnect_candidate(route_name)?;
 
     let mut client = IpcClient::new(&address);
     match client.connect().await {
         Ok(()) => {
             let client = Arc::new(client);
-            state.reconnect(route_name, client.clone());
-            Some(client)
+            if state.reconnect_generation(route_name, generation, &address, client.clone()) {
+                Some(client)
+            } else {
+                None
+            }
         }
         Err(e) => {
             eprintln!("[relay] Failed to reconnect upstream '{route_name}': {e}");

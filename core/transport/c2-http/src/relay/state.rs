@@ -105,12 +105,24 @@ impl RelayState {
         self.conn_pool.read().get(name)
     }
 
+    pub fn begin_request(&self, name: &str) -> Option<(Arc<IpcClient>, u64)> {
+        self.conn_pool.read().begin_request(name)
+    }
+
+    pub fn end_request(&self, name: &str, generation: u64) {
+        self.conn_pool.read().end_request(name, generation);
+    }
+
     pub fn touch_connection(&self, name: &str) {
         self.conn_pool.read().touch(name);
     }
 
     pub fn get_address(&self, name: &str) -> Option<String> {
         self.conn_pool.read().get_address(name)
+    }
+
+    pub fn reconnect_candidate(&self, name: &str) -> Option<(String, u64)> {
+        self.conn_pool.read().reconnect_candidate(name)
     }
 
     pub fn evict_idle(&self, idle_timeout_ms: u64) -> Vec<(String, Option<Arc<IpcClient>>)> {
@@ -129,8 +141,28 @@ impl RelayState {
         self.conn_pool.write().evict(name)
     }
 
+    pub fn evict_connection_generation(
+        &self,
+        name: &str,
+        generation: u64,
+    ) -> Option<Arc<IpcClient>> {
+        self.conn_pool.write().evict_generation(name, generation)
+    }
+
     pub fn reconnect(&self, name: &str, client: Arc<IpcClient>) {
         self.conn_pool.write().reconnect(name, client);
+    }
+
+    pub fn reconnect_generation(
+        &self,
+        name: &str,
+        generation: u64,
+        address: &str,
+        client: Arc<IpcClient>,
+    ) -> bool {
+        self.conn_pool
+            .write()
+            .reconnect_generation(name, generation, address, client)
     }
 
     pub fn has_connection(&self, name: &str) -> bool {
