@@ -198,6 +198,9 @@ An **HTTP relay** (`c3 relay`) is a lightweight broker that lets clients reach s
 The `c3` command is C-Two's cross-language native CLI. From a source checkout,
 build and link a local development binary with
 `python tools/dev/c3_tool.py --build --link`.
+The Python SDK does not embed or start the relay server; start `c3 relay`,
+Docker Compose, or your orchestrator separately, then point Python code at it
+with `C2_RELAY_ADDRESS` or `cc.set_relay()`.
 
 ```bash
 # Start a relay anywhere reachable on your network

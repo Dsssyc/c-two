@@ -27,6 +27,18 @@ Rebuild the native extension after changing Rust code:
 uv sync --reinstall-package c-two
 ```
 
+Relay-dependent tests and examples require the standalone `c3` binary. From a
+source checkout, build and link it before running relay flows:
+
+```bash
+python tools/dev/c3_tool.py --build --link
+```
+
+The Python SDK does not embed or start a relay server. Start the standalone
+Rust relay with `c3 relay`, Docker Compose, or orchestration such as
+Kubernetes, then point Python code at it with `C2_RELAY_ADDRESS` or
+`cc.set_relay()`.
+
 Run the Python SDK tests:
 
 ```bash
@@ -48,6 +60,13 @@ Python examples live under `../../examples/python/`:
 ```bash
 uv sync --group examples
 uv run python examples/python/local.py
+```
+
+Relay examples also need a running standalone relay, for example:
+
+```bash
+python tools/dev/c3_tool.py --build --link
+c3 relay --bind 127.0.0.1:8080
 ```
 
 ## Benchmarks

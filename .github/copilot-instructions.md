@@ -45,7 +45,7 @@ uv run python examples/python/client.py <address>  # terminal 2: client
 
 # Run relay mesh example (three terminals)
 python tools/dev/c3_tool.py --build --link                 # one-time source checkout setup
-c3 relay -b 0.0.0.0:8300                                 # terminal 1: relay
+c3 relay --bind 0.0.0.0:8300                             # terminal 1: relay
 uv run python examples/python/relay_mesh/resource.py      # terminal 2: CRM server
 uv run python examples/python/relay_mesh/client.py        # terminal 3: client
 
@@ -79,14 +79,14 @@ Two-language design: Python owns domain logic (CRM + Resource + client code); Ru
 
 ### 3. Config Layer (`sdk/python/src/c_two/config/`)
 
-Unified configuration with Python as the single source of truth, passed through to Rust via FFI.
+Runtime defaults and environment parsing are migrating to the shared Rust config resolver. Python keeps ergonomic code-level override APIs and compatibility dataclasses, but relay server configuration belongs to the standalone Rust `c3 relay` runtime.
 
 | File | Purpose |
 |------|---------|
-| `settings.py` | `C2Settings` pydantic model — all `C2_*` env vars, `.env` loading (`extra='ignore'`), relay server config |
+| `settings.py` | Compatibility settings facade during resolver migration; do not add new relay server ownership here |
 | `ipc.py` | Frozen dataclasses: `BaseIPCConfig`, `ServerIPCConfig`, `ClientIPCConfig` + `build_server_config()` / `build_client_config()` |
 
-Config priority chain: explicit kwargs (`cc.set_*()`) → environment variables / `.env` → class defaults.
+Config priority chain: explicit kwargs (`cc.set_*()`) → process environment / `.env` via the resolver → Rust defaults.
 
 ### 4. Transport Layer (`sdk/python/src/c_two/transport/`)
 
@@ -152,7 +152,7 @@ Do not add CLI command behavior under `sdk/python/src/c_two`.
 | `--seeds` | `C2_RELAY_SEEDS` | `""` | Comma-separated seed relay URLs for mesh |
 | `--relay-id` | `C2_RELAY_ID` | auto UUID | Stable relay identifier |
 | `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | `""` | Publicly reachable URL for peers |
-| `--idle-timeout` | `C2_RELAY_IDLE_TIMEOUT` | `300` | IPC idle disconnect timeout (seconds) |
+| `--idle-timeout` | `C2_RELAY_IDLE_TIMEOUT` | `60` | IPC idle disconnect timeout in seconds; use `0` to disable time-based eviction |
 
 ## Key Conventions
 
@@ -290,7 +290,7 @@ Wire codec and transport code in Rust (`c2-wire`, `c2-ipc`, `c2-mem`) prioritize
 | `C2_RELAY_ID` | Stable relay identifier for mesh protocol | auto UUID |
 | `C2_RELAY_ADVERTISE_URL` | Publicly reachable URL announced to mesh peers | (none) |
 | `C2_RELAY_SEEDS` | Comma-separated seed relay URLs for mesh mode | (none) |
-| `C2_RELAY_IDLE_TIMEOUT` | Upstream IPC idle disconnect timeout in seconds | `300` |
+| `C2_RELAY_IDLE_TIMEOUT` | Upstream IPC idle disconnect timeout in seconds; `0` disables time-based eviction | `60` |
 | `C2_RELAY_ANTI_ENTROPY_INTERVAL` | Anti-entropy digest exchange interval in seconds | `60.0` |
 | `C2_SHM_THRESHOLD` | Payload size threshold for SHM vs inline | 4096 (4 KB) |
 | `C2_IPC_POOL_SEGMENT_SIZE` | Buddy pool segment size in bytes | 268435456 (256 MB) |
@@ -302,7 +302,7 @@ Wire codec and transport code in Rust (`c2-wire`, `c2-ipc`, `c2-mem`) prioritize
 | `C2_IPC_HEARTBEAT_INTERVAL` | Heartbeat interval seconds (0 disables) | 30.0 |
 | `C2_ENV_FILE` | Path to `.env` file; empty string disables | `.env` |
 
-All `C2_*` variables can be set in `.env` (loaded via pydantic-settings). See `.env.example` for the full reference.
+Runtime `C2_*` variables can be set in `.env` and are migrating to the shared Rust resolver as the canonical source. See `.env.example` for the full reference.
 
 ## Python Version
 

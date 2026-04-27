@@ -2,6 +2,14 @@
 
 ## Running Tests
 
+Relay integration tests start standalone `c3 relay` subprocesses. From a
+source checkout, build and link the local `c3` binary before running those
+tests:
+
+```bash
+python tools/dev/c3_tool.py --build --link
+```
+
 ```bash
 # Full test suite (855 tests, ~80s on Apple Silicon)
 uv run pytest sdk/python/tests -q
@@ -63,7 +71,6 @@ All tests use a **30-second per-test timeout**. Verified on Python 3.14t (free-t
 | File | Description |
 |------|-------------|
 | `test_http_client.py` | HTTP client transport — request/response, error handling |
-| `test_native_relay.py` | `NativeRelay` (Rust/axum) — start/stop, upstream registration |
 | `test_relay_graceful_shutdown.py` | Relay graceful shutdown — drain, timeout |
 
 ## Integration Tests (`sdk/python/tests/integration/`)
@@ -81,7 +88,10 @@ All tests use a **30-second per-test timeout**. Verified on Python 3.14t (free-t
 | `test_error_propagation.py` | CRM-side exceptions propagate to client as typed `CCError` |
 | `test_p0_fixes.py` | P0 regression tests — scheduler, proxy, lifecycle fixes |
 | `test_serve.py` | `cc.serve()` integration — multi-protocol serving |
-| `test_http_relay.py` | HTTP relay end-to-end — POST routing, error forwarding |
+| `test_http_relay.py` | Standalone `c3 relay` end-to-end — POST routing, error forwarding |
+
+Relay mesh integration tests also exercise standalone `c3 relay` coverage for
+multi-relay route propagation and discovery.
 
 ## Shared Fixtures (`sdk/python/tests/fixtures/`)
 

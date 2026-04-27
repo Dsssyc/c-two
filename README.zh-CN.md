@@ -197,6 +197,9 @@ cc.serve()                                     # 阻塞；Ctrl-C 触发优雅关
 
 `c3` 是 C-Two 的跨语言原生 CLI。从源码 checkout 开发时，可以用
 `python tools/dev/c3_tool.py --build --link` 构建并链接本地开发二进制。
+Python SDK 不内嵌也不启动中继服务器；请单独启动 `c3 relay`、Docker
+Compose 或编排系统中的中继，再通过 `C2_RELAY_ADDRESS` 或
+`cc.set_relay()` 让 Python 代码连接它。
 
 ```bash
 # 在网络可达的任意节点启动中继

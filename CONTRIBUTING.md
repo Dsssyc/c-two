@@ -12,6 +12,15 @@ cd c-two
 uv sync  # installs dependencies and builds the Python SDK native extension
 ```
 
+Relay tests and examples use the standalone Rust `c3 relay` runtime. From a
+source checkout, build and link the local `c3` binary before running relay
+flows:
+
+```bash
+python tools/dev/c3_tool.py --build --link
+c3 relay --bind 127.0.0.1:8080
+```
+
 To force-rebuild after Rust source changes:
 
 ```bash

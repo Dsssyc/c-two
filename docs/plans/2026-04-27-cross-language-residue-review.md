@@ -61,33 +61,34 @@ than a true configuration authority.
 - Should env parsing live in Rust for shared runtime variables, or should each
   SDK parse env vars but use Rust-generated defaults?
 
-### 2. Relay idle-timeout defaults diverge by entry point
+### 2. Relay ownership and idle-timeout defaults are now unified
 
 **Severity:** Medium  
 **Type:** Runtime behavior consistency
 
-The same relay runtime currently gets different idle-connection behavior
-depending on how it is started:
+Resolved state:
 
-- `core/foundation/c2-config/src/relay.rs`: `RelayConfig::default()` uses
-  `idle_timeout_secs = 0`.
-- `cli/src/relay.rs`: `c3 relay --idle-timeout` defaults to `300`.
-- `sdk/python/native/src/relay_ffi.rs`: `NativeRelay(..., idle_timeout=0)`
-  defaults to disabled eviction.
+- Python SDK no longer exposes embedded relay lifecycle APIs.
+- Relay server configuration, including `C2_RELAY_IDLE_TIMEOUT`, belongs to the
+  standalone Rust relay runtime started with `c3 relay`, Docker, or
+  orchestration.
+- The canonical idle timeout default is 60 seconds.
+- Setting the idle timeout to `0` explicitly disables time-based eviction.
+- Idle eviction is in-flight-safe.
 
 **Why this hurts cross-language support:**
 
-A future SDK embedding the relay and the `c3` CLI would not share the same
-runtime behavior by default. Operators may see different connection lifecycle
-behavior depending on whether the relay was launched from CLI or embedded from
-an SDK.
+The original finding identified a cross-language ownership risk: SDK embedding
+and CLI startup could have drifted into different relay lifecycle behavior.
+The resolved model makes the relay a standalone Rust runtime with one default
+matrix.
 
 **Discussion questions:**
 
-- Is the intended default idle eviction `0` or `300`?
-- Should CLI, Python embedding, and Rust default all use the same value?
-- If CLI needs a different operational default, should that be documented as
-  CLI-specific rather than presented as the relay default?
+- Are docs, examples, and tests consistently using the standalone `c3 relay`
+  workflow?
+- Do language SDKs only own client-side relay address selection via
+  `C2_RELAY_ADDRESS` or `cc.set_relay()` equivalents?
 
 ### 3. Workflow-policy tests still live under the Python SDK test tree
 
@@ -252,42 +253,38 @@ configuration authority.
 - Python SDK no longer has to duplicate the full default matrix manually.
 - Future SDKs have a clear path to obtain identical runtime defaults.
 
-### Issue 2: Align relay idle-timeout defaults across CLI, Rust config, and Python embedding
+### Issue 2: Align standalone relay idle-timeout defaults and ownership
 
 **Labels:** `runtime`, `cross-language`
 
 #### Problem
 
-The same relay runtime currently gets different idle-connection behavior
-depending on how it is started:
+Resolved plan and state:
 
-- `core/foundation/c2-config/src/relay.rs`: `RelayConfig::default()` uses
-  `idle_timeout_secs = 0`.
-- `cli/src/relay.rs`: `c3 relay --idle-timeout` / `C2_RELAY_IDLE_TIMEOUT`
-  defaults to `300`.
-- `sdk/python/native/src/relay_ffi.rs`: `NativeRelay(..., idle_timeout=0)`
-  defaults to disabled eviction.
+- Python SDK no longer exposes embedded relay lifecycle APIs.
+- Relay server configuration, including `C2_RELAY_IDLE_TIMEOUT`, belongs to the
+  standalone Rust relay runtime.
+- The canonical idle timeout default is 60 seconds.
+- Setting the idle timeout to `0` explicitly disables time-based eviction.
+- Idle eviction is in-flight-safe.
 
 #### Why this matters
 
-A future SDK embedding the relay and the `c3` CLI would not share the same
-operational behavior by default. Operators may see different connection
-lifecycle behavior depending on whether the relay was launched from CLI or
-embedded from an SDK.
+Language SDKs should not own relay server lifecycle behavior. They keep HTTP
+client bindings and point at an existing relay through relay address
+configuration.
 
 #### Discussion questions
 
-- Is the intended default idle eviction `0` or `300`?
-- Should CLI, Python embedding, and Rust default all use the same value?
-- If CLI needs a different operational default, should that be documented as
-  CLI-specific rather than presented as the relay default?
+- Are all public docs using `python tools/dev/c3_tool.py --build --link` for
+  source-checkout relay-dependent tests and examples?
+- Are relay server defaults documented only for the standalone Rust runtime?
 
 #### Candidate acceptance criteria
 
-- Relay default is explicit and consistent, or intentionally overridden with
-  documentation.
-- `cli/README.md`, `.env.example`, and embedding defaults agree with the chosen
-  policy.
+- Relay default is explicit and consistent across `c3 relay`, `.env.example`,
+  CLI docs, and SDK docs.
+- SDK docs state that language SDKs do not embed or start relay servers.
 
 ### Issue 3: Move root and CLI workflow-policy tests out of the Python SDK test tree
 
