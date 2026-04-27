@@ -3,7 +3,7 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use thiserror::Error;
 
 /// Characters allowed unencoded in URL path segments — matches Python's
@@ -69,7 +69,22 @@ impl HttpClient {
         timeout_secs: f64,
         max_connections: usize,
     ) -> Result<Self, HttpError> {
-        let client = crate::relay_client_builder()
+        Self::new_with_proxy_policy(
+            base_url,
+            timeout_secs,
+            max_connections,
+            crate::relay_use_proxy(),
+        )
+    }
+
+    /// Create a new client with an explicit relay proxy policy.
+    pub fn new_with_proxy_policy(
+        base_url: &str,
+        timeout_secs: f64,
+        max_connections: usize,
+        use_proxy: bool,
+    ) -> Result<Self, HttpError> {
+        let client = crate::relay_client_builder_with_proxy(use_proxy)
             .timeout(Duration::from_secs_f64(timeout_secs))
             .pool_max_idle_per_host(max_connections)
             .build()

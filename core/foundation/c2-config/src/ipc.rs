@@ -6,8 +6,7 @@
 //! for ergonomic field access.
 //!
 //! All size fields are in bytes; time fields are in seconds (with `_secs`
-//! suffix).  `Default` impls exist for Rust-side testing only — Python is
-//! authoritative at runtime.
+//! suffix). Defaults are canonical for Rust, CLI, and SDK config resolution.
 
 use std::ops::Deref;
 
@@ -66,19 +65,19 @@ impl Default for BaseIpcConfig {
     fn default() -> Self {
         Self {
             pool_enabled: true,
-            pool_segment_size: 268_435_456,       // 256 MB
+            pool_segment_size: 268_435_456, // 256 MB
             max_pool_segments: 4,
-            max_pool_memory: 1_073_741_824,        // 1 GB
+            max_pool_memory: 1_073_741_824, // 1 GB
 
-            reassembly_segment_size: 268_435_456,  // 256 MB (server default)
+            reassembly_segment_size: 64 * 1024 * 1024, // 64 MB
             reassembly_max_segments: 4,
 
             max_total_chunks: 512,
             chunk_gc_interval_secs: 5.0,
             chunk_threshold_ratio: 0.9,
             chunk_assembler_timeout_secs: 60.0,
-            max_reassembly_bytes: 8_589_934_592,   // 8 GB
-            chunk_size: 131_072,                   // 128 KB
+            max_reassembly_bytes: 8_589_934_592, // 8 GB
+            chunk_size: 131_072,                 // 128 KB
         }
     }
 }
@@ -89,8 +88,8 @@ impl Default for ServerIpcConfig {
             base: BaseIpcConfig::default(),
 
             shm_threshold: 4_096,
-            max_frame_size: 2_147_483_648,         // 2 GB
-            max_payload_size: 17_179_869_184,      // 16 GB
+            max_frame_size: 2_147_483_648,    // 2 GB
+            max_payload_size: 17_179_869_184, // 16 GB
             max_pending_requests: 1024,
             pool_decay_seconds: 60.0,
             heartbeat_interval_secs: 15.0,
@@ -115,12 +114,16 @@ impl Default for ClientIpcConfig {
 
 impl Deref for ServerIpcConfig {
     type Target = BaseIpcConfig;
-    fn deref(&self) -> &BaseIpcConfig { &self.base }
+    fn deref(&self) -> &BaseIpcConfig {
+        &self.base
+    }
 }
 
 impl Deref for ClientIpcConfig {
     type Target = BaseIpcConfig;
-    fn deref(&self) -> &BaseIpcConfig { &self.base }
+    fn deref(&self) -> &BaseIpcConfig {
+        &self.base
+    }
 }
 
 // ─── Validation ──────────────────────────────────────────────────────────────
@@ -133,17 +136,72 @@ impl BaseIpcConfig {
         if self.pool_segment_size > u32::MAX as u64 {
             return Err(format!(
                 "pool_segment_size ({}) must be <= u32::MAX ({}) for wire format compatibility",
-                self.pool_segment_size, u32::MAX,
+                self.pool_segment_size,
+                u32::MAX,
+            ));
+        }
+        if !(1..=255).contains(&self.max_pool_segments) {
+            return Err(format!(
+                "max_pool_segments ({}) must be in 1..=255",
+                self.max_pool_segments,
+            ));
+        }
+        if self.max_pool_memory < self.pool_segment_size {
+            return Err(format!(
+                "max_pool_memory ({}) must be >= pool_segment_size ({})",
+                self.max_pool_memory, self.pool_segment_size,
+            ));
+        }
+        if self.reassembly_segment_size == 0 {
+            return Err("reassembly_segment_size must be > 0".into());
+        }
+        if !(1..=255).contains(&self.reassembly_max_segments) {
+            return Err(format!(
+                "reassembly_max_segments ({}) must be in 1..=255",
+                self.reassembly_max_segments,
             ));
         }
         if self.chunk_size == 0 {
             return Err("chunk_size must be > 0".into());
+        }
+        if !self.chunk_gc_interval_secs.is_finite() {
+            return Err(format!(
+                "chunk_gc_interval_secs ({}) must be finite",
+                self.chunk_gc_interval_secs,
+            ));
+        }
+        if self.chunk_gc_interval_secs <= 0.0 {
+            return Err(format!(
+                "chunk_gc_interval_secs ({}) must be > 0",
+                self.chunk_gc_interval_secs,
+            ));
+        }
+        if !self.chunk_threshold_ratio.is_finite() {
+            return Err(format!(
+                "chunk_threshold_ratio ({}) must be finite",
+                self.chunk_threshold_ratio,
+            ));
         }
         if self.chunk_threshold_ratio <= 0.0 || self.chunk_threshold_ratio > 1.0 {
             return Err(format!(
                 "chunk_threshold_ratio ({}) must be in (0, 1]",
                 self.chunk_threshold_ratio,
             ));
+        }
+        if !self.chunk_assembler_timeout_secs.is_finite() {
+            return Err(format!(
+                "chunk_assembler_timeout_secs ({}) must be finite",
+                self.chunk_assembler_timeout_secs,
+            ));
+        }
+        if self.chunk_assembler_timeout_secs <= 0.0 {
+            return Err(format!(
+                "chunk_assembler_timeout_secs ({}) must be > 0",
+                self.chunk_assembler_timeout_secs,
+            ));
+        }
+        if self.max_reassembly_bytes == 0 {
+            return Err("max_reassembly_bytes must be > 0".into());
         }
         Ok(())
     }
@@ -161,10 +219,48 @@ impl ServerIpcConfig {
         if self.max_payload_size == 0 {
             return Err("max_payload_size must be > 0".into());
         }
+        if self.base.pool_segment_size > self.max_payload_size {
+            return Err(format!(
+                "pool_segment_size ({}) must not exceed max_payload_size ({})",
+                self.base.pool_segment_size, self.max_payload_size,
+            ));
+        }
         if self.shm_threshold > self.max_frame_size {
             return Err(format!(
                 "shm_threshold ({}) must not exceed max_frame_size ({})",
                 self.shm_threshold, self.max_frame_size,
+            ));
+        }
+        if !self.pool_decay_seconds.is_finite() {
+            return Err(format!(
+                "pool_decay_seconds ({}) must be finite",
+                self.pool_decay_seconds,
+            ));
+        }
+        if !self.heartbeat_interval_secs.is_finite() {
+            return Err(format!(
+                "heartbeat_interval_secs ({}) must be finite",
+                self.heartbeat_interval_secs,
+            ));
+        }
+        if self.heartbeat_interval_secs < 0.0 {
+            return Err(format!(
+                "heartbeat_interval_secs ({}) must be >= 0",
+                self.heartbeat_interval_secs,
+            ));
+        }
+        if !self.heartbeat_timeout_secs.is_finite() {
+            return Err(format!(
+                "heartbeat_timeout_secs ({}) must be finite",
+                self.heartbeat_timeout_secs,
+            ));
+        }
+        if self.heartbeat_interval_secs > 0.0
+            && self.heartbeat_timeout_secs <= self.heartbeat_interval_secs
+        {
+            return Err(format!(
+                "heartbeat_timeout_secs ({}) must exceed heartbeat_interval_secs ({})",
+                self.heartbeat_timeout_secs, self.heartbeat_interval_secs,
             ));
         }
         Ok(())
@@ -206,7 +302,11 @@ mod tests {
     fn reject_zero_segment_size() {
         let mut cfg = ServerIpcConfig::default();
         cfg.base.pool_segment_size = 0;
-        assert!(cfg.validate().unwrap_err().contains("pool_segment_size must be > 0"));
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .contains("pool_segment_size must be > 0")
+        );
     }
 
     #[test]
@@ -220,17 +320,29 @@ mod tests {
     fn reject_zero_chunk_size() {
         let mut cfg = ServerIpcConfig::default();
         cfg.base.chunk_size = 0;
-        assert!(cfg.validate().unwrap_err().contains("chunk_size must be > 0"));
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .contains("chunk_size must be > 0")
+        );
     }
 
     #[test]
     fn reject_bad_threshold_ratio() {
         let mut cfg = BaseIpcConfig::default();
         cfg.chunk_threshold_ratio = 0.0;
-        assert!(cfg.validate().unwrap_err().contains("chunk_threshold_ratio"));
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .contains("chunk_threshold_ratio")
+        );
 
         cfg.chunk_threshold_ratio = 1.1;
-        assert!(cfg.validate().unwrap_err().contains("chunk_threshold_ratio"));
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .contains("chunk_threshold_ratio")
+        );
 
         cfg.chunk_threshold_ratio = 1.0; // boundary — valid
         assert!(cfg.validate().is_ok());
@@ -249,7 +361,21 @@ mod tests {
     fn reject_zero_payload_size() {
         let mut cfg = ServerIpcConfig::default();
         cfg.max_payload_size = 0;
-        assert!(cfg.validate().unwrap_err().contains("max_payload_size must be > 0"));
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .contains("max_payload_size must be > 0")
+        );
+    }
+
+    #[test]
+    fn reject_pool_segment_larger_than_payload_size() {
+        let mut cfg = ServerIpcConfig::default();
+        cfg.base.pool_segment_size = 2 * 1024 * 1024;
+        cfg.max_payload_size = 1024 * 1024;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("pool_segment_size"));
+        assert!(err.contains("max_payload_size"));
     }
 
     #[test]
@@ -285,9 +411,9 @@ mod tests {
     }
 
     #[test]
-    fn server_reassembly_segment_is_256mb() {
+    fn server_reassembly_segment_is_64mb() {
         let cfg = ServerIpcConfig::default();
-        assert_eq!(cfg.base.reassembly_segment_size, 268_435_456);
+        assert_eq!(cfg.base.reassembly_segment_size, 64 * 1024 * 1024);
     }
 
     // ── Type checks ──────────────────────────────────────────────────────
@@ -312,6 +438,10 @@ mod tests {
     fn client_rejects_zero_segment_size() {
         let mut cfg = ClientIpcConfig::default();
         cfg.base.pool_segment_size = 0;
-        assert!(cfg.validate().unwrap_err().contains("pool_segment_size must be > 0"));
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .contains("pool_segment_size must be > 0")
+        );
     }
 }

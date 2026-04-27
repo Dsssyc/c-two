@@ -28,6 +28,8 @@ pub struct RelayConfig {
     pub seed_retry_interval: Duration,
     /// Skip IPC validation in `/_register`. For testing only.
     pub skip_ipc_validation: bool,
+    /// Whether relay HTTP clients should honor system HTTP proxy variables.
+    pub use_proxy: bool,
 }
 
 impl Default for RelayConfig {
@@ -44,15 +46,14 @@ impl Default for RelayConfig {
             dead_peer_probe_interval: Duration::from_secs(30),
             seed_retry_interval: Duration::from_secs(10),
             skip_ipc_validation: false,
+            use_proxy: false,
         }
     }
 }
 
 impl RelayConfig {
     pub fn generate_relay_id() -> String {
-        let host = gethostname::gethostname()
-            .to_string_lossy()
-            .to_string();
+        let host = gethostname::gethostname().to_string_lossy().to_string();
         let pid = std::process::id();
         let uuid = uuid::Uuid::new_v4();
         format!("{host}_{pid}_{}", &uuid.to_string()[..8])
@@ -65,7 +66,11 @@ impl RelayConfig {
         }
         let bind = &self.bind;
         if let Some((host, port)) = bind.rsplit_once(':') {
-            let host = if host == "0.0.0.0" || host == "::" { "127.0.0.1" } else { host };
+            let host = if host == "0.0.0.0" || host == "::" {
+                "127.0.0.1"
+            } else {
+                host
+            };
             format!("http://{host}:{port}")
         } else {
             format!("http://127.0.0.1:{bind}")

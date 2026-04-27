@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use c2_config::{ConfigResolver, ConfigSources, RuntimeConfigOverrides};
 use clap::{Args, Subcommand};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::Value;
@@ -50,7 +51,7 @@ fn get_json(relay: &str, path: &str) -> Result<Value> {
         path.trim_start_matches('/')
     );
     let builder = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(5));
-    let builder = if c2_http::relay_use_proxy() {
+    let builder = if resolve_relay_use_proxy(ConfigSources::from_process())? {
         builder
     } else {
         builder.no_proxy()
@@ -69,6 +70,12 @@ fn get_json(relay: &str, path: &str) -> Result<Value> {
     response
         .json::<Value>()
         .map_err(|e| anyhow!("invalid JSON from {url}: {e}"))
+}
+
+fn resolve_relay_use_proxy(sources: ConfigSources) -> Result<bool> {
+    let resolved = ConfigResolver::resolve(RuntimeConfigOverrides::default(), sources)
+        .map_err(|e| anyhow!("{e}"))?;
+    Ok(resolved.relay_use_proxy)
 }
 
 fn list_routes(relay: &str) -> Result<()> {
@@ -127,5 +134,20 @@ mod tests {
     #[test]
     fn resolve_path_percent_encodes_route_name() {
         assert_eq!(resolve_path("grid/a b"), "/_resolve/grid%2Fa%20b");
+    }
+
+    #[test]
+    fn proxy_policy_uses_env_file() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let env_file = tempdir.path().join(".env");
+        std::fs::write(&env_file, "C2_RELAY_USE_PROXY=1\n").unwrap();
+
+        let use_proxy = resolve_relay_use_proxy(ConfigSources {
+            env_file: c2_config::EnvFilePolicy::Path(env_file),
+            process_env: Default::default(),
+        })
+        .unwrap();
+
+        assert!(use_proxy);
     }
 }

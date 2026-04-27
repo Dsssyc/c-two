@@ -1,8 +1,8 @@
 //! Reference-counted pool of [`HttpClient`] instances.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
-use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::client::{HttpClient, HttpError};
@@ -12,6 +12,7 @@ use crate::client::{HttpClient, HttpError};
 struct PoolEntry {
     client: Arc<HttpClient>,
     ref_count: usize,
+    use_proxy: bool,
     /// Set to `Some(Instant::now())` when `ref_count` drops to 0.
     last_release: Option<Instant>,
 }
@@ -54,21 +55,33 @@ impl HttpClientPool {
 
     /// Acquire (or create) a client for `base_url`.
     pub fn acquire(&self, base_url: &str) -> Result<Arc<HttpClient>, HttpError> {
+        self.acquire_with_proxy_policy(base_url, crate::relay_use_proxy())
+    }
+
+    /// Acquire (or create) a client for `base_url` with an explicit proxy policy.
+    pub fn acquire_with_proxy_policy(
+        &self,
+        base_url: &str,
+        use_proxy: bool,
+    ) -> Result<Arc<HttpClient>, HttpError> {
         self.sweep_expired();
 
         let mut entries = self.entries.lock();
 
         if let Some(entry) = entries.get_mut(base_url) {
-            entry.ref_count += 1;
-            entry.last_release = None;
-            return Ok(Arc::clone(&entry.client));
+            if entry.use_proxy == use_proxy || entry.ref_count > 0 {
+                entry.ref_count += 1;
+                entry.last_release = None;
+                return Ok(Arc::clone(&entry.client));
+            }
         }
 
         // Create a new client (lock held — HttpClient::new is fast).
-        let client = Arc::new(HttpClient::new(
+        let client = Arc::new(HttpClient::new_with_proxy_policy(
             base_url,
             self.default_timeout,
             self.default_max_connections,
+            use_proxy,
         )?);
 
         entries.insert(
@@ -76,6 +89,7 @@ impl HttpClientPool {
             PoolEntry {
                 client: Arc::clone(&client),
                 ref_count: 1,
+                use_proxy,
                 last_release: None,
             },
         );
@@ -88,9 +102,7 @@ impl HttpClientPool {
         let mut entries = self.entries.lock();
         if let Some(entry) = entries.get_mut(base_url) {
             if entry.ref_count == 0 {
-                eprintln!(
-                    "HttpClientPool::release: ref_count already 0 for {base_url}"
-                );
+                eprintln!("HttpClientPool::release: ref_count already 0 for {base_url}");
                 return;
             }
             entry.ref_count -= 1;
@@ -129,10 +141,7 @@ impl HttpClientPool {
 
     /// Reference count for a specific URL.
     pub fn refcount(&self, base_url: &str) -> usize {
-        self.entries
-            .lock()
-            .get(base_url)
-            .map_or(0, |e| e.ref_count)
+        self.entries.lock().get(base_url).map_or(0, |e| e.ref_count)
     }
 }
 

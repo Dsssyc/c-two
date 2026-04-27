@@ -9,6 +9,7 @@ from c_two.config.ipc import (
     build_server_config,
     build_client_config,
 )
+from c_two.transport.registry import _relay_use_proxy
 
 
 class TestBaseIPCConfig:
@@ -73,7 +74,7 @@ class TestServerIPCConfig:
     def test_inherits_base(self):
         cfg = ServerIPCConfig()
         assert cfg.pool_segment_size == 268_435_456
-        assert cfg.reassembly_segment_size == 268_435_456  # NOT 64 MB
+        assert cfg.reassembly_segment_size == 67_108_864
 
     def test_heartbeat_disabled(self):
         cfg = ServerIPCConfig(heartbeat_interval=0.0)
@@ -87,9 +88,9 @@ class TestServerIPCConfig:
         with pytest.raises(ValueError, match='heartbeat_timeout'):
             ServerIPCConfig(heartbeat_interval=10.0, heartbeat_timeout=10.0)
 
-    def test_max_pool_memory_check(self):
-        with pytest.raises(ValueError, match='max_pool_memory'):
-            ServerIPCConfig(max_pool_memory=1, pool_segment_size=1024)
+    def test_max_pool_memory_is_derived(self):
+        cfg = ServerIPCConfig(pool_segment_size=1024, max_pool_segments=2)
+        assert cfg.max_pool_memory == 2048
 
     def test_max_frame_size_check(self):
         with pytest.raises(ValueError, match='max_frame_size'):
@@ -103,7 +104,6 @@ class TestServerIPCConfig:
         cfg = ServerIPCConfig(
             pool_segment_size=1 << 20,
             max_pool_segments=2,
-            max_pool_memory=2 << 20,
             max_frame_size=1 << 20,
             max_payload_size=1 << 30,
             heartbeat_interval=5.0,
@@ -141,29 +141,37 @@ class TestBuildServerConfig:
     def test_env_override(self, monkeypatch):
         monkeypatch.setenv('C2_ENV_FILE', '')
         monkeypatch.setenv('C2_IPC_POOL_SEGMENT_SIZE', '536870912')
-        from c_two.config.settings import C2Settings
-        s = C2Settings()
-        cfg = build_server_config(settings=s)
+        cfg = build_server_config()
         assert cfg.pool_segment_size == 536_870_912
+
+    def test_proxy_policy_reads_env_file(self, tmp_path, monkeypatch):
+        env_file = tmp_path / '.env'
+        env_file.write_text('C2_RELAY_USE_PROXY=1\n', encoding='utf-8')
+        monkeypatch.setenv('C2_ENV_FILE', str(env_file))
+        monkeypatch.delenv('C2_RELAY_USE_PROXY', raising=False)
+
+        assert _relay_use_proxy() is True
 
     def test_kwargs_beat_env(self, monkeypatch):
         monkeypatch.setenv('C2_ENV_FILE', '')
         monkeypatch.setenv('C2_IPC_POOL_SEGMENT_SIZE', '536870912')
-        from c_two.config.settings import C2Settings
-        s = C2Settings()
-        cfg = build_server_config(settings=s, pool_segment_size=1 << 20)
+        cfg = build_server_config(pool_segment_size=1 << 20)
         assert cfg.pool_segment_size == 1 << 20
 
-    def test_clamping(self):
-        cfg = build_server_config(
-            pool_segment_size=100 * (1 << 30),  # 100 GB
-            max_payload_size=1 * (1 << 30),      # 1 GB
-        )
-        assert cfg.pool_segment_size == 1 * (1 << 30)  # clamped
+    def test_pool_segment_larger_than_payload_is_rejected(self):
+        with pytest.raises(ValueError, match='pool_segment_size|max_payload_size'):
+            build_server_config(
+                pool_segment_size=100 * (1 << 30),  # 100 GB
+                max_payload_size=1 * (1 << 30),     # 1 GB
+            )
 
     def test_auto_max_pool_memory(self):
         cfg = build_server_config(pool_segment_size=1 << 20, max_pool_segments=2)
         assert cfg.max_pool_memory == 2 * (1 << 20)
+
+    def test_max_pool_memory_override_rejected(self):
+        with pytest.raises(ValueError, match='max_pool_memory'):
+            build_server_config(max_pool_memory=1)
 
 
 class TestBuildClientConfig:
@@ -178,9 +186,7 @@ class TestBuildClientConfig:
     def test_env_override(self, monkeypatch):
         monkeypatch.setenv('C2_ENV_FILE', '')
         monkeypatch.setenv('C2_IPC_REASSEMBLY_SEGMENT_SIZE', '33554432')
-        from c_two.config.settings import C2Settings
-        s = C2Settings()
-        cfg = build_client_config(settings=s)
+        cfg = build_client_config()
         assert cfg.reassembly_segment_size == 33_554_432
 
 

@@ -83,3 +83,59 @@ fn relay_dry_run_respects_custom_env_file() {
         .success()
         .stdout(predicate::str::contains("bind=127.0.0.1:9292"));
 }
+
+#[test]
+fn relay_dry_run_loads_proxy_policy_from_env_file() {
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::write(tempdir.path().join(".env"), "C2_RELAY_USE_PROXY=1\n").unwrap();
+
+    let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.current_dir(tempdir.path())
+        .env_remove("C2_RELAY_USE_PROXY")
+        .env_remove("C2_ENV_FILE")
+        .args(["relay", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("relay_use_proxy=true"));
+}
+
+#[test]
+fn relay_process_env_overrides_env_file() {
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tempdir.path().join(".env"),
+        "C2_RELAY_BIND=127.0.0.1:9191\n",
+    )
+    .unwrap();
+
+    let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.current_dir(tempdir.path())
+        .env("C2_RELAY_BIND", "127.0.0.1:9393")
+        .env_remove("C2_ENV_FILE")
+        .args(["relay", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("bind=127.0.0.1:9393"));
+}
+
+#[test]
+fn relay_cli_flag_overrides_process_env() {
+    let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.env("C2_RELAY_BIND", "127.0.0.1:9393")
+        .env("C2_ENV_FILE", "")
+        .args(["relay", "--bind", "127.0.0.1:9494", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("bind=127.0.0.1:9494"));
+}
+
+#[test]
+fn relay_rejects_removed_max_pool_memory_env() {
+    let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.env("C2_ENV_FILE", "")
+        .env("C2_IPC_MAX_POOL_MEMORY", "1")
+        .args(["relay", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("C2_IPC_MAX_POOL_MEMORY"));
+}

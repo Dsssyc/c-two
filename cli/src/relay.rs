@@ -2,43 +2,34 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
-use c2_config::RelayConfig;
+use c2_config::{ConfigResolver, ConfigSources, RelayConfigOverrides, RuntimeConfigOverrides};
 use c2_http::relay::RelayServer;
 use clap::Args;
 
 #[derive(Debug, Args)]
 pub struct RelayArgs {
     /// HTTP listen address.
-    #[arg(
-        long,
-        short = 'b',
-        env = "C2_RELAY_BIND",
-        default_value = "0.0.0.0:8080"
-    )]
-    pub bind: String,
+    #[arg(long, short = 'b')]
+    pub bind: Option<String>,
 
     /// Pre-register an upstream CRM as NAME=ADDRESS. Repeatable.
     #[arg(long = "upstream", short = 'u', value_parser = parse_upstream)]
     pub upstreams: Vec<(String, String)>,
 
     /// Disconnect idle upstream IPC connections after this many seconds. 0 disables eviction.
-    #[arg(
-        long = "idle-timeout",
-        env = "C2_RELAY_IDLE_TIMEOUT",
-        default_value_t = 300
-    )]
-    pub idle_timeout_secs: u64,
+    #[arg(long = "idle-timeout")]
+    pub idle_timeout_secs: Option<u64>,
 
     /// Comma-separated seed relay URLs for mesh mode.
-    #[arg(long, short = 's', env = "C2_RELAY_SEEDS", value_delimiter = ',')]
+    #[arg(long, short = 's', value_delimiter = ',')]
     pub seeds: Vec<String>,
 
     /// Stable relay identifier for mesh protocol.
-    #[arg(long = "relay-id", env = "C2_RELAY_ID")]
+    #[arg(long = "relay-id")]
     pub relay_id: Option<String>,
 
     /// Publicly reachable URL for this relay.
-    #[arg(long = "advertise-url", env = "C2_RELAY_ADVERTISE_URL")]
+    #[arg(long = "advertise-url")]
     pub advertise_url: Option<String>,
 
     /// Validate and print relay configuration without starting the server.
@@ -62,23 +53,30 @@ pub fn parse_upstream(value: &str) -> Result<(String, String), String> {
 }
 
 pub fn run(args: RelayArgs) -> Result<()> {
-    let config = RelayConfig {
+    let mut overrides = RuntimeConfigOverrides::default();
+    overrides.relay = RelayConfigOverrides {
         bind: args.bind.clone(),
-        relay_id: args
-            .relay_id
-            .clone()
-            .unwrap_or_else(RelayConfig::generate_relay_id),
-        advertise_url: args.advertise_url.clone().unwrap_or_default(),
-        seeds: args.seeds.clone(),
+        relay_id: args.relay_id.clone(),
+        advertise_url: args.advertise_url.clone(),
+        seeds: if args.seeds.is_empty() {
+            None
+        } else {
+            Some(args.seeds.clone())
+        },
         idle_timeout_secs: args.idle_timeout_secs,
         ..Default::default()
     };
+    let resolved = ConfigResolver::resolve(overrides, ConfigSources::from_process())
+        .map_err(|e| anyhow!("{e}"))?;
+    let config = resolved.relay;
+    let display_bind = config.bind.clone();
 
     if args.dry_run {
         println!("bind={}", config.bind);
         println!("relay_id={}", config.relay_id);
         println!("advertise_url={}", config.effective_advertise_url());
         println!("idle_timeout={}", config.idle_timeout_secs);
+        println!("relay_use_proxy={}", config.use_proxy);
         for seed in &config.seeds {
             println!("seed={seed}");
         }
@@ -103,7 +101,7 @@ pub fn run(args: RelayArgs) -> Result<()> {
             .map_err(|e| anyhow!("failed to register upstream {name:?}: {e}"))?;
     }
 
-    println!("C-Two relay listening at {}", display_url(&args.bind));
+    println!("C-Two relay listening at {}", display_url(&display_bind));
     println!("Press Ctrl+C to stop.");
 
     let (tx, rx) = std::sync::mpsc::channel();

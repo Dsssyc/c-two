@@ -37,7 +37,6 @@ import logging
 import os
 import signal
 import sys
-import os
 import threading
 import time
 import urllib.request
@@ -56,22 +55,20 @@ from typing import TypeVar
 # correctness hazard to leak internal mesh control traffic to a third-party
 # proxy. An empty ProxyHandler({}) tells urllib to never use any proxy.
 #
-# Users who actually want to route relay traffic through the system proxy
-# (e.g., behind a forward proxy that doesn't normalize URLs) can opt in by
-# setting C2_RELAY_USE_PROXY=1.
+# Users who actually want to route relay traffic through the system proxy can
+# opt in with C2_RELAY_USE_PROXY=1 in the Rust config resolver inputs.
 _NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def _relay_use_proxy() -> bool:
-    """Read C2_RELAY_USE_PROXY directly from the environment.
+    """Resolve relay proxy policy through the shared Rust config resolver."""
+    try:
+        from c_two._native import resolve_runtime_config
+    except (ImportError, AttributeError):
+        val = os.environ.get("C2_RELAY_USE_PROXY", "").strip().lower()
+        return val in ("1", "true", "yes")
 
-    We read the env var at call time (not via the cached pydantic settings
-    object) so behavior matches the Rust side, which also reads the env on
-    every client creation. This avoids a confusing "Python and Rust
-    disagree" failure mode if the user mutates the env after import.
-    """
-    val = os.environ.get("C2_RELAY_USE_PROXY", "").strip().lower()
-    return val in ("1", "true", "yes")
+    return bool(resolve_runtime_config().get("relay_use_proxy", False))
 
 
 def _relay_urlopen(req, timeout: float = 5.0):

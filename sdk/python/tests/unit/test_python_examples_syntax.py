@@ -13,10 +13,6 @@ def _repo_root() -> Path:
 
 
 def _python310() -> str | None:
-    explicit = os.environ.get("C2_TEST_PYTHON310")
-    if explicit:
-        return explicit
-
     found = shutil.which("python3.10")
     if found:
         return found

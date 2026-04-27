@@ -1,8 +1,8 @@
-"""Frozen IPC configuration dataclasses with validation."""
+"""Frozen IPC configuration dataclasses backed by the Rust config resolver."""
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .settings import C2Settings
@@ -16,7 +16,7 @@ class BaseIPCConfig:
     pool_segment_size: int = 268_435_456        # 256 MB
     max_pool_segments: int = 4
     max_pool_memory: int = 1_073_741_824        # 1 GB
-    reassembly_segment_size: int = 268_435_456  # 256 MB
+    reassembly_segment_size: int = 67_108_864   # 64 MB
     reassembly_max_segments: int = 4
     max_total_chunks: int = 512
     chunk_gc_interval: float = 5.0
@@ -26,6 +26,10 @@ class BaseIPCConfig:
     chunk_size: int = 131_072                   # 128 KB
 
     def __post_init__(self) -> None:
+        segment_size = int(self.pool_segment_size)
+        segment_count = int(self.max_pool_segments)
+        object.__setattr__(self, 'max_pool_memory', segment_size * segment_count)
+
         if self.pool_segment_size <= 0 or self.pool_segment_size > 0xFFFFFFFF:
             raise ValueError(
                 f'pool_segment_size must be in (0, {0xFFFFFFFF}], '
@@ -82,6 +86,11 @@ class ServerIPCConfig(BaseIPCConfig):
             raise ValueError(
                 f'max_payload_size must be positive, got {self.max_payload_size}'
             )
+        if self.pool_segment_size > self.max_payload_size:
+            raise ValueError(
+                f'pool_segment_size ({self.pool_segment_size}) must not exceed '
+                f'max_payload_size ({self.max_payload_size})'
+            )
         if self.heartbeat_interval < 0:
             raise ValueError(
                 f'heartbeat_interval must be >= 0, got {self.heartbeat_interval}'
@@ -105,55 +114,70 @@ class ClientIPCConfig(BaseIPCConfig):
     reassembly_segment_size: int = 67_108_864   # 64 MB
 
 
+_SERVER_FIELD_NAMES = {f.name for f in fields(ServerIPCConfig)}
+_CLIENT_FIELD_NAMES = {f.name for f in fields(ClientIPCConfig)}
+
+
 def build_server_config(
     settings: C2Settings | None = None,
     **kwargs: object,
 ) -> ServerIPCConfig:
-    """Build a ``ServerIPCConfig`` from kwargs > env vars > class defaults."""
-    if settings is None:
-        from .settings import settings as _settings
-        settings = _settings
-
-    merged: dict[str, object] = {}
-    for f in fields(ServerIPCConfig):
-        name = f.name
-        env_name = f'ipc_{name}'
-        if name in kwargs:
-            merged[name] = kwargs[name]
-        elif hasattr(settings, env_name) and getattr(settings, env_name) is not None:
-            merged[name] = getattr(settings, env_name)
-
-    # Clamping: pool_segment_size <= max_payload_size
-    seg = merged.get('pool_segment_size', ServerIPCConfig.pool_segment_size)
-    pay = merged.get('max_payload_size', ServerIPCConfig.max_payload_size)
-    if seg > pay:  # type: ignore[operator]
-        merged['pool_segment_size'] = pay
-
-    # Auto-derive max_pool_memory if not explicitly set
-    if 'max_pool_memory' not in merged:
-        seg_final = merged.get('pool_segment_size', ServerIPCConfig.pool_segment_size)
-        segs = merged.get('max_pool_segments', ServerIPCConfig.max_pool_segments)
-        merged['max_pool_memory'] = seg_final * segs  # type: ignore[operator]
-
-    return ServerIPCConfig(**merged)
+    """Build a ``ServerIPCConfig`` through Rust config resolution."""
+    _reject_unknown_kwargs(kwargs, _SERVER_FIELD_NAMES)
+    native = _native_resolver()
+    resolved = native.resolve_server_ipc_config(
+        _clean_overrides(kwargs),
+        _global_overrides(settings),
+    )
+    return ServerIPCConfig(**_dataclass_kwargs(resolved, _SERVER_FIELD_NAMES))
 
 
 def build_client_config(
     settings: C2Settings | None = None,
     **kwargs: object,
 ) -> ClientIPCConfig:
-    """Build a ``ClientIPCConfig`` from kwargs > env vars > class defaults."""
+    """Build a ``ClientIPCConfig`` through Rust config resolution."""
+    _reject_unknown_kwargs(kwargs, _CLIENT_FIELD_NAMES)
+    native = _native_resolver()
+    resolved = native.resolve_client_ipc_config(
+        _clean_overrides(kwargs),
+        _global_overrides(settings),
+    )
+    return ClientIPCConfig(**_dataclass_kwargs(resolved, _CLIENT_FIELD_NAMES))
+
+
+def _native_resolver() -> Any:
+    from c_two import _native
+
+    return _native
+
+
+def _clean_overrides(kwargs: dict[str, object]) -> dict[str, object]:
+    return {key: value for key, value in kwargs.items() if value is not None}
+
+
+def _global_overrides(settings: C2Settings | None) -> dict[str, object]:
     if settings is None:
         from .settings import settings as _settings
         settings = _settings
+    if hasattr(settings, '_global_overrides'):
+        return settings._global_overrides()  # noqa: SLF001
+    overrides: dict[str, object] = {}
+    shm_threshold = getattr(settings, 'shm_threshold', None)
+    if shm_threshold is not None:
+        overrides['shm_threshold'] = shm_threshold
+    relay_address = getattr(settings, 'relay_address', None)
+    if relay_address is not None:
+        overrides['relay_address'] = relay_address
+    return overrides
 
-    merged: dict[str, object] = {}
-    for f in fields(ClientIPCConfig):
-        name = f.name
-        env_name = f'ipc_{name}'
-        if name in kwargs:
-            merged[name] = kwargs[name]
-        elif hasattr(settings, env_name) and getattr(settings, env_name) is not None:
-            merged[name] = getattr(settings, env_name)
 
-    return ClientIPCConfig(**merged)
+def _reject_unknown_kwargs(kwargs: dict[str, object], allowed: set[str]) -> None:
+    unknown = sorted(set(kwargs) - allowed)
+    if unknown:
+        joined = ', '.join(unknown)
+        raise TypeError(f'unknown IPC config option(s): {joined}')
+
+
+def _dataclass_kwargs(resolved: dict[str, object], allowed: set[str]) -> dict[str, object]:
+    return {key: value for key, value in resolved.items() if key in allowed}

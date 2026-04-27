@@ -5,7 +5,6 @@ mod version;
 use anyhow::Result;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::io::IsTerminal;
-use std::path::PathBuf;
 
 const BANNER: &str = include_str!("../assets/banner_unicode.txt");
 const BANNER_COLOR: &str = "\x1b[38;2;102;237;173m";
@@ -31,7 +30,6 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
-    load_env_file();
     let matches = Cli::command().before_help(render_banner()).get_matches();
     let cli = Cli::from_arg_matches(&matches)?;
     match cli.command {
@@ -59,16 +57,4 @@ fn should_color_banner() -> bool {
         return true;
     }
     std::io::stdout().is_terminal()
-}
-
-fn load_env_file() {
-    let env_file = std::env::var_os("C2_ENV_FILE");
-    let Some(path) = env_file
-        .map(PathBuf::from)
-        .or_else(|| Some(PathBuf::from(".env")))
-        .filter(|path| !path.as_os_str().is_empty())
-    else {
-        return;
-    };
-    let _ = dotenvy::from_path(path);
 }

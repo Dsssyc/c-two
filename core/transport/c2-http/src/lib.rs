@@ -27,6 +27,15 @@ pub fn relay_use_proxy() -> bool {
 /// Build a reqwest::ClientBuilder pre-configured for c-two relay traffic.
 /// Applies `.no_proxy()` unless the user opted in via `C2_RELAY_USE_PROXY=1`.
 pub fn relay_client_builder() -> reqwest::ClientBuilder {
-    let b = reqwest::Client::builder();
-    if relay_use_proxy() { b } else { b.no_proxy() }
+    relay_client_builder_with_proxy(relay_use_proxy())
+}
+
+/// Build a relay client builder with an explicit proxy policy.
+pub fn relay_client_builder_with_proxy(use_proxy: bool) -> reqwest::ClientBuilder {
+    let builder = reqwest::Client::builder();
+    if use_proxy {
+        builder
+    } else {
+        builder.no_proxy()
+    }
 }

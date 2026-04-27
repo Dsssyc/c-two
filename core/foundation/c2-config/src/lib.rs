@@ -6,7 +6,12 @@
 mod ipc;
 mod pool;
 mod relay;
+mod resolver;
 
 pub use ipc::{BaseIpcConfig, ClientIpcConfig, ServerIpcConfig};
 pub use pool::PoolConfig;
 pub use relay::RelayConfig;
+pub use resolver::{
+    ClientIpcConfigOverrides, ConfigResolver, ConfigSources, EnvFilePolicy, EnvMap,
+    RelayConfigOverrides, ResolvedRuntimeConfig, RuntimeConfigOverrides, ServerIpcConfigOverrides,
+};

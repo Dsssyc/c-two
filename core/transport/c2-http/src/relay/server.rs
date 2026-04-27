@@ -16,12 +16,12 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use c2_ipc::IpcClient;
-use c2_config::RelayConfig;
 use crate::relay::background::spawn_background_tasks;
 use crate::relay::peer::{PeerEnvelope, PeerMessage};
 use crate::relay::router;
 use crate::relay::state::RelayState;
+use c2_config::RelayConfig;
+use c2_ipc::IpcClient;
 
 /// Errors from the embeddable relay control API.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,12 +98,15 @@ pub struct RelayServer {
 impl RelayServer {
     /// Start the relay server on a background thread.
     pub fn start(config: RelayConfig) -> Result<Self, String> {
-        let addr: SocketAddr = config.bind.parse()
+        let addr: SocketAddr = config
+            .bind
+            .parse()
             .map_err(|e| format!("Invalid bind address '{}': {e}", config.bind))?;
 
         let config = Arc::new(config);
-        let disseminator: Arc<dyn crate::relay::disseminator::Disseminator> =
-            Arc::new(crate::relay::disseminator::FullBroadcast::new());
+        let disseminator: Arc<dyn crate::relay::disseminator::Disseminator> = Arc::new(
+            crate::relay::disseminator::FullBroadcast::with_proxy_policy(config.use_proxy),
+        );
         let state = Arc::new(RelayState::new(config.clone(), disseminator));
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(64);
@@ -123,7 +126,15 @@ impl RelayServer {
                     .expect("Failed to create tokio runtime");
 
                 rt.block_on(async move {
-                    Self::run(addr, server_state, cmd_rx, ready_tx, idle_timeout_secs, cancel_clone).await;
+                    Self::run(
+                        addr,
+                        server_state,
+                        cmd_rx,
+                        ready_tx,
+                        idle_timeout_secs,
+                        cancel_clone,
+                    )
+                    .await;
                 });
             })
             .map_err(|e| format!("Failed to spawn relay thread: {e}"))?;
@@ -231,9 +242,9 @@ impl RelayServer {
         if !state.config().seeds.is_empty() {
             let s = state.clone();
             tokio::spawn(async move {
-                let client = crate::relay_client_builder()
+                let client = crate::relay_client_builder_with_proxy(s.config().use_proxy)
                     .timeout(std::time::Duration::from_secs(5))
-            .build()
+                    .build()
                     .expect("c-two: failed to build reqwest Client for relay traffic");
                 for seed_url in &s.config().seeds {
                     let join_url = format!("{seed_url}/_peer/join");
@@ -275,7 +286,9 @@ impl RelayServer {
         // Shutdown: broadcast leave, cancel background tasks
         let leave = PeerEnvelope::new(
             state.relay_id(),
-            PeerMessage::RelayLeave { relay_id: state.relay_id().to_string() },
+            PeerMessage::RelayLeave {
+                relay_id: state.relay_id().to_string(),
+            },
         );
         let peers = state.list_peers();
         let leave_handle = state.disseminator().broadcast(leave, &peers);
@@ -330,13 +343,14 @@ impl RelayServer {
         }
     }
 
-    async fn command_loop(
-        state: Arc<RelayState>,
-        cmd_rx: &mut mpsc::Receiver<Command>,
-    ) {
+    async fn command_loop(state: Arc<RelayState>, cmd_rx: &mut mpsc::Receiver<Command>) {
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
-                Command::RegisterUpstream { name, address, reply } => {
+                Command::RegisterUpstream {
+                    name,
+                    address,
+                    reply,
+                } => {
                     if state.has_local_route(&name) {
                         let _ = reply.send(Err(RelayControlError::DuplicateRoute { name }));
                         continue;
@@ -344,7 +358,13 @@ impl RelayServer {
                     let mut client = IpcClient::new(&address);
                     let result = match client.connect().await {
                         Ok(()) => {
-                            state.register_upstream(name, address, String::new(), String::new(), Arc::new(client));
+                            state.register_upstream(
+                                name,
+                                address,
+                                String::new(),
+                                String::new(),
+                                Arc::new(client),
+                            );
                             Ok(())
                         }
                         Err(e) => Err(RelayControlError::Other(format!("Failed to connect: {e}"))),
@@ -371,7 +391,8 @@ impl RelayServer {
                     }
                 }
                 Command::ListRoutes { reply } => {
-                    let routes: Vec<(String, String)> = state.list_routes()
+                    let routes: Vec<(String, String)> = state
+                        .list_routes()
                         .into_iter()
                         .map(|r| (r.name, r.ipc_address.unwrap_or_default()))
                         .collect();

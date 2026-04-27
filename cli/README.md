@@ -49,9 +49,10 @@ cargo run --manifest-path cli/Cargo.toml -- relay --help
 
 ## Configuration
 
-The CLI loads environment variables from `.env` in the current working
-directory before parsing command-line arguments. Set `C2_ENV_FILE` to load a
-different file:
+The shared Rust config resolver loads runtime environment variables from `.env`
+in the current working directory before parsing command-line overrides. Set
+`C2_ENV_FILE` to load a different file; set `C2_ENV_FILE=""` to disable env-file
+loading:
 
 ```bash
 C2_ENV_FILE=relay.env c3 relay --dry-run
@@ -79,7 +80,7 @@ Useful options:
 | Option | Environment | Default | Purpose |
 |---|---|---:|---|
 | `--bind`, `-b` | `C2_RELAY_BIND` | `0.0.0.0:8080` | HTTP listen address. |
-| `--idle-timeout` | `C2_RELAY_IDLE_TIMEOUT` | `300` | Seconds before idle upstream IPC connections are evicted. Use `0` to disable eviction. |
+| `--idle-timeout` | `C2_RELAY_IDLE_TIMEOUT` | `0` | Seconds before idle upstream IPC connections are evicted. Use `0` to disable eviction. |
 | `--seeds`, `-s` | `C2_RELAY_SEEDS` | empty | Comma-separated seed relay URLs for mesh mode. |
 | `--relay-id` | `C2_RELAY_ID` | generated | Stable relay identifier for the mesh protocol. |
 | `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | derived | Public URL other relays should use to reach this relay. |

@@ -9,13 +9,18 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
+use c2_config::{ConfigResolver, ConfigSources, RuntimeConfigOverrides};
 use c2_http::client::{HttpClient, HttpClientPool, HttpError};
 
 // ---------------------------------------------------------------------------
 // HttpCrmCallError — custom exception carrying serialised error bytes
 // ---------------------------------------------------------------------------
 
-pyo3::create_exception!(c_two._native, HttpCrmCallError, pyo3::exceptions::PyException);
+pyo3::create_exception!(
+    c_two._native,
+    HttpCrmCallError,
+    pyo3::exceptions::PyException
+);
 
 // ---------------------------------------------------------------------------
 // PyRustHttpClient
@@ -58,8 +63,7 @@ impl PyRustHttpClient {
         match result {
             Ok(bytes) => Ok(PyBytes::new(py, &bytes)),
             Err(HttpError::CrmError(err_bytes)) => {
-                let exc =
-                    PyErr::new::<HttpCrmCallError, _>("CRM method error");
+                let exc = PyErr::new::<HttpCrmCallError, _>("CRM method error");
                 exc.value(py)
                     .setattr("error_bytes", PyBytes::new(py, &err_bytes))?;
                 Err(exc)
@@ -110,15 +114,18 @@ impl PyRustHttpClientPool {
     }
 
     /// Acquire (or create) an HTTP client for the given relay URL.
-    fn acquire(
-        &self,
-        py: Python<'_>,
-        base_url: &str,
-    ) -> PyResult<PyRustHttpClient> {
+    fn acquire(&self, py: Python<'_>, base_url: &str) -> PyResult<PyRustHttpClient> {
         let url = base_url.to_string();
         let pool = self.inner;
         let client = py
-            .detach(move || pool.acquire(&url))
+            .detach(move || {
+                let config = ConfigResolver::resolve(
+                    RuntimeConfigOverrides::default(),
+                    ConfigSources::from_process(),
+                )
+                .map_err(|e| HttpError::Transport(e.to_string()))?;
+                pool.acquire_with_proxy_policy(&url, config.relay_use_proxy)
+            })
             .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
         Ok(PyRustHttpClient { inner: client })
     }
@@ -152,9 +159,6 @@ impl PyRustHttpClientPool {
 pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRustHttpClient>()?;
     m.add_class::<PyRustHttpClientPool>()?;
-    m.add(
-        "HttpCrmCallError",
-        m.py().get_type::<HttpCrmCallError>(),
-    )?;
+    m.add("HttpCrmCallError", m.py().get_type::<HttpCrmCallError>())?;
     Ok(())
 }

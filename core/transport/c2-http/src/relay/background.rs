@@ -133,9 +133,9 @@ async fn anti_entropy_loop(state: Arc<RelayState>, cancel: CancellationToken) {
     ticker.tick().await;
     let mut round_robin_idx: usize = 0;
 
-    let client = crate::relay_client_builder()
+    let client = crate::relay_client_builder_with_proxy(state.config().use_proxy)
         .timeout(Duration::from_secs(5))
-            .build()
+        .build()
         .expect("c-two: failed to build reqwest Client for relay traffic");
 
     loop {
@@ -159,10 +159,7 @@ async fn anti_entropy_loop(state: Arc<RelayState>, cancel: CancellationToken) {
         let (_peer_id, peer_url) = &alive[idx];
 
         let digest = build_digest(&state);
-        let envelope = PeerEnvelope::new(
-            state.relay_id(),
-            PeerMessage::DigestExchange { digest },
-        );
+        let envelope = PeerEnvelope::new(state.relay_id(), PeerMessage::DigestExchange { digest });
 
         let url = format!("{peer_url}/_peer/digest");
         if let Ok(resp) = client.post(&url).json(&envelope).send().await {
@@ -171,8 +168,7 @@ async fn anti_entropy_loop(state: Arc<RelayState>, cancel: CancellationToken) {
                     for diff_entry in entries {
                         // Defense-in-depth: scrub ipc_address from incoming
                         // peer routes — the path is local to the sender.
-                        let mut entry: crate::relay::types::RouteEntry =
-                            diff_entry.into();
+                        let mut entry: crate::relay::types::RouteEntry = diff_entry.into();
                         entry.ipc_address = None;
                         state.register_peer_route(entry);
                     }
@@ -201,9 +197,9 @@ async fn dead_peer_probe_loop(state: Arc<RelayState>, cancel: CancellationToken)
     let mut ticker = tokio::time::interval(interval);
     ticker.tick().await;
 
-    let client = crate::relay_client_builder()
+    let client = crate::relay_client_builder_with_proxy(state.config().use_proxy)
         .timeout(Duration::from_secs(5))
-            .build()
+        .build()
         .expect("c-two: failed to build reqwest Client for relay traffic");
 
     loop {
@@ -236,17 +232,14 @@ async fn dead_peer_probe_loop(state: Arc<RelayState>, cancel: CancellationToken)
 
                 // Immediate digest exchange with recovered peer
                 let digest = build_digest(&state);
-                let envelope = PeerEnvelope::new(
-                    state.relay_id(),
-                    PeerMessage::DigestExchange { digest },
-                );
+                let envelope =
+                    PeerEnvelope::new(state.relay_id(), PeerMessage::DigestExchange { digest });
                 let digest_url = format!("{url}/_peer/digest");
                 if let Ok(resp) = client.post(&digest_url).json(&envelope).send().await {
                     if let Ok(resp_env) = resp.json::<PeerEnvelope>().await {
                         if let PeerMessage::DigestDiff { entries, extra: _ } = resp_env.message {
                             for diff_entry in entries {
-                                let mut entry: crate::relay::types::RouteEntry =
-                                    diff_entry.into();
+                                let mut entry: crate::relay::types::RouteEntry = diff_entry.into();
                                 entry.ipc_address = None;
                                 state.register_peer_route(entry);
                             }
@@ -265,9 +258,9 @@ async fn seed_retry_loop(state: Arc<RelayState>, cancel: CancellationToken) {
     let mut ticker = tokio::time::interval(interval);
     ticker.tick().await;
 
-    let client = crate::relay_client_builder()
+    let client = crate::relay_client_builder_with_proxy(state.config().use_proxy)
         .timeout(Duration::from_secs(5))
-            .build()
+        .build()
         .expect("c-two: failed to build reqwest Client for relay traffic");
 
     loop {
