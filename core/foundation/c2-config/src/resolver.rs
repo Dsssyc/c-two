@@ -635,7 +635,7 @@ mod tests {
         assert_eq!(resolved.server_ipc.max_pool_memory, 268_435_456 * 4);
         assert_eq!(resolved.client_ipc.max_pool_memory, 268_435_456 * 4);
         assert_eq!(resolved.relay.bind, "0.0.0.0:8080");
-        assert_eq!(resolved.relay.idle_timeout_secs, 0);
+        assert_eq!(resolved.relay.idle_timeout_secs, 60);
         assert!(!resolved.relay_use_proxy);
     }
 

@@ -69,6 +69,17 @@ fn relay_dry_run_loads_default_env_file() {
 }
 
 #[test]
+fn relay_dry_run_uses_canonical_idle_timeout_default() {
+    let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.env("C2_ENV_FILE", "")
+        .env_remove("C2_RELAY_IDLE_TIMEOUT")
+        .args(["relay", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("idle_timeout=60"));
+}
+
+#[test]
 fn relay_dry_run_respects_custom_env_file() {
     let tempdir = tempfile::tempdir().unwrap();
     let env_file = tempdir.path().join("relay.env");

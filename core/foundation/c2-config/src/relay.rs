@@ -39,7 +39,7 @@ impl Default for RelayConfig {
             relay_id: Self::generate_relay_id(),
             advertise_url: String::new(),
             seeds: Vec::new(),
-            idle_timeout_secs: 0,
+            idle_timeout_secs: 60,
             anti_entropy_interval: Duration::from_secs(60),
             heartbeat_interval: Duration::from_secs(5),
             heartbeat_miss_threshold: 3,

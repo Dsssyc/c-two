@@ -80,7 +80,7 @@ Useful options:
 | Option | Environment | Default | Purpose |
 |---|---|---:|---|
 | `--bind`, `-b` | `C2_RELAY_BIND` | `0.0.0.0:8080` | HTTP listen address. |
-| `--idle-timeout` | `C2_RELAY_IDLE_TIMEOUT` | `0` | Seconds before idle upstream IPC connections are evicted. Use `0` to disable eviction. |
+| `--idle-timeout` | `C2_RELAY_IDLE_TIMEOUT` | `60` | Seconds before idle upstream IPC connections are evicted. Use `0` to disable time-based eviction. |
 | `--seeds`, `-s` | `C2_RELAY_SEEDS` | empty | Comma-separated seed relay URLs for mesh mode. |
 | `--relay-id` | `C2_RELAY_ID` | generated | Stable relay identifier for the mesh protocol. |
 | `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | derived | Public URL other relays should use to reach this relay. |
