@@ -11,7 +11,7 @@ use c2_config::RelayConfig;
 use c2_ipc::IpcClient;
 use parking_lot::RwLock;
 
-use crate::relay::conn_pool::ConnectionPool;
+use crate::relay::conn_pool::{CachedClient, ConnectionPool};
 use crate::relay::route_table::RouteTable;
 use crate::relay::types::*;
 
@@ -20,6 +20,19 @@ pub struct RelayState {
     conn_pool: RwLock<ConnectionPool>,
     config: Arc<RelayConfig>,
     disseminator: Arc<dyn crate::relay::disseminator::Disseminator>,
+}
+
+#[derive(Clone)]
+pub enum LocalOwnerStatus {
+    NoOwner,
+    SameAddress,
+    DifferentAddressReady {
+        existing_address: String,
+    },
+    DifferentAddressNeedsProbe {
+        existing_address: String,
+        generation: u64,
+    },
 }
 
 impl RelayState {
@@ -101,12 +114,12 @@ impl RelayState {
 
     // -- Connection-only operations --
 
-    pub fn get_client(&self, name: &str) -> Option<Arc<IpcClient>> {
-        self.conn_pool.read().get(name)
-    }
-
     pub fn begin_request(&self, name: &str) -> Option<(Arc<IpcClient>, u64)> {
         self.conn_pool.read().begin_request(name)
+    }
+
+    pub fn lookup_client(&self, name: &str) -> CachedClient {
+        self.conn_pool.read().lookup(name)
     }
 
     pub fn end_request(&self, name: &str, generation: u64) {
@@ -165,8 +178,47 @@ impl RelayState {
             .reconnect_generation(name, generation, address, client)
     }
 
-    pub fn has_connection(&self, name: &str) -> bool {
-        self.conn_pool.read().has_entry(name)
+    pub fn check_local_owner(&self, name: &str, address: &str) -> LocalOwnerStatus {
+        let local_route = self.route_table.read().local_route(name);
+        match self.conn_pool.read().lookup(name) {
+            CachedClient::Ready {
+                address: existing_address,
+                ..
+            } => {
+                if existing_address == address {
+                    LocalOwnerStatus::SameAddress
+                } else {
+                    LocalOwnerStatus::DifferentAddressReady { existing_address }
+                }
+            }
+            CachedClient::Evicted {
+                address: existing_address,
+                generation,
+            }
+            | CachedClient::Disconnected {
+                address: existing_address,
+                generation,
+            } => {
+                if existing_address == address {
+                    LocalOwnerStatus::SameAddress
+                } else {
+                    LocalOwnerStatus::DifferentAddressNeedsProbe {
+                        existing_address,
+                        generation,
+                    }
+                }
+            }
+            CachedClient::Missing => {
+                let Some(existing_address) = local_route.and_then(|entry| entry.ipc_address) else {
+                    return LocalOwnerStatus::NoOwner;
+                };
+                if existing_address == address {
+                    LocalOwnerStatus::SameAddress
+                } else {
+                    LocalOwnerStatus::DifferentAddressReady { existing_address }
+                }
+            }
+        }
     }
 
     // -- PEER route operations (gossip) --
@@ -365,5 +417,31 @@ mod tests {
             Some("ipc://grid"),
             "echoed peer route must not overwrite our LOCAL route"
         );
+    }
+
+    #[test]
+    fn local_owner_check_uses_route_table_when_connection_entry_is_missing() {
+        let state = RelayState::new(test_config(), null_disseminator());
+        state.with_route_table_mut(|rt| {
+            rt.register_route(RouteEntry {
+                name: "grid".into(),
+                relay_id: "test-relay".into(),
+                relay_url: "http://localhost:9999".into(),
+                ipc_address: Some("ipc://grid-old".into()),
+                crm_ns: String::new(),
+                crm_ver: String::new(),
+                locality: Locality::Local,
+                registered_at: 1000.0,
+            });
+        });
+
+        assert!(matches!(
+            state.check_local_owner("grid", "ipc://grid-old"),
+            LocalOwnerStatus::SameAddress
+        ));
+        assert!(matches!(
+            state.check_local_owner("grid", "ipc://grid-new"),
+            LocalOwnerStatus::DifferentAddressReady { .. }
+        ));
     }
 }

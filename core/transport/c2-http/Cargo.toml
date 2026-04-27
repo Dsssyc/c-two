@@ -39,3 +39,8 @@ serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 tracing = { version = "0.1", optional = true }
 futures = { version = "0.3", optional = true }
+
+[dev-dependencies]
+c2-mem = { path = "../../foundation/c2-mem" }
+c2-server = { path = "../c2-server" }
+tower = { version = "0.5", features = ["util"] }

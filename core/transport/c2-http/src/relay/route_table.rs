@@ -49,6 +49,12 @@ impl RouteTable {
             .contains_key(&(name.to_string(), self.relay_id.clone()))
     }
 
+    pub fn local_route(&self, name: &str) -> Option<RouteEntry> {
+        self.routes
+            .get(&(name.to_string(), self.relay_id.clone()))
+            .cloned()
+    }
+
     /// Resolve a name → ordered list of RouteInfo.
     /// LOCAL first, then PEER sorted by (registered_at, relay_id).
     pub fn resolve(&self, name: &str) -> Vec<RouteInfo> {

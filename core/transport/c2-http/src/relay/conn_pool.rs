@@ -21,6 +21,24 @@ struct ConnectionEntry {
     active_requests: AtomicUsize,
 }
 
+#[derive(Clone)]
+pub enum CachedClient {
+    Ready {
+        client: Arc<IpcClient>,
+        address: String,
+        generation: u64,
+    },
+    Evicted {
+        address: String,
+        generation: u64,
+    },
+    Disconnected {
+        address: String,
+        generation: u64,
+    },
+    Missing,
+}
+
 /// Pool of IPC connections keyed by route name.
 ///
 /// Separated from RouteTable to keep route metadata independent of
@@ -62,15 +80,24 @@ impl ConnectionPool {
         );
     }
 
-    /// Get a connected client for a route name.
-    /// Returns None if not registered, evicted, or disconnected.
-    pub fn get(&self, name: &str) -> Option<Arc<IpcClient>> {
-        let entry = self.entries.get(name)?;
-        let client = entry.client.as_ref()?;
-        if client.is_connected() {
-            Some(client.clone())
-        } else {
-            None
+    pub fn lookup(&self, name: &str) -> CachedClient {
+        let Some(entry) = self.entries.get(name) else {
+            return CachedClient::Missing;
+        };
+        match &entry.client {
+            Some(client) if client.is_connected() => CachedClient::Ready {
+                client: client.clone(),
+                address: entry.address.clone(),
+                generation: entry.generation,
+            },
+            Some(_) => CachedClient::Disconnected {
+                address: entry.address.clone(),
+                generation: entry.generation,
+            },
+            None => CachedClient::Evicted {
+                address: entry.address.clone(),
+                generation: entry.generation,
+            },
         }
     }
 
@@ -110,11 +137,6 @@ impl ConnectionPool {
             }
             entry.last_activity.store(now_millis(), Ordering::Release);
         }
-    }
-
-    /// Check if an entry exists (even if evicted).
-    pub fn has_entry(&self, name: &str) -> bool {
-        self.entries.contains_key(name)
     }
 
     /// Get stored address for reconnection.
@@ -236,21 +258,75 @@ mod tests {
     }
 
     #[test]
-    fn insert_and_get() {
+    fn insert_and_lookup_ready() {
         let mut pool = ConnectionPool::new();
         let client = Arc::new(IpcClient::new("ipc://test"));
         client.force_connected(true);
         pool.insert("grid".into(), "ipc://test".into(), client);
-        assert!(pool.get("grid").is_some());
+        assert!(matches!(pool.lookup("grid"), CachedClient::Ready { .. }));
     }
 
     #[test]
-    fn get_returns_none_for_disconnected() {
+    fn lookup_distinguishes_ready_evicted_disconnected_and_missing() {
+        let mut pool = ConnectionPool::new();
+        let ready = Arc::new(IpcClient::new("ipc://ready"));
+        ready.force_connected(true);
+        pool.insert("ready".into(), "ipc://ready".into(), ready);
+        let disconnected = Arc::new(IpcClient::new("ipc://disconnected"));
+        pool.insert(
+            "disconnected".into(),
+            "ipc://disconnected".into(),
+            disconnected,
+        );
+        let evicted = Arc::new(IpcClient::new("ipc://evicted"));
+        evicted.force_connected(true);
+        pool.insert("evicted".into(), "ipc://evicted".into(), evicted);
+        pool.evict("evicted");
+
+        match pool.lookup("ready") {
+            CachedClient::Ready {
+                address,
+                generation,
+                ..
+            } => {
+                assert_eq!(address, "ipc://ready");
+                assert!(generation > 0);
+            }
+            _ => panic!("ready connection should be explicit"),
+        }
+        match pool.lookup("evicted") {
+            CachedClient::Evicted {
+                address,
+                generation,
+            } => {
+                assert_eq!(address, "ipc://evicted");
+                assert!(generation > 0);
+            }
+            _ => panic!("evicted connection should be explicit"),
+        }
+        match pool.lookup("disconnected") {
+            CachedClient::Disconnected {
+                address,
+                generation,
+            } => {
+                assert_eq!(address, "ipc://disconnected");
+                assert!(generation > 0);
+            }
+            _ => panic!("disconnected connection should be explicit"),
+        }
+        assert!(matches!(pool.lookup("missing"), CachedClient::Missing));
+    }
+
+    #[test]
+    fn lookup_returns_disconnected_for_disconnected() {
         let mut pool = ConnectionPool::new();
         let client = Arc::new(IpcClient::new("ipc://test"));
         // Client starts disconnected.
         pool.insert("grid".into(), "ipc://test".into(), client);
-        assert!(pool.get("grid").is_none());
+        assert!(matches!(
+            pool.lookup("grid"),
+            CachedClient::Disconnected { .. }
+        ));
     }
 
     #[test]
@@ -260,13 +336,12 @@ mod tests {
         c1.force_connected(true);
         pool.insert("grid".into(), "ipc://test".into(), c1);
         pool.evict("grid");
-        assert!(pool.get("grid").is_none());
-        assert!(pool.has_entry("grid"));
+        assert!(matches!(pool.lookup("grid"), CachedClient::Evicted { .. }));
 
         let c2 = Arc::new(IpcClient::new("ipc://test"));
         c2.force_connected(true);
         pool.reconnect("grid", c2);
-        assert!(pool.get("grid").is_some());
+        assert!(matches!(pool.lookup("grid"), CachedClient::Ready { .. }));
     }
 
     #[test]
@@ -275,7 +350,7 @@ mod tests {
         let client = Arc::new(IpcClient::new("ipc://test"));
         pool.insert("grid".into(), "ipc://test".into(), client);
         pool.remove("grid");
-        assert!(!pool.has_entry("grid"));
+        assert!(matches!(pool.lookup("grid"), CachedClient::Missing));
     }
 
     #[test]
@@ -386,7 +461,7 @@ mod tests {
         pool.insert("grid".into(), "ipc://new".into(), new_client);
 
         assert!(pool.evict_generation("grid", old_generation).is_none());
-        assert!(pool.get("grid").is_some());
+        assert!(matches!(pool.lookup("grid"), CachedClient::Ready { .. }));
     }
 
     #[test]
@@ -398,8 +473,7 @@ mod tests {
         let (_, generation) = pool.begin_request("grid").unwrap();
 
         assert!(pool.evict_generation("grid", generation).is_some());
-        assert!(pool.get("grid").is_none());
-        assert!(pool.has_entry("grid"));
+        assert!(matches!(pool.lookup("grid"), CachedClient::Evicted { .. }));
     }
 
     #[test]
@@ -417,7 +491,7 @@ mod tests {
         pool.reconnect("grid", new_client);
 
         assert!(pool.evict_generation("grid", old_generation).is_none());
-        assert!(pool.get("grid").is_some());
+        assert!(matches!(pool.lookup("grid"), CachedClient::Ready { .. }));
     }
 
     #[test]
@@ -467,7 +541,7 @@ mod tests {
         let (client, current_generation) = pool.begin_request("grid").unwrap();
         assert!(Arc::ptr_eq(&client, &current_client));
         assert_ne!(current_generation, old_generation);
-        assert!(pool.get("grid").is_some());
+        assert!(matches!(pool.lookup("grid"), CachedClient::Ready { .. }));
     }
 
     #[test]

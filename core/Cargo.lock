@@ -112,6 +112,8 @@ dependencies = [
  "c2-config",
  "c2-error",
  "c2-ipc",
+ "c2-mem",
+ "c2-server",
  "c2-wire",
  "futures",
  "parking_lot",
@@ -122,6 +124,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "tower",
  "tower-http",
  "tracing",
 ]
