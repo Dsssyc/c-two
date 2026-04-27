@@ -33,19 +33,13 @@ Run the Python SDK tests:
 C2_RELAY_ADDRESS= uv run pytest sdk/python/tests -q --timeout=30
 ```
 
-Build and link the local `c3` CLI for source-checkout workflows:
-
-```bash
-python tools/dev/c3_tool.py --build --link
-c3 --version
-```
-
-Run Rust checks when validating Rust changes:
+Run Rust core checks when validating shared native runtime changes:
 
 ```bash
 cargo test --manifest-path core/Cargo.toml --workspace
-cargo test --manifest-path cli/Cargo.toml
 ```
+
+For CLI build, link, and test commands, see [`../../cli/README.md`](../../cli/README.md).
 
 ## Examples
 
