@@ -11,23 +11,26 @@ use axum::{
     routing::{get, post},
 };
 
-use crate::relay::conn_pool::CachedClient;
+use crate::relay::conn_pool::{AcquireError, UpstreamLease};
 use crate::relay::peer::{PeerEnvelope, PeerMessage};
 use crate::relay::peer_handlers;
-use crate::relay::state::{LocalOwnerStatus, RelayState};
+use crate::relay::state::{
+    LocalOwnerStatus, OwnerReplacementToken, RegisterCommitResult, RelayState,
+};
 use c2_ipc::IpcClient;
 
 enum RegisterOwnerCheck {
-    Available,
+    Available {
+        replacement: Option<OwnerReplacementToken>,
+    },
     SameOwner,
-    DuplicateAlive { existing_address: String },
+    DuplicateAlive {
+        existing_address: String,
+    },
 }
 
 enum RequestClient {
-    Ready {
-        client: Arc<IpcClient>,
-        guard: RelayRequestGuard,
-    },
+    Ready { lease: UpstreamLease },
     NotFound,
     Unreachable,
 }
@@ -103,12 +106,13 @@ async fn handle_register(
         .unwrap_or("")
         .to_string();
 
-    match check_local_owner_for_register(&state, &name, &address).await {
-        RegisterOwnerCheck::Available | RegisterOwnerCheck::SameOwner => {}
+    let replacement = match check_local_owner_for_register(&state, &name, &address).await {
+        RegisterOwnerCheck::Available { replacement } => replacement,
+        RegisterOwnerCheck::SameOwner => None,
         RegisterOwnerCheck::DuplicateAlive { existing_address } => {
             return duplicate_route_response(&name, &existing_address);
         }
-    }
+    };
 
     // Connect IPC client (or skip if configured for testing)
     let client = if state.config().skip_ipc_validation {
@@ -124,7 +128,25 @@ async fn handle_register(
         Arc::new(c)
     };
 
-    let entry = state.register_upstream(name.clone(), address, crm_ns, crm_ver, client);
+    let commit_client = client.clone();
+    let entry = match state.commit_register_upstream(
+        name.clone(),
+        address,
+        crm_ns,
+        crm_ver,
+        commit_client,
+        replacement,
+    ) {
+        RegisterCommitResult::Registered { entry } => entry,
+        RegisterCommitResult::SameOwner { entry } => {
+            close_arc_client(client);
+            entry
+        }
+        RegisterCommitResult::Duplicate { existing_address } => {
+            close_arc_client(client);
+            return duplicate_route_response(&name, &existing_address);
+        }
+    };
 
     // Gossip announce to peers — strip ipc_address since it's a local UDS
     // path on THIS relay's filesystem and is meaningless to remote peers.
@@ -150,6 +172,10 @@ async fn handle_register(
         .into_response()
 }
 
+fn close_arc_client(arc_client: Arc<IpcClient>) {
+    tokio::spawn(async move { arc_client.close_shared().await });
+}
+
 async fn check_local_owner_for_register(
     state: &RelayState,
     name: &str,
@@ -158,7 +184,9 @@ async fn check_local_owner_for_register(
     let mut last_stale_owner = None;
     for _ in 0..3 {
         match state.check_local_owner(name, address) {
-            LocalOwnerStatus::NoOwner => return RegisterOwnerCheck::Available,
+            LocalOwnerStatus::NoOwner => {
+                return RegisterOwnerCheck::Available { replacement: None };
+            }
             LocalOwnerStatus::SameAddress => return RegisterOwnerCheck::SameOwner,
             LocalOwnerStatus::DifferentAddressReady {
                 existing_address, ..
@@ -170,7 +198,14 @@ async fn check_local_owner_for_register(
                 OwnerProbe::Alive => {
                     return RegisterOwnerCheck::DuplicateAlive { existing_address };
                 }
-                OwnerProbe::Dead => return RegisterOwnerCheck::Available,
+                OwnerProbe::Dead => {
+                    return RegisterOwnerCheck::Available {
+                        replacement: Some(OwnerReplacementToken {
+                            existing_address,
+                            generation,
+                        }),
+                    };
+                }
                 OwnerProbe::Stale => {
                     last_stale_owner = Some(existing_address);
                 }
@@ -191,9 +226,16 @@ async fn probe_owner(
     let mut client = IpcClient::new(existing_address);
     match client.connect().await {
         Ok(()) => {
-            if state.reconnect_generation(name, generation, existing_address, Arc::new(client)) {
+            if state
+                .reconnect_candidate(name)
+                .is_some_and(|(address, current_generation)| {
+                    address == existing_address && current_generation == generation
+                })
+            {
+                client.close().await;
                 OwnerProbe::Alive
             } else {
+                client.close().await;
                 OwnerProbe::Stale
             }
         }
@@ -218,13 +260,7 @@ async fn handle_unregister(
         Some((entry, old_client)) => {
             // Close old client asynchronously
             if let Some(arc_client) = old_client {
-                tokio::spawn(async move {
-                    let mut client = match Arc::try_unwrap(arc_client) {
-                        Ok(c) => c,
-                        Err(_) => return,
-                    };
-                    client.close().await;
-                });
+                close_arc_client(arc_client);
             }
 
             // Gossip withdraw to peers
@@ -312,28 +348,6 @@ async fn handle_peers(State(state): State<Arc<RelayState>>) -> impl IntoResponse
     Json(state.list_peers()).into_response()
 }
 
-struct RelayRequestGuard {
-    state: Arc<RelayState>,
-    route_name: String,
-    generation: u64,
-}
-
-impl RelayRequestGuard {
-    fn new(state: Arc<RelayState>, route_name: String, generation: u64) -> Self {
-        Self {
-            state,
-            route_name,
-            generation,
-        }
-    }
-}
-
-impl Drop for RelayRequestGuard {
-    fn drop(&mut self) {
-        self.state.end_request(&self.route_name, self.generation);
-    }
-}
-
 /// `POST /{route_name}/{method_name}` — relay CRM call to upstream.
 ///
 /// If the upstream was evicted by the idle sweeper, attempts a lazy
@@ -343,8 +357,8 @@ async fn call_handler(
     Path((route_name, method_name)): Path<(String, String)>,
     body: Bytes,
 ) -> Response {
-    let (client, request_guard) = match acquire_request_client(state.clone(), &route_name).await {
-        RequestClient::Ready { client, guard } => (client, guard),
+    let lease = match acquire_request_client(state.clone(), &route_name).await {
+        RequestClient::Ready { lease } => lease,
         RequestClient::NotFound => {
             return (
                 StatusCode::NOT_FOUND,
@@ -364,8 +378,8 @@ async fn call_handler(
                 .into_response();
         }
     };
-    let request_generation = request_guard.generation;
-    let _request_guard = request_guard;
+    let client = lease.client();
+    let request_generation = lease.generation();
 
     match client.call(&route_name, &method_name, &body).await {
         Ok(result) => {
@@ -399,49 +413,12 @@ async fn call_handler(
 }
 
 async fn acquire_request_client(state: Arc<RelayState>, route_name: &str) -> RequestClient {
-    if let Some((client, generation)) = state.begin_request(route_name) {
-        return RequestClient::Ready {
-            client,
-            guard: RelayRequestGuard::new(state, route_name.to_string(), generation),
-        };
-    }
-
-    match state.lookup_client(route_name) {
-        CachedClient::Missing => RequestClient::NotFound,
-        CachedClient::Ready { .. }
-        | CachedClient::Evicted { .. }
-        | CachedClient::Disconnected { .. } => {
-            if try_reconnect(&state, route_name).await.is_none() {
-                return RequestClient::Unreachable;
-            }
-            match state.begin_request(route_name) {
-                Some((client, generation)) => RequestClient::Ready {
-                    client,
-                    guard: RelayRequestGuard::new(state, route_name.to_string(), generation),
-                },
-                None => RequestClient::Unreachable,
-            }
-        }
-    }
-}
-
-/// Attempt to reconnect an evicted upstream.
-async fn try_reconnect(state: &RelayState, route_name: &str) -> Option<Arc<IpcClient>> {
-    let (address, generation) = state.reconnect_candidate(route_name)?;
-
-    let mut client = IpcClient::new(&address);
-    match client.connect().await {
-        Ok(()) => {
-            let client = Arc::new(client);
-            if state.reconnect_generation(route_name, generation, &address, client.clone()) {
-                Some(client)
-            } else {
-                None
-            }
-        }
-        Err(e) => {
-            eprintln!("[relay] Failed to reconnect upstream '{route_name}': {e}");
-            None
+    match state.acquire_upstream(route_name).await {
+        Ok(lease) => RequestClient::Ready { lease },
+        Err(AcquireError::NotFound) => RequestClient::NotFound,
+        Err(AcquireError::Unreachable(e)) => {
+            eprintln!("[relay] Failed to acquire upstream '{route_name}': {e}");
+            RequestClient::Unreachable
         }
     }
 }
@@ -633,6 +610,110 @@ mod tests {
         );
 
         new_server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn concurrent_calls_after_idle_eviction_do_not_report_unreachable() {
+        let state = test_state();
+        let address = format!(
+            "ipc://relay_concurrent_reconnect_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let server = start_live_server(&address).await;
+
+        assert_eq!(
+            post_register(state.clone(), "grid", &address).await,
+            StatusCode::CREATED
+        );
+        state.evict_connection("grid");
+
+        let app = build_router(state.clone());
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let app = app.clone();
+            tasks.push(tokio::spawn(async move {
+                let response = app
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/grid/ping")
+                            .header("content-type", "application/octet-stream")
+                            .body(Body::from(Vec::new()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                response.status()
+            }));
+        }
+
+        let mut statuses = Vec::new();
+        for task in tasks {
+            statuses.push(task.await.unwrap());
+        }
+
+        assert!(
+            statuses.iter().all(|status| *status == StatusCode::OK),
+            "all concurrent requests should succeed after one task reconnects, got {statuses:?}"
+        );
+
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn concurrent_register_different_addresses_keeps_single_owner() {
+        let state = test_state();
+        let first_address = format!(
+            "ipc://relay_race_first_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let second_address = format!(
+            "ipc://relay_race_second_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let first_server = start_live_server(&first_address).await;
+        let second_server = start_live_server(&second_address).await;
+
+        let first = {
+            let state = state.clone();
+            let first_address = first_address.clone();
+            tokio::spawn(async move { post_register(state, "grid", &first_address).await })
+        };
+        let second = {
+            let state = state.clone();
+            let second_address = second_address.clone();
+            tokio::spawn(async move { post_register(state, "grid", &second_address).await })
+        };
+
+        let statuses = vec![first.await.unwrap(), second.await.unwrap()];
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| **status == StatusCode::CREATED)
+                .count(),
+            1,
+            "exactly one registration should create the route, got {statuses:?}"
+        );
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| **status == StatusCode::CONFLICT)
+                .count(),
+            1,
+            "exactly one registration should be rejected as duplicate, got {statuses:?}"
+        );
+
+        let final_address = state.get_address("grid").expect("route should exist");
+        assert!(
+            final_address == first_address || final_address == second_address,
+            "final route owner should be one of the racing addresses, got {final_address}"
+        );
+
+        first_server.shutdown();
+        second_server.shutdown();
     }
 
     fn unique_suffix() -> u64 {

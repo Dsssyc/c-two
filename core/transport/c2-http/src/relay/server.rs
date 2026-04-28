@@ -6,8 +6,8 @@
 //!
 //! Includes a configurable idle sweeper that periodically evicts
 //! upstream connections that have not been used recently. Evicted
-//! upstreams are lazily reconnected on the next HTTP request (see
-//! `router::try_reconnect`).
+//! upstreams are lazily reconnected through the route's upstream slot
+//! on the next HTTP request.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use crate::relay::background::spawn_background_tasks;
 use crate::relay::peer::{PeerEnvelope, PeerMessage};
 use crate::relay::router;
-use crate::relay::state::RelayState;
+use crate::relay::state::{RegisterCommitResult, RelayState};
 use c2_config::RelayConfig;
 use c2_ipc::IpcClient;
 
@@ -326,13 +326,7 @@ impl RelayServer {
             for (name, old_client) in evicted {
                 if let Some(arc_client) = old_client {
                     let dead = !arc_client.is_connected();
-                    tokio::spawn(async move {
-                        let mut client = match Arc::try_unwrap(arc_client) {
-                            Ok(c) => c,
-                            Err(_arc) => return,
-                        };
-                        client.close().await;
-                    });
+                    tokio::spawn(async move { arc_client.close_shared().await });
                     if dead {
                         eprintln!("[relay] Evicted dead upstream: {name}");
                     } else {
@@ -351,21 +345,28 @@ impl RelayServer {
                     address,
                     reply,
                 } => {
-                    if state.has_local_route(&name) {
-                        let _ = reply.send(Err(RelayControlError::DuplicateRoute { name }));
-                        continue;
-                    }
                     let mut client = IpcClient::new(&address);
                     let result = match client.connect().await {
                         Ok(()) => {
-                            state.register_upstream(
-                                name,
+                            let client = Arc::new(client);
+                            match state.commit_register_upstream(
+                                name.clone(),
                                 address,
                                 String::new(),
                                 String::new(),
-                                Arc::new(client),
-                            );
-                            Ok(())
+                                client.clone(),
+                                None,
+                            ) {
+                                RegisterCommitResult::Registered { .. } => Ok(()),
+                                RegisterCommitResult::SameOwner { .. } => {
+                                    tokio::spawn(async move { client.close_shared().await });
+                                    Ok(())
+                                }
+                                RegisterCommitResult::Duplicate { .. } => {
+                                    tokio::spawn(async move { client.close_shared().await });
+                                    Err(RelayControlError::DuplicateRoute { name })
+                                }
+                            }
                         }
                         Err(e) => Err(RelayControlError::Other(format!("Failed to connect: {e}"))),
                     };
@@ -375,13 +376,7 @@ impl RelayServer {
                     match state.unregister_upstream(&name) {
                         Some((_entry, old_client)) => {
                             if let Some(arc_client) = old_client {
-                                tokio::spawn(async move {
-                                    let mut client = match Arc::try_unwrap(arc_client) {
-                                        Ok(c) => c,
-                                        Err(_) => return,
-                                    };
-                                    client.close().await;
-                                });
+                                tokio::spawn(async move { arc_client.close_shared().await });
                             }
                             let _ = reply.send(Ok(()));
                         }

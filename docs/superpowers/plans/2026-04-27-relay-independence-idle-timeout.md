@@ -1366,3 +1366,17 @@ If verification fixes touch concrete files, stage those files explicitly. For ex
 git add core/transport/c2-http/src/relay/conn_pool.rs
 git commit -m "chore: finalize relay independence cleanup"
 ```
+
+## Addendum: Relay Ownership Hardening
+
+The initial idle-timeout work exposed a deeper ownership problem: route
+ownership had been coupled to the presence of a cached IPC client. After idle
+eviction, a live but evicted owner could be overwritten by a duplicate
+registration.
+
+The approved follow-up design is documented in
+`docs/superpowers/plans/2026-04-28-relay-ownership-hardening.md` and uses one
+per-route upstream slot. `RouteTable` remains the ownership source of truth,
+while each slot serializes lazy reconnect, tracks active requests, supports
+retirement on unregister/replacement, and prevents orphan reconnect results
+from serving routes that no longer exist.

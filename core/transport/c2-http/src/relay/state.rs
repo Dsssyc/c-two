@@ -2,7 +2,7 @@
 //!
 //! Lock ordering (must be followed everywhere):
 //!   1. route_table (RwLock)
-//!   2. conn_pool (RwLock)
+//!   2. conn_pool (internal slot mutexes)
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,13 +11,13 @@ use c2_config::RelayConfig;
 use c2_ipc::IpcClient;
 use parking_lot::RwLock;
 
-use crate::relay::conn_pool::{CachedClient, ConnectionPool};
+use crate::relay::conn_pool::{AcquireError, CachedClient, ConnectionPool, UpstreamLease};
 use crate::relay::route_table::RouteTable;
 use crate::relay::types::*;
 
 pub struct RelayState {
     route_table: RwLock<RouteTable>,
-    conn_pool: RwLock<ConnectionPool>,
+    conn_pool: ConnectionPool,
     config: Arc<RelayConfig>,
     disseminator: Arc<dyn crate::relay::disseminator::Disseminator>,
 }
@@ -35,6 +35,18 @@ pub enum LocalOwnerStatus {
     },
 }
 
+#[derive(Clone)]
+pub struct OwnerReplacementToken {
+    pub existing_address: String,
+    pub generation: u64,
+}
+
+pub enum RegisterCommitResult {
+    Registered { entry: RouteEntry },
+    SameOwner { entry: RouteEntry },
+    Duplicate { existing_address: String },
+}
+
 impl RelayState {
     pub fn new(
         config: Arc<RelayConfig>,
@@ -42,7 +54,7 @@ impl RelayState {
     ) -> Self {
         Self {
             route_table: RwLock::new(RouteTable::new(config.relay_id.clone())),
-            conn_pool: RwLock::new(ConnectionPool::new()),
+            conn_pool: ConnectionPool::new(),
             disseminator,
             config,
         }
@@ -70,6 +82,47 @@ impl RelayState {
         crm_ver: String,
         client: Arc<IpcClient>,
     ) -> RouteEntry {
+        match self.commit_register_upstream(name, address, crm_ns, crm_ver, client, None) {
+            RegisterCommitResult::Registered { entry }
+            | RegisterCommitResult::SameOwner { entry } => entry,
+            RegisterCommitResult::Duplicate { existing_address } => {
+                panic!("duplicate upstream registration for existing address {existing_address}")
+            }
+        }
+    }
+
+    pub fn commit_register_upstream(
+        &self,
+        name: String,
+        address: String,
+        crm_ns: String,
+        crm_ver: String,
+        client: Arc<IpcClient>,
+        replacement: Option<OwnerReplacementToken>,
+    ) -> RegisterCommitResult {
+        let mut route_table = self.route_table.write();
+        if let Some(existing) = route_table.local_route(&name) {
+            let existing_address = existing.ipc_address.clone().unwrap_or_default();
+            if existing_address == address {
+                if matches!(self.conn_pool.lookup(&name), CachedClient::Ready { .. }) {
+                    return RegisterCommitResult::SameOwner { entry: existing };
+                }
+                self.conn_pool.insert(name, address, client);
+                return RegisterCommitResult::Registered { entry: existing };
+            }
+            match replacement {
+                Some(token) if token.existing_address == existing_address => {
+                    match self.conn_pool.reconnect_candidate(&name) {
+                        Some((slot_address, generation))
+                            if slot_address == existing_address
+                                && generation == token.generation => {}
+                        _ => return RegisterCommitResult::Duplicate { existing_address },
+                    }
+                }
+                _ => return RegisterCommitResult::Duplicate { existing_address },
+            }
+        }
+
         let entry = RouteEntry {
             name: name.clone(),
             relay_id: self.config.relay_id.clone(),
@@ -80,17 +133,16 @@ impl RelayState {
             locality: Locality::Local,
             registered_at: now_secs(),
         };
-        // Lock order: route_table then conn_pool
-        self.route_table.write().register_route(entry.clone());
-        self.conn_pool.write().insert(name, address, client);
-        entry
+        route_table.register_route(entry.clone());
+        self.conn_pool.insert(name, address, client);
+        RegisterCommitResult::Registered { entry }
     }
 
     /// Unregister a LOCAL upstream CRM.
     pub fn unregister_upstream(&self, name: &str) -> Option<(RouteEntry, Option<Arc<IpcClient>>)> {
         let relay_id = self.config.relay_id.clone();
         let entry = self.route_table.write().unregister_route(name, &relay_id);
-        let client = self.conn_pool.write().remove(name);
+        let client = self.conn_pool.remove(name);
         entry.map(|e| (e, client))
     }
 
@@ -98,10 +150,6 @@ impl RelayState {
 
     pub fn resolve(&self, name: &str) -> Vec<RouteInfo> {
         self.route_table.read().resolve(name)
-    }
-
-    pub fn has_local_route(&self, name: &str) -> bool {
-        self.route_table.read().has_local_route(name)
     }
 
     pub fn route_names(&self) -> Vec<String> {
@@ -114,44 +162,47 @@ impl RelayState {
 
     // -- Connection-only operations --
 
-    pub fn begin_request(&self, name: &str) -> Option<(Arc<IpcClient>, u64)> {
-        self.conn_pool.read().begin_request(name)
-    }
+    pub async fn acquire_upstream(&self, name: &str) -> Result<UpstreamLease, AcquireError> {
+        let lease = self
+            .conn_pool
+            .acquire_with(name, |address| async move {
+                let mut client = IpcClient::new(&address);
+                client.connect().await?;
+                Ok(Arc::new(client))
+            })
+            .await?;
 
-    pub fn lookup_client(&self, name: &str) -> CachedClient {
-        self.conn_pool.read().lookup(name)
-    }
+        let route_matches_lease = self
+            .route_table
+            .read()
+            .local_route(name)
+            .and_then(|entry| entry.ipc_address)
+            .is_some_and(|address| address == lease.address());
 
-    pub fn end_request(&self, name: &str, generation: u64) {
-        self.conn_pool.read().end_request(name, generation);
-    }
-
-    pub fn touch_connection(&self, name: &str) {
-        self.conn_pool.read().touch(name);
+        if route_matches_lease {
+            Ok(lease)
+        } else {
+            let client = lease.client();
+            drop(lease);
+            client.close_shared().await;
+            Err(AcquireError::NotFound)
+        }
     }
 
     pub fn get_address(&self, name: &str) -> Option<String> {
-        self.conn_pool.read().get_address(name)
+        self.conn_pool.get_address(name)
     }
 
     pub fn reconnect_candidate(&self, name: &str) -> Option<(String, u64)> {
-        self.conn_pool.read().reconnect_candidate(name)
+        self.conn_pool.reconnect_candidate(name)
     }
 
     pub fn evict_idle(&self, idle_timeout_ms: u64) -> Vec<(String, Option<Arc<IpcClient>>)> {
-        let mut cp = self.conn_pool.write();
-        let names = cp.idle_entries(idle_timeout_ms);
-        names
-            .into_iter()
-            .map(|n| {
-                let c = cp.evict(&n);
-                (n, c)
-            })
-            .collect()
+        self.conn_pool.evict_idle(idle_timeout_ms)
     }
 
     pub fn evict_connection(&self, name: &str) -> Option<Arc<IpcClient>> {
-        self.conn_pool.write().evict(name)
+        self.conn_pool.evict(name)
     }
 
     pub fn evict_connection_generation(
@@ -159,28 +210,16 @@ impl RelayState {
         name: &str,
         generation: u64,
     ) -> Option<Arc<IpcClient>> {
-        self.conn_pool.write().evict_generation(name, generation)
+        self.conn_pool.evict_generation(name, generation)
     }
 
     pub fn reconnect(&self, name: &str, client: Arc<IpcClient>) {
-        self.conn_pool.write().reconnect(name, client);
-    }
-
-    pub fn reconnect_generation(
-        &self,
-        name: &str,
-        generation: u64,
-        address: &str,
-        client: Arc<IpcClient>,
-    ) -> bool {
-        self.conn_pool
-            .write()
-            .reconnect_generation(name, generation, address, client)
+        self.conn_pool.reconnect(name, client);
     }
 
     pub fn check_local_owner(&self, name: &str, address: &str) -> LocalOwnerStatus {
         let local_route = self.route_table.read().local_route(name);
-        match self.conn_pool.read().lookup(name) {
+        match self.conn_pool.lookup(name) {
             CachedClient::Ready {
                 address: existing_address,
                 ..
@@ -443,5 +482,134 @@ mod tests {
             state.check_local_owner("grid", "ipc://grid-new"),
             LocalOwnerStatus::DifferentAddressReady { .. }
         ));
+    }
+
+    #[test]
+    fn register_commit_rechecks_owner_after_preflight_no_owner() {
+        let state = RelayState::new(test_config(), null_disseminator());
+        let first = Arc::new(IpcClient::new("ipc://first"));
+        first.force_connected(true);
+        let second = Arc::new(IpcClient::new("ipc://second"));
+        second.force_connected(true);
+
+        let first_result = state.commit_register_upstream(
+            "grid".into(),
+            "ipc://first".into(),
+            String::new(),
+            String::new(),
+            first,
+            None,
+        );
+        assert!(matches!(
+            first_result,
+            RegisterCommitResult::Registered { .. }
+        ));
+
+        let second_result = state.commit_register_upstream(
+            "grid".into(),
+            "ipc://second".into(),
+            String::new(),
+            String::new(),
+            second,
+            None,
+        );
+        assert!(matches!(
+            second_result,
+            RegisterCommitResult::Duplicate {
+                existing_address
+            } if existing_address == "ipc://first"
+        ));
+        assert_eq!(state.get_address("grid").as_deref(), Some("ipc://first"));
+    }
+
+    #[test]
+    fn replacement_token_must_match_current_owner_generation() {
+        let state = RelayState::new(test_config(), null_disseminator());
+        let old = Arc::new(IpcClient::new("ipc://old"));
+        old.force_connected(true);
+        state.register_upstream(
+            "grid".into(),
+            "ipc://old".into(),
+            String::new(),
+            String::new(),
+            old,
+        );
+        let (_, old_generation) = state.reconnect_candidate("grid").unwrap();
+
+        let refreshed = Arc::new(IpcClient::new("ipc://old"));
+        refreshed.force_connected(true);
+        state.reconnect("grid", refreshed);
+
+        let replacement = Arc::new(IpcClient::new("ipc://new"));
+        replacement.force_connected(true);
+        let result = state.commit_register_upstream(
+            "grid".into(),
+            "ipc://new".into(),
+            String::new(),
+            String::new(),
+            replacement,
+            Some(OwnerReplacementToken {
+                existing_address: "ipc://old".into(),
+                generation: old_generation,
+            }),
+        );
+
+        assert!(matches!(
+            result,
+            RegisterCommitResult::Duplicate {
+                existing_address
+            } if existing_address == "ipc://old"
+        ));
+        assert_eq!(state.get_address("grid").as_deref(), Some("ipc://old"));
+    }
+
+    #[tokio::test]
+    async fn acquire_after_unregister_reports_not_found() {
+        let state = RelayState::new(test_config(), null_disseminator());
+        let client = Arc::new(IpcClient::new("ipc://grid"));
+        client.force_connected(true);
+        state.register_upstream(
+            "grid".into(),
+            "ipc://grid".into(),
+            String::new(),
+            String::new(),
+            client,
+        );
+
+        assert!(state.unregister_upstream("grid").is_some());
+
+        assert!(matches!(
+            state.acquire_upstream("grid").await,
+            Err(AcquireError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn same_address_register_repairs_evicted_slot() {
+        let state = RelayState::new(test_config(), null_disseminator());
+        let original = Arc::new(IpcClient::new("ipc://grid"));
+        original.force_connected(true);
+        state.register_upstream(
+            "grid".into(),
+            "ipc://grid".into(),
+            String::new(),
+            String::new(),
+            original,
+        );
+        state.evict_connection("grid");
+
+        let replacement = Arc::new(IpcClient::new("ipc://grid"));
+        replacement.force_connected(true);
+        let result = state.commit_register_upstream(
+            "grid".into(),
+            "ipc://grid".into(),
+            String::new(),
+            String::new(),
+            replacement,
+            None,
+        );
+
+        assert!(matches!(result, RegisterCommitResult::Registered { .. }));
+        assert!(state.acquire_upstream("grid").await.is_ok());
     }
 }

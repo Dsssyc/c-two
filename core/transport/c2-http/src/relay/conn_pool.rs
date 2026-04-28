@@ -1,9 +1,13 @@
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use c2_ipc::IpcClient;
+use parking_lot::Mutex;
+use tokio::sync::Notify;
 
 fn now_millis() -> u64 {
     SystemTime::now()
@@ -12,13 +16,40 @@ fn now_millis() -> u64 {
         .as_millis() as u64
 }
 
-/// A managed IPC connection with activity tracking.
-struct ConnectionEntry {
+/// A single route/address upstream slot.
+struct UpstreamSlot {
+    inner: Mutex<SlotInner>,
+    notify: Notify,
+}
+
+struct SlotInner {
     address: String,
     client: Option<Arc<IpcClient>>,
     generation: u64,
-    last_activity: AtomicU64,
-    active_requests: AtomicUsize,
+    last_activity: u64,
+    active_requests: usize,
+    state: SlotState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SlotState {
+    Ready,
+    Evicted,
+    Disconnected,
+    Reconnecting,
+    Retired,
+}
+
+#[derive(Debug)]
+pub enum AcquireError {
+    NotFound,
+    Unreachable(c2_ipc::IpcError),
+}
+
+pub struct UpstreamLease {
+    slot: Arc<UpstreamSlot>,
+    client: Arc<IpcClient>,
+    generation: u64,
 }
 
 #[derive(Clone)]
@@ -44,212 +75,498 @@ pub enum CachedClient {
 /// Separated from RouteTable to keep route metadata independent of
 /// connection lifecycle. Supports lazy reconnection and idle eviction.
 pub struct ConnectionPool {
-    entries: HashMap<String, ConnectionEntry>,
-    next_generation: u64,
+    entries: Mutex<HashMap<String, Arc<UpstreamSlot>>>,
+    next_generation: AtomicU64,
 }
 
 impl ConnectionPool {
     pub fn new() -> Self {
         Self {
-            entries: HashMap::new(),
-            next_generation: 1,
+            entries: Mutex::new(HashMap::new()),
+            next_generation: AtomicU64::new(1),
         }
     }
 
-    fn allocate_generation(&mut self) -> u64 {
-        let generation = self.next_generation;
-        self.next_generation = self
-            .next_generation
-            .checked_add(1)
-            .expect("connection generation exhausted");
-        generation
+    fn allocate_generation(&self) -> u64 {
+        self.next_generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .expect("connection generation exhausted")
+    }
+
+    fn slot(&self, name: &str) -> Option<Arc<UpstreamSlot>> {
+        self.entries.lock().get(name).cloned()
+    }
+
+    pub async fn acquire_with<C, Fut>(
+        &self,
+        name: &str,
+        connector: C,
+    ) -> Result<UpstreamLease, AcquireError>
+    where
+        C: Fn(String) -> Fut,
+        Fut: Future<Output = Result<Arc<IpcClient>, c2_ipc::IpcError>>,
+    {
+        let Some(slot) = self.slot(name) else {
+            return Err(AcquireError::NotFound);
+        };
+        slot.acquire_with(connector).await
     }
 
     /// Insert a pre-connected client for a route name.
-    pub fn insert(&mut self, name: String, address: String, client: Arc<IpcClient>) {
+    pub fn insert(&self, name: String, address: String, client: Arc<IpcClient>) {
         let generation = self.allocate_generation();
-        self.entries.insert(
+        let old_slot = self.entries.lock().insert(
             name,
-            ConnectionEntry {
+            Arc::new(UpstreamSlot::new(
                 address,
-                client: Some(client),
+                Some(client),
                 generation,
-                last_activity: AtomicU64::new(now_millis()),
-                active_requests: AtomicUsize::new(0),
-            },
+                SlotState::Ready,
+            )),
         );
+        if let Some(old_slot) = old_slot {
+            if let Some(client) = old_slot.retire() {
+                close_replaced_client(client);
+            }
+        }
     }
 
     pub fn lookup(&self, name: &str) -> CachedClient {
-        let Some(entry) = self.entries.get(name) else {
+        let Some(slot) = self.slot(name) else {
             return CachedClient::Missing;
         };
-        match &entry.client {
-            Some(client) if client.is_connected() => CachedClient::Ready {
-                client: client.clone(),
-                address: entry.address.clone(),
-                generation: entry.generation,
-            },
-            Some(_) => CachedClient::Disconnected {
-                address: entry.address.clone(),
-                generation: entry.generation,
-            },
-            None => CachedClient::Evicted {
-                address: entry.address.clone(),
-                generation: entry.generation,
-            },
-        }
+        slot.lookup()
     }
 
     /// Begin an upstream request against a connected client.
     pub fn begin_request(&self, name: &str) -> Option<(Arc<IpcClient>, u64)> {
-        let entry = self.entries.get(name)?;
-        let client = entry.client.as_ref()?;
-        if !client.is_connected() {
-            return None;
-        }
-        entry.active_requests.fetch_add(1, Ordering::AcqRel);
-        entry.last_activity.store(now_millis(), Ordering::Release);
-        Some((client.clone(), entry.generation))
+        self.slot(name)?.begin_request()
     }
 
     /// End an upstream request and refresh activity.
     pub fn end_request(&self, name: &str, generation: u64) {
-        if let Some(entry) = self.entries.get(name) {
-            if entry.generation != generation {
-                return;
-            }
-            let mut current = entry.active_requests.load(Ordering::Acquire);
-            loop {
-                if current == 0 {
-                    debug_assert!(false, "end_request called without begin_request");
-                    break;
-                }
-                match entry.active_requests.compare_exchange_weak(
-                    current,
-                    current - 1,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => break,
-                    Err(actual) => current = actual,
-                }
-            }
-            entry.last_activity.store(now_millis(), Ordering::Release);
+        if let Some(slot) = self.slot(name) {
+            slot.end_request(generation);
         }
     }
 
     /// Get stored address for reconnection.
     pub fn get_address(&self, name: &str) -> Option<String> {
-        self.entries.get(name).map(|e| e.address.clone())
+        self.slot(name).map(|slot| slot.address())
     }
 
     /// Capture the current reconnect identity before awaiting a new connection.
     pub fn reconnect_candidate(&self, name: &str) -> Option<(String, u64)> {
-        self.entries
-            .get(name)
-            .map(|e| (e.address.clone(), e.generation))
+        self.slot(name).map(|slot| slot.reconnect_candidate())
     }
 
-    /// Touch activity timestamp (lock-free, Relaxed).
+    /// Touch activity timestamp.
     pub fn touch(&self, name: &str) {
-        if let Some(entry) = self.entries.get(name) {
-            entry.last_activity.store(now_millis(), Ordering::Relaxed);
+        if let Some(slot) = self.slot(name) {
+            slot.touch();
         }
     }
 
     /// Names of entries to evict (dead or idle beyond timeout_ms).
     pub fn idle_entries(&self, idle_timeout_ms: u64) -> Vec<String> {
-        let cutoff = now_millis().saturating_sub(idle_timeout_ms);
         self.entries
+            .lock()
             .iter()
-            .filter(|(_, e)| {
-                if let Some(ref client) = e.client {
-                    if !client.is_connected() {
-                        return true;
-                    }
-                    e.active_requests.load(Ordering::Acquire) == 0
-                        && e.last_activity.load(Ordering::Acquire) <= cutoff
-                } else {
-                    false
-                }
-            })
+            .filter(|(_, slot)| slot.is_idle_candidate(idle_timeout_ms))
             .map(|(name, _)| name.clone())
             .collect()
     }
 
+    /// Evict idle clients with a slot-local recheck before removing them.
+    pub fn evict_idle(&self, idle_timeout_ms: u64) -> Vec<(String, Option<Arc<IpcClient>>)> {
+        let names = self.idle_entries(idle_timeout_ms);
+        names
+            .into_iter()
+            .map(|name| {
+                let client = self
+                    .slot(&name)
+                    .and_then(|slot| slot.evict_if_idle(idle_timeout_ms));
+                (name, client)
+            })
+            .collect()
+    }
+
     /// Evict a client — returns old Arc for async close.
-    pub fn evict(&mut self, name: &str) -> Option<Arc<IpcClient>> {
-        self.entries.get_mut(name).and_then(|e| e.client.take())
+    pub fn evict(&self, name: &str) -> Option<Arc<IpcClient>> {
+        self.slot(name)?.evict()
     }
 
     /// Evict a client only if the current entry matches the request generation.
-    pub fn evict_generation(&mut self, name: &str, generation: u64) -> Option<Arc<IpcClient>> {
-        self.entries.get_mut(name).and_then(|e| {
-            if e.generation == generation {
-                e.client.take()
-            } else {
-                None
-            }
-        })
+    pub fn evict_generation(&self, name: &str, generation: u64) -> Option<Arc<IpcClient>> {
+        self.slot(name)?.evict_generation(generation)
     }
 
     /// Re-attach a freshly connected client.
-    pub fn reconnect(&mut self, name: &str, client: Arc<IpcClient>) {
-        if !self.entries.contains_key(name) {
-            return;
-        }
-        let generation = self.allocate_generation();
-        if let Some(entry) = self.entries.get_mut(name) {
-            entry.client = Some(client);
-            entry.generation = generation;
-            entry.active_requests.store(0, Ordering::Release);
-            entry.last_activity.store(now_millis(), Ordering::Release);
+    pub fn reconnect(&self, name: &str, client: Arc<IpcClient>) {
+        if let Some(slot) = self.slot(name) {
+            slot.reconnect(client);
         }
     }
 
     /// Re-attach a freshly connected client only if the entry still matches.
     pub fn reconnect_generation(
-        &mut self,
+        &self,
         name: &str,
         generation: u64,
         address: &str,
         client: Arc<IpcClient>,
     ) -> bool {
-        if !matches!(
-            self.entries.get(name),
-            Some(entry) if entry.generation == generation && entry.address == address
-        ) {
-            return false;
-        }
-        let new_generation = self.allocate_generation();
-        if let Some(entry) = self.entries.get_mut(name) {
-            entry.client = Some(client);
-            entry.generation = new_generation;
-            entry.active_requests.store(0, Ordering::Release);
-            entry.last_activity.store(now_millis(), Ordering::Release);
-            return true;
-        }
-        false
+        self.slot(name)
+            .map(|slot| slot.reconnect_generation(generation, address, client))
+            .unwrap_or(false)
     }
 
     /// Remove entry entirely.
-    pub fn remove(&mut self, name: &str) -> Option<Arc<IpcClient>> {
-        self.entries.remove(name).and_then(|e| e.client)
+    pub fn remove(&self, name: &str) -> Option<Arc<IpcClient>> {
+        self.entries
+            .lock()
+            .remove(name)
+            .and_then(|slot| slot.retire())
     }
 
     /// List route names with addresses.
     pub fn list_connections(&self) -> Vec<(String, String)> {
         self.entries
+            .lock()
             .iter()
-            .map(|(n, e)| (n.clone(), e.address.clone()))
+            .map(|(n, slot)| (n.clone(), slot.address()))
             .collect()
+    }
+}
+
+fn close_replaced_client(client: Arc<IpcClient>) {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move { client.close_shared().await });
+    }
+}
+
+impl UpstreamSlot {
+    fn new(
+        address: String,
+        client: Option<Arc<IpcClient>>,
+        generation: u64,
+        state: SlotState,
+    ) -> Self {
+        Self {
+            inner: Mutex::new(SlotInner {
+                address,
+                client,
+                generation,
+                last_activity: now_millis(),
+                active_requests: 0,
+                state,
+            }),
+            notify: Notify::new(),
+        }
+    }
+
+    async fn acquire_with<C, Fut>(
+        self: Arc<Self>,
+        connector: C,
+    ) -> Result<UpstreamLease, AcquireError>
+    where
+        C: Fn(String) -> Fut,
+        Fut: Future<Output = Result<Arc<IpcClient>, c2_ipc::IpcError>>,
+    {
+        loop {
+            let notified = self.notify.notified();
+            let mut notified = pin!(notified);
+            notified.as_mut().enable();
+            let address = {
+                let mut inner = self.inner.lock();
+                match inner.state {
+                    SlotState::Retired => return Err(AcquireError::NotFound),
+                    SlotState::Ready => {
+                        if let Some(client) = inner.client.clone() {
+                            if client.is_connected() {
+                                inner.active_requests += 1;
+                                inner.last_activity = now_millis();
+                                return Ok(UpstreamLease {
+                                    slot: self.clone(),
+                                    client,
+                                    generation: inner.generation,
+                                });
+                            }
+                        }
+                        inner.client = None;
+                        inner.state = SlotState::Reconnecting;
+                        Some(inner.address.clone())
+                    }
+                    SlotState::Evicted | SlotState::Disconnected => {
+                        inner.state = SlotState::Reconnecting;
+                        Some(inner.address.clone())
+                    }
+                    SlotState::Reconnecting => None,
+                }
+            };
+
+            match address {
+                Some(address) => match connector(address).await {
+                    Ok(client) => {
+                        let acquire = {
+                            let mut inner = self.inner.lock();
+                            if inner.state == SlotState::Retired {
+                                None
+                            } else {
+                                inner.generation = inner
+                                    .generation
+                                    .checked_add(1)
+                                    .expect("connection generation exhausted");
+                                inner.client = Some(client.clone());
+                                inner.state = SlotState::Ready;
+                                inner.active_requests += 1;
+                                inner.last_activity = now_millis();
+                                Some(inner.generation)
+                            }
+                        };
+                        let Some(generation) = acquire else {
+                            client.close_shared().await;
+                            return Err(AcquireError::NotFound);
+                        };
+                        self.notify.notify_waiters();
+                        return Ok(UpstreamLease {
+                            slot: self.clone(),
+                            client,
+                            generation,
+                        });
+                    }
+                    Err(err) => {
+                        let mut inner = self.inner.lock();
+                        if inner.state == SlotState::Retired {
+                            drop(inner);
+                            return Err(AcquireError::NotFound);
+                        }
+                        inner.client = None;
+                        inner.state = SlotState::Disconnected;
+                        inner.last_activity = now_millis();
+                        drop(inner);
+                        self.notify.notify_waiters();
+                        return Err(AcquireError::Unreachable(err));
+                    }
+                },
+                None => {
+                    notified.as_mut().await;
+                }
+            }
+        }
+    }
+
+    fn lookup(&self) -> CachedClient {
+        let inner = self.inner.lock();
+        match inner.state {
+            SlotState::Ready => match &inner.client {
+                Some(client) if client.is_connected() => CachedClient::Ready {
+                    client: client.clone(),
+                    address: inner.address.clone(),
+                    generation: inner.generation,
+                },
+                Some(_) => CachedClient::Disconnected {
+                    address: inner.address.clone(),
+                    generation: inner.generation,
+                },
+                None => CachedClient::Evicted {
+                    address: inner.address.clone(),
+                    generation: inner.generation,
+                },
+            },
+            SlotState::Evicted => CachedClient::Evicted {
+                address: inner.address.clone(),
+                generation: inner.generation,
+            },
+            SlotState::Disconnected | SlotState::Reconnecting => CachedClient::Disconnected {
+                address: inner.address.clone(),
+                generation: inner.generation,
+            },
+            SlotState::Retired => CachedClient::Missing,
+        }
+    }
+
+    fn begin_request(&self) -> Option<(Arc<IpcClient>, u64)> {
+        let mut inner = self.inner.lock();
+        if inner.state != SlotState::Ready {
+            return None;
+        }
+        let client = inner.client.as_ref()?.clone();
+        if !client.is_connected() {
+            inner.state = SlotState::Disconnected;
+            inner.client = None;
+            return None;
+        }
+        inner.active_requests += 1;
+        inner.last_activity = now_millis();
+        Some((client, inner.generation))
+    }
+
+    fn end_request(&self, generation: u64) {
+        let mut inner = self.inner.lock();
+        if inner.generation != generation {
+            return;
+        }
+        if inner.active_requests == 0 {
+            debug_assert!(false, "end_request called without begin_request");
+        } else {
+            inner.active_requests -= 1;
+        }
+        inner.last_activity = now_millis();
+    }
+
+    fn address(&self) -> String {
+        self.inner.lock().address.clone()
+    }
+
+    fn reconnect_candidate(&self) -> (String, u64) {
+        let inner = self.inner.lock();
+        (inner.address.clone(), inner.generation)
+    }
+
+    fn touch(&self) {
+        self.inner.lock().last_activity = now_millis();
+    }
+
+    fn is_idle_candidate(&self, idle_timeout_ms: u64) -> bool {
+        let cutoff = now_millis().saturating_sub(idle_timeout_ms);
+        let inner = self.inner.lock();
+        match &inner.client {
+            Some(client) if !client.is_connected() => true,
+            Some(_) => {
+                inner.state == SlotState::Ready
+                    && inner.active_requests == 0
+                    && inner.last_activity <= cutoff
+            }
+            None => false,
+        }
+    }
+
+    fn evict_if_idle(&self, idle_timeout_ms: u64) -> Option<Arc<IpcClient>> {
+        let cutoff = now_millis().saturating_sub(idle_timeout_ms);
+        let mut inner = self.inner.lock();
+        if inner.state == SlotState::Retired {
+            return None;
+        }
+        let should_evict = match &inner.client {
+            Some(client) if !client.is_connected() => true,
+            Some(_) => {
+                inner.state == SlotState::Ready
+                    && inner.active_requests == 0
+                    && inner.last_activity <= cutoff
+            }
+            None => false,
+        };
+        if !should_evict {
+            return None;
+        }
+        let client = inner.client.take();
+        if client.is_some() {
+            inner.state = SlotState::Evicted;
+        }
+        client
+    }
+
+    fn evict(&self) -> Option<Arc<IpcClient>> {
+        let mut inner = self.inner.lock();
+        if inner.state == SlotState::Retired {
+            return None;
+        }
+        let client = inner.client.take();
+        if client.is_some() {
+            inner.state = SlotState::Evicted;
+        }
+        client
+    }
+
+    fn evict_generation(&self, generation: u64) -> Option<Arc<IpcClient>> {
+        let mut inner = self.inner.lock();
+        if inner.state == SlotState::Retired {
+            return None;
+        }
+        if inner.generation != generation {
+            return None;
+        }
+        let client = inner.client.take();
+        if client.is_some() {
+            inner.state = SlotState::Evicted;
+        }
+        client
+    }
+
+    fn reconnect(&self, client: Arc<IpcClient>) {
+        let mut inner = self.inner.lock();
+        if inner.state == SlotState::Retired {
+            return;
+        }
+        inner.generation = inner
+            .generation
+            .checked_add(1)
+            .expect("connection generation exhausted");
+        inner.client = Some(client);
+        inner.state = SlotState::Ready;
+        inner.active_requests = 0;
+        inner.last_activity = now_millis();
+        self.notify.notify_waiters();
+    }
+
+    fn reconnect_generation(&self, generation: u64, address: &str, client: Arc<IpcClient>) -> bool {
+        let mut inner = self.inner.lock();
+        if inner.state == SlotState::Retired {
+            return false;
+        }
+        if inner.generation != generation || inner.address != address {
+            return false;
+        }
+        inner.generation = inner
+            .generation
+            .checked_add(1)
+            .expect("connection generation exhausted");
+        inner.client = Some(client);
+        inner.state = SlotState::Ready;
+        inner.active_requests = 0;
+        inner.last_activity = now_millis();
+        drop(inner);
+        self.notify.notify_waiters();
+        true
+    }
+
+    fn retire(&self) -> Option<Arc<IpcClient>> {
+        let mut inner = self.inner.lock();
+        inner.state = SlotState::Retired;
+        let client = inner.client.take();
+        drop(inner);
+        self.notify.notify_waiters();
+        client
+    }
+}
+
+impl UpstreamLease {
+    pub fn client(&self) -> Arc<IpcClient> {
+        self.client.clone()
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn address(&self) -> String {
+        self.slot.address()
+    }
+}
+
+impl Drop for UpstreamLease {
+    fn drop(&mut self) {
+        self.slot.end_request(self.generation);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn new_pool_is_empty() {
@@ -259,7 +576,7 @@ mod tests {
 
     #[test]
     fn insert_and_lookup_ready() {
-        let mut pool = ConnectionPool::new();
+        let pool = ConnectionPool::new();
         let client = Arc::new(IpcClient::new("ipc://test"));
         client.force_connected(true);
         pool.insert("grid".into(), "ipc://test".into(), client);
@@ -268,7 +585,7 @@ mod tests {
 
     #[test]
     fn lookup_distinguishes_ready_evicted_disconnected_and_missing() {
-        let mut pool = ConnectionPool::new();
+        let pool = ConnectionPool::new();
         let ready = Arc::new(IpcClient::new("ipc://ready"));
         ready.force_connected(true);
         pool.insert("ready".into(), "ipc://ready".into(), ready);
@@ -319,7 +636,7 @@ mod tests {
 
     #[test]
     fn lookup_returns_disconnected_for_disconnected() {
-        let mut pool = ConnectionPool::new();
+        let pool = ConnectionPool::new();
         let client = Arc::new(IpcClient::new("ipc://test"));
         // Client starts disconnected.
         pool.insert("grid".into(), "ipc://test".into(), client);
@@ -331,7 +648,7 @@ mod tests {
 
     #[test]
     fn evict_and_reconnect() {
-        let mut pool = ConnectionPool::new();
+        let pool = ConnectionPool::new();
         let c1 = Arc::new(IpcClient::new("ipc://test"));
         c1.force_connected(true);
         pool.insert("grid".into(), "ipc://test".into(), c1);
@@ -346,7 +663,7 @@ mod tests {
 
     #[test]
     fn remove_deletes_entry() {
-        let mut pool = ConnectionPool::new();
+        let pool = ConnectionPool::new();
         let client = Arc::new(IpcClient::new("ipc://test"));
         pool.insert("grid".into(), "ipc://test".into(), client);
         pool.remove("grid");
@@ -355,7 +672,7 @@ mod tests {
 
     #[test]
     fn idle_entries_detects_disconnected() {
-        let mut pool = ConnectionPool::new();
+        let pool = ConnectionPool::new();
         let client = Arc::new(IpcClient::new("ipc://dead"));
         pool.insert("d".into(), "ipc://dead".into(), client);
         assert_eq!(pool.idle_entries(u64::MAX).len(), 1);
@@ -363,7 +680,7 @@ mod tests {
 
     #[test]
     fn idle_entries_do_not_evict_active_connected_client() {
-        let mut pool = ConnectionPool::new();
+        let pool = ConnectionPool::new();
         let client = Arc::new(IpcClient::new("ipc://active"));
         client.force_connected(true);
         pool.insert("grid".into(), "ipc://active".into(), client);
@@ -375,7 +692,7 @@ mod tests {
 
     #[test]
     fn idle_entries_can_evict_inactive_connected_client() {
-        let mut pool = ConnectionPool::new();
+        let pool = ConnectionPool::new();
         let client = Arc::new(IpcClient::new("ipc://idle"));
         client.force_connected(true);
         pool.insert("grid".into(), "ipc://idle".into(), client);
@@ -385,7 +702,7 @@ mod tests {
 
     #[test]
     fn end_request_makes_client_idle_candidate_again() {
-        let mut pool = ConnectionPool::new();
+        let pool = ConnectionPool::new();
         let client = Arc::new(IpcClient::new("ipc://active"));
         client.force_connected(true);
         pool.insert("grid".into(), "ipc://active".into(), client);
@@ -398,7 +715,7 @@ mod tests {
 
     #[test]
     fn disconnected_client_is_evicted_even_when_not_idle_by_time() {
-        let mut pool = ConnectionPool::new();
+        let pool = ConnectionPool::new();
         let client = Arc::new(IpcClient::new("ipc://dead"));
         client.force_connected(false);
         pool.insert("grid".into(), "ipc://dead".into(), client);
@@ -408,7 +725,7 @@ mod tests {
 
     #[test]
     fn stale_generation_end_after_reinsert_leaves_new_entry_idle() {
-        let mut pool = ConnectionPool::new();
+        let pool = ConnectionPool::new();
         let old_client = Arc::new(IpcClient::new("ipc://old"));
         old_client.force_connected(true);
         pool.insert("grid".into(), "ipc://old".into(), old_client);
@@ -426,7 +743,7 @@ mod tests {
 
     #[test]
     fn stale_generation_end_after_reinsert_does_not_release_new_active_request() {
-        let mut pool = ConnectionPool::new();
+        let pool = ConnectionPool::new();
         let old_client = Arc::new(IpcClient::new("ipc://old"));
         old_client.force_connected(true);
         pool.insert("grid".into(), "ipc://old".into(), old_client);
@@ -448,7 +765,7 @@ mod tests {
 
     #[test]
     fn stale_generation_evict_after_reinsert_does_not_evict_new_entry() {
-        let mut pool = ConnectionPool::new();
+        let pool = ConnectionPool::new();
         let old_client = Arc::new(IpcClient::new("ipc://old"));
         old_client.force_connected(true);
         pool.insert("grid".into(), "ipc://old".into(), old_client);
@@ -466,7 +783,7 @@ mod tests {
 
     #[test]
     fn matching_generation_evict_removes_current_entry_client() {
-        let mut pool = ConnectionPool::new();
+        let pool = ConnectionPool::new();
         let client = Arc::new(IpcClient::new("ipc://current"));
         client.force_connected(true);
         pool.insert("grid".into(), "ipc://current".into(), client);
@@ -478,7 +795,7 @@ mod tests {
 
     #[test]
     fn stale_generation_evict_after_reconnect_does_not_evict_reconnected_client() {
-        let mut pool = ConnectionPool::new();
+        let pool = ConnectionPool::new();
         let old_client = Arc::new(IpcClient::new("ipc://old"));
         old_client.force_connected(true);
         pool.insert("grid".into(), "ipc://old".into(), old_client);
@@ -496,7 +813,7 @@ mod tests {
 
     #[test]
     fn stale_generation_end_after_reconnect_does_not_release_new_active_request() {
-        let mut pool = ConnectionPool::new();
+        let pool = ConnectionPool::new();
         let old_client = Arc::new(IpcClient::new("ipc://old"));
         old_client.force_connected(true);
         pool.insert("grid".into(), "ipc://old".into(), old_client);
@@ -518,7 +835,7 @@ mod tests {
 
     #[test]
     fn stale_generation_reconnect_after_reinsert_does_not_replace_new_entry() {
-        let mut pool = ConnectionPool::new();
+        let pool = ConnectionPool::new();
         let old_client = Arc::new(IpcClient::new("ipc://old"));
         old_client.force_connected(true);
         pool.insert("grid".into(), "ipc://old".into(), old_client);
@@ -546,7 +863,7 @@ mod tests {
 
     #[test]
     fn matching_generation_reconnect_attaches_client_and_advances_generation() {
-        let mut pool = ConnectionPool::new();
+        let pool = ConnectionPool::new();
         let old_client = Arc::new(IpcClient::new("ipc://old"));
         old_client.force_connected(true);
         pool.insert("grid".into(), "ipc://old".into(), old_client);
@@ -571,13 +888,152 @@ mod tests {
     #[test]
     #[should_panic(expected = "connection generation exhausted")]
     fn generation_allocator_panics_instead_of_reusing_on_overflow() {
-        let mut pool = ConnectionPool::new();
-        pool.next_generation = u64::MAX;
+        let pool = ConnectionPool::new();
+        pool.next_generation.store(u64::MAX, Ordering::Release);
 
         let c1 = Arc::new(IpcClient::new("ipc://max"));
         pool.insert("max".into(), "ipc://max".into(), c1);
 
         let c2 = Arc::new(IpcClient::new("ipc://overflow"));
         pool.insert("overflow".into(), "ipc://overflow".into(), c2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_acquire_after_eviction_shares_one_reconnect() {
+        let pool = Arc::new(ConnectionPool::new());
+        let client = Arc::new(IpcClient::new("ipc://shared"));
+        client.force_connected(true);
+        pool.insert("grid".into(), "ipc://shared".into(), client);
+        pool.evict("grid");
+
+        let connect_count = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+
+        for _ in 0..16 {
+            let pool = pool.clone();
+            let connect_count = connect_count.clone();
+            tasks.push(tokio::spawn(async move {
+                pool.acquire_with("grid", move |address| {
+                    let connect_count = connect_count.clone();
+                    async move {
+                        connect_count.fetch_add(1, Ordering::SeqCst);
+                        let client = Arc::new(IpcClient::new(&address));
+                        client.force_connected(true);
+                        Ok(client)
+                    }
+                })
+                .await
+                .expect("acquire should reconnect")
+            }));
+        }
+
+        let mut leases = Vec::new();
+        for task in tasks {
+            leases.push(task.await.unwrap());
+        }
+
+        assert_eq!(connect_count.load(Ordering::SeqCst), 1);
+        let first = leases[0].client();
+        assert!(
+            leases
+                .iter()
+                .all(|lease| Arc::ptr_eq(&first, &lease.client()))
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_during_reconnect_makes_waiting_acquire_not_found() {
+        let pool = Arc::new(ConnectionPool::new());
+        let client = Arc::new(IpcClient::new("ipc://removed"));
+        client.force_connected(true);
+        pool.insert("grid".into(), "ipc://removed".into(), client);
+        pool.evict("grid");
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let started_tx = Arc::new(std::sync::Mutex::new(Some(started_tx)));
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let finish_rx = Arc::new(tokio::sync::Mutex::new(Some(finish_rx)));
+
+        let acquire = {
+            let pool = pool.clone();
+            let finish_rx = finish_rx.clone();
+            let started_tx = started_tx.clone();
+            tokio::spawn(async move {
+                pool.acquire_with("grid", move |address| {
+                    let finish_rx = finish_rx.clone();
+                    let started_tx = started_tx.clone();
+                    async move {
+                        if let Some(started_tx) = started_tx.lock().unwrap().take() {
+                            let _ = started_tx.send(());
+                        }
+                        let rx = finish_rx.lock().await.take().unwrap();
+                        rx.await.unwrap();
+                        let client = Arc::new(IpcClient::new(&address));
+                        client.force_connected(true);
+                        Ok(client)
+                    }
+                })
+                .await
+            })
+        };
+
+        started_rx.await.unwrap();
+        pool.remove("grid");
+        finish_tx.send(()).unwrap();
+
+        assert!(matches!(
+            acquire.await.unwrap(),
+            Err(AcquireError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn insert_retires_replaced_slot_before_waiting_reconnect_completes() {
+        let pool = Arc::new(ConnectionPool::new());
+        let old_client = Arc::new(IpcClient::new("ipc://old"));
+        old_client.force_connected(true);
+        pool.insert("grid".into(), "ipc://old".into(), old_client);
+        pool.evict("grid");
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let started_tx = Arc::new(std::sync::Mutex::new(Some(started_tx)));
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let finish_rx = Arc::new(tokio::sync::Mutex::new(Some(finish_rx)));
+
+        let acquire = {
+            let pool = pool.clone();
+            let finish_rx = finish_rx.clone();
+            let started_tx = started_tx.clone();
+            tokio::spawn(async move {
+                pool.acquire_with("grid", move |address| {
+                    let finish_rx = finish_rx.clone();
+                    let started_tx = started_tx.clone();
+                    async move {
+                        if let Some(started_tx) = started_tx.lock().unwrap().take() {
+                            let _ = started_tx.send(());
+                        }
+                        let rx = finish_rx.lock().await.take().unwrap();
+                        rx.await.unwrap();
+                        let client = Arc::new(IpcClient::new(&address));
+                        client.force_connected(true);
+                        Ok(client)
+                    }
+                })
+                .await
+            })
+        };
+
+        started_rx.await.unwrap();
+        let replacement = Arc::new(IpcClient::new("ipc://new"));
+        replacement.force_connected(true);
+        pool.insert("grid".into(), "ipc://new".into(), replacement.clone());
+        finish_tx.send(()).unwrap();
+
+        assert!(matches!(
+            acquire.await.unwrap(),
+            Err(AcquireError::NotFound)
+        ));
+        let (current, _) = pool.begin_request("grid").unwrap();
+        assert!(Arc::ptr_eq(&current, &replacement));
     }
 }
