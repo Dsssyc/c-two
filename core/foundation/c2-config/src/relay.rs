@@ -52,6 +52,13 @@ impl Default for RelayConfig {
 }
 
 impl RelayConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.idle_timeout_secs != 0 && self.idle_timeout_secs.checked_mul(1000).is_none() {
+            return Err("idle_timeout_secs must fit in milliseconds".into());
+        }
+        Ok(())
+    }
+
     pub fn generate_relay_id() -> String {
         let host = gethostname::gethostname().to_string_lossy().to_string();
         let pid = std::process::id();
@@ -75,5 +82,23 @@ impl RelayConfig {
         } else {
             format!("http://127.0.0.1:{bind}")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_timeout_must_fit_milliseconds() {
+        let mut config = RelayConfig::default();
+        config.idle_timeout_secs = u64::MAX;
+
+        let err = config
+            .validate()
+            .expect_err("idle timeout should reject millisecond overflow");
+
+        assert!(err.contains("idle_timeout_secs"));
+        assert!(err.contains("milliseconds"));
     }
 }

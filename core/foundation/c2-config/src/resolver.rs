@@ -365,7 +365,7 @@ fn resolve_relay_server_config(
         cfg.seeds = v;
     }
     if let Some(v) = catalog.optional_u64("C2_RELAY_IDLE_TIMEOUT").transpose()? {
-        cfg.idle_timeout_secs = v;
+        cfg.idle_timeout_secs = validate_millis_timeout("C2_RELAY_IDLE_TIMEOUT", v)?;
     }
     if let Some(v) = catalog
         .optional_f64("C2_RELAY_ANTI_ENTROPY_INTERVAL")
@@ -387,7 +387,7 @@ fn resolve_relay_server_config(
         cfg.seeds = v;
     }
     if let Some(v) = overrides.idle_timeout_secs {
-        cfg.idle_timeout_secs = v;
+        cfg.idle_timeout_secs = validate_millis_timeout("idle_timeout_secs", v)?;
     }
     if let Some(v) = overrides.skip_ipc_validation {
         cfg.skip_ipc_validation = v;
@@ -396,6 +396,7 @@ fn resolve_relay_server_config(
         cfg.anti_entropy_interval = duration_from_secs("anti_entropy_interval_secs", v)?;
     }
 
+    cfg.validate().map_err(ConfigError::new)?;
     Ok(cfg)
 }
 
@@ -761,7 +762,17 @@ fn duration_from_secs(name: &str, secs: f64) -> Result<Duration, ConfigError> {
     if secs < 0.0 {
         return Err(ConfigError::new(format!("{name} must be >= 0")));
     }
-    Ok(Duration::from_secs_f64(secs))
+    Duration::try_from_secs_f64(secs).map_err(|_| {
+        ConfigError::new(format!(
+            "{name} must be a representable duration in seconds"
+        ))
+    })
+}
+
+fn validate_millis_timeout(name: &str, secs: u64) -> Result<u64, ConfigError> {
+    secs.checked_mul(1000)
+        .ok_or_else(|| ConfigError::new(format!("{name} must fit in milliseconds")))?;
+    Ok(secs)
 }
 
 fn validate_finite(name: &str, value: f64) -> Result<f64, ConfigError> {
@@ -895,6 +906,71 @@ mod tests {
 
         assert!(err.to_string().contains("C2_RELAY_ANTI_ENTROPY_INTERVAL"));
         assert!(err.to_string().contains("finite"));
+    }
+
+    #[test]
+    fn oversized_relay_duration_env_value_is_rejected() {
+        let sources = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[("C2_RELAY_ANTI_ENTROPY_INTERVAL", "1e100")]),
+        };
+
+        let err = ConfigResolver::resolve_relay_server(RuntimeConfigOverrides::default(), sources)
+            .expect_err("oversized relay duration should fail without panicking");
+
+        assert!(err.to_string().contains("C2_RELAY_ANTI_ENTROPY_INTERVAL"));
+        assert!(err.to_string().contains("representable duration"));
+    }
+
+    #[test]
+    fn oversized_ipc_duration_env_value_is_rejected() {
+        let sources = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[("C2_IPC_CHUNK_GC_INTERVAL", "1e100")]),
+        };
+
+        let err = ConfigResolver::resolve_server_ipc(
+            ServerIpcConfigOverrides::default(),
+            RuntimeConfigOverrides::default(),
+            sources,
+        )
+        .expect_err("oversized IPC duration should fail without panicking");
+
+        assert!(err.to_string().contains("chunk_gc_interval_secs"));
+        assert!(err.to_string().contains("representable duration"));
+    }
+
+    #[test]
+    fn oversized_ipc_duration_override_is_rejected() {
+        let overrides = ServerIpcConfigOverrides {
+            heartbeat_interval_secs: Some(1e100),
+            heartbeat_timeout_secs: Some(2e100),
+            ..Default::default()
+        };
+
+        let err = ConfigResolver::resolve_server_ipc(
+            overrides,
+            RuntimeConfigOverrides::default(),
+            ConfigSources::empty(),
+        )
+        .expect_err("oversized IPC duration override should fail without panicking");
+
+        assert!(err.to_string().contains("heartbeat_interval_secs"));
+        assert!(err.to_string().contains("representable duration"));
+    }
+
+    #[test]
+    fn relay_idle_timeout_must_fit_millisecond_sweeper_interval() {
+        let sources = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[("C2_RELAY_IDLE_TIMEOUT", "18446744073709551615")]),
+        };
+
+        let err = ConfigResolver::resolve_relay_server(RuntimeConfigOverrides::default(), sources)
+            .expect_err("idle timeout should reject millisecond overflow");
+
+        assert!(err.to_string().contains("C2_RELAY_IDLE_TIMEOUT"));
+        assert!(err.to_string().contains("milliseconds"));
     }
 
     #[test]

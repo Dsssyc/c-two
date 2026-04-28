@@ -98,6 +98,10 @@ pub struct RelayServer {
 impl RelayServer {
     /// Start the relay server on a background thread.
     pub fn start(config: RelayConfig) -> Result<Self, String> {
+        config
+            .validate()
+            .map_err(|e| format!("Invalid relay config: {e}"))?;
+
         let addr: SocketAddr = config
             .bind
             .parse()
@@ -410,7 +414,8 @@ impl Drop for RelayServer {
 
 #[cfg(test)]
 mod tests {
-    use super::RelayControlError;
+    use super::{RelayControlError, RelayServer};
+    use c2_config::RelayConfig;
 
     #[test]
     fn duplicate_route_error_has_stable_variant_and_message() {
@@ -436,5 +441,26 @@ mod tests {
 
         assert_eq!(c2.code, c2_error::ErrorCode::ResourceAlreadyRegistered);
         assert_eq!(c2.message, "Route name already registered: 'grid'");
+    }
+
+    #[test]
+    fn relay_start_rejects_idle_timeout_millisecond_overflow() {
+        let config = RelayConfig {
+            bind: "127.0.0.1:0".to_string(),
+            idle_timeout_secs: u64::MAX,
+            ..RelayConfig::default()
+        };
+
+        let err = match RelayServer::start(config) {
+            Ok(mut server) => {
+                let _ = server.stop();
+                panic!("invalid relay config should fail");
+            }
+            Err(err) => err,
+        };
+
+        assert!(err.contains("Invalid relay config"));
+        assert!(err.contains("idle_timeout_secs"));
+        assert!(err.contains("milliseconds"));
     }
 }

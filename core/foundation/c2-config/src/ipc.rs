@@ -9,6 +9,7 @@
 //! suffix). Defaults are canonical for Rust, CLI, and SDK config resolution.
 
 use std::ops::Deref;
+use std::time::Duration;
 
 // ─── Base ────────────────────────────────────────────────────────────────────
 
@@ -180,6 +181,7 @@ impl BaseIpcConfig {
                 self.chunk_gc_interval_secs,
             ));
         }
+        validate_duration_secs("chunk_gc_interval_secs", self.chunk_gc_interval_secs)?;
         if !self.chunk_threshold_ratio.is_finite() {
             return Err(format!(
                 "chunk_threshold_ratio ({}) must be finite",
@@ -204,6 +206,10 @@ impl BaseIpcConfig {
                 self.chunk_assembler_timeout_secs,
             ));
         }
+        validate_duration_secs(
+            "chunk_assembler_timeout_secs",
+            self.chunk_assembler_timeout_secs,
+        )?;
         if self.max_reassembly_bytes == 0 {
             return Err("max_reassembly_bytes must be > 0".into());
         }
@@ -241,6 +247,7 @@ impl ServerIpcConfig {
                 self.pool_decay_seconds,
             ));
         }
+        validate_duration_secs("pool_decay_seconds", self.pool_decay_seconds)?;
         if !self.heartbeat_interval_secs.is_finite() {
             return Err(format!(
                 "heartbeat_interval_secs ({}) must be finite",
@@ -253,12 +260,14 @@ impl ServerIpcConfig {
                 self.heartbeat_interval_secs,
             ));
         }
+        validate_duration_secs("heartbeat_interval_secs", self.heartbeat_interval_secs)?;
         if !self.heartbeat_timeout_secs.is_finite() {
             return Err(format!(
                 "heartbeat_timeout_secs ({}) must be finite",
                 self.heartbeat_timeout_secs,
             ));
         }
+        validate_duration_secs("heartbeat_timeout_secs", self.heartbeat_timeout_secs)?;
         if self.heartbeat_interval_secs > 0.0
             && self.heartbeat_timeout_secs <= self.heartbeat_interval_secs
         {
@@ -275,6 +284,12 @@ impl ClientIpcConfig {
     pub fn validate(&self) -> Result<(), String> {
         self.base.validate()
     }
+}
+
+fn validate_duration_secs(name: &str, secs: f64) -> Result<(), String> {
+    Duration::try_from_secs_f64(secs)
+        .map(|_| ())
+        .map_err(|_| format!("{name} ({secs}) must be a representable duration in seconds"))
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -306,10 +321,11 @@ mod tests {
     fn reject_zero_segment_size() {
         let mut cfg = ServerIpcConfig::default();
         cfg.base.pool_segment_size = 0;
-        assert!(cfg
-            .validate()
-            .unwrap_err()
-            .contains("pool_segment_size must be > 0"));
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .contains("pool_segment_size must be > 0")
+        );
     }
 
     #[test]
@@ -323,26 +339,29 @@ mod tests {
     fn reject_zero_chunk_size() {
         let mut cfg = ServerIpcConfig::default();
         cfg.base.chunk_size = 0;
-        assert!(cfg
-            .validate()
-            .unwrap_err()
-            .contains("chunk_size must be > 0"));
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .contains("chunk_size must be > 0")
+        );
     }
 
     #[test]
     fn reject_bad_threshold_ratio() {
         let mut cfg = BaseIpcConfig::default();
         cfg.chunk_threshold_ratio = 0.0;
-        assert!(cfg
-            .validate()
-            .unwrap_err()
-            .contains("chunk_threshold_ratio"));
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .contains("chunk_threshold_ratio")
+        );
 
         cfg.chunk_threshold_ratio = 1.1;
-        assert!(cfg
-            .validate()
-            .unwrap_err()
-            .contains("chunk_threshold_ratio"));
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .contains("chunk_threshold_ratio")
+        );
 
         cfg.chunk_threshold_ratio = 1.0; // boundary — valid
         assert!(cfg.validate().is_ok());
@@ -361,10 +380,11 @@ mod tests {
     fn reject_zero_payload_size() {
         let mut cfg = ServerIpcConfig::default();
         cfg.max_payload_size = 0;
-        assert!(cfg
-            .validate()
-            .unwrap_err()
-            .contains("max_payload_size must be > 0"));
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .contains("max_payload_size must be > 0")
+        );
     }
 
     #[test]
@@ -439,9 +459,10 @@ mod tests {
     fn client_rejects_zero_segment_size() {
         let mut cfg = ClientIpcConfig::default();
         cfg.base.pool_segment_size = 0;
-        assert!(cfg
-            .validate()
-            .unwrap_err()
-            .contains("pool_segment_size must be > 0"));
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .contains("pool_segment_size must be > 0")
+        );
     }
 }

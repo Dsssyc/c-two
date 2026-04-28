@@ -3,10 +3,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
 import math
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-if TYPE_CHECKING:
-    from .settings import C2Settings
+from .settings import C2Settings
 
 
 @dataclass(frozen=True)
@@ -53,6 +52,7 @@ class BaseIPCConfig:
             raise ValueError(
                 f'chunk_gc_interval must be positive, got {self.chunk_gc_interval}'
             )
+        _validate_duration_seconds('chunk_gc_interval', self.chunk_gc_interval)
         if not math.isfinite(self.chunk_assembler_timeout):
             raise ValueError(
                 f'chunk_assembler_timeout must be finite, '
@@ -63,6 +63,10 @@ class BaseIPCConfig:
                 f'chunk_assembler_timeout must be positive, '
                 f'got {self.chunk_assembler_timeout}'
             )
+        _validate_duration_seconds(
+            'chunk_assembler_timeout',
+            self.chunk_assembler_timeout,
+        )
         if not 1 <= self.reassembly_max_segments <= 255:
             raise ValueError(
                 f'reassembly_max_segments must be 1..255, '
@@ -105,6 +109,7 @@ class ServerIPCConfig(BaseIPCConfig):
             raise ValueError(
                 f'pool_decay_seconds must be finite, got {self.pool_decay_seconds}'
             )
+        _validate_duration_seconds('pool_decay_seconds', self.pool_decay_seconds)
         if not math.isfinite(self.heartbeat_interval):
             raise ValueError(
                 f'heartbeat_interval must be finite, got {self.heartbeat_interval}'
@@ -113,10 +118,12 @@ class ServerIPCConfig(BaseIPCConfig):
             raise ValueError(
                 f'heartbeat_interval must be >= 0, got {self.heartbeat_interval}'
             )
+        _validate_duration_seconds('heartbeat_interval', self.heartbeat_interval)
         if not math.isfinite(self.heartbeat_timeout):
             raise ValueError(
                 f'heartbeat_timeout must be finite, got {self.heartbeat_timeout}'
             )
+        _validate_duration_seconds('heartbeat_timeout', self.heartbeat_timeout)
         if self.heartbeat_interval > 0 and self.heartbeat_timeout <= self.heartbeat_interval:
             raise ValueError(
                 f'heartbeat_timeout ({self.heartbeat_timeout}) must exceed '
@@ -173,20 +180,24 @@ def _clean_overrides(kwargs: dict[str, object]) -> dict[str, object]:
     return {key: value for key, value in kwargs.items() if value is not None}
 
 
+def _validate_duration_seconds(name: str, value: float) -> None:
+    if not math.isfinite(value):
+        raise ValueError(f'{name} must be finite, got {value}')
+    if value < 0:
+        raise ValueError(f'{name} must be >= 0, got {value}')
+    # Rust Duration stores seconds in u64 and nanoseconds separately. Values
+    # beyond u64::MAX seconds would panic in Duration::from_secs_f64.
+    if value >= 2 ** 64:
+        raise ValueError(f'{name} must be a representable duration in seconds')
+
+
 def _global_overrides(settings: C2Settings | None) -> dict[str, object]:
     if settings is None:
         from .settings import settings as _settings
         settings = _settings
-    if hasattr(settings, '_global_overrides'):
-        return settings._global_overrides()  # noqa: SLF001
-    overrides: dict[str, object] = {}
-    shm_threshold = getattr(settings, 'shm_threshold', None)
-    if shm_threshold is not None:
-        overrides['shm_threshold'] = shm_threshold
-    relay_address = getattr(settings, 'relay_address', None)
-    if relay_address is not None:
-        overrides['relay_address'] = relay_address
-    return overrides
+    if not isinstance(settings, C2Settings):
+        raise TypeError('settings must be a C2Settings instance')
+    return settings._global_overrides()  # noqa: SLF001
 
 
 def _reject_unknown_kwargs(kwargs: dict[str, object], allowed: set[str]) -> None:

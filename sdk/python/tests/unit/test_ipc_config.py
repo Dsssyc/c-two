@@ -54,6 +54,8 @@ class TestBaseIPCConfig:
             BaseIPCConfig(chunk_gc_interval=math.nan)
         with pytest.raises(ValueError, match='chunk_gc_interval'):
             BaseIPCConfig(chunk_gc_interval=math.inf)
+        with pytest.raises(ValueError, match='representable duration'):
+            BaseIPCConfig(chunk_gc_interval=1e100)
 
     def test_reject_bad_assembler_timeout(self):
         with pytest.raises(ValueError, match='chunk_assembler_timeout'):
@@ -62,6 +64,8 @@ class TestBaseIPCConfig:
             BaseIPCConfig(chunk_assembler_timeout=math.nan)
         with pytest.raises(ValueError, match='chunk_assembler_timeout'):
             BaseIPCConfig(chunk_assembler_timeout=math.inf)
+        with pytest.raises(ValueError, match='representable duration'):
+            BaseIPCConfig(chunk_assembler_timeout=1e100)
 
     def test_reject_bad_reassembly_segments(self):
         with pytest.raises(ValueError, match='reassembly_max_segments'):
@@ -98,6 +102,8 @@ class TestServerIPCConfig:
             ServerIPCConfig(heartbeat_interval=math.nan)
         with pytest.raises(ValueError, match='heartbeat_interval'):
             ServerIPCConfig(heartbeat_interval=math.inf)
+        with pytest.raises(ValueError, match='representable duration'):
+            ServerIPCConfig(heartbeat_interval=1e100, heartbeat_timeout=2e100)
 
     def test_heartbeat_timeout_must_exceed_interval(self):
         with pytest.raises(ValueError, match='heartbeat_timeout'):
@@ -106,12 +112,16 @@ class TestServerIPCConfig:
             ServerIPCConfig(heartbeat_timeout=math.nan)
         with pytest.raises(ValueError, match='heartbeat_timeout'):
             ServerIPCConfig(heartbeat_timeout=math.inf)
+        with pytest.raises(ValueError, match='representable duration'):
+            ServerIPCConfig(heartbeat_interval=0.0, heartbeat_timeout=1e100)
 
     def test_pool_decay_must_be_finite(self):
         with pytest.raises(ValueError, match='pool_decay_seconds'):
             ServerIPCConfig(pool_decay_seconds=math.nan)
         with pytest.raises(ValueError, match='pool_decay_seconds'):
             ServerIPCConfig(pool_decay_seconds=math.inf)
+        with pytest.raises(ValueError, match='representable duration'):
+            ServerIPCConfig(pool_decay_seconds=1e100)
 
     def test_max_pool_memory_is_derived(self):
         cfg = ServerIPCConfig(pool_segment_size=1024, max_pool_segments=2)
@@ -221,6 +231,14 @@ class TestBuildServerConfig:
         )
 
         assert resolved['pool_segment_size'] == 268_435_456
+
+    def test_ipc_config_requires_c2_settings_object(self):
+        class AdHocSettings:
+            shm_threshold = 8192
+            relay_address = 'http://127.0.0.1:8080'
+
+        with pytest.raises(TypeError, match='C2Settings'):
+            build_server_config(AdHocSettings())
 
     def test_server_config_does_not_resolve_relay_env(self, monkeypatch):
         monkeypatch.setenv('C2_ENV_FILE', '')
