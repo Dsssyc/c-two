@@ -73,7 +73,7 @@ fn get_json(relay: &str, path: &str) -> Result<Value> {
 }
 
 fn resolve_relay_use_proxy(sources: ConfigSources) -> Result<bool> {
-    let resolved = ConfigResolver::resolve_relay(RuntimeConfigOverrides::default(), sources)
+    let resolved = ConfigResolver::resolve_relay_client(RuntimeConfigOverrides::default(), sources)
         .map_err(|e| anyhow!("{e}"))?;
     Ok(resolved.relay_use_proxy)
 }
@@ -145,6 +145,25 @@ mod tests {
         let use_proxy = resolve_relay_use_proxy(ConfigSources {
             env_file: c2_config::EnvFilePolicy::Path(env_file),
             process_env: Default::default(),
+        })
+        .unwrap();
+
+        assert!(use_proxy);
+    }
+
+    #[test]
+    fn proxy_policy_ignores_relay_server_env() {
+        let use_proxy = resolve_relay_use_proxy(ConfigSources {
+            env_file: c2_config::EnvFilePolicy::Disabled,
+            process_env: [
+                ("C2_RELAY_USE_PROXY".to_string(), "1".to_string()),
+                (
+                    "C2_RELAY_IDLE_TIMEOUT".to_string(),
+                    "not-a-number".to_string(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
         })
         .unwrap();
 

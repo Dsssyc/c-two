@@ -13,6 +13,6 @@ pub use pool::PoolConfig;
 pub use relay::RelayConfig;
 pub use resolver::{
     ClientIpcConfigOverrides, ConfigResolver, ConfigSources, EnvFilePolicy, EnvMap,
-    RelayConfigOverrides, ResolvedRelayConfig, ResolvedRuntimeConfig, RuntimeConfigOverrides,
-    ServerIpcConfigOverrides,
+    RelayConfigOverrides, ResolvedRelayClientConfig, ResolvedRelayConfig, ResolvedRuntimeConfig,
+    RuntimeConfigOverrides, ServerIpcConfigOverrides,
 };

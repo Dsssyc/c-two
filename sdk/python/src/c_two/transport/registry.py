@@ -62,9 +62,9 @@ _NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 def _relay_use_proxy() -> bool:
     """Resolve relay proxy policy through the shared Rust config resolver."""
-    from c_two._native import resolve_relay_config
+    from c_two._native import resolve_relay_client_config
 
-    resolved = resolve_relay_config(settings._global_overrides())  # noqa: SLF001
+    resolved = resolve_relay_client_config(settings._global_overrides())  # noqa: SLF001
     return bool(resolved.get("relay_use_proxy", False))
 
 

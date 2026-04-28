@@ -36,6 +36,43 @@ impl ConfigSources {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct EnvCatalog {
+    env: EnvMap,
+}
+
+impl EnvCatalog {
+    pub fn load(sources: ConfigSources) -> Result<Self, ConfigError> {
+        Ok(Self {
+            env: resolve_env(sources)?,
+        })
+    }
+
+    fn optional_string(&self, key: &str) -> Option<String> {
+        optional_string(&self.env, key)
+    }
+
+    fn optional_bool(&self, key: &str) -> Option<Result<bool, ConfigError>> {
+        parse_optional_bool(&self.env, key)
+    }
+
+    fn optional_u64(&self, key: &str) -> Option<Result<u64, ConfigError>> {
+        parse_optional_u64(&self.env, key)
+    }
+
+    fn optional_u32(&self, key: &str) -> Option<Result<u32, ConfigError>> {
+        parse_optional_u32(&self.env, key)
+    }
+
+    fn optional_f64(&self, key: &str) -> Option<Result<f64, ConfigError>> {
+        parse_optional_f64(&self.env, key)
+    }
+
+    fn optional_list(&self, key: &str) -> Option<Vec<String>> {
+        self.optional_string(key).map(|value| parse_list(&value))
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct BaseIpcConfigOverrides {
     pub pool_enabled: Option<bool>,
@@ -129,6 +166,12 @@ pub struct ResolvedRelayConfig {
     pub relay_use_proxy: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct ResolvedRelayClientConfig {
+    pub relay_address: Option<String>,
+    pub relay_use_proxy: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigError {
     message: String,
@@ -157,30 +200,54 @@ impl ConfigResolver {
         overrides: RuntimeConfigOverrides,
         sources: ConfigSources,
     ) -> Result<ResolvedRuntimeConfig, ConfigError> {
-        let env = resolve_env(sources)?;
+        let catalog = EnvCatalog::load(sources)?;
 
-        let shm_threshold = resolve_shm_threshold(&env, overrides.shm_threshold)?;
+        let shm_threshold = resolve_shm_threshold(&catalog, overrides.shm_threshold)?;
 
-        let resolved_relay = resolve_relay_only(&env, &overrides)?;
-        let server_ipc = resolve_server_ipc_config(&env, overrides.server_ipc, shm_threshold)?;
-        let client_ipc = resolve_client_ipc_config(&env, overrides.client_ipc, shm_threshold)?;
+        let relay = resolve_relay_server_config(&catalog, overrides.relay.clone())?;
+        let relay_client = resolve_relay_client_config(&catalog, &overrides)?;
+        let relay = RelayConfig {
+            use_proxy: relay_client.relay_use_proxy,
+            ..relay
+        };
+        let server_ipc = resolve_server_ipc_config(&catalog, overrides.server_ipc, shm_threshold)?;
+        let client_ipc = resolve_client_ipc_config(&catalog, overrides.client_ipc, shm_threshold)?;
 
         Ok(ResolvedRuntimeConfig {
-            relay_address: resolved_relay.relay_address,
-            relay: resolved_relay.relay,
+            relay_address: relay_client.relay_address,
+            relay,
             server_ipc,
             client_ipc,
             shm_threshold,
-            relay_use_proxy: resolved_relay.relay_use_proxy,
+            relay_use_proxy: relay_client.relay_use_proxy,
         })
     }
 
-    pub fn resolve_relay(
+    pub fn resolve_relay_server(
         overrides: RuntimeConfigOverrides,
         sources: ConfigSources,
     ) -> Result<ResolvedRelayConfig, ConfigError> {
-        let env = resolve_env(sources)?;
-        resolve_relay_only(&env, &overrides)
+        let catalog = EnvCatalog::load(sources)?;
+        let relay = resolve_relay_server_config(&catalog, overrides.relay.clone())?;
+        let relay_client = resolve_relay_client_config(&catalog, &overrides)?;
+        let relay = RelayConfig {
+            use_proxy: relay_client.relay_use_proxy,
+            ..relay
+        };
+
+        Ok(ResolvedRelayConfig {
+            relay_address: relay_client.relay_address,
+            relay,
+            relay_use_proxy: relay_client.relay_use_proxy,
+        })
+    }
+
+    pub fn resolve_relay_client(
+        overrides: RuntimeConfigOverrides,
+        sources: ConfigSources,
+    ) -> Result<ResolvedRelayClientConfig, ConfigError> {
+        let catalog = EnvCatalog::load(sources)?;
+        resolve_relay_client_config(&catalog, &overrides)
     }
 
     pub fn resolve_server_ipc(
@@ -188,9 +255,9 @@ impl ConfigResolver {
         global_overrides: RuntimeConfigOverrides,
         sources: ConfigSources,
     ) -> Result<ServerIpcConfig, ConfigError> {
-        let env = resolve_env(sources)?;
-        let shm_threshold = resolve_shm_threshold(&env, global_overrides.shm_threshold)?;
-        resolve_server_ipc_config(&env, overrides, shm_threshold)
+        let catalog = EnvCatalog::load(sources)?;
+        let shm_threshold = resolve_shm_threshold(&catalog, global_overrides.shm_threshold)?;
+        resolve_server_ipc_config(&catalog, overrides, shm_threshold)
     }
 
     pub fn resolve_client_ipc(
@@ -198,43 +265,38 @@ impl ConfigResolver {
         global_overrides: RuntimeConfigOverrides,
         sources: ConfigSources,
     ) -> Result<ClientIpcConfig, ConfigError> {
-        let env = resolve_env(sources)?;
-        let shm_threshold = resolve_shm_threshold(&env, global_overrides.shm_threshold)?;
-        resolve_client_ipc_config(&env, overrides, shm_threshold)
+        let catalog = EnvCatalog::load(sources)?;
+        let shm_threshold = resolve_shm_threshold(&catalog, global_overrides.shm_threshold)?;
+        resolve_client_ipc_config(&catalog, overrides, shm_threshold)
     }
 
     pub fn resolve_shm_threshold(
         override_value: Option<u64>,
         sources: ConfigSources,
     ) -> Result<u64, ConfigError> {
-        let env = resolve_env(sources)?;
-        resolve_shm_threshold(&env, override_value)
+        let catalog = EnvCatalog::load(sources)?;
+        resolve_shm_threshold(&catalog, override_value)
     }
 }
 
-fn resolve_relay_only(
-    env: &EnvMap,
+fn resolve_relay_client_config(
+    catalog: &EnvCatalog,
     overrides: &RuntimeConfigOverrides,
-) -> Result<ResolvedRelayConfig, ConfigError> {
+) -> Result<ResolvedRelayClientConfig, ConfigError> {
     let relay_address = overrides
         .relay_address
         .clone()
-        .or_else(|| optional_string(env, "C2_RELAY_ADDRESS"));
+        .or_else(|| catalog.optional_string("C2_RELAY_ADDRESS"));
     let relay_use_proxy = match overrides.relay_use_proxy {
         Some(value) => value,
-        None => parse_optional_bool(env, "C2_RELAY_USE_PROXY")
+        None => catalog
+            .optional_bool("C2_RELAY_USE_PROXY")
             .transpose()?
             .unwrap_or(false),
     };
-    let relay = resolve_relay_config(env, overrides.relay.clone())?;
-    let relay = RelayConfig {
-        use_proxy: relay_use_proxy,
-        ..relay
-    };
 
-    Ok(ResolvedRelayConfig {
+    Ok(ResolvedRelayClientConfig {
         relay_address,
-        relay,
         relay_use_proxy,
     })
 }
@@ -284,28 +346,31 @@ fn resolve_env(sources: ConfigSources) -> Result<EnvMap, ConfigError> {
     Ok(env)
 }
 
-fn resolve_relay_config(
-    env: &EnvMap,
+fn resolve_relay_server_config(
+    catalog: &EnvCatalog,
     overrides: RelayConfigOverrides,
 ) -> Result<RelayConfig, ConfigError> {
     let mut cfg = RelayConfig::default();
 
-    if let Some(v) = optional_string(env, "C2_RELAY_BIND") {
+    if let Some(v) = catalog.optional_string("C2_RELAY_BIND") {
         cfg.bind = v;
     }
-    if let Some(v) = optional_string(env, "C2_RELAY_ID") {
+    if let Some(v) = catalog.optional_string("C2_RELAY_ID") {
         cfg.relay_id = v;
     }
-    if let Some(v) = optional_string(env, "C2_RELAY_ADVERTISE_URL") {
+    if let Some(v) = catalog.optional_string("C2_RELAY_ADVERTISE_URL") {
         cfg.advertise_url = v;
     }
-    if let Some(v) = optional_string(env, "C2_RELAY_SEEDS") {
-        cfg.seeds = parse_list(&v);
+    if let Some(v) = catalog.optional_list("C2_RELAY_SEEDS") {
+        cfg.seeds = v;
     }
-    if let Some(v) = parse_optional_u64(env, "C2_RELAY_IDLE_TIMEOUT").transpose()? {
+    if let Some(v) = catalog.optional_u64("C2_RELAY_IDLE_TIMEOUT").transpose()? {
         cfg.idle_timeout_secs = v;
     }
-    if let Some(v) = parse_optional_f64(env, "C2_RELAY_ANTI_ENTROPY_INTERVAL").transpose()? {
+    if let Some(v) = catalog
+        .optional_f64("C2_RELAY_ANTI_ENTROPY_INTERVAL")
+        .transpose()?
+    {
         cfg.anti_entropy_interval = duration_from_secs("C2_RELAY_ANTI_ENTROPY_INTERVAL", v)?;
     }
 
@@ -335,30 +400,45 @@ fn resolve_relay_config(
 }
 
 fn resolve_server_ipc_config(
-    env: &EnvMap,
+    catalog: &EnvCatalog,
     overrides: ServerIpcConfigOverrides,
     shm_threshold: u64,
 ) -> Result<ServerIpcConfig, ConfigError> {
     let mut cfg = ServerIpcConfig::default();
     cfg.shm_threshold = shm_threshold;
 
-    apply_base_env(&mut cfg.base, env)?;
-    if let Some(v) = parse_optional_u64(env, "C2_IPC_MAX_FRAME_SIZE").transpose()? {
+    apply_base_env(&mut cfg.base, catalog)?;
+    if let Some(v) = catalog.optional_u64("C2_IPC_MAX_FRAME_SIZE").transpose()? {
         cfg.max_frame_size = v;
     }
-    if let Some(v) = parse_optional_u64(env, "C2_IPC_MAX_PAYLOAD_SIZE").transpose()? {
+    if let Some(v) = catalog
+        .optional_u64("C2_IPC_MAX_PAYLOAD_SIZE")
+        .transpose()?
+    {
         cfg.max_payload_size = v;
     }
-    if let Some(v) = parse_optional_u32(env, "C2_IPC_MAX_PENDING_REQUESTS").transpose()? {
+    if let Some(v) = catalog
+        .optional_u32("C2_IPC_MAX_PENDING_REQUESTS")
+        .transpose()?
+    {
         cfg.max_pending_requests = v;
     }
-    if let Some(v) = parse_optional_f64(env, "C2_IPC_POOL_DECAY_SECONDS").transpose()? {
+    if let Some(v) = catalog
+        .optional_f64("C2_IPC_POOL_DECAY_SECONDS")
+        .transpose()?
+    {
         cfg.pool_decay_seconds = v;
     }
-    if let Some(v) = parse_optional_f64(env, "C2_IPC_HEARTBEAT_INTERVAL").transpose()? {
+    if let Some(v) = catalog
+        .optional_f64("C2_IPC_HEARTBEAT_INTERVAL")
+        .transpose()?
+    {
         cfg.heartbeat_interval_secs = v;
     }
-    if let Some(v) = parse_optional_f64(env, "C2_IPC_HEARTBEAT_TIMEOUT").transpose()? {
+    if let Some(v) = catalog
+        .optional_f64("C2_IPC_HEARTBEAT_TIMEOUT")
+        .transpose()?
+    {
         cfg.heartbeat_timeout_secs = v;
     }
 
@@ -392,14 +472,14 @@ fn resolve_server_ipc_config(
 }
 
 fn resolve_client_ipc_config(
-    env: &EnvMap,
+    catalog: &EnvCatalog,
     overrides: ClientIpcConfigOverrides,
     shm_threshold: u64,
 ) -> Result<ClientIpcConfig, ConfigError> {
     let mut cfg = ClientIpcConfig::default();
     cfg.shm_threshold = shm_threshold;
 
-    apply_base_env(&mut cfg.base, env)?;
+    apply_base_env(&mut cfg.base, catalog)?;
     apply_base_overrides(&mut cfg.base, &overrides.base);
     apply_flat_base_overrides_to_client(&mut cfg, &overrides);
     if let Some(v) = overrides.shm_threshold {
@@ -411,38 +491,65 @@ fn resolve_client_ipc_config(
     Ok(cfg)
 }
 
-fn apply_base_env(cfg: &mut BaseIpcConfig, env: &EnvMap) -> Result<(), ConfigError> {
-    if let Some(v) = parse_optional_bool(env, "C2_IPC_POOL_ENABLED").transpose()? {
+fn apply_base_env(cfg: &mut BaseIpcConfig, catalog: &EnvCatalog) -> Result<(), ConfigError> {
+    if let Some(v) = catalog.optional_bool("C2_IPC_POOL_ENABLED").transpose()? {
         cfg.pool_enabled = v;
     }
-    if let Some(v) = parse_optional_u64(env, "C2_IPC_POOL_SEGMENT_SIZE").transpose()? {
+    if let Some(v) = catalog
+        .optional_u64("C2_IPC_POOL_SEGMENT_SIZE")
+        .transpose()?
+    {
         cfg.pool_segment_size = v;
     }
-    if let Some(v) = parse_optional_u32(env, "C2_IPC_MAX_POOL_SEGMENTS").transpose()? {
+    if let Some(v) = catalog
+        .optional_u32("C2_IPC_MAX_POOL_SEGMENTS")
+        .transpose()?
+    {
         cfg.max_pool_segments = v;
     }
-    if let Some(v) = parse_optional_u64(env, "C2_IPC_REASSEMBLY_SEGMENT_SIZE").transpose()? {
+    if let Some(v) = catalog
+        .optional_u64("C2_IPC_REASSEMBLY_SEGMENT_SIZE")
+        .transpose()?
+    {
         cfg.reassembly_segment_size = v;
     }
-    if let Some(v) = parse_optional_u32(env, "C2_IPC_REASSEMBLY_MAX_SEGMENTS").transpose()? {
+    if let Some(v) = catalog
+        .optional_u32("C2_IPC_REASSEMBLY_MAX_SEGMENTS")
+        .transpose()?
+    {
         cfg.reassembly_max_segments = v;
     }
-    if let Some(v) = parse_optional_u32(env, "C2_IPC_MAX_TOTAL_CHUNKS").transpose()? {
+    if let Some(v) = catalog
+        .optional_u32("C2_IPC_MAX_TOTAL_CHUNKS")
+        .transpose()?
+    {
         cfg.max_total_chunks = v;
     }
-    if let Some(v) = parse_optional_f64(env, "C2_IPC_CHUNK_GC_INTERVAL").transpose()? {
+    if let Some(v) = catalog
+        .optional_f64("C2_IPC_CHUNK_GC_INTERVAL")
+        .transpose()?
+    {
         cfg.chunk_gc_interval_secs = v;
     }
-    if let Some(v) = parse_optional_f64(env, "C2_IPC_CHUNK_THRESHOLD_RATIO").transpose()? {
+    if let Some(v) = catalog
+        .optional_f64("C2_IPC_CHUNK_THRESHOLD_RATIO")
+        .transpose()?
+    {
         cfg.chunk_threshold_ratio = v;
     }
-    if let Some(v) = parse_optional_f64(env, "C2_IPC_CHUNK_ASSEMBLER_TIMEOUT").transpose()? {
+    if let Some(v) = catalog
+        .optional_f64("C2_IPC_CHUNK_ASSEMBLER_TIMEOUT")
+        .transpose()?
+    {
         cfg.chunk_assembler_timeout_secs = v;
     }
-    if let Some(v) = parse_optional_u64(env, "C2_IPC_MAX_REASSEMBLY_BYTES").transpose()? {
+    if let Some(v) = catalog
+        .optional_u64("C2_IPC_MAX_REASSEMBLY_BYTES")
+        .transpose()?
+    {
         cfg.max_reassembly_bytes = v;
     }
-    if let Some(v) = parse_optional_u64(env, "C2_IPC_CHUNK_SIZE").transpose()? {
+    if let Some(v) = catalog.optional_u64("C2_IPC_CHUNK_SIZE").transpose()? {
         cfg.chunk_size = v;
     }
     Ok(())
@@ -484,10 +591,14 @@ fn apply_base_overrides(cfg: &mut BaseIpcConfig, overrides: &BaseIpcConfigOverri
     }
 }
 
-fn resolve_shm_threshold(env: &EnvMap, override_value: Option<u64>) -> Result<u64, ConfigError> {
+fn resolve_shm_threshold(
+    catalog: &EnvCatalog,
+    override_value: Option<u64>,
+) -> Result<u64, ConfigError> {
     let shm_threshold = match override_value {
         Some(value) => value,
-        None => parse_optional_u64(env, "C2_SHM_THRESHOLD")
+        None => catalog
+            .optional_u64("C2_SHM_THRESHOLD")
             .transpose()?
             .unwrap_or(4096),
     };
@@ -597,11 +708,7 @@ fn optional_string(env: &EnvMap, key: &str) -> Option<String> {
 fn clean_string(value: Option<String>) -> Option<String> {
     value.and_then(|value| {
         let value = value.trim().to_string();
-        if value.is_empty() {
-            None
-        } else {
-            Some(value)
-        }
+        if value.is_empty() { None } else { Some(value) }
     })
 }
 
@@ -853,5 +960,56 @@ mod tests {
         );
         assert!(resolved.relay_use_proxy);
         assert!(resolved.relay.use_proxy);
+    }
+
+    #[test]
+    fn relay_client_resolution_ignores_relay_server_env() {
+        let sources = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[
+                ("C2_RELAY_ADDRESS", "http://127.0.0.1:8080"),
+                ("C2_RELAY_USE_PROXY", "yes"),
+                ("C2_RELAY_IDLE_TIMEOUT", "not-a-number"),
+            ]),
+        };
+
+        let resolved =
+            ConfigResolver::resolve_relay_client(RuntimeConfigOverrides::default(), sources)
+                .expect("relay client config should not parse relay server-only env");
+
+        assert_eq!(
+            resolved.relay_address.as_deref(),
+            Some("http://127.0.0.1:8080")
+        );
+        assert!(resolved.relay_use_proxy);
+    }
+
+    #[test]
+    fn relay_server_resolution_rejects_bad_relay_server_env() {
+        let sources = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[("C2_RELAY_IDLE_TIMEOUT", "not-a-number")]),
+        };
+
+        let err = ConfigResolver::resolve_relay_server(RuntimeConfigOverrides::default(), sources)
+            .expect_err("relay server config should parse idle timeout");
+
+        assert!(err.to_string().contains("C2_RELAY_IDLE_TIMEOUT"));
+    }
+
+    #[test]
+    fn relay_server_resolution_uses_single_runtime_override_source() {
+        let mut overrides = RuntimeConfigOverrides::default();
+        overrides.relay.idle_timeout_secs = Some(5);
+        overrides.relay_address = Some("http://127.0.0.1:8080".to_string());
+
+        let resolved = ConfigResolver::resolve_relay_server(overrides, ConfigSources::empty())
+            .expect("relay server should resolve from one override source");
+
+        assert_eq!(resolved.relay.idle_timeout_secs, 5);
+        assert_eq!(
+            resolved.relay_address.as_deref(),
+            Some("http://127.0.0.1:8080")
+        );
     }
 }

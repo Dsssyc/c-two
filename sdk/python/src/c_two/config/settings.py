@@ -17,10 +17,8 @@ class C2Settings:
         *,
         relay_address: str | None = None,
         shm_threshold: int | None = None,
-        relay_seeds: str | None = None,
     ) -> None:
         self._relay_address = _clean_optional_str(relay_address)
-        self._relay_seeds = _clean_optional_str(relay_seeds)
         self._shm_threshold: int | None = None
         if shm_threshold is not None:
             self.shm_threshold = shm_threshold
@@ -29,29 +27,11 @@ class C2Settings:
     def relay_address(self) -> str | None:
         if self._relay_address is not None:
             return self._relay_address
-        return _resolve_relay_config().get('relay_address')
+        return _resolve_relay_client_config().get('relay_address')
 
     @relay_address.setter
     def relay_address(self, value: str | None) -> None:
         self._relay_address = _clean_optional_str(value)
-
-    @property
-    def relay_seeds(self) -> str:
-        if self._relay_seeds is not None:
-            return self._relay_seeds
-        seeds = _resolve_relay_config().get('seeds', [])
-        return ','.join(str(seed) for seed in seeds)
-
-    @relay_seeds.setter
-    def relay_seeds(self, value: str | None) -> None:
-        self._relay_seeds = _clean_optional_str(value)
-
-    @property
-    def relay_seed_list(self) -> list[str]:
-        if self._relay_seeds is not None:
-            return [s.strip() for s in self._relay_seeds.split(',') if s.strip()]
-        seeds = _resolve_relay_config().get('seeds', [])
-        return [str(seed) for seed in seeds]
 
     @property
     def shm_threshold(self) -> int:
@@ -85,12 +65,6 @@ def _clean_optional_str(value: str | None) -> str | None:
     return value or None
 
 
-def _resolve_runtime_config() -> dict[str, Any]:
-    from c_two._native import resolve_runtime_config
-
-    return resolve_runtime_config()
-
-
 def _resolve_shm_threshold() -> int:
     from c_two._native import resolve_shm_threshold
 
@@ -98,18 +72,11 @@ def _resolve_shm_threshold() -> int:
     return int(resolve_shm_threshold(global_overrides))
 
 
-def _resolve_relay_config() -> dict[str, Any]:
-    from c_two._native import resolve_relay_config
+def _resolve_relay_client_config() -> dict[str, Any]:
+    from c_two._native import resolve_relay_client_config
 
     global_overrides = settings._global_overrides()  # noqa: SLF001
-    resolved = resolve_relay_config(global_overrides)
-    relay = resolved.get('relay', {})
-    if isinstance(relay, dict):
-        return {
-            **relay,
-            'relay_address': resolved.get('relay_address'),
-            'relay_use_proxy': resolved.get('relay_use_proxy', False),
-        }
+    resolved = resolve_relay_client_config(global_overrides)
     return {
         'relay_address': resolved.get('relay_address'),
         'relay_use_proxy': resolved.get('relay_use_proxy', False),

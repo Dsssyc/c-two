@@ -1,49 +1,26 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::PyDict;
 
 use c2_config::{
-    ClientIpcConfig, ClientIpcConfigOverrides, ConfigResolver, ConfigSources, RelayConfig,
+    ClientIpcConfig, ClientIpcConfigOverrides, ConfigResolver, ConfigSources,
     RuntimeConfigOverrides, ServerIpcConfig, ServerIpcConfigOverrides,
 };
 
 #[pyfunction]
-#[pyo3(signature = (server_overrides=None, client_overrides=None, global_overrides=None))]
-fn resolve_runtime_config(
-    py: Python<'_>,
-    server_overrides: Option<&Bound<'_, PyDict>>,
-    client_overrides: Option<&Bound<'_, PyDict>>,
-    global_overrides: Option<&Bound<'_, PyDict>>,
-) -> PyResult<Py<PyAny>> {
-    let overrides = runtime_overrides(server_overrides, client_overrides, global_overrides)?;
-    let resolved = ConfigResolver::resolve(overrides, ConfigSources::from_process())
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-    let dict = PyDict::new(py);
-    dict.set_item("relay_address", resolved.relay_address)?;
-    dict.set_item("relay_use_proxy", resolved.relay_use_proxy)?;
-    dict.set_item("shm_threshold", resolved.shm_threshold)?;
-    dict.set_item("relay", relay_to_dict(py, &resolved.relay)?)?;
-    dict.set_item("server_ipc", server_ipc_to_dict(py, &resolved.server_ipc)?)?;
-    dict.set_item("client_ipc", client_ipc_to_dict(py, &resolved.client_ipc)?)?;
-    Ok(dict.into_any().unbind())
-}
-
-#[pyfunction]
 #[pyo3(signature = (global_overrides=None))]
-fn resolve_relay_config(
+fn resolve_relay_client_config(
     py: Python<'_>,
     global_overrides: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
     let mut overrides = RuntimeConfigOverrides::default();
-    apply_global_overrides(&mut overrides, global_overrides)?;
-    let resolved = ConfigResolver::resolve_relay(overrides, ConfigSources::from_process())
+    apply_relay_client_overrides(&mut overrides, global_overrides)?;
+    let resolved = ConfigResolver::resolve_relay_client(overrides, ConfigSources::from_process())
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
     let dict = PyDict::new(py);
     dict.set_item("relay_address", resolved.relay_address)?;
     dict.set_item("relay_use_proxy", resolved.relay_use_proxy)?;
-    dict.set_item("relay", relay_to_dict(py, &resolved.relay)?)?;
     Ok(dict.into_any().unbind())
 }
 
@@ -51,7 +28,7 @@ fn resolve_relay_config(
 #[pyo3(signature = (global_overrides=None))]
 fn resolve_shm_threshold(global_overrides: Option<&Bound<'_, PyDict>>) -> PyResult<u64> {
     let mut overrides = RuntimeConfigOverrides::default();
-    apply_global_overrides(&mut overrides, global_overrides)?;
+    apply_shm_overrides(&mut overrides, global_overrides)?;
     ConfigResolver::resolve_shm_threshold(overrides.shm_threshold, ConfigSources::from_process())
         .map_err(|e| PyValueError::new_err(e.to_string()))
 }
@@ -65,7 +42,7 @@ fn resolve_server_ipc_config(
 ) -> PyResult<Py<PyAny>> {
     let mut runtime = RuntimeConfigOverrides::default();
     let server_overrides = server_overrides(overrides)?;
-    apply_global_overrides(&mut runtime, global_overrides)?;
+    apply_shm_overrides(&mut runtime, global_overrides)?;
     let resolved = ConfigResolver::resolve_server_ipc(
         server_overrides,
         runtime,
@@ -84,7 +61,7 @@ fn resolve_client_ipc_config(
 ) -> PyResult<Py<PyAny>> {
     let mut runtime = RuntimeConfigOverrides::default();
     let client_overrides = client_overrides(overrides)?;
-    apply_global_overrides(&mut runtime, global_overrides)?;
+    apply_shm_overrides(&mut runtime, global_overrides)?;
     let resolved = ConfigResolver::resolve_client_ipc(
         client_overrides,
         runtime,
@@ -94,21 +71,19 @@ fn resolve_client_ipc_config(
     Ok(client_ipc_to_dict(py, &resolved)?.into_any().unbind())
 }
 
-fn runtime_overrides(
-    server: Option<&Bound<'_, PyDict>>,
-    client: Option<&Bound<'_, PyDict>>,
+fn apply_relay_client_overrides(
+    overrides: &mut RuntimeConfigOverrides,
     global: Option<&Bound<'_, PyDict>>,
-) -> PyResult<RuntimeConfigOverrides> {
-    let mut overrides = RuntimeConfigOverrides {
-        server_ipc: server_overrides(server)?,
-        client_ipc: client_overrides(client)?,
-        ..Default::default()
+) -> PyResult<()> {
+    let Some(global) = global else {
+        return Ok(());
     };
-    apply_global_overrides(&mut overrides, global)?;
-    Ok(overrides)
+    overrides.relay_address = get_opt(global, "relay_address")?;
+    overrides.relay_use_proxy = get_opt(global, "relay_use_proxy")?;
+    Ok(())
 }
 
-fn apply_global_overrides(
+fn apply_shm_overrides(
     overrides: &mut RuntimeConfigOverrides,
     global: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<()> {
@@ -116,8 +91,6 @@ fn apply_global_overrides(
         return Ok(());
     };
     overrides.shm_threshold = get_opt(global, "shm_threshold")?;
-    overrides.relay_address = get_opt(global, "relay_address")?;
-    overrides.relay_use_proxy = get_opt(global, "relay_use_proxy")?;
     Ok(())
 }
 
@@ -212,21 +185,6 @@ where
     }
 }
 
-fn relay_to_dict<'py>(py: Python<'py>, relay: &RelayConfig) -> PyResult<Bound<'py, PyDict>> {
-    let dict = PyDict::new(py);
-    dict.set_item("bind", &relay.bind)?;
-    dict.set_item("relay_id", &relay.relay_id)?;
-    dict.set_item("advertise_url", &relay.advertise_url)?;
-    dict.set_item("seeds", PyList::new(py, &relay.seeds)?)?;
-    dict.set_item("idle_timeout_secs", relay.idle_timeout_secs)?;
-    dict.set_item("use_proxy", relay.use_proxy)?;
-    dict.set_item(
-        "anti_entropy_interval_secs",
-        relay.anti_entropy_interval.as_secs_f64(),
-    )?;
-    Ok(dict)
-}
-
 fn server_ipc_to_dict<'py>(py: Python<'py>, cfg: &ServerIpcConfig) -> PyResult<Bound<'py, PyDict>> {
     let dict = base_ipc_to_dict(py, &cfg.base)?;
     dict.set_item("shm_threshold", cfg.shm_threshold)?;
@@ -266,8 +224,7 @@ fn base_ipc_to_dict<'py>(
 }
 
 pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(resolve_runtime_config, m)?)?;
-    m.add_function(wrap_pyfunction!(resolve_relay_config, m)?)?;
+    m.add_function(wrap_pyfunction!(resolve_relay_client_config, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_shm_threshold, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_server_ipc_config, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_client_ipc_config, m)?)?;

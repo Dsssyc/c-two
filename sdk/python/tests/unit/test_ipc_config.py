@@ -192,6 +192,36 @@ class TestBuildServerConfig:
 
         assert _relay_use_proxy() is True
 
+    def test_proxy_policy_does_not_resolve_relay_server_env(self, monkeypatch):
+        monkeypatch.setenv('C2_ENV_FILE', '')
+        monkeypatch.setenv('C2_RELAY_USE_PROXY', '1')
+        monkeypatch.setenv('C2_RELAY_IDLE_TIMEOUT', 'not-a-number')
+
+        assert _relay_use_proxy() is True
+
+    def test_native_does_not_export_full_runtime_resolver(self):
+        from c_two import _native
+
+        assert not hasattr(_native, 'resolve_runtime_config')
+
+    def test_relay_client_native_ignores_unrelated_global_overrides(self):
+        from c_two._native import resolve_relay_client_config
+
+        resolved = resolve_relay_client_config({'shm_threshold': object()})
+
+        assert resolved['relay_address'] is None
+        assert resolved['relay_use_proxy'] is False
+
+    def test_ipc_native_ignores_unrelated_global_overrides(self):
+        from c_two._native import resolve_server_ipc_config
+
+        resolved = resolve_server_ipc_config(
+            {},
+            {'relay_address': object(), 'relay_use_proxy': object()},
+        )
+
+        assert resolved['pool_segment_size'] == 268_435_456
+
     def test_server_config_does_not_resolve_relay_env(self, monkeypatch):
         monkeypatch.setenv('C2_ENV_FILE', '')
         monkeypatch.setenv('C2_RELAY_ANTI_ENTROPY_INTERVAL', 'not-a-number')
@@ -212,10 +242,17 @@ class TestBuildServerConfig:
         monkeypatch.setenv('C2_RELAY_SEEDS', 'http://127.0.0.1:8081')
         monkeypatch.setenv('C2_IPC_POOL_SEGMENT_SIZE', 'not-a-number')
         settings.relay_address = None
-        settings.relay_seeds = None
 
         assert settings.relay_address == 'http://127.0.0.1:8080'
-        assert settings.relay_seed_list == ['http://127.0.0.1:8081']
+        assert not hasattr(settings, 'relay_seed_list')
+
+    def test_relay_settings_do_not_resolve_relay_server_env(self, monkeypatch):
+        monkeypatch.setenv('C2_ENV_FILE', '')
+        monkeypatch.setenv('C2_RELAY_ADDRESS', 'http://127.0.0.1:8080')
+        monkeypatch.setenv('C2_RELAY_IDLE_TIMEOUT', 'not-a-number')
+        settings.relay_address = None
+
+        assert settings.relay_address == 'http://127.0.0.1:8080'
 
     def test_shm_threshold_does_not_resolve_relay_env(self, monkeypatch):
         monkeypatch.setenv('C2_ENV_FILE', '')

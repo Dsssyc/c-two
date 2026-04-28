@@ -75,7 +75,7 @@ pub fn run(args: RelayArgs) -> Result<()> {
         },
         ..Default::default()
     };
-    let resolved = ConfigResolver::resolve_relay(overrides, ConfigSources::from_process())
+    let resolved = ConfigResolver::resolve_relay_server(overrides, ConfigSources::from_process())
         .map_err(|e| anyhow!("{e}"))?;
     let config = resolved.relay;
     let display_bind = config.bind.clone();
