@@ -1,8 +1,7 @@
 """Native server bridge — Python wrapper around ``RustServer``.
 
-Preserves the same interface as the Python :class:`Server` for
-``registry.py`` compatibility, but delegates transport to the Rust
-``c2-server`` crate via PyO3 bindings.
+Provides the Python CRM dispatch surface while delegating transport to the
+Rust ``c2-server`` crate via PyO3 bindings.
 
 CRM domain logic (CRM instance creation, method discovery, dispatch tables,
 shutdown callbacks) remains in Python.  Only the UDS accept loop,
@@ -85,6 +84,7 @@ class NativeServerBridge:
         *,
         name: str | None = None,
         shm_threshold: int = 4096,
+        hold_warn_seconds: float = 60.0,
     ) -> None:
         self._config = ipc_config or ServerIPCConfig()
         self._address = bind_address
@@ -98,8 +98,7 @@ class NativeServerBridge:
         self._default_name: str | None = None
         self._started = False
 
-        hold_warn = float(os.environ.get('C2_HOLD_WARN_SECONDS', '60'))
-        self._hold_registry = HoldRegistry(warn_threshold=hold_warn)
+        self._hold_registry = HoldRegistry(warn_threshold=hold_warn_seconds)
         self._hold_sweep_interval = 10
 
         from c_two._native import RustServer
@@ -110,7 +109,6 @@ class NativeServerBridge:
             pool_enabled=self._config.pool_enabled,
             pool_segment_size=self._config.pool_segment_size,
             max_pool_segments=self._config.max_pool_segments,
-            max_pool_memory=self._config.max_pool_memory,
             reassembly_segment_size=self._config.reassembly_segment_size,
             reassembly_max_segments=self._config.reassembly_max_segments,
             max_frame_size=self._config.max_frame_size,

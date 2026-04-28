@@ -12,7 +12,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyTuple};
 
@@ -116,7 +116,7 @@ impl PyServer {
     #[new]
     #[pyo3(signature = (
         address, shm_threshold, pool_enabled, pool_segment_size,
-        max_pool_segments, max_pool_memory, reassembly_segment_size,
+        max_pool_segments, reassembly_segment_size,
         reassembly_max_segments, max_frame_size, max_payload_size,
         max_pending_requests, pool_decay_seconds, heartbeat_interval,
         heartbeat_timeout, max_total_chunks, chunk_gc_interval,
@@ -129,7 +129,6 @@ impl PyServer {
         pool_enabled: bool,
         pool_segment_size: u64,
         max_pool_segments: u32,
-        max_pool_memory: u64,
         reassembly_segment_size: u64,
         reassembly_max_segments: u32,
         max_frame_size: u64,
@@ -150,7 +149,11 @@ impl PyServer {
                 pool_enabled,
                 pool_segment_size,
                 max_pool_segments,
-                max_pool_memory,
+                max_pool_memory: pool_segment_size
+                    .checked_mul(u64::from(max_pool_segments))
+                    .ok_or_else(|| {
+                        PyRuntimeError::new_err("max_pool_memory derived value overflowed")
+                    })?,
                 reassembly_segment_size,
                 reassembly_max_segments,
                 max_total_chunks,
@@ -168,6 +171,9 @@ impl PyServer {
             heartbeat_interval_secs: heartbeat_interval,
             heartbeat_timeout_secs: heartbeat_timeout,
         };
+        config
+            .validate()
+            .map_err(|e| PyValueError::new_err(format!("invalid IPC server config: {e}")))?;
         let server =
             Server::new(address, config).map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
         Ok(Self {

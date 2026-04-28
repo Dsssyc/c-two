@@ -1,7 +1,8 @@
 """Frozen IPC configuration dataclasses backed by the Rust config resolver."""
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
+import math
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -15,7 +16,7 @@ class BaseIPCConfig:
     pool_enabled: bool = True
     pool_segment_size: int = 268_435_456        # 256 MB
     max_pool_segments: int = 4
-    max_pool_memory: int = 1_073_741_824        # 1 GB
+    max_pool_memory: int = field(init=False)
     reassembly_segment_size: int = 67_108_864   # 64 MB
     reassembly_max_segments: int = 4
     max_total_chunks: int = 512
@@ -44,9 +45,18 @@ class BaseIPCConfig:
                 f'chunk_threshold_ratio must be in (0, 1], '
                 f'got {self.chunk_threshold_ratio}'
             )
+        if not math.isfinite(self.chunk_gc_interval):
+            raise ValueError(
+                f'chunk_gc_interval must be finite, got {self.chunk_gc_interval}'
+            )
         if self.chunk_gc_interval <= 0:
             raise ValueError(
                 f'chunk_gc_interval must be positive, got {self.chunk_gc_interval}'
+            )
+        if not math.isfinite(self.chunk_assembler_timeout):
+            raise ValueError(
+                f'chunk_assembler_timeout must be finite, '
+                f'got {self.chunk_assembler_timeout}'
             )
         if self.chunk_assembler_timeout <= 0:
             raise ValueError(
@@ -91,19 +101,26 @@ class ServerIPCConfig(BaseIPCConfig):
                 f'pool_segment_size ({self.pool_segment_size}) must not exceed '
                 f'max_payload_size ({self.max_payload_size})'
             )
+        if not math.isfinite(self.pool_decay_seconds):
+            raise ValueError(
+                f'pool_decay_seconds must be finite, got {self.pool_decay_seconds}'
+            )
+        if not math.isfinite(self.heartbeat_interval):
+            raise ValueError(
+                f'heartbeat_interval must be finite, got {self.heartbeat_interval}'
+            )
         if self.heartbeat_interval < 0:
             raise ValueError(
                 f'heartbeat_interval must be >= 0, got {self.heartbeat_interval}'
+            )
+        if not math.isfinite(self.heartbeat_timeout):
+            raise ValueError(
+                f'heartbeat_timeout must be finite, got {self.heartbeat_timeout}'
             )
         if self.heartbeat_interval > 0 and self.heartbeat_timeout <= self.heartbeat_interval:
             raise ValueError(
                 f'heartbeat_timeout ({self.heartbeat_timeout}) must exceed '
                 f'heartbeat_interval ({self.heartbeat_interval})'
-            )
-        if self.max_pool_memory < self.pool_segment_size:
-            raise ValueError(
-                f'max_pool_memory ({self.max_pool_memory}) must be >= '
-                f'pool_segment_size ({self.pool_segment_size})'
             )
 
 
@@ -114,8 +131,8 @@ class ClientIPCConfig(BaseIPCConfig):
     reassembly_segment_size: int = 67_108_864   # 64 MB
 
 
-_SERVER_FIELD_NAMES = {f.name for f in fields(ServerIPCConfig)}
-_CLIENT_FIELD_NAMES = {f.name for f in fields(ClientIPCConfig)}
+_SERVER_INIT_FIELD_NAMES = {f.name for f in fields(ServerIPCConfig) if f.init}
+_CLIENT_INIT_FIELD_NAMES = {f.name for f in fields(ClientIPCConfig) if f.init}
 
 
 def build_server_config(
@@ -123,13 +140,13 @@ def build_server_config(
     **kwargs: object,
 ) -> ServerIPCConfig:
     """Build a ``ServerIPCConfig`` through Rust config resolution."""
-    _reject_unknown_kwargs(kwargs, _SERVER_FIELD_NAMES)
+    _reject_unknown_kwargs(kwargs, _SERVER_INIT_FIELD_NAMES)
     native = _native_resolver()
     resolved = native.resolve_server_ipc_config(
         _clean_overrides(kwargs),
         _global_overrides(settings),
     )
-    return ServerIPCConfig(**_dataclass_kwargs(resolved, _SERVER_FIELD_NAMES))
+    return ServerIPCConfig(**_dataclass_kwargs(resolved, _SERVER_INIT_FIELD_NAMES))
 
 
 def build_client_config(
@@ -137,13 +154,13 @@ def build_client_config(
     **kwargs: object,
 ) -> ClientIPCConfig:
     """Build a ``ClientIPCConfig`` through Rust config resolution."""
-    _reject_unknown_kwargs(kwargs, _CLIENT_FIELD_NAMES)
+    _reject_unknown_kwargs(kwargs, _CLIENT_INIT_FIELD_NAMES)
     native = _native_resolver()
     resolved = native.resolve_client_ipc_config(
         _clean_overrides(kwargs),
         _global_overrides(settings),
     )
-    return ClientIPCConfig(**_dataclass_kwargs(resolved, _CLIENT_FIELD_NAMES))
+    return ClientIPCConfig(**_dataclass_kwargs(resolved, _CLIENT_INIT_FIELD_NAMES))
 
 
 def _native_resolver() -> Any:

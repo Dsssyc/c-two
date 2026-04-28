@@ -73,7 +73,7 @@ fn get_json(relay: &str, path: &str) -> Result<Value> {
 }
 
 fn resolve_relay_use_proxy(sources: ConfigSources) -> Result<bool> {
-    let resolved = ConfigResolver::resolve(RuntimeConfigOverrides::default(), sources)
+    let resolved = ConfigResolver::resolve_relay(RuntimeConfigOverrides::default(), sources)
         .map_err(|e| anyhow!("{e}"))?;
     Ok(resolved.relay_use_proxy)
 }

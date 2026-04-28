@@ -30,6 +30,33 @@ fn resolve_runtime_config(
 }
 
 #[pyfunction]
+#[pyo3(signature = (global_overrides=None))]
+fn resolve_relay_config(
+    py: Python<'_>,
+    global_overrides: Option<&Bound<'_, PyDict>>,
+) -> PyResult<Py<PyAny>> {
+    let mut overrides = RuntimeConfigOverrides::default();
+    apply_global_overrides(&mut overrides, global_overrides)?;
+    let resolved = ConfigResolver::resolve_relay(overrides, ConfigSources::from_process())
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+    let dict = PyDict::new(py);
+    dict.set_item("relay_address", resolved.relay_address)?;
+    dict.set_item("relay_use_proxy", resolved.relay_use_proxy)?;
+    dict.set_item("relay", relay_to_dict(py, &resolved.relay)?)?;
+    Ok(dict.into_any().unbind())
+}
+
+#[pyfunction]
+#[pyo3(signature = (global_overrides=None))]
+fn resolve_shm_threshold(global_overrides: Option<&Bound<'_, PyDict>>) -> PyResult<u64> {
+    let mut overrides = RuntimeConfigOverrides::default();
+    apply_global_overrides(&mut overrides, global_overrides)?;
+    ConfigResolver::resolve_shm_threshold(overrides.shm_threshold, ConfigSources::from_process())
+        .map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
+#[pyfunction]
 #[pyo3(signature = (overrides=None, global_overrides=None))]
 fn resolve_server_ipc_config(
     py: Python<'_>,
@@ -37,13 +64,15 @@ fn resolve_server_ipc_config(
     global_overrides: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
     let mut runtime = RuntimeConfigOverrides::default();
-    runtime.server_ipc = server_overrides(overrides)?;
+    let server_overrides = server_overrides(overrides)?;
     apply_global_overrides(&mut runtime, global_overrides)?;
-    let resolved = ConfigResolver::resolve(runtime, ConfigSources::from_process())
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(server_ipc_to_dict(py, &resolved.server_ipc)?
-        .into_any()
-        .unbind())
+    let resolved = ConfigResolver::resolve_server_ipc(
+        server_overrides,
+        runtime,
+        ConfigSources::from_process(),
+    )
+    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(server_ipc_to_dict(py, &resolved)?.into_any().unbind())
 }
 
 #[pyfunction]
@@ -54,13 +83,15 @@ fn resolve_client_ipc_config(
     global_overrides: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
     let mut runtime = RuntimeConfigOverrides::default();
-    runtime.client_ipc = client_overrides(overrides)?;
+    let client_overrides = client_overrides(overrides)?;
     apply_global_overrides(&mut runtime, global_overrides)?;
-    let resolved = ConfigResolver::resolve(runtime, ConfigSources::from_process())
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok(client_ipc_to_dict(py, &resolved.client_ipc)?
-        .into_any()
-        .unbind())
+    let resolved = ConfigResolver::resolve_client_ipc(
+        client_overrides,
+        runtime,
+        ConfigSources::from_process(),
+    )
+    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(client_ipc_to_dict(py, &resolved)?.into_any().unbind())
 }
 
 fn runtime_overrides(
@@ -236,6 +267,8 @@ fn base_ipc_to_dict<'py>(
 
 pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(resolve_runtime_config, m)?)?;
+    m.add_function(wrap_pyfunction!(resolve_relay_config, m)?)?;
+    m.add_function(wrap_pyfunction!(resolve_shm_threshold, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_server_ipc_config, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_client_ipc_config, m)?)?;
     Ok(())

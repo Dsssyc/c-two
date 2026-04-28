@@ -122,6 +122,13 @@ pub struct ResolvedRuntimeConfig {
     pub relay_use_proxy: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct ResolvedRelayConfig {
+    pub relay_address: Option<String>,
+    pub relay: RelayConfig,
+    pub relay_use_proxy: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigError {
     message: String,
@@ -151,45 +158,85 @@ impl ConfigResolver {
         sources: ConfigSources,
     ) -> Result<ResolvedRuntimeConfig, ConfigError> {
         let env = resolve_env(sources)?;
-        reject_removed_env(&env)?;
 
-        let shm_threshold = match overrides.shm_threshold {
-            Some(value) => value,
-            None => parse_optional_u64(&env, "C2_SHM_THRESHOLD")
-                .transpose()?
-                .unwrap_or(4096),
-        };
-        if shm_threshold == 0 {
-            return Err(ConfigError::new("shm_threshold must be > 0"));
-        }
+        let shm_threshold = resolve_shm_threshold(&env, overrides.shm_threshold)?;
 
-        let relay_address = overrides
-            .relay_address
-            .or_else(|| optional_string(&env, "C2_RELAY_ADDRESS"));
-        let relay_use_proxy = match overrides.relay_use_proxy {
-            Some(value) => value,
-            None => parse_optional_bool(&env, "C2_RELAY_USE_PROXY")
-                .transpose()?
-                .unwrap_or(false),
-        };
-
-        let relay = resolve_relay_config(&env, overrides.relay)?;
-        let relay = RelayConfig {
-            use_proxy: relay_use_proxy,
-            ..relay
-        };
+        let resolved_relay = resolve_relay_only(&env, &overrides)?;
         let server_ipc = resolve_server_ipc_config(&env, overrides.server_ipc, shm_threshold)?;
         let client_ipc = resolve_client_ipc_config(&env, overrides.client_ipc, shm_threshold)?;
 
         Ok(ResolvedRuntimeConfig {
-            relay_address,
-            relay,
+            relay_address: resolved_relay.relay_address,
+            relay: resolved_relay.relay,
             server_ipc,
             client_ipc,
             shm_threshold,
-            relay_use_proxy,
+            relay_use_proxy: resolved_relay.relay_use_proxy,
         })
     }
+
+    pub fn resolve_relay(
+        overrides: RuntimeConfigOverrides,
+        sources: ConfigSources,
+    ) -> Result<ResolvedRelayConfig, ConfigError> {
+        let env = resolve_env(sources)?;
+        resolve_relay_only(&env, &overrides)
+    }
+
+    pub fn resolve_server_ipc(
+        overrides: ServerIpcConfigOverrides,
+        global_overrides: RuntimeConfigOverrides,
+        sources: ConfigSources,
+    ) -> Result<ServerIpcConfig, ConfigError> {
+        let env = resolve_env(sources)?;
+        let shm_threshold = resolve_shm_threshold(&env, global_overrides.shm_threshold)?;
+        resolve_server_ipc_config(&env, overrides, shm_threshold)
+    }
+
+    pub fn resolve_client_ipc(
+        overrides: ClientIpcConfigOverrides,
+        global_overrides: RuntimeConfigOverrides,
+        sources: ConfigSources,
+    ) -> Result<ClientIpcConfig, ConfigError> {
+        let env = resolve_env(sources)?;
+        let shm_threshold = resolve_shm_threshold(&env, global_overrides.shm_threshold)?;
+        resolve_client_ipc_config(&env, overrides, shm_threshold)
+    }
+
+    pub fn resolve_shm_threshold(
+        override_value: Option<u64>,
+        sources: ConfigSources,
+    ) -> Result<u64, ConfigError> {
+        let env = resolve_env(sources)?;
+        resolve_shm_threshold(&env, override_value)
+    }
+}
+
+fn resolve_relay_only(
+    env: &EnvMap,
+    overrides: &RuntimeConfigOverrides,
+) -> Result<ResolvedRelayConfig, ConfigError> {
+    let relay_address = overrides
+        .relay_address
+        .clone()
+        .or_else(|| optional_string(env, "C2_RELAY_ADDRESS"));
+    let relay_use_proxy = match overrides.relay_use_proxy {
+        Some(value) => value,
+        None => parse_optional_bool(env, "C2_RELAY_USE_PROXY")
+            .transpose()?
+            .unwrap_or(false),
+    };
+    let relay = resolve_relay_config(env, overrides.relay.clone())?;
+    let relay = RelayConfig {
+        use_proxy: relay_use_proxy,
+        ..relay
+    };
+
+    Ok(ResolvedRelayConfig {
+        relay_address,
+        relay,
+        relay_use_proxy,
+    })
 }
 
 fn resolve_env(sources: ConfigSources) -> Result<EnvMap, ConfigError> {
@@ -235,15 +282,6 @@ fn resolve_env(sources: ConfigSources) -> Result<EnvMap, ConfigError> {
     }
 
     Ok(env)
-}
-
-fn reject_removed_env(env: &EnvMap) -> Result<(), ConfigError> {
-    if env.contains_key("C2_IPC_MAX_POOL_MEMORY") {
-        return Err(ConfigError::new(
-            "C2_IPC_MAX_POOL_MEMORY is no longer supported; max_pool_memory is derived from C2_IPC_POOL_SEGMENT_SIZE * C2_IPC_MAX_POOL_SEGMENTS",
-        ));
-    }
-    Ok(())
 }
 
 fn resolve_relay_config(
@@ -446,6 +484,19 @@ fn apply_base_overrides(cfg: &mut BaseIpcConfig, overrides: &BaseIpcConfigOverri
     }
 }
 
+fn resolve_shm_threshold(env: &EnvMap, override_value: Option<u64>) -> Result<u64, ConfigError> {
+    let shm_threshold = match override_value {
+        Some(value) => value,
+        None => parse_optional_u64(env, "C2_SHM_THRESHOLD")
+            .transpose()?
+            .unwrap_or(4096),
+    };
+    if shm_threshold == 0 {
+        return Err(ConfigError::new("shm_threshold must be > 0"));
+    }
+    Ok(shm_threshold)
+}
+
 fn apply_flat_base_overrides_to_server(
     cfg: &mut ServerIpcConfig,
     overrides: &ServerIpcConfigOverrides,
@@ -546,7 +597,11 @@ fn optional_string(env: &EnvMap, key: &str) -> Option<String> {
 fn clean_string(value: Option<String>) -> Option<String> {
     value.and_then(|value| {
         let value = value.trim().to_string();
-        if value.is_empty() { None } else { Some(value) }
+        if value.is_empty() {
+            None
+        } else {
+            Some(value)
+        }
     })
 }
 
@@ -696,19 +751,6 @@ mod tests {
     }
 
     #[test]
-    fn max_pool_memory_env_is_rejected() {
-        let sources = ConfigSources {
-            env_file: EnvFilePolicy::Disabled,
-            process_env: env(&[("C2_IPC_MAX_POOL_MEMORY", "1")]),
-        };
-
-        let err = ConfigResolver::resolve(RuntimeConfigOverrides::default(), sources)
-            .expect_err("removed env var should fail");
-
-        assert!(err.to_string().contains("C2_IPC_MAX_POOL_MEMORY"));
-    }
-
-    #[test]
     fn server_pool_segment_must_not_exceed_payload_limit() {
         let mut overrides = RuntimeConfigOverrides::default();
         overrides.server_ipc.pool_segment_size = Some(2 * 1024 * 1024);
@@ -758,6 +800,38 @@ mod tests {
 
         assert!(err.to_string().contains("chunk_gc_interval_secs"));
         assert!(err.to_string().contains("finite"));
+    }
+
+    #[test]
+    fn scoped_shm_threshold_ignores_relay_env() {
+        let sources = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[
+                ("C2_SHM_THRESHOLD", "8192"),
+                ("C2_RELAY_ANTI_ENTROPY_INTERVAL", "not-a-number"),
+            ]),
+        };
+
+        let threshold =
+            ConfigResolver::resolve_shm_threshold(None, sources).expect("threshold should resolve");
+
+        assert_eq!(threshold, 8192);
+    }
+
+    #[test]
+    fn scoped_shm_threshold_ignores_ipc_env() {
+        let sources = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[
+                ("C2_SHM_THRESHOLD", "8192"),
+                ("C2_IPC_MAX_FRAME_SIZE", "not-a-number"),
+            ]),
+        };
+
+        let threshold =
+            ConfigResolver::resolve_shm_threshold(None, sources).expect("threshold should resolve");
+
+        assert_eq!(threshold, 8192);
     }
 
     #[test]

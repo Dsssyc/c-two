@@ -79,7 +79,6 @@ def _pool_config(max_segs: int = 4) -> ServerIPCConfig:
     return ServerIPCConfig(
         pool_segment_size=_SEG_SIZE,
         max_pool_segments=max_segs,
-        max_pool_memory=_SEG_SIZE * max_segs,
     )
 
 

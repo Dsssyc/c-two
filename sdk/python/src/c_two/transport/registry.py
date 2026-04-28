@@ -62,13 +62,10 @@ _NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 def _relay_use_proxy() -> bool:
     """Resolve relay proxy policy through the shared Rust config resolver."""
-    try:
-        from c_two._native import resolve_runtime_config
-    except (ImportError, AttributeError):
-        val = os.environ.get("C2_RELAY_USE_PROXY", "").strip().lower()
-        return val in ("1", "true", "yes")
+    from c_two._native import resolve_relay_config
 
-    return bool(resolve_runtime_config().get("relay_use_proxy", False))
+    resolved = resolve_relay_config(settings._global_overrides())  # noqa: SLF001
+    return bool(resolved.get("relay_use_proxy", False))
 
 
 def _relay_urlopen(req, timeout: float = 5.0):
@@ -869,7 +866,6 @@ class _ProcessRegistry:
                 pool_enabled=cfg.pool_enabled,
                 pool_segment_size=cfg.pool_segment_size,
                 max_pool_segments=cfg.max_pool_segments,
-                max_pool_memory=cfg.max_pool_memory,
                 reassembly_segment_size=cfg.reassembly_segment_size,
                 reassembly_max_segments=cfg.reassembly_max_segments,
                 max_total_chunks=cfg.max_total_chunks,

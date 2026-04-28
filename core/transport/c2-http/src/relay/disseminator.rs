@@ -18,10 +18,6 @@ pub struct FullBroadcast {
 }
 
 impl FullBroadcast {
-    pub fn new() -> Self {
-        Self::with_proxy_policy(crate::relay_use_proxy())
-    }
-
     pub fn with_proxy_policy(use_proxy: bool) -> Self {
         Self {
             http_client: crate::relay_client_builder_with_proxy(use_proxy)

@@ -79,11 +79,14 @@ Two-language design: Python owns domain logic (CRM + Resource + client code); Ru
 
 ### 3. Config Layer (`sdk/python/src/c_two/config/`)
 
-Runtime defaults and environment parsing are migrating to the shared Rust config resolver. Python keeps ergonomic code-level override APIs and compatibility dataclasses, but relay server configuration belongs to the standalone Rust `c3 relay` runtime.
+Unified configuration is resolved by the Rust `c2-config` resolver. Python
+stores SDK code-level overrides and asks the native resolver for env / `.env`
+and default values. Relay server configuration belongs to the standalone Rust
+`c3 relay` runtime.
 
 | File | Purpose |
 |------|---------|
-| `settings.py` | Compatibility settings facade during resolver migration; do not add new relay server ownership here |
+| `settings.py` | `C2Settings` facade for SDK code overrides such as `cc.set_relay()` and `cc.set_config()` |
 | `ipc.py` | Frozen dataclasses: `BaseIPCConfig`, `ServerIPCConfig`, `ClientIPCConfig` + `build_server_config()` / `build_client_config()` |
 
 Config priority chain: explicit kwargs (`cc.set_*()`) → process environment / `.env` via the resolver → Rust defaults.
@@ -111,7 +114,8 @@ The transport layer is a thin Python orchestration shell around a Rust-native co
 - **IPC** (`ipc://`): UDS control channel + POSIX SHM data plane via Rust (`c2-ipc`, `c2-server`).
 - **HTTP** (`http://`): HTTP relay for cross-machine transport via Rust (`c2-http`).
 
-**Address priority:** `cc.set_address()` > `C2_IPC_ADDRESS` env var > auto-generated UUID path.
+**Server address:** Python resource servers create an auto-generated `ipc://` address.
+Use `cc.server_address()` after registration to inspect it.
 
 **Relay priority:** `cc.set_relay()` > `C2_RELAY_ADDRESS` env var > none (standalone mode).
 
@@ -231,7 +235,6 @@ The registry exposes a flat top-level API on the `cc` namespace:
 import c_two as cc
 
 # Server side
-cc.set_address('ipc://my_server')                       # optional: explicit address
 cc.set_relay('http://relay-host:8080')                   # optional: relay for name resolution
 cc.set_server(pool_segment_size=2*1024*1024*1024)        # optional: tune IPC config
 cc.register(Grid, grid_instance, name='grid')           # register a Grid resource
@@ -284,7 +287,6 @@ Wire codec and transport code in Rust (`c2-wire`, `c2-ipc`, `c2-mem`) prioritize
 ### Environment Variables
 | Variable | Purpose | Default |
 |----------|---------|---------|
-| `C2_IPC_ADDRESS` | Override auto-generated IPC server address | auto UUID |
 | `C2_RELAY_ADDRESS` | HTTP relay URL for CRM registration and client name resolution | (none) |
 | `C2_RELAY_BIND` | Relay HTTP listen address (`c3 relay --bind`) | `0.0.0.0:8080` |
 | `C2_RELAY_ID` | Stable relay identifier for mesh protocol | auto UUID |
@@ -295,14 +297,26 @@ Wire codec and transport code in Rust (`c2-wire`, `c2-ipc`, `c2-mem`) prioritize
 | `C2_SHM_THRESHOLD` | Payload size threshold for SHM vs inline | 4096 (4 KB) |
 | `C2_IPC_POOL_SEGMENT_SIZE` | Buddy pool segment size in bytes | 268435456 (256 MB) |
 | `C2_IPC_MAX_POOL_SEGMENTS` | Max buddy pool segments (1–255) | 4 |
-| `C2_IPC_MAX_POOL_MEMORY` | Max total pool memory in bytes | segment_size × max_segments |
 | `C2_IPC_POOL_DECAY_SECONDS` | Idle segment decay time | 60.0 |
-| `C2_IPC_MAX_FRAME_SIZE` | Max inline frame size | 131072 (128 KB) |
-| `C2_IPC_MAX_PAYLOAD_SIZE` | Max single-call payload size | 2147483648 (2 GB) |
-| `C2_IPC_HEARTBEAT_INTERVAL` | Heartbeat interval seconds (0 disables) | 30.0 |
+| `C2_IPC_POOL_ENABLED` | Enable/disable SHM pool | true |
+| `C2_IPC_MAX_FRAME_SIZE` | Max inline frame size | 2147483648 (2 GB) |
+| `C2_IPC_MAX_PAYLOAD_SIZE` | Max single-call payload size | 17179869184 (16 GB) |
+| `C2_IPC_MAX_PENDING_REQUESTS` | Max concurrent pending requests per connection | 1024 |
+| `C2_IPC_HEARTBEAT_INTERVAL` | Heartbeat interval seconds (0 disables) | 15.0 |
+| `C2_IPC_HEARTBEAT_TIMEOUT` | Heartbeat timeout seconds | 30.0 |
+| `C2_IPC_MAX_TOTAL_CHUNKS` | Max total in-flight chunks across all connections | 512 |
+| `C2_IPC_CHUNK_GC_INTERVAL` | Chunk GC sweep interval seconds | 5.0 |
+| `C2_IPC_CHUNK_THRESHOLD_RATIO` | Fraction of max frame size that triggers chunking | 0.9 |
+| `C2_IPC_CHUNK_ASSEMBLER_TIMEOUT` | Chunk assembler timeout seconds | 60.0 |
+| `C2_IPC_MAX_REASSEMBLY_BYTES` | Max reassembly buffer memory | 8589934592 (8 GB) |
+| `C2_IPC_CHUNK_SIZE` | Individual chunk size | 131072 (128 KB) |
+| `C2_IPC_REASSEMBLY_SEGMENT_SIZE` | Reassembly pool segment size | 67108864 (64 MB) |
+| `C2_IPC_REASSEMBLY_MAX_SEGMENTS` | Max reassembly pool segments | 4 |
 | `C2_ENV_FILE` | Path to `.env` file; empty string disables | `.env` |
 
-Runtime `C2_*` variables can be set in `.env` and are migrating to the shared Rust resolver as the canonical source. See `.env.example` for the full reference.
+The Rust `c2-config` resolver loads `.env` and process environment values.
+Precedence is explicit code overrides > process environment / `.env` > defaults.
+See `.env.example` for the full reference.
 
 ## Python Version
 

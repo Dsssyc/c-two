@@ -66,7 +66,6 @@ class TestConcurrentCallSafety:
         cfg = ServerIPCConfig(
             pool_segment_size=1 << 20,  # 1MB
             max_pool_segments=2,
-            max_pool_memory=2 << 20,
         )
         server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IEcho, EchoImpl(), name='echo')
@@ -111,7 +110,6 @@ class TestConcurrentCallSafety:
         cfg = ServerIPCConfig(
             pool_segment_size=1 << 20,
             max_pool_segments=2,
-            max_pool_memory=2 << 20,
         )
         server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IEcho, EchoImpl(), name='echo')
@@ -178,7 +176,6 @@ class TestDoubleShutdown:
         cfg = ServerIPCConfig(
             pool_segment_size=65536,
             max_pool_segments=1,
-            max_pool_memory=65536,
         )
         server = Server(bind_address=addr, ipc_config=cfg)
         server.register_crm(IEcho, EchoImpl(), name='echo')

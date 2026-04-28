@@ -119,7 +119,7 @@ impl PyRustHttpClientPool {
         let pool = self.inner;
         let client = py
             .detach(move || {
-                let config = ConfigResolver::resolve(
+                let config = ConfigResolver::resolve_relay(
                     RuntimeConfigOverrides::default(),
                     ConfigSources::from_process(),
                 )

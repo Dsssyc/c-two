@@ -63,20 +63,6 @@ pub struct HttpClient {
 }
 
 impl HttpClient {
-    /// Create a new client targeting `base_url`.
-    pub fn new(
-        base_url: &str,
-        timeout_secs: f64,
-        max_connections: usize,
-    ) -> Result<Self, HttpError> {
-        Self::new_with_proxy_policy(
-            base_url,
-            timeout_secs,
-            max_connections,
-            crate::relay_use_proxy(),
-        )
-    }
-
     /// Create a new client with an explicit relay proxy policy.
     pub fn new_with_proxy_policy(
         base_url: &str,

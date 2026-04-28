@@ -8,8 +8,8 @@
 //! for free-threading builds.
 
 use parking_lot::{Mutex, RwLock};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use pyo3::exceptions::{PyBufferError, PyRuntimeError, PyValueError};
 use pyo3::ffi;
@@ -315,7 +315,7 @@ impl PyRustClient {
     #[new]
     #[pyo3(signature = (
         address, shm_threshold, pool_enabled, pool_segment_size,
-        max_pool_segments, max_pool_memory, reassembly_segment_size,
+        max_pool_segments, reassembly_segment_size,
         reassembly_max_segments, max_total_chunks, chunk_gc_interval,
         chunk_threshold_ratio, chunk_assembler_timeout,
         max_reassembly_bytes, chunk_size,
@@ -327,7 +327,6 @@ impl PyRustClient {
         pool_enabled: bool,
         pool_segment_size: u64,
         max_pool_segments: u32,
-        max_pool_memory: u64,
         reassembly_segment_size: u64,
         reassembly_max_segments: u32,
         max_total_chunks: u32,
@@ -342,7 +341,11 @@ impl PyRustClient {
                 pool_enabled,
                 pool_segment_size,
                 max_pool_segments,
-                max_pool_memory,
+                max_pool_memory: pool_segment_size
+                    .checked_mul(u64::from(max_pool_segments))
+                    .ok_or_else(|| {
+                        PyRuntimeError::new_err("max_pool_memory derived value overflowed")
+                    })?,
                 reassembly_segment_size,
                 reassembly_max_segments,
                 max_total_chunks,
@@ -354,11 +357,16 @@ impl PyRustClient {
             },
             shm_threshold,
         };
+        config
+            .validate()
+            .map_err(|e| PyValueError::new_err(format!("invalid IPC client config: {e}")))?;
         let seg_size = config.pool_segment_size as usize;
+        let max_segs = config.max_pool_segments as usize;
         let addr = address.to_string();
         let client = py.detach(move || {
             let mut pc = c2_mem::PoolConfig::default();
             pc.segment_size = seg_size;
+            pc.max_segments = max_segs;
             let pool = Arc::new(parking_lot::Mutex::new(c2_mem::MemPool::new(pc)));
             SyncClient::connect(&addr, Some(pool), config)
                 .map_err(|e| PyRuntimeError::new_err(format!("{e}")))
@@ -524,7 +532,7 @@ impl PyRustClientPool {
     /// Set the default IPC config for newly created clients.
     #[pyo3(signature = (
         shm_threshold, pool_enabled, pool_segment_size, max_pool_segments,
-        max_pool_memory, reassembly_segment_size, reassembly_max_segments,
+        reassembly_segment_size, reassembly_max_segments,
         max_total_chunks, chunk_gc_interval, chunk_threshold_ratio,
         chunk_assembler_timeout, max_reassembly_bytes, chunk_size,
     ))]
@@ -534,7 +542,6 @@ impl PyRustClientPool {
         pool_enabled: bool,
         pool_segment_size: u64,
         max_pool_segments: u32,
-        max_pool_memory: u64,
         reassembly_segment_size: u64,
         reassembly_max_segments: u32,
         max_total_chunks: u32,
@@ -543,13 +550,17 @@ impl PyRustClientPool {
         chunk_assembler_timeout: f64,
         max_reassembly_bytes: u64,
         chunk_size: u64,
-    ) {
+    ) -> PyResult<()> {
         let config = ClientIpcConfig {
             base: BaseIpcConfig {
                 pool_enabled,
                 pool_segment_size,
                 max_pool_segments,
-                max_pool_memory,
+                max_pool_memory: pool_segment_size
+                    .checked_mul(u64::from(max_pool_segments))
+                    .ok_or_else(|| {
+                        PyRuntimeError::new_err("max_pool_memory derived value overflowed")
+                    })?,
                 reassembly_segment_size,
                 reassembly_max_segments,
                 max_total_chunks,
@@ -561,7 +572,11 @@ impl PyRustClientPool {
             },
             shm_threshold,
         };
+        config
+            .validate()
+            .map_err(|e| PyValueError::new_err(format!("invalid IPC client config: {e}")))?;
         self.inner.set_default_config(config);
+        Ok(())
     }
 
     /// Sweep entries that have been unreferenced beyond the grace period.

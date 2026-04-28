@@ -157,14 +157,3 @@ fn relay_cli_flag_overrides_process_env() {
         .success()
         .stdout(predicate::str::contains("bind=127.0.0.1:9494"));
 }
-
-#[test]
-fn relay_rejects_removed_max_pool_memory_env() {
-    let mut cmd = Command::cargo_bin("c3").unwrap();
-    cmd.env("C2_ENV_FILE", "")
-        .env("C2_IPC_MAX_POOL_MEMORY", "1")
-        .args(["relay", "--dry-run"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("C2_IPC_MAX_POOL_MEMORY"));
-}

@@ -108,15 +108,16 @@ counter.value()          # → 0
 cc.close(counter)
 ```
 
-### Or remotely — same API, different address
+### Or remotely — same API, relay discovery
 
 ```python
 # Server process
-cc.set_address('ipc:///tmp/my_server')
+cc.set_relay('http://relay-host:8080')
 cc.register(Counter, CounterImpl(), name='counter')
 
 # Client process (separate terminal)
-counter = cc.connect(Counter, name='counter', address='ipc:///tmp/my_server')
+cc.set_relay('http://relay-host:8080')
+counter = cc.connect(Counter, name='counter')
 counter.increment(5)     # works identically
 cc.close(counter)
 ```
@@ -181,13 +182,12 @@ A **server** is any process that calls `cc.register(...)` to host one or more re
 ```python
 import c_two as cc
 
-cc.set_address('ipc://my_server')              # optional — default is auto UUID path
 cc.register(Greeter, GreeterImpl(), name='greeter')
 cc.register(Counter, CounterImpl(), name='counter')
 cc.serve()                                     # blocks; Ctrl-C triggers graceful shutdown
 ```
 
-- **Address** (`ipc://...`) is the local transport endpoint. Clients in the *same process* skip it entirely (zero serialization); clients in a *different process on the same host* connect to this address directly.
+- **Address** (`ipc://...`) is the local transport endpoint. Servers auto-bind one on first registration; inspect it with `cc.server_address()` when a same-host process needs to connect directly.
 - **`cc.serve()`** is optional — if your host process has its own event loop (web server, GUI, simulation), you can register resources and let them serve in the background while your main loop runs.
 - A process can be both a server and a client at the same time (register some resources, connect to others).
 
@@ -397,8 +397,8 @@ class MeshStore:
     def cleanup(self):
         print('MeshStore shutting down')
 
-cc.set_address('ipc://mesh_server')
 cc.register(MeshStore, MeshStore(), name='mesh')
+print(cc.server_address())
 cc.serve()  # blocks until interrupted
 ```
 
@@ -408,7 +408,7 @@ import c_two as cc
 from types import MeshStore, Mesh
 import numpy as np
 
-mesh_store = cc.connect(MeshStore, name='mesh', address='ipc://mesh_server')
+mesh_store = cc.connect(MeshStore, name='mesh', address='ipc://<server-address>')
 
 # Upload data
 big_mesh = Mesh(n_vertices=1_000_000,
@@ -436,7 +436,6 @@ An HTTP relay bridges network requests to CRM processes running on IPC. CRM proc
 import c_two as cc
 
 cc.set_relay('http://relay-host:8080')
-cc.set_address('ipc://mesh_server')
 cc.register(MeshStore, MeshStore(), name='mesh')
 cc.serve()  # blocks until Ctrl-C
 ```

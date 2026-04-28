@@ -1,6 +1,8 @@
 """Unit tests for c_two.config.ipc frozen dataclasses."""
 from __future__ import annotations
 
+import math
+
 import pytest
 from c_two.config.ipc import (
     BaseIPCConfig,
@@ -9,6 +11,7 @@ from c_two.config.ipc import (
     build_server_config,
     build_client_config,
 )
+from c_two.config.settings import settings
 from c_two.transport.registry import _relay_use_proxy
 
 
@@ -47,10 +50,18 @@ class TestBaseIPCConfig:
     def test_reject_bad_gc_interval(self):
         with pytest.raises(ValueError, match='chunk_gc_interval'):
             BaseIPCConfig(chunk_gc_interval=0.0)
+        with pytest.raises(ValueError, match='chunk_gc_interval'):
+            BaseIPCConfig(chunk_gc_interval=math.nan)
+        with pytest.raises(ValueError, match='chunk_gc_interval'):
+            BaseIPCConfig(chunk_gc_interval=math.inf)
 
     def test_reject_bad_assembler_timeout(self):
         with pytest.raises(ValueError, match='chunk_assembler_timeout'):
             BaseIPCConfig(chunk_assembler_timeout=-1.0)
+        with pytest.raises(ValueError, match='chunk_assembler_timeout'):
+            BaseIPCConfig(chunk_assembler_timeout=math.nan)
+        with pytest.raises(ValueError, match='chunk_assembler_timeout'):
+            BaseIPCConfig(chunk_assembler_timeout=math.inf)
 
     def test_reject_bad_reassembly_segments(self):
         with pytest.raises(ValueError, match='reassembly_max_segments'):
@@ -83,14 +94,32 @@ class TestServerIPCConfig:
     def test_heartbeat_negative_rejected(self):
         with pytest.raises(ValueError, match='heartbeat_interval'):
             ServerIPCConfig(heartbeat_interval=-1.0)
+        with pytest.raises(ValueError, match='heartbeat_interval'):
+            ServerIPCConfig(heartbeat_interval=math.nan)
+        with pytest.raises(ValueError, match='heartbeat_interval'):
+            ServerIPCConfig(heartbeat_interval=math.inf)
 
     def test_heartbeat_timeout_must_exceed_interval(self):
         with pytest.raises(ValueError, match='heartbeat_timeout'):
             ServerIPCConfig(heartbeat_interval=10.0, heartbeat_timeout=10.0)
+        with pytest.raises(ValueError, match='heartbeat_timeout'):
+            ServerIPCConfig(heartbeat_timeout=math.nan)
+        with pytest.raises(ValueError, match='heartbeat_timeout'):
+            ServerIPCConfig(heartbeat_timeout=math.inf)
+
+    def test_pool_decay_must_be_finite(self):
+        with pytest.raises(ValueError, match='pool_decay_seconds'):
+            ServerIPCConfig(pool_decay_seconds=math.nan)
+        with pytest.raises(ValueError, match='pool_decay_seconds'):
+            ServerIPCConfig(pool_decay_seconds=math.inf)
 
     def test_max_pool_memory_is_derived(self):
         cfg = ServerIPCConfig(pool_segment_size=1024, max_pool_segments=2)
         assert cfg.max_pool_memory == 2048
+
+    def test_max_pool_memory_init_rejected(self):
+        with pytest.raises(TypeError, match='max_pool_memory'):
+            ServerIPCConfig(max_pool_memory=1)
 
     def test_max_frame_size_check(self):
         with pytest.raises(ValueError, match='max_frame_size'):
@@ -127,6 +156,10 @@ class TestClientIPCConfig:
         cfg = ClientIPCConfig(reassembly_segment_size=1 << 28)
         assert cfg.reassembly_segment_size == 1 << 28
 
+    def test_max_pool_memory_init_rejected(self):
+        with pytest.raises(TypeError, match='max_pool_memory'):
+            ClientIPCConfig(max_pool_memory=1)
+
 
 class TestBuildServerConfig:
     def test_defaults(self):
@@ -152,6 +185,54 @@ class TestBuildServerConfig:
 
         assert _relay_use_proxy() is True
 
+    def test_proxy_policy_does_not_resolve_ipc_env(self, monkeypatch):
+        monkeypatch.setenv('C2_ENV_FILE', '')
+        monkeypatch.setenv('C2_RELAY_USE_PROXY', '1')
+        monkeypatch.setenv('C2_IPC_POOL_SEGMENT_SIZE', 'not-a-number')
+
+        assert _relay_use_proxy() is True
+
+    def test_server_config_does_not_resolve_relay_env(self, monkeypatch):
+        monkeypatch.setenv('C2_ENV_FILE', '')
+        monkeypatch.setenv('C2_RELAY_ANTI_ENTROPY_INTERVAL', 'not-a-number')
+
+        cfg = build_server_config()
+        assert cfg.pool_segment_size == 268_435_456
+
+    def test_client_config_does_not_resolve_server_only_env(self, monkeypatch):
+        monkeypatch.setenv('C2_ENV_FILE', '')
+        monkeypatch.setenv('C2_IPC_MAX_FRAME_SIZE', 'not-a-number')
+
+        cfg = build_client_config()
+        assert cfg.reassembly_segment_size == 67_108_864
+
+    def test_relay_settings_do_not_resolve_ipc_env(self, monkeypatch):
+        monkeypatch.setenv('C2_ENV_FILE', '')
+        monkeypatch.setenv('C2_RELAY_ADDRESS', 'http://127.0.0.1:8080')
+        monkeypatch.setenv('C2_RELAY_SEEDS', 'http://127.0.0.1:8081')
+        monkeypatch.setenv('C2_IPC_POOL_SEGMENT_SIZE', 'not-a-number')
+        settings.relay_address = None
+        settings.relay_seeds = None
+
+        assert settings.relay_address == 'http://127.0.0.1:8080'
+        assert settings.relay_seed_list == ['http://127.0.0.1:8081']
+
+    def test_shm_threshold_does_not_resolve_relay_env(self, monkeypatch):
+        monkeypatch.setenv('C2_ENV_FILE', '')
+        monkeypatch.setenv('C2_SHM_THRESHOLD', '8192')
+        monkeypatch.setenv('C2_RELAY_ANTI_ENTROPY_INTERVAL', 'not-a-number')
+        settings.shm_threshold = None
+
+        assert settings.shm_threshold == 8192
+
+    def test_shm_threshold_does_not_resolve_server_only_env(self, monkeypatch):
+        monkeypatch.setenv('C2_ENV_FILE', '')
+        monkeypatch.setenv('C2_SHM_THRESHOLD', '8192')
+        monkeypatch.setenv('C2_IPC_MAX_FRAME_SIZE', 'not-a-number')
+        settings.shm_threshold = None
+
+        assert settings.shm_threshold == 8192
+
     def test_kwargs_beat_env(self, monkeypatch):
         monkeypatch.setenv('C2_ENV_FILE', '')
         monkeypatch.setenv('C2_IPC_POOL_SEGMENT_SIZE', '536870912')
@@ -170,7 +251,7 @@ class TestBuildServerConfig:
         assert cfg.max_pool_memory == 2 * (1 << 20)
 
     def test_max_pool_memory_override_rejected(self):
-        with pytest.raises(ValueError, match='max_pool_memory'):
+        with pytest.raises(TypeError, match='max_pool_memory'):
             build_server_config(max_pool_memory=1)
 
 

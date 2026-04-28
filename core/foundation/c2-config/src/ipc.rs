@@ -146,10 +146,14 @@ impl BaseIpcConfig {
                 self.max_pool_segments,
             ));
         }
-        if self.max_pool_memory < self.pool_segment_size {
+        let expected_max_pool_memory = self
+            .pool_segment_size
+            .checked_mul(u64::from(self.max_pool_segments))
+            .ok_or_else(|| "max_pool_memory derived value overflowed".to_string())?;
+        if self.max_pool_memory != expected_max_pool_memory {
             return Err(format!(
-                "max_pool_memory ({}) must be >= pool_segment_size ({})",
-                self.max_pool_memory, self.pool_segment_size,
+                "max_pool_memory ({}) must equal pool_segment_size * max_pool_segments ({})",
+                self.max_pool_memory, expected_max_pool_memory,
             ));
         }
         if self.reassembly_segment_size == 0 {
@@ -302,11 +306,10 @@ mod tests {
     fn reject_zero_segment_size() {
         let mut cfg = ServerIpcConfig::default();
         cfg.base.pool_segment_size = 0;
-        assert!(
-            cfg.validate()
-                .unwrap_err()
-                .contains("pool_segment_size must be > 0")
-        );
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .contains("pool_segment_size must be > 0"));
     }
 
     #[test]
@@ -320,29 +323,26 @@ mod tests {
     fn reject_zero_chunk_size() {
         let mut cfg = ServerIpcConfig::default();
         cfg.base.chunk_size = 0;
-        assert!(
-            cfg.validate()
-                .unwrap_err()
-                .contains("chunk_size must be > 0")
-        );
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .contains("chunk_size must be > 0"));
     }
 
     #[test]
     fn reject_bad_threshold_ratio() {
         let mut cfg = BaseIpcConfig::default();
         cfg.chunk_threshold_ratio = 0.0;
-        assert!(
-            cfg.validate()
-                .unwrap_err()
-                .contains("chunk_threshold_ratio")
-        );
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .contains("chunk_threshold_ratio"));
 
         cfg.chunk_threshold_ratio = 1.1;
-        assert!(
-            cfg.validate()
-                .unwrap_err()
-                .contains("chunk_threshold_ratio")
-        );
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .contains("chunk_threshold_ratio"));
 
         cfg.chunk_threshold_ratio = 1.0; // boundary — valid
         assert!(cfg.validate().is_ok());
@@ -361,17 +361,18 @@ mod tests {
     fn reject_zero_payload_size() {
         let mut cfg = ServerIpcConfig::default();
         cfg.max_payload_size = 0;
-        assert!(
-            cfg.validate()
-                .unwrap_err()
-                .contains("max_payload_size must be > 0")
-        );
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .contains("max_payload_size must be > 0"));
     }
 
     #[test]
     fn reject_pool_segment_larger_than_payload_size() {
         let mut cfg = ServerIpcConfig::default();
         cfg.base.pool_segment_size = 2 * 1024 * 1024;
+        cfg.base.max_pool_memory =
+            cfg.base.pool_segment_size * u64::from(cfg.base.max_pool_segments);
         cfg.max_payload_size = 1024 * 1024;
         let err = cfg.validate().unwrap_err();
         assert!(err.contains("pool_segment_size"));
@@ -438,10 +439,9 @@ mod tests {
     fn client_rejects_zero_segment_size() {
         let mut cfg = ClientIpcConfig::default();
         cfg.base.pool_segment_size = 0;
-        assert!(
-            cfg.validate()
-                .unwrap_err()
-                .contains("pool_segment_size must be > 0")
-        );
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .contains("pool_segment_size must be > 0"));
     }
 }

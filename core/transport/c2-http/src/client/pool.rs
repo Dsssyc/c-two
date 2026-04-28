@@ -53,11 +53,6 @@ impl HttpClientPool {
         }
     }
 
-    /// Acquire (or create) a client for `base_url`.
-    pub fn acquire(&self, base_url: &str) -> Result<Arc<HttpClient>, HttpError> {
-        self.acquire_with_proxy_policy(base_url, crate::relay_use_proxy())
-    }
-
     /// Acquire (or create) a client for `base_url` with an explicit proxy policy.
     pub fn acquire_with_proxy_policy(
         &self,
@@ -176,15 +171,15 @@ mod tests {
     }
 
     #[test]
-    fn test_pool_acquire_release() {
+    fn test_pool_acquire_with_proxy_policy_release() {
         let pool = HttpClientPool::new(60.0);
         let url = "http://localhost:9999";
 
-        let _client = pool.acquire(url).unwrap();
+        let _client = pool.acquire_with_proxy_policy(url, false).unwrap();
         assert_eq!(pool.active_count(), 1);
         assert_eq!(pool.refcount(url), 1);
 
-        let _client2 = pool.acquire(url).unwrap();
+        let _client2 = pool.acquire_with_proxy_policy(url, false).unwrap();
         assert_eq!(pool.refcount(url), 2);
 
         pool.release(url);
@@ -199,7 +194,7 @@ mod tests {
         let pool = HttpClientPool::new(0.0); // zero grace
 
         let url = "http://localhost:9998";
-        let _client = pool.acquire(url).unwrap();
+        let _client = pool.acquire_with_proxy_policy(url, false).unwrap();
         pool.release(url);
 
         // After release with zero grace, sweep should remove it.
@@ -211,8 +206,12 @@ mod tests {
     #[test]
     fn test_pool_shutdown_all() {
         let pool = HttpClientPool::new(60.0);
-        let _c1 = pool.acquire("http://localhost:9997").unwrap();
-        let _c2 = pool.acquire("http://localhost:9996").unwrap();
+        let _c1 = pool
+            .acquire_with_proxy_policy("http://localhost:9997", false)
+            .unwrap();
+        let _c2 = pool
+            .acquire_with_proxy_policy("http://localhost:9996", false)
+            .unwrap();
         assert_eq!(pool.active_count(), 2);
 
         pool.shutdown_all();

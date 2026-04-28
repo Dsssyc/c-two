@@ -5,7 +5,7 @@ from typing import Any
 
 
 class C2Settings:
-    """Lightweight compatibility facade for SDK-level code overrides.
+    """Process-level facade for SDK code overrides.
 
     Environment variables and ``.env`` files are resolved by the Rust
     ``c2-config`` resolver. This object only stores Python code-level
@@ -29,7 +29,7 @@ class C2Settings:
     def relay_address(self) -> str | None:
         if self._relay_address is not None:
             return self._relay_address
-        return _resolve_runtime_config().get('relay_address')
+        return _resolve_relay_config().get('relay_address')
 
     @relay_address.setter
     def relay_address(self, value: str | None) -> None:
@@ -57,7 +57,7 @@ class C2Settings:
     def shm_threshold(self) -> int:
         if self._shm_threshold is not None:
             return self._shm_threshold
-        return int(_resolve_runtime_config().get('shm_threshold', 4096))
+        return _resolve_shm_threshold()
 
     @shm_threshold.setter
     def shm_threshold(self, value: int | None) -> None:
@@ -91,9 +91,29 @@ def _resolve_runtime_config() -> dict[str, Any]:
     return resolve_runtime_config()
 
 
+def _resolve_shm_threshold() -> int:
+    from c_two._native import resolve_shm_threshold
+
+    global_overrides = settings._global_overrides()  # noqa: SLF001
+    return int(resolve_shm_threshold(global_overrides))
+
+
 def _resolve_relay_config() -> dict[str, Any]:
-    relay = _resolve_runtime_config().get('relay', {})
-    return relay if isinstance(relay, dict) else {}
+    from c_two._native import resolve_relay_config
+
+    global_overrides = settings._global_overrides()  # noqa: SLF001
+    resolved = resolve_relay_config(global_overrides)
+    relay = resolved.get('relay', {})
+    if isinstance(relay, dict):
+        return {
+            **relay,
+            'relay_address': resolved.get('relay_address'),
+            'relay_use_proxy': resolved.get('relay_use_proxy', False),
+        }
+    return {
+        'relay_address': resolved.get('relay_address'),
+        'relay_use_proxy': resolved.get('relay_use_proxy', False),
+    }
 
 
 settings = C2Settings()
