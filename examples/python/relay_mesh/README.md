@@ -5,6 +5,9 @@ Clients connect to CRM resources **by name** — no IPC addresses needed.
 
 Reuses the `Grid` contract and `NestedGrid` resource from `examples/python/grid/`.
 
+This is the advanced multi-relay example. For the basic relay smoke test, use
+`examples/python/relay_resource.py` and `examples/python/relay_client.py`.
+
 ## Prerequisites
 
 Install the examples dependency group (includes pandas, numpy, pyarrow):

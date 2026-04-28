@@ -9,13 +9,12 @@ Usage (3-terminal workflow):
     c3 relay -b 0.0.0.0:8300
 
     # Terminal 2 — start the Grid CRM and register it with the relay
-    uv run python examples/python/crm_process.py --relay-url http://127.0.0.1:8300
+    uv run python examples/python/relay_resource.py --relay-url http://127.0.0.1:8300
 
     # Terminal 3 — run this client
     uv run python examples/python/relay_client.py --relay-url http://127.0.0.1:8300
 """
 import argparse
-import os
 import sys
 from pathlib import Path
 
@@ -24,29 +23,42 @@ sys.path.insert(0, str(EXAMPLES_ROOT))
 
 import c_two as cc
 from grid.grid_contract import Grid, GridAttribute
+from relay_config import ensure_http_relay_url, resolved_relay_url
 
 DEFAULT_RELAY_URL = 'http://127.0.0.1:8300'
 
 
-def parse_args() -> argparse.Namespace:
+def _relay_url(value: str) -> str:
+    try:
+        return ensure_http_relay_url(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description='Connect to the Grid CRM through an HTTP relay.',
     )
     parser.add_argument(
         '--relay-url',
-        default=os.environ.get('C2_RELAY_ADDRESS') or DEFAULT_RELAY_URL,
+        type=_relay_url,
+        default=resolved_relay_url(DEFAULT_RELAY_URL),
         help=(
             'HTTP relay URL used for name resolution '
             f'(default: C2_RELAY_ADDRESS or {DEFAULT_RELAY_URL}).'
         ),
     )
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    try:
+        args.relay_url = ensure_http_relay_url(args.relay_url)
+    except ValueError as exc:
+        parser.error(str(exc))
+    return args
 
 
-def main():
+def main() -> None:
     args = parse_args()
-    if args.relay_url:
-        cc.set_relay(args.relay_url)
+    cc.set_relay(args.relay_url)
 
     # Connect via HTTP relay — same API as IPC, different address.
     grid = cc.connect(Grid, name='examples/grid')
