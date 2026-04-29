@@ -103,7 +103,11 @@ pub enum DecodeError {
     /// Buffer is shorter than the minimum header size.
     BufferTooShort { need: usize, have: usize },
     /// A length field references more data than available.
-    Truncated { field: &'static str, need: usize, have: usize },
+    Truncated {
+        field: &'static str,
+        need: usize,
+        have: usize,
+    },
     /// An invalid value was encountered (e.g. unknown status byte).
     InvalidValue { field: &'static str, value: u64 },
     /// UTF-8 decoding failed.
@@ -136,7 +140,10 @@ impl std::error::Error for DecodeError {}
 #[inline]
 pub fn decode_total_len(buf: &[u8]) -> Result<(u32, &[u8]), DecodeError> {
     if buf.len() < 4 {
-        return Err(DecodeError::BufferTooShort { need: 4, have: buf.len() });
+        return Err(DecodeError::BufferTooShort {
+            need: 4,
+            have: buf.len(),
+        });
     }
     let total_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
     Ok((total_len, &buf[4..]))
@@ -147,11 +154,13 @@ pub fn decode_total_len(buf: &[u8]) -> Result<(u32, &[u8]), DecodeError> {
 /// Returns `(header, payload_slice)`.
 pub fn decode_frame_body(body: &[u8], total_len: u32) -> Result<(FrameHeader, &[u8]), DecodeError> {
     if body.len() < 12 {
-        return Err(DecodeError::BufferTooShort { need: 12, have: body.len() });
+        return Err(DecodeError::BufferTooShort {
+            need: 12,
+            have: body.len(),
+        });
     }
     let request_id = u64::from_le_bytes([
-        body[0], body[1], body[2], body[3],
-        body[4], body[5], body[6], body[7],
+        body[0], body[1], body[2], body[3], body[4], body[5], body[6], body[7],
     ]);
     let frame_flags = u32::from_le_bytes([body[8], body[9], body[10], body[11]]);
     let payload = &body[12..];

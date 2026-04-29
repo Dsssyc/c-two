@@ -120,8 +120,7 @@ mod tests {
         let meta = encode_reply_chunk_meta(500, 3, 1);
         let mut buf = vec![0xFF, 0xFF];
         buf.extend_from_slice(&meta);
-        let (total_size, total_chunks, chunk_idx, _) =
-            decode_reply_chunk_meta(&buf, 2).unwrap();
+        let (total_size, total_chunks, chunk_idx, _) = decode_reply_chunk_meta(&buf, 2).unwrap();
         assert_eq!(total_size, 500);
         assert_eq!(total_chunks, 3);
         assert_eq!(chunk_idx, 1);

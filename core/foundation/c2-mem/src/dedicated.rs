@@ -41,7 +41,9 @@ impl DedicatedSegment {
 
         // Initialize header: read_done = 0
         let hdr = region.base_ptr() as *const AtomicU32;
-        unsafe { (*hdr).store(0, Ordering::Release); }
+        unsafe {
+            (*hdr).store(0, Ordering::Release);
+        }
 
         Ok(Self { region })
     }
@@ -82,7 +84,9 @@ impl DedicatedSegment {
     /// when it is safe to `shm_unlink`.
     pub fn mark_read_done(&self) {
         let hdr = self.region.base_ptr() as *const AtomicU32;
-        unsafe { (*hdr).store(1, Ordering::Release); }
+        unsafe {
+            (*hdr).store(1, Ordering::Release);
+        }
     }
 
     /// Check whether the reader has signalled completion.
@@ -104,7 +108,9 @@ mod tests {
         let creator = DedicatedSegment::create(&name, data_size).unwrap();
         assert!(!creator.is_read_done());
 
-        unsafe { *creator.data_ptr() = 0xAB; }
+        unsafe {
+            *creator.data_ptr() = 0xAB;
+        }
 
         let reader = DedicatedSegment::open(&name, data_size).unwrap();
         assert_eq!(unsafe { *reader.data_ptr() }, 0xAB);

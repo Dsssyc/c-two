@@ -139,11 +139,8 @@ impl BuddyAllocator {
 
         // Initialize spinlock.
         // SAFETY: spinlock offset is within the header region.
-        let lock = unsafe {
-            ShmSpinlock::new(
-                base.add(std::mem::offset_of!(SegmentHeader, spinlock)),
-            )
-        };
+        let lock =
+            unsafe { ShmSpinlock::new(base.add(std::mem::offset_of!(SegmentHeader, spinlock))) };
         lock.init();
 
         // Initialize bitmaps — SHM is zero-filled by ftruncate, so all bits
@@ -189,11 +186,8 @@ impl BuddyAllocator {
         let data_size = Self::round_down_pow2(total_size - data_offset);
 
         // SAFETY: spinlock offset is within the validated header region.
-        let lock = unsafe {
-            ShmSpinlock::new(
-                base.add(std::mem::offset_of!(SegmentHeader, spinlock)),
-            )
-        };
+        let lock =
+            unsafe { ShmSpinlock::new(base.add(std::mem::offset_of!(SegmentHeader, spinlock))) };
         let bitmaps = Self::create_bitmaps(base, data_size, min_block, levels);
 
         Ok(Self {
@@ -217,7 +211,8 @@ impl BuddyAllocator {
         let actual_size = size.next_power_of_two().max(self.min_block);
         let target_level = self.size_to_level(actual_size)?;
 
-        self.lock.with_lock(|| self.alloc_with_split(target_level, actual_size))
+        self.lock
+            .with_lock(|| self.alloc_with_split(target_level, actual_size))
     }
 
     /// Free a previously allocated block.
@@ -377,11 +372,11 @@ impl BuddyAllocator {
         let header = unsafe { &*(self.base as *const SegmentHeader) };
         // R-I4: Use fetch_update for saturating decrement — prevents u32
         // underflow if a double-free somehow bypasses bitmap validation.
-        let _ = header.alloc_count.fetch_update(
-            Ordering::Release,
-            Ordering::Relaxed,
-            |prev| if prev > 0 { Some(prev - 1) } else { None },
-        );
+        let _ = header
+            .alloc_count
+            .fetch_update(Ordering::Release, Ordering::Relaxed, |prev| {
+                if prev > 0 { Some(prev - 1) } else { None }
+            });
         header.free_bytes.fetch_add(size as u64, Ordering::Release);
     }
 
@@ -442,8 +437,7 @@ impl BuddyAllocator {
 
     fn compute_data_offset(total_size: usize, min_block: usize) -> usize {
         let data_candidate = Self::round_down_pow2(total_size - HEADER_ALIGN);
-        let bitmap_bytes =
-            crate::alloc::bitmap::total_bitmap_bytes(data_candidate, min_block);
+        let bitmap_bytes = crate::alloc::bitmap::total_bitmap_bytes(data_candidate, min_block);
         let header_need = std::mem::size_of::<SegmentHeader>() + bitmap_bytes;
         // Round up to page alignment.
         let data_offset = (header_need + HEADER_ALIGN - 1) & !(HEADER_ALIGN - 1);
@@ -459,8 +453,7 @@ impl BuddyAllocator {
     pub fn required_shm_size(min_data_capacity: usize, min_block: usize) -> usize {
         // Target data_size is the smallest power-of-2 >= min_data_capacity.
         let data_size = min_data_capacity.next_power_of_two();
-        let bitmap_bytes =
-            crate::alloc::bitmap::total_bitmap_bytes(data_size, min_block);
+        let bitmap_bytes = crate::alloc::bitmap::total_bitmap_bytes(data_size, min_block);
         let header_need = std::mem::size_of::<SegmentHeader>() + bitmap_bytes;
         let data_offset = (header_need + HEADER_ALIGN - 1) & !(HEADER_ALIGN - 1);
         data_offset + data_size

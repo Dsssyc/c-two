@@ -5,8 +5,8 @@
 //! - `registry`: sharded lifecycle manager for in-flight chunked transfers
 //! - `promote`: heap-to-SHM promotion for finished chunks
 
-pub mod header;
 pub mod config;
+pub mod header;
 pub mod promote;
 pub mod registry;
 

@@ -4,15 +4,15 @@
 //! reassemblies. It wraps [`ChunkAssembler`] instances with tracking metadata
 //! and provides `insert` / `feed` / `finish` / `abort` lifecycle operations.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
 use parking_lot::{Mutex, RwLock};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
-use c2_mem::handle::MemHandle;
-use c2_mem::MemPool;
 use crate::assembler::ChunkAssembler;
+use c2_mem::MemPool;
+use c2_mem::handle::MemHandle;
 use tracing::warn;
 
 use crate::chunk::config::ChunkConfig;
@@ -134,12 +134,8 @@ impl ChunkRegistry {
         let mut shard = self.shard(conn_id).lock();
         if shard.contains_key(&(conn_id, request_id)) {
             // Abort the newly allocated assembler before returning error.
-            tracked
-                .inner
-                .abort(&mut self.pool.write());
-            return Err(format!(
-                "duplicate assembly for ({conn_id}, {request_id})"
-            ));
+            tracked.inner.abort(&mut self.pool.write());
+            return Err(format!("duplicate assembly for ({conn_id}, {request_id})"));
         }
         shard.insert((conn_id, request_id), tracked);
         drop(shard);
@@ -192,11 +188,7 @@ impl ChunkRegistry {
     /// The entry is removed from the registry regardless of success or failure.
     /// On any error path after `take_handle()`, the handle is released back to
     /// the pool to prevent leaks.
-    pub fn finish(
-        &self,
-        conn_id: u64,
-        request_id: u64,
-    ) -> Result<FinishedChunk, String> {
+    pub fn finish(&self, conn_id: u64, request_id: u64) -> Result<FinishedChunk, String> {
         // Remove from shard and decrement counters first.
         let tracked = {
             let mut shard = self.shard(conn_id).lock();
@@ -219,9 +211,7 @@ impl ChunkRegistry {
         if !inner.is_complete() {
             // Incomplete: release handle and report error.
             self.pool.write().release_handle(handle);
-            return Err(format!(
-                "incomplete assembly for ({conn_id}, {request_id})"
-            ));
+            return Err(format!("incomplete assembly for ({conn_id}, {request_id})"));
         }
 
         // Trim logical length to actual written data (last chunk may be short).
@@ -251,9 +241,7 @@ impl ChunkRegistry {
             self.active_count.fetch_sub(1, Ordering::Relaxed);
             self.total_bytes
                 .fetch_sub(tracked.total_bytes, Ordering::Relaxed);
-            tracked
-                .inner
-                .abort(&mut self.pool.write());
+            tracked.inner.abort(&mut self.pool.write());
         }
     }
 
@@ -278,9 +266,7 @@ impl ChunkRegistry {
                     self.active_count.fetch_sub(1, Ordering::Relaxed);
                     self.total_bytes
                         .fetch_sub(tracked.total_bytes, Ordering::Relaxed);
-                    tracked
-                        .inner
-                        .abort(&mut self.pool.write());
+                    tracked.inner.abort(&mut self.pool.write());
                 }
             }
             stats.remaining += shard.len();
@@ -305,9 +291,7 @@ impl ChunkRegistry {
                 self.active_count.fetch_sub(1, Ordering::Relaxed);
                 self.total_bytes
                     .fetch_sub(tracked.total_bytes, Ordering::Relaxed);
-                tracked
-                    .inner
-                    .abort(&mut self.pool.write());
+                tracked.inner.abort(&mut self.pool.write());
             }
         }
     }

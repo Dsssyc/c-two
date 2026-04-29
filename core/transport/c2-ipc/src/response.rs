@@ -56,7 +56,12 @@ impl ResponseData {
     ) -> Result<Vec<u8>, String> {
         match self {
             ResponseData::Inline(v) => Ok(v),
-            ResponseData::Shm { seg_idx, offset, data_size, is_dedicated } => {
+            ResponseData::Shm {
+                seg_idx,
+                offset,
+                data_size,
+                is_dedicated,
+            } => {
                 let mut guard = server_pool.lock();
                 let state = guard.as_mut().ok_or("server pool not initialised")?;
                 let (data, _) = state.read_and_free(seg_idx, offset, data_size, is_dedicated)?;

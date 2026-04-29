@@ -8,8 +8,8 @@
 //! for free-threading builds.
 
 use parking_lot::{Mutex, RwLock};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use pyo3::exceptions::{PyBufferError, PyRuntimeError, PyValueError};
 use pyo3::ffi;

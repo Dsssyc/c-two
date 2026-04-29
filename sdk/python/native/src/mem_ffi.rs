@@ -72,16 +72,8 @@ impl PyPoolConfig {
         if !segment_size.is_power_of_two() {
             return Err(PyValueError::new_err("segment_size must be a power of 2"));
         }
-        if dedicated_crash_timeout_secs.is_nan() {
-            return Err(PyValueError::new_err(
-                "dedicated_crash_timeout_secs must not be NaN",
-            ));
-        }
-        if buddy_idle_decay_secs.is_nan() {
-            return Err(PyValueError::new_err(
-                "buddy_idle_decay_secs must not be NaN",
-            ));
-        }
+        validate_duration_secs("dedicated_crash_timeout_secs", dedicated_crash_timeout_secs)?;
+        validate_duration_secs("buddy_idle_decay_secs", buddy_idle_decay_secs)?;
         if spill_threshold < 0.0 || spill_threshold > 1.0 || spill_threshold.is_nan() {
             return Err(PyValueError::new_err(
                 "spill_threshold must be in [0.0, 1.0]",
@@ -110,6 +102,22 @@ impl PyPoolConfig {
             self.spill_dir
         )
     }
+}
+
+fn validate_duration_secs(name: &str, secs: f64) -> PyResult<()> {
+    if !secs.is_finite() {
+        return Err(PyValueError::new_err(format!("{name} must be finite")));
+    }
+    if secs < 0.0 {
+        return Ok(());
+    }
+    std::time::Duration::try_from_secs_f64(secs)
+        .map(|_| ())
+        .map_err(|_| {
+            PyValueError::new_err(format!(
+                "{name} must be a representable duration in seconds"
+            ))
+        })
 }
 
 impl From<&PyPoolConfig> for PoolConfig {

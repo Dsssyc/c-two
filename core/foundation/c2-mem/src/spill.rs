@@ -17,9 +17,8 @@ static SPILL_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "macos")]
 pub fn available_physical_memory() -> u64 {
     use libc::{
-        host_statistics64, mach_msg_type_number_t,
-        sysconf, vm_statistics64, HOST_VM_INFO64,
-        HOST_VM_INFO64_COUNT, _SC_PAGESIZE,
+        _SC_PAGESIZE, HOST_VM_INFO64, HOST_VM_INFO64_COUNT, host_statistics64,
+        mach_msg_type_number_t, sysconf, vm_statistics64,
     };
     unsafe {
         let page_size = sysconf(_SC_PAGESIZE) as u64;
@@ -94,10 +93,7 @@ pub fn should_spill(requested: usize, threshold: f64) -> bool {
 /// OS reclaims the fd + mmap — no residual files.
 ///
 /// Returns `(mmap, path)` where `path` is for logging/debug only.
-pub fn create_file_spill(
-    size: usize,
-    spill_dir: &Path,
-) -> std::io::Result<(MmapMut, PathBuf)> {
+pub fn create_file_spill(size: usize, spill_dir: &Path) -> std::io::Result<(MmapMut, PathBuf)> {
     std::fs::create_dir_all(spill_dir)?;
 
     let pid = std::process::id();

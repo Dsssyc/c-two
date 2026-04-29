@@ -12,7 +12,7 @@ use crate::dedicated::DedicatedSegment;
 use crate::handle::MemHandle;
 use crate::spill;
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Result of a free operation — signals whether the segment became fully idle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,7 +68,9 @@ impl MemPool {
         assert!(
             name_prefix.len() <= Self::MAX_SHM_PREFIX_LEN,
             "SHM prefix '{}' is {} chars, exceeds max {} (macOS 31-char limit)",
-            name_prefix, name_prefix.len(), Self::MAX_SHM_PREFIX_LEN,
+            name_prefix,
+            name_prefix.len(),
+            Self::MAX_SHM_PREFIX_LEN,
         );
         Self::validate_config(&config).expect("invalid PoolConfig");
         Self {
@@ -95,12 +97,11 @@ impl MemPool {
                 config.segment_size, config.min_block_size
             ));
         }
-        if config.dedicated_crash_timeout_secs.is_nan() {
-            return Err("dedicated_crash_timeout_secs must not be NaN".into());
-        }
-        if config.buddy_idle_decay_secs.is_nan() {
-            return Err("buddy_idle_decay_secs must not be NaN".into());
-        }
+        validate_duration_secs(
+            "dedicated_crash_timeout_secs",
+            config.dedicated_crash_timeout_secs,
+        )?;
+        validate_duration_secs("buddy_idle_decay_secs", config.buddy_idle_decay_secs)?;
         Ok(())
     }
 
@@ -135,7 +136,9 @@ impl MemPool {
                 if !is_process_alive(pid) {
                     let shm_name = format!("/{}", name_str);
                     if let Ok(c_name) = std::ffi::CString::new(shm_name) {
-                        unsafe { libc::shm_unlink(c_name.as_ptr()); }
+                        unsafe {
+                            libc::shm_unlink(c_name.as_ptr());
+                        }
                         removed += 1;
                     }
                 }
@@ -388,7 +391,9 @@ impl MemPool {
     pub fn open_dedicated(&mut self, name: &str, size: usize) -> Result<u32, String> {
         let seg = DedicatedSegment::open(name, size)?;
         let idx = self.next_dedicated_idx;
-        self.next_dedicated_idx = self.next_dedicated_idx.checked_add(1)
+        self.next_dedicated_idx = self
+            .next_dedicated_idx
+            .checked_add(1)
             .expect("dedicated segment index overflow");
         self.dedicated.insert(
             idx,
@@ -406,7 +411,12 @@ impl MemPool {
     /// Used by the server to lazy-open peer dedicated segments, where the
     /// index must match the producer's `seg_idx` from the wire frame.
     /// No-op if the index already exists in the map.
-    pub fn open_dedicated_at(&mut self, idx: u32, name: &str, min_size: usize) -> Result<(), String> {
+    pub fn open_dedicated_at(
+        &mut self,
+        idx: u32,
+        name: &str,
+        min_size: usize,
+    ) -> Result<(), String> {
         if self.dedicated.contains_key(&idx) {
             return Ok(());
         }
@@ -421,7 +431,8 @@ impl MemPool {
         );
         // Keep next_dedicated_idx ahead of all known keys to avoid collision.
         if idx >= self.next_dedicated_idx {
-            self.next_dedicated_idx = idx.checked_add(1)
+            self.next_dedicated_idx = idx
+                .checked_add(1)
                 .expect("dedicated segment index overflow");
         }
         Ok(())
@@ -431,11 +442,19 @@ impl MemPool {
     ///
     /// This recomputes the buddy level from the data size, enabling cross-process
     /// freeing where the remote side only knows (offset, data_size) from the wire.
-    pub fn free_at(&mut self, seg_idx: u32, offset: u32, data_size: u32, is_dedicated: bool) -> Result<FreeResult, String> {
+    pub fn free_at(
+        &mut self,
+        seg_idx: u32,
+        offset: u32,
+        data_size: u32,
+        is_dedicated: bool,
+    ) -> Result<FreeResult, String> {
         self.gc_dedicated();
         if is_dedicated {
             self.free_dedicated(seg_idx);
-            Ok(FreeResult::DedicatedFreed { seg_idx: seg_idx as u16 })
+            Ok(FreeResult::DedicatedFreed {
+                seg_idx: seg_idx as u16,
+            })
         } else if let Some(seg) = self.segments.get(seg_idx as usize) {
             let actual_size = (data_size as usize)
                 .next_power_of_two()
@@ -447,7 +466,9 @@ impl MemPool {
                     if idx < self.idle_since.len() && self.idle_since[idx].is_none() {
                         self.idle_since[idx] = Some(Instant::now());
                     }
-                    return Ok(FreeResult::SegmentIdle { seg_idx: seg_idx as u16 });
+                    return Ok(FreeResult::SegmentIdle {
+                        seg_idx: seg_idx as u16,
+                    });
                 }
                 Ok(FreeResult::Normal)
             } else {
@@ -515,11 +536,17 @@ impl MemPool {
         // Fast path: existing buddy segments (bitmap only, no RAM query).
         if max_buddy > 0 && size <= max_buddy {
             for (idx, seg) in self.segments.iter().enumerate() {
-                if (seg.allocator().free_bytes() as usize) < size { continue; }
+                if (seg.allocator().free_bytes() as usize) < size {
+                    continue;
+                }
                 if let Some(a) = seg.allocator().alloc(size) {
-                    if idx < self.idle_since.len() { self.idle_since[idx] = None; }
+                    if idx < self.idle_since.len() {
+                        self.idle_since[idx] = None;
+                    }
                     return Ok(MemHandle::Buddy {
-                        seg_idx: idx as u16, offset: a.offset, len: size,
+                        seg_idx: idx as u16,
+                        offset: a.offset,
+                        len: size,
                     });
                 }
             }
@@ -531,19 +558,23 @@ impl MemPool {
         }
 
         // RAM fine: try buddy expansion.
-        if max_buddy > 0 && size <= max_buddy
-            && self.segments.len() < self.config.max_segments
-        {
+        if max_buddy > 0 && size <= max_buddy && self.segments.len() < self.config.max_segments {
             // GC before expanding — may free trailing idle segments
             let reclaimed = self.gc_buddy();
             if reclaimed > 0 {
                 // Retry existing segments after GC
                 for (idx, seg) in self.segments.iter().enumerate() {
-                    if (seg.allocator().free_bytes() as usize) < size { continue; }
+                    if (seg.allocator().free_bytes() as usize) < size {
+                        continue;
+                    }
                     if let Some(a) = seg.allocator().alloc(size) {
-                        if idx < self.idle_since.len() { self.idle_since[idx] = None; }
+                        if idx < self.idle_since.len() {
+                            self.idle_since[idx] = None;
+                        }
                         return Ok(MemHandle::Buddy {
-                            seg_idx: idx as u16, offset: a.offset, len: size,
+                            seg_idx: idx as u16,
+                            offset: a.offset,
+                            len: size,
                         });
                     }
                 }
@@ -556,7 +587,9 @@ impl MemPool {
                     self.idle_since.push(None);
                     if let Some(a) = self.segments[idx].allocator().alloc(size) {
                         return Ok(MemHandle::Buddy {
-                            seg_idx: idx as u16, offset: a.offset, len: size,
+                            seg_idx: idx as u16,
+                            offset: a.offset,
+                            len: size,
                         });
                     }
                 }
@@ -567,7 +600,8 @@ impl MemPool {
         // Large → dedicated SHM, file spill fallback.
         match self.alloc_dedicated(size) {
             Ok(alloc) => Ok(MemHandle::Dedicated {
-                seg_idx: alloc.seg_idx as u16, len: size,
+                seg_idx: alloc.seg_idx as u16,
+                len: size,
             }),
             Err(_) => self.alloc_file_spill(size),
         }
@@ -586,28 +620,38 @@ impl MemPool {
         // Try existing buddy segments.
         if max_buddy > 0 && size <= max_buddy {
             for (idx, seg) in self.segments.iter().enumerate() {
-                if (seg.allocator().free_bytes() as usize) < size { continue; }
+                if (seg.allocator().free_bytes() as usize) < size {
+                    continue;
+                }
                 if let Some(a) = seg.allocator().alloc(size) {
-                    if idx < self.idle_since.len() { self.idle_since[idx] = None; }
+                    if idx < self.idle_since.len() {
+                        self.idle_since[idx] = None;
+                    }
                     return Ok(MemHandle::Buddy {
-                        seg_idx: idx as u16, offset: a.offset, len: size,
+                        seg_idx: idx as u16,
+                        offset: a.offset,
+                        len: size,
                     });
                 }
             }
         }
 
         // Try buddy expansion (no RAM check — caller already has data in RAM).
-        if max_buddy > 0 && size <= max_buddy
-            && self.segments.len() < self.config.max_segments
-        {
+        if max_buddy > 0 && size <= max_buddy && self.segments.len() < self.config.max_segments {
             let reclaimed = self.gc_buddy();
             if reclaimed > 0 {
                 for (idx, seg) in self.segments.iter().enumerate() {
-                    if (seg.allocator().free_bytes() as usize) < size { continue; }
+                    if (seg.allocator().free_bytes() as usize) < size {
+                        continue;
+                    }
                     if let Some(a) = seg.allocator().alloc(size) {
-                        if idx < self.idle_since.len() { self.idle_since[idx] = None; }
+                        if idx < self.idle_since.len() {
+                            self.idle_since[idx] = None;
+                        }
                         return Ok(MemHandle::Buddy {
-                            seg_idx: idx as u16, offset: a.offset, len: size,
+                            seg_idx: idx as u16,
+                            offset: a.offset,
+                            len: size,
                         });
                     }
                 }
@@ -618,7 +662,9 @@ impl MemPool {
                 self.idle_since.push(None);
                 if let Some(a) = self.segments[idx].allocator().alloc(size) {
                     return Ok(MemHandle::Buddy {
-                        seg_idx: idx as u16, offset: a.offset, len: size,
+                        seg_idx: idx as u16,
+                        offset: a.offset,
+                        len: size,
                     });
                 }
             }
@@ -627,31 +673,38 @@ impl MemPool {
         // Try dedicated SHM — NO FileSpill fallback.
         match self.alloc_dedicated(size) {
             Ok(alloc) => Ok(MemHandle::Dedicated {
-                seg_idx: alloc.seg_idx as u16, len: size,
+                seg_idx: alloc.seg_idx as u16,
+                len: size,
             }),
-            Err(_) => Err(format!(
-                "try_alloc_shm: no SHM capacity for {size} bytes"
-            )),
+            Err(_) => Err(format!("try_alloc_shm: no SHM capacity for {size} bytes")),
         }
     }
 
     fn alloc_file_spill(&self, size: usize) -> Result<MemHandle, String> {
         let (mmap, path) = spill::create_file_spill(size, &self.config.spill_dir)
             .map_err(|e| format!("file spill failed: {e}"))?;
-        Ok(MemHandle::FileSpill { mmap, path, len: size })
+        Ok(MemHandle::FileSpill {
+            mmap,
+            path,
+            len: size,
+        })
     }
 
     /// Read-only slice from a handle.
     pub fn handle_slice<'a>(&'a self, handle: &'a MemHandle) -> &'a [u8] {
         match handle {
-            MemHandle::Buddy { seg_idx, offset, len } => {
+            MemHandle::Buddy {
+                seg_idx,
+                offset,
+                len,
+            } => {
                 let ptr = self.segments[*seg_idx as usize]
-                    .allocator().data_ptr(*offset);
+                    .allocator()
+                    .data_ptr(*offset);
                 unsafe { std::slice::from_raw_parts(ptr, *len) }
             }
             MemHandle::Dedicated { seg_idx, len } => {
-                let ptr = self.dedicated[&(*seg_idx as u32)]
-                    .segment.data_ptr();
+                let ptr = self.dedicated[&(*seg_idx as u32)].segment.data_ptr();
                 unsafe { std::slice::from_raw_parts(ptr, *len) }
             }
             MemHandle::FileSpill { mmap, len, .. } => &mmap[..*len],
@@ -659,18 +712,20 @@ impl MemPool {
     }
 
     /// Mutable slice from a handle.
-    pub fn handle_slice_mut<'a>(
-        &'a self, handle: &'a mut MemHandle,
-    ) -> &'a mut [u8] {
+    pub fn handle_slice_mut<'a>(&'a self, handle: &'a mut MemHandle) -> &'a mut [u8] {
         match handle {
-            MemHandle::Buddy { seg_idx, offset, len } => {
+            MemHandle::Buddy {
+                seg_idx,
+                offset,
+                len,
+            } => {
                 let ptr = self.segments[*seg_idx as usize]
-                    .allocator().data_ptr(*offset);
+                    .allocator()
+                    .data_ptr(*offset);
                 unsafe { std::slice::from_raw_parts_mut(ptr, *len) }
             }
             MemHandle::Dedicated { seg_idx, len } => {
-                let ptr = self.dedicated[&(*seg_idx as u32)]
-                    .segment.data_ptr();
+                let ptr = self.dedicated[&(*seg_idx as u32)].segment.data_ptr();
                 unsafe { std::slice::from_raw_parts_mut(ptr, *len) }
             }
             MemHandle::FileSpill { mmap, len, .. } => &mut mmap[..*len],
@@ -683,10 +738,13 @@ impl MemPool {
     /// For `FileSpill`, always returns `Normal` (OS handles cleanup via Drop).
     pub fn release_handle(&mut self, handle: MemHandle) -> FreeResult {
         match handle {
-            MemHandle::Buddy { seg_idx, offset, len } => {
-                self.free_at(seg_idx as u32, offset, len as u32, false)
-                    .unwrap_or(FreeResult::Normal)
-            }
+            MemHandle::Buddy {
+                seg_idx,
+                offset,
+                len,
+            } => self
+                .free_at(seg_idx as u32, offset, len as u32, false)
+                .unwrap_or(FreeResult::Normal),
             MemHandle::Dedicated { seg_idx, .. } => {
                 self.free_dedicated(seg_idx as u32);
                 FreeResult::DedicatedFreed { seg_idx }
@@ -800,13 +858,16 @@ impl MemPool {
         let idx = self.next_dedicated_idx;
         let name = format!("{}_{}{:04x}", self.name_prefix, "d", idx);
         let seg = DedicatedSegment::create(&name, size)?;
-        self.next_dedicated_idx = self.next_dedicated_idx.checked_add(1)
+        self.next_dedicated_idx = self
+            .next_dedicated_idx
+            .checked_add(1)
             .expect("dedicated segment index overflow");
 
         // R-I2: Guard against u32 truncation for dedicated segment size.
         if seg.size() > u32::MAX as usize {
             return Err(format!(
-                "dedicated segment size {} exceeds 4GB limit", seg.size()
+                "dedicated segment size {} exceeds 4GB limit",
+                seg.size()
             ));
         }
         let alloc_size = seg.size() as u32;
@@ -858,6 +919,18 @@ impl MemPool {
         let name = format!("{}_{}{:04x}", self.name_prefix, "b", idx);
         BuddySegment::create(&name, self.config.segment_size, self.config.min_block_size)
     }
+}
+
+fn validate_duration_secs(name: &str, secs: f64) -> Result<(), String> {
+    if !secs.is_finite() {
+        return Err(format!("{name} must be finite"));
+    }
+    if secs < 0.0 {
+        return Ok(());
+    }
+    Duration::try_from_secs_f64(secs)
+        .map(|_| ())
+        .map_err(|_| format!("{name} must be a representable duration in seconds"))
 }
 
 impl Drop for MemPool {
@@ -1026,6 +1099,44 @@ mod tests {
             ..small_config()
         };
         test_pool(config);
+    }
+
+    #[test]
+    fn test_validate_rejects_non_finite_gc_delays() {
+        let mut config = small_config();
+        config.dedicated_crash_timeout_secs = f64::INFINITY;
+        assert!(
+            MemPool::validate_config(&config)
+                .unwrap_err()
+                .contains("dedicated_crash_timeout_secs")
+        );
+
+        let mut config = small_config();
+        config.buddy_idle_decay_secs = f64::INFINITY;
+        assert!(
+            MemPool::validate_config(&config)
+                .unwrap_err()
+                .contains("buddy_idle_decay_secs")
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_unrepresentable_gc_delays() {
+        let mut config = small_config();
+        config.dedicated_crash_timeout_secs = 1e100;
+        assert!(
+            MemPool::validate_config(&config)
+                .unwrap_err()
+                .contains("representable duration")
+        );
+
+        let mut config = small_config();
+        config.buddy_idle_decay_secs = 1e100;
+        assert!(
+            MemPool::validate_config(&config)
+                .unwrap_err()
+                .contains("representable duration")
+        );
     }
 
     #[test]
@@ -1247,7 +1358,10 @@ mod tests {
         pool.free(&a).unwrap();
         pool.free(&b).unwrap();
         let reclaimed = pool.gc_buddy();
-        assert!(reclaimed >= 1, "expected at least one idle segment to be reclaimed");
+        assert!(
+            reclaimed >= 1,
+            "expected at least one idle segment to be reclaimed"
+        );
         assert!(pool.segment_count() < seg_before);
         // gc_buddy always retains at least one segment.
         assert!(pool.segment_count() >= 1);
@@ -1277,7 +1391,11 @@ mod tests {
         assert!(pool.dedicated.contains_key(&seg_idx));
 
         // Simulate reader: set read_done via the segment
-        pool.dedicated.get(&seg_idx).unwrap().segment.mark_read_done();
+        pool.dedicated
+            .get(&seg_idx)
+            .unwrap()
+            .segment
+            .mark_read_done();
 
         // Now GC should remove
         pool.gc_dedicated();
@@ -1297,23 +1415,38 @@ mod tests {
         let mut creator_pool = test_pool(config.clone());
         let a = creator_pool.alloc(64 * 1024).unwrap();
         assert!(a.is_dedicated);
-        let seg_name = creator_pool.dedicated.get(&a.seg_idx).unwrap()
-            .segment.name().to_string();
+        let seg_name = creator_pool
+            .dedicated
+            .get(&a.seg_idx)
+            .unwrap()
+            .segment
+            .name()
+            .to_string();
         let data_size = 64 * 1024;
 
         // Open in a second pool (simulates reader/peer side)
         let mut reader_pool = test_pool(config);
-        reader_pool.open_dedicated_at(a.seg_idx, &seg_name, data_size).unwrap();
+        reader_pool
+            .open_dedicated_at(a.seg_idx, &seg_name, data_size)
+            .unwrap();
         assert!(reader_pool.dedicated.contains_key(&a.seg_idx));
 
         // Reader frees → should mark read_done + be immediately removable
-        reader_pool.free_at(a.seg_idx, 0, data_size as u32, true).unwrap();
+        reader_pool
+            .free_at(a.seg_idx, 0, data_size as u32, true)
+            .unwrap();
         reader_pool.gc_dedicated();
         assert!(!reader_pool.dedicated.contains_key(&a.seg_idx));
 
         // Creator sees read_done
-        assert!(creator_pool.dedicated.get(&a.seg_idx).unwrap()
-            .segment.is_read_done());
+        assert!(
+            creator_pool
+                .dedicated
+                .get(&a.seg_idx)
+                .unwrap()
+                .segment
+                .is_read_done()
+        );
 
         creator_pool.free(&a).unwrap();
         creator_pool.gc_dedicated();
@@ -1350,7 +1483,10 @@ mod tests {
                 _ => break,
             }
         }
-        assert!(!held.is_empty(), "should have allocated at least one buddy block");
+        assert!(
+            !held.is_empty(),
+            "should have allocated at least one buddy block"
+        );
         // Now try_alloc_shm should fail — NOT fall back to FileSpill
         let result = pool.try_alloc_shm(4096);
         assert!(result.is_err());
@@ -1398,7 +1534,9 @@ mod handle_tests {
     fn test_alloc_handle_file_spill_forced() {
         let dir = std::env::temp_dir().join("c2_pool_spill_test");
         let config = PoolConfig {
-            spill_threshold: 0.0, spill_dir: dir.clone(), ..test_config()
+            spill_threshold: 0.0,
+            spill_dir: dir.clone(),
+            ..test_config()
         };
         let mut pool = MemPool::new(config);
         let handle = pool.alloc_handle(4096).unwrap();
@@ -1421,7 +1559,9 @@ mod handle_tests {
     fn test_handle_slice_file_spill() {
         let dir = std::env::temp_dir().join("c2_pool_spill_slice_test");
         let config = PoolConfig {
-            spill_threshold: 0.0, spill_dir: dir.clone(), ..test_config()
+            spill_threshold: 0.0,
+            spill_dir: dir.clone(),
+            ..test_config()
         };
         let mut pool = MemPool::new(config);
         let mut handle = pool.alloc_handle(8192).unwrap();

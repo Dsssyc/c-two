@@ -77,8 +77,14 @@ mod frame_tests {
 
         // Check request_id
         let rid = u64::from_le_bytes([
-            encoded[4], encoded[5], encoded[6], encoded[7],
-            encoded[8], encoded[9], encoded[10], encoded[11],
+            encoded[4],
+            encoded[5],
+            encoded[6],
+            encoded[7],
+            encoded[8],
+            encoded[9],
+            encoded[10],
+            encoded[11],
         ]);
         assert_eq!(rid, 100);
 
@@ -250,16 +256,31 @@ mod handshake_tests {
             RouteInfo {
                 name: "grid".into(),
                 methods: vec![
-                    MethodEntry { name: "hello".into(), index: 0 },
-                    MethodEntry { name: "subdivide_grids".into(), index: 1 },
-                    MethodEntry { name: "get_grid_infos".into(), index: 2 },
+                    MethodEntry {
+                        name: "hello".into(),
+                        index: 0,
+                    },
+                    MethodEntry {
+                        name: "subdivide_grids".into(),
+                        index: 1,
+                    },
+                    MethodEntry {
+                        name: "get_grid_infos".into(),
+                        index: 2,
+                    },
                 ],
             },
             RouteInfo {
                 name: "counter".into(),
                 methods: vec![
-                    MethodEntry { name: "get".into(), index: 0 },
-                    MethodEntry { name: "increment".into(), index: 1 },
+                    MethodEntry {
+                        name: "get".into(),
+                        index: 0,
+                    },
+                    MethodEntry {
+                        name: "increment".into(),
+                        index: 1,
+                    },
                 ],
             },
         ];
@@ -394,7 +415,7 @@ mod cross_lang_tests {
     fn python_server_handshake_decode() {
         // v6: [06][00 prefix_len] then same body
         let bytes = hex_to_bytes(
-            "0600010000000008047372763003000100046772696402000568656c6c6f0000036164640100"
+            "0600010000000008047372763003000100046772696402000568656c6c6f0000036164640100",
         );
         let hs = decode_handshake(&bytes).unwrap();
         assert_eq!(hs.prefix, "");
@@ -435,7 +456,10 @@ mod cross_lang_tests {
     #[test]
     fn rust_encode_matches_python_buddy_payload() {
         let bp = BuddyPayload {
-            seg_idx: 2, offset: 4096, data_size: 512, is_dedicated: false,
+            seg_idx: 2,
+            offset: 4096,
+            data_size: 512,
+            is_dedicated: false,
         };
         let encoded = encode_buddy_payload(&bp);
         let expected = hex_to_bytes("0200001000000002000000");
@@ -457,14 +481,20 @@ mod cross_lang_tests {
         let routes = vec![RouteInfo {
             name: "grid".into(),
             methods: vec![
-                MethodEntry { name: "hello".into(), index: 0 },
-                MethodEntry { name: "add".into(), index: 1 },
+                MethodEntry {
+                    name: "hello".into(),
+                    index: 0,
+                },
+                MethodEntry {
+                    name: "add".into(),
+                    index: 1,
+                },
             ],
         }];
         let encoded = encode_server_handshake(&segments, CAP_CALL_V2 | CAP_METHOD_IDX, &routes, "");
         // v6: [06][00 prefix_len] then same body as v5
         let expected = hex_to_bytes(
-            "0600010000000008047372763003000100046772696402000568656c6c6f0000036164640100"
+            "0600010000000008047372763003000100046772696402000568656c6c6f0000036164640100",
         );
         assert_eq!(encoded, expected);
     }

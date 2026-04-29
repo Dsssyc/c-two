@@ -72,7 +72,10 @@ pub fn encode_call_control_into(
 pub fn decode_call_control(buf: &[u8], offset: usize) -> Result<(CallControl, usize), DecodeError> {
     let remaining = buf.len().saturating_sub(offset);
     if remaining < 3 {
-        return Err(DecodeError::BufferTooShort { need: 3, have: remaining });
+        return Err(DecodeError::BufferTooShort {
+            need: 3,
+            have: remaining,
+        });
     }
     let name_len = buf[offset] as usize;
     let needed = 1 + name_len + 2;
@@ -93,7 +96,13 @@ pub fn decode_call_control(buf: &[u8], offset: usize) -> Result<(CallControl, us
     };
     let idx_start = name_start + name_len;
     let method_idx = u16::from_le_bytes([buf[idx_start], buf[idx_start + 1]]);
-    Ok((CallControl { route_name, method_idx }, needed))
+    Ok((
+        CallControl {
+            route_name,
+            method_idx,
+        },
+        needed,
+    ))
 }
 
 // ── V2 Reply Control ─────────────────────────────────────────────────────
@@ -126,7 +135,10 @@ pub fn encode_reply_control(ctrl: &ReplyControl) -> Vec<u8> {
 /// Decode v2 reply control from `buf[offset..]`.
 ///
 /// Returns `(control, bytes_consumed)`.
-pub fn decode_reply_control(buf: &[u8], offset: usize) -> Result<(ReplyControl, usize), DecodeError> {
+pub fn decode_reply_control(
+    buf: &[u8],
+    offset: usize,
+) -> Result<(ReplyControl, usize), DecodeError> {
     let remaining = buf.len().saturating_sub(offset);
     if remaining < 1 {
         return Err(DecodeError::BufferTooShort { need: 1, have: 0 });
@@ -143,8 +155,10 @@ pub fn decode_reply_control(buf: &[u8], offset: usize) -> Result<(ReplyControl, 
                 });
             }
             let err_len = u32::from_le_bytes([
-                buf[offset + 1], buf[offset + 2],
-                buf[offset + 3], buf[offset + 4],
+                buf[offset + 1],
+                buf[offset + 2],
+                buf[offset + 3],
+                buf[offset + 4],
             ]) as usize;
             let total = 5 + err_len;
             if remaining < total {

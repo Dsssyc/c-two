@@ -36,12 +36,7 @@ pub const POOL_DIR_RESPONSE: u8 = 1;
 /// Encode a `CTRL_SEGMENT_ANNOUNCE` message.
 ///
 /// Format: `[1B ctrl=0x01][1B direction][1B index][4B size LE][name UTF-8]`
-pub fn encode_ctrl_segment_announce(
-    direction: u8,
-    index: u8,
-    size: u32,
-    name: &str,
-) -> Vec<u8> {
+pub fn encode_ctrl_segment_announce(direction: u8, index: u8, size: u32, name: &str) -> Vec<u8> {
     let name_b = name.as_bytes();
     let mut buf = Vec::with_capacity(7 + name_b.len());
     buf.push(CTRL_SEGMENT_ANNOUNCE);
@@ -55,9 +50,7 @@ pub fn encode_ctrl_segment_announce(
 /// Decode a `CTRL_SEGMENT_ANNOUNCE` message.
 ///
 /// Returns `(direction, segment_index, segment_size, shm_name)`.
-pub fn decode_ctrl_segment_announce(
-    payload: &[u8],
-) -> Result<(u8, u8, u32, String), DecodeError> {
+pub fn decode_ctrl_segment_announce(payload: &[u8]) -> Result<(u8, u8, u32, String), DecodeError> {
     if payload.len() < 7 {
         return Err(DecodeError::BufferTooShort {
             need: 7,

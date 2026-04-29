@@ -11,13 +11,13 @@
 //! - `parking_lot::RwLock` — sync lock for `MemPool` (blocking, no `.await`)
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{watch, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, watch};
 use tracing::{debug, info, warn};
 
 /// Monotonic counter ensuring each `Server` instance gets a unique SHM prefix,
@@ -30,22 +30,29 @@ use tracing::{debug, info, warn};
 /// suffix the max SHM name is 27 chars (within macOS 31-char limit).
 static RESPONSE_POOL_GEN: AtomicU64 = AtomicU64::new(0);
 
-use c2_mem::config::PoolConfig;
 use c2_mem::MemPool;
-use c2_wire::buddy::{decode_buddy_payload, encode_buddy_payload, BuddyPayload, BUDDY_PAYLOAD_SIZE};
-use c2_wire::chunk::{decode_chunk_header, encode_reply_chunk_meta, REPLY_CHUNK_META_SIZE};
-use c2_wire::control::{decode_call_control, encode_reply_control, ReplyControl};
-use c2_wire::flags::{FLAG_BUDDY, FLAG_CHUNKED, FLAG_CHUNK_LAST, FLAG_HANDSHAKE, FLAG_REPLY_V2, FLAG_RESPONSE, FLAG_SIGNAL};
+use c2_mem::config::PoolConfig;
+use c2_wire::buddy::{
+    BUDDY_PAYLOAD_SIZE, BuddyPayload, decode_buddy_payload, encode_buddy_payload,
+};
+use c2_wire::chunk::{REPLY_CHUNK_META_SIZE, decode_chunk_header, encode_reply_chunk_meta};
+use c2_wire::control::{ReplyControl, decode_call_control, encode_reply_control};
+use c2_wire::flags::{
+    FLAG_BUDDY, FLAG_CHUNK_LAST, FLAG_CHUNKED, FLAG_HANDSHAKE, FLAG_REPLY_V2, FLAG_RESPONSE,
+    FLAG_SIGNAL,
+};
 use c2_wire::frame::{self, decode_frame_body, encode_frame};
 use c2_wire::handshake::{
-    decode_handshake, encode_server_handshake, MethodEntry, RouteInfo, CAP_CALL_V2, CAP_CHUNKED,
-    CAP_METHOD_IDX,
+    CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX, MethodEntry, RouteInfo, decode_handshake,
+    encode_server_handshake,
 };
-use c2_wire::msg_type::{MsgType, DISCONNECT_ACK_BYTES, PONG_BYTES, SHUTDOWN_ACK_BYTES};
+use c2_wire::msg_type::{DISCONNECT_ACK_BYTES, MsgType, PONG_BYTES, SHUTDOWN_ACK_BYTES};
 
 use crate::config::ServerIpcConfig;
 use crate::connection::Connection;
-use crate::dispatcher::{CrmError, CrmRoute, Dispatcher, RequestData, ResponseMeta, cleanup_request};
+use crate::dispatcher::{
+    CrmError, CrmRoute, Dispatcher, RequestData, ResponseMeta, cleanup_request,
+};
 use crate::heartbeat::run_heartbeat;
 
 const IPC_SOCK_DIR: &str = "/tmp/c_two_ipc";
@@ -151,7 +158,8 @@ impl Server {
             let prefix = format!("/cc3r{:08x}{:08x}", pid, generation as u32);
             MemPool::new_with_prefix(response_cfg, prefix)
         };
-        response_pool.ensure_ready()
+        response_pool
+            .ensure_ready()
             .map_err(|e| ServerError::Config(format!("response pool init: {e}")))?;
         Ok(Self {
             config,
@@ -200,10 +208,8 @@ impl Server {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
-                &self.socket_path,
-                std::fs::Permissions::from_mode(0o600),
-            );
+            let _ =
+                std::fs::set_permissions(&self.socket_path, std::fs::Permissions::from_mode(0o600));
         }
 
         info!(path = %self.socket_path.display(), "server listening");
@@ -526,14 +532,23 @@ async fn dispatch_call(
 
     let result = route
         .scheduler
-        .execute(idx, move || callback.invoke(&name, idx, RequestData::Inline(args), resp_pool))
+        .execute(idx, move || {
+            callback.invoke(&name, idx, RequestData::Inline(args), resp_pool)
+        })
         .await;
 
     match result {
-        Ok(meta) => send_response_meta(
-            &server.response_pool, writer, request_id, meta,
-            server.config.shm_threshold, server.config.chunk_size as usize,
-        ).await,
+        Ok(meta) => {
+            send_response_meta(
+                &server.response_pool,
+                writer,
+                request_id,
+                meta,
+                server.config.shm_threshold,
+                server.config.chunk_size as usize,
+            )
+            .await
+        }
         Err(CrmError::UserError(b)) => {
             write_reply(writer, request_id, &ReplyControl::Error(b)).await;
         }
@@ -572,7 +587,11 @@ async fn dispatch_buddy_call(
     let (ctrl, ctrl_consumed) = match decode_call_control(payload, BUDDY_PAYLOAD_SIZE) {
         Ok(v) => v,
         Err(e) => {
-            warn!(conn_id = conn.conn_id(), ?e, "buddy call control decode error");
+            warn!(
+                conn_id = conn.conn_id(),
+                ?e,
+                "buddy call control decode error"
+            );
             conn.flight_dec();
             return;
         }
@@ -609,7 +628,11 @@ async fn dispatch_buddy_call(
         }
     } else {
         // Rare edge case: extra inline args after buddy payload — fall back to copy.
-        warn!(conn_id = conn.conn_id(), extra_len = extra_args.len(), "buddy call has trailing inline args, falling back to copy");
+        warn!(
+            conn_id = conn.conn_id(),
+            extra_len = extra_args.len(),
+            "buddy call has trailing inline args, falling back to copy"
+        );
         let args = match conn.read_peer_data(bp.seg_idx, bp.offset, bp.data_size, bp.is_dedicated) {
             Ok(data) => data,
             Err(e) => {
@@ -620,7 +643,8 @@ async fn dispatch_buddy_call(
                 return;
             }
         };
-        let free_result = conn.free_peer_block(bp.seg_idx, bp.offset, bp.data_size, bp.is_dedicated);
+        let free_result =
+            conn.free_peer_block(bp.seg_idx, bp.offset, bp.data_size, bp.is_dedicated);
         if let c2_mem::FreeResult::SegmentIdle { .. } = free_result {
             let conn2 = Arc::clone(&conn);
             tokio::spawn(async move {
@@ -657,10 +681,17 @@ async fn dispatch_buddy_call(
         .await;
 
     match result {
-        Ok(meta) => send_response_meta(
-            &server.response_pool, writer, request_id, meta,
-            server.config.shm_threshold, server.config.chunk_size as usize,
-        ).await,
+        Ok(meta) => {
+            send_response_meta(
+                &server.response_pool,
+                writer,
+                request_id,
+                meta,
+                server.config.shm_threshold,
+                server.config.chunk_size as usize,
+            )
+            .await
+        }
         Err(CrmError::UserError(b)) => {
             write_reply(writer, request_id, &ReplyControl::Error(b)).await;
         }
@@ -702,7 +733,8 @@ async fn dispatch_chunked_call(
         offset = bp_consumed;
         match conn.read_peer_data(bp.seg_idx, bp.offset, bp.data_size, bp.is_dedicated) {
             Ok(data) => {
-                let free_result = conn.free_peer_block(bp.seg_idx, bp.offset, bp.data_size, bp.is_dedicated);
+                let free_result =
+                    conn.free_peer_block(bp.seg_idx, bp.offset, bp.data_size, bp.is_dedicated);
                 if let c2_mem::FreeResult::SegmentIdle { .. } = free_result {
                     let conn2 = Arc::clone(&conn);
                     tokio::spawn(async move {
@@ -736,7 +768,11 @@ async fn dispatch_chunked_call(
         let (ctrl, ctrl_consumed) = match decode_call_control(payload, offset) {
             Ok(v) => v,
             Err(e) => {
-                warn!(conn_id = conn.conn_id(), ?e, "chunked call control decode error");
+                warn!(
+                    conn_id = conn.conn_id(),
+                    ?e,
+                    "chunked call control decode error"
+                );
                 return;
             }
         };
@@ -750,7 +786,10 @@ async fn dispatch_chunked_call(
         };
         let chunk_size = first_data.len();
         if chunk_size == 0 {
-            warn!(conn_id = conn.conn_id(), "chunked: first chunk has zero data");
+            warn!(
+                conn_id = conn.conn_id(),
+                "chunked: first chunk has zero data"
+            );
             return;
         }
 
@@ -779,18 +818,17 @@ async fn dispatch_chunked_call(
     };
 
     // 5. Feed chunk to registry.
-    let complete = match server.chunk_registry.feed(
-        conn.conn_id(),
-        request_id,
-        chunk_idx as usize,
-        chunk_data,
-    ) {
-        Ok(complete) => complete,
-        Err(e) => {
-            warn!(conn_id = conn.conn_id(), %e, "chunk feed error");
-            return;
-        }
-    };
+    let complete =
+        match server
+            .chunk_registry
+            .feed(conn.conn_id(), request_id, chunk_idx as usize, chunk_data)
+        {
+            Ok(complete) => complete,
+            Err(e) => {
+                warn!(conn_id = conn.conn_id(), %e, "chunk feed error");
+                return;
+            }
+        };
 
     // 6. If complete, finish and dispatch.
     if complete {
@@ -835,10 +873,17 @@ async fn dispatch_chunked_call(
             .await;
 
         match result {
-            Ok(meta) => send_response_meta(
-                &server.response_pool, writer, request_id, meta,
-                server.config.shm_threshold, server.config.chunk_size as usize,
-            ).await,
+            Ok(meta) => {
+                send_response_meta(
+                    &server.response_pool,
+                    writer,
+                    request_id,
+                    meta,
+                    server.config.shm_threshold,
+                    server.config.chunk_size as usize,
+                )
+                .await
+            }
             Err(CrmError::UserError(b)) => {
                 write_reply(writer, request_id, &ReplyControl::Error(b)).await;
             }
@@ -1008,15 +1053,31 @@ async fn send_response_meta(
     match meta {
         ResponseMeta::Inline(data) => {
             smart_reply_with_data(
-                response_pool, writer, request_id, &data, shm_threshold, chunk_size,
-            ).await;
+                response_pool,
+                writer,
+                request_id,
+                &data,
+                shm_threshold,
+                chunk_size,
+            )
+            .await;
         }
         ResponseMeta::Empty => {
             write_reply_with_data(writer, request_id, &[]).await;
         }
-        ResponseMeta::ShmAlloc { seg_idx, offset, data_size, is_dedicated } => {
+        ResponseMeta::ShmAlloc {
+            seg_idx,
+            offset,
+            data_size,
+            is_dedicated,
+        } => {
             // CRM already wrote into our response pool — send buddy pointer.
-            let bp = BuddyPayload { seg_idx, offset, data_size, is_dedicated };
+            let bp = BuddyPayload {
+                seg_idx,
+                offset,
+                data_size,
+                is_dedicated,
+            };
             let buddy_bytes = encode_buddy_payload(&bp);
             let ctrl_bytes = encode_reply_control(&ReplyControl::Success);
             let mut payload = Vec::with_capacity(BUDDY_PAYLOAD_SIZE + ctrl_bytes.len());
@@ -1046,7 +1107,10 @@ async fn smart_reply_with_data(
 ) {
     if data.len() as u64 > shm_threshold {
         // Try buddy SHM first
-        if write_buddy_reply_with_data(response_pool, writer, request_id, data).await.is_err() {
+        if write_buddy_reply_with_data(response_pool, writer, request_id, data)
+            .await
+            .is_err()
+        {
             // SHM failed — use chunked for large data, inline for small
             if data.len() > chunk_size {
                 write_chunked_reply(writer, request_id, data, chunk_size).await;
@@ -1110,7 +1174,10 @@ mod tests {
 
     #[test]
     fn server_new_bad_config() {
-        let cfg = ServerIpcConfig { max_payload_size: 0, ..ServerIpcConfig::default() };
+        let cfg = ServerIpcConfig {
+            max_payload_size: 0,
+            ..ServerIpcConfig::default()
+        };
         assert!(Server::new("ipc://x", cfg).is_err());
     }
 
@@ -1132,7 +1199,10 @@ mod tests {
     fn make_route(name: &str) -> CrmRoute {
         CrmRoute {
             name: name.into(),
-            scheduler: Arc::new(Scheduler::new(ConcurrencyMode::ReadParallel, HashMap::new())),
+            scheduler: Arc::new(Scheduler::new(
+                ConcurrencyMode::ReadParallel,
+                HashMap::new(),
+            )),
             callback: Arc::new(Echo),
             method_names: vec!["step".into(), "query".into()],
         }
@@ -1175,7 +1245,7 @@ mod tests {
 
     #[test]
     fn decode_buddy_then_call_control() {
-        use c2_wire::buddy::{encode_buddy_payload, BuddyPayload, BUDDY_PAYLOAD_SIZE};
+        use c2_wire::buddy::{BUDDY_PAYLOAD_SIZE, BuddyPayload, encode_buddy_payload};
         use c2_wire::control::encode_call_control;
 
         let bp = BuddyPayload {
@@ -1206,8 +1276,8 @@ mod tests {
 
     #[test]
     fn chunked_reassembly_via_registry() {
-        use std::sync::Arc;
         use parking_lot::RwLock;
+        use std::sync::Arc;
 
         let reassembly_cfg = c2_mem::config::PoolConfig {
             segment_size: 64 * 1024,
@@ -1230,7 +1300,9 @@ mod tests {
         let total_chunks = 3usize;
         let chunk_size = 8usize;
 
-        registry.insert(conn_id, request_id, total_chunks, chunk_size).unwrap();
+        registry
+            .insert(conn_id, request_id, total_chunks, chunk_size)
+            .unwrap();
         registry.set_route_info(conn_id, request_id, "grid".into(), 0);
 
         // Feed chunks.
@@ -1256,7 +1328,9 @@ mod tests {
 
     #[test]
     fn handshake_extracts_client_info() {
-        use c2_wire::handshake::{encode_client_handshake, decode_handshake, CAP_CALL_V2, CAP_CHUNKED};
+        use c2_wire::handshake::{
+            CAP_CALL_V2, CAP_CHUNKED, decode_handshake, encode_client_handshake,
+        };
 
         let segments = vec![("seg0".into(), 4096u32), ("seg1".into(), 8192u32)];
         let cap = CAP_CALL_V2 | CAP_CHUNKED;

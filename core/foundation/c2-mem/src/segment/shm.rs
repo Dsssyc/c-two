@@ -32,11 +32,7 @@ impl ShmRegion {
             // Clean up stale segment if it exists.
             libc::shm_unlink(c_name.as_ptr());
 
-            let fd = libc::shm_open(
-                c_name.as_ptr(),
-                libc::O_CREAT | libc::O_RDWR,
-                0o600,
-            );
+            let fd = libc::shm_open(c_name.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600);
             if fd < 0 {
                 return Err(format!(
                     "shm_open failed: {}",
@@ -63,10 +59,7 @@ impl ShmRegion {
 
             if ptr == libc::MAP_FAILED {
                 libc::shm_unlink(c_name.as_ptr());
-                return Err(format!(
-                    "mmap failed: {}",
-                    std::io::Error::last_os_error()
-                ));
+                return Err(format!("mmap failed: {}", std::io::Error::last_os_error()));
             }
 
             Ok(Self {
@@ -122,10 +115,7 @@ impl ShmRegion {
             libc::close(fd);
 
             if ptr == libc::MAP_FAILED {
-                return Err(format!(
-                    "mmap failed: {}",
-                    std::io::Error::last_os_error()
-                ));
+                return Err(format!("mmap failed: {}", std::io::Error::last_os_error()));
             }
 
             Ok(Self {
