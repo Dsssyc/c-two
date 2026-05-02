@@ -38,6 +38,10 @@ The Python SDK does not embed or start a relay server. Start the standalone
 Rust relay with `c3 relay`, Docker Compose, or orchestration such as
 Kubernetes, then point Python code at it with `C2_RELAY_ADDRESS` or
 `cc.set_relay()`.
+Relay-aware clients preflight routes before the first call and re-resolve
+structured stale-route responses; set `C2_RELAY_ROUTE_MAX_ATTEMPTS` to tune the
+maximum route acquisition attempts (default `3`, valid range `1..=32`, `0` is
+treated as `1`). Ambiguous data-plane failures are not replayed.
 
 Run the Python SDK tests:
 

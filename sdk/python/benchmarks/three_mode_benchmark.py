@@ -126,17 +126,29 @@ def _post_json(url: str, payload: dict[str, str], timeout: float = 5.0) -> int:
         return resp.status
 
 
-def _register_relay_upstream(relay_url: str, name: str, address: str) -> None:
-    _post_json(f'{relay_url}/_register', {'name': name, 'address': address})
+def _register_relay_upstream(
+    relay_url: str,
+    name: str,
+    address: str,
+    server_id: str,
+) -> None:
+    _post_json(
+        f'{relay_url}/_register',
+        {'name': name, 'server_id': server_id, 'address': address},
+    )
 
 
-def _unregister_relay_upstream(relay_url: str, name: str) -> None:
-    _post_json(f'{relay_url}/_unregister', {'name': name})
+def _unregister_relay_upstream(relay_url: str, name: str, server_id: str) -> None:
+    _post_json(f'{relay_url}/_unregister', {'name': name, 'server_id': server_id})
 
 
-def _best_effort_unregister_relay_upstream(relay_url: str, name: str) -> None:
+def _best_effort_unregister_relay_upstream(
+    relay_url: str,
+    name: str,
+    server_id: str,
+) -> None:
     try:
-        _unregister_relay_upstream(relay_url, name)
+        _unregister_relay_upstream(relay_url, name, server_id)
     except urllib.error.HTTPError as exc:
         if exc.code != 404:
             print(f'Warning: failed to unregister relay route {name!r}: {exc}', file=sys.stderr)
@@ -224,8 +236,12 @@ def bench_ipc(payload_size: int) -> float:
     _ipc_counter += 1
     _ProcessRegistry.reset()
 
-    cc.set_server(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
-    cc.set_client(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
+    ipc_overrides = {
+        'pool_segment_size': _SEGMENT_SIZE,
+        'max_pool_segments': _MAX_SEGMENTS,
+    }
+    cc.set_server(ipc_overrides=ipc_overrides)
+    cc.set_client(ipc_overrides=ipc_overrides)
     cc.register(Echo, EchoImpl(), name='echo_ipc')
     address = cc.server_address()
     _wait_sock(address)
@@ -254,16 +270,24 @@ def bench_relay(payload_size: int) -> float | None:
     route_name = f'echo_relay_{os.getpid()}_{_ipc_counter}'
     local_registered = False
     route_registered = False
+    server_id: str | None = None
 
     try:
-        cc.set_server(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
-        cc.set_client(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
+        ipc_overrides = {
+            'pool_segment_size': _SEGMENT_SIZE,
+            'max_pool_segments': _MAX_SEGMENTS,
+        }
+        cc.set_server(ipc_overrides=ipc_overrides)
+        cc.set_client(ipc_overrides=ipc_overrides)
         cc.register(Echo, EchoImpl(), name=route_name)
         local_registered = True
         address = cc.server_address()
+        server_id = cc.server_id()
+        if server_id is None:
+            raise RuntimeError('registered server did not expose server_id')
         _wait_sock(address)
 
-        _register_relay_upstream(relay_url, route_name, address)
+        _register_relay_upstream(relay_url, route_name, address, server_id)
         route_registered = True
 
         payload = b'\xAB' * payload_size
@@ -276,8 +300,8 @@ def bench_relay(payload_size: int) -> float | None:
             print(f'  [relay FAILED: {exc}]', file=sys.stderr)
             return None
     finally:
-        if route_registered:
-            _best_effort_unregister_relay_upstream(relay_url, route_name)
+        if route_registered and server_id is not None:
+            _best_effort_unregister_relay_upstream(relay_url, route_name, server_id)
         if local_registered:
             _best_effort_unregister_local(route_name)
         cc.shutdown()
@@ -303,8 +327,12 @@ def bench_ipc_dict(payload_size: int) -> float | None:
     _ipc_counter += 1
     _ProcessRegistry.reset()
 
-    cc.set_server(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
-    cc.set_client(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
+    ipc_overrides = {
+        'pool_segment_size': _SEGMENT_SIZE,
+        'max_pool_segments': _MAX_SEGMENTS,
+    }
+    cc.set_server(ipc_overrides=ipc_overrides)
+    cc.set_client(ipc_overrides=ipc_overrides)
     cc.register(DictEcho, DictEchoImpl(), name='echo_dict')
     address = cc.server_address()
     _wait_sock(address)

@@ -26,40 +26,35 @@ in core/docs.
 
 ## Findings
 
-### 1. IPC configuration still has two authorities
+### 1. IPC configuration authority is now unified in Rust
 
-**Severity:** High  
+**Severity:** High, resolved
 **Type:** Architecture / cross-language maintainability
 
-`c2-config` is described as the shared configuration authority:
+Resolved state:
 
-- `core/foundation/c2-config/src/lib.rs`
-
-But `core/foundation/c2-config/src/ipc.rs` still says the Rust `Default`
-implementations exist only for Rust-side testing and that Python is
-authoritative at runtime.
-
-At the same time, `sdk/python/src/c_two/config/ipc.py` duplicates the IPC
-defaults, validation, env merging, clamping, and derived `max_pool_memory`
-behavior. The PyO3 constructors in `sdk/python/native/src/server_ffi.rs` and
-`sdk/python/native/src/client_ffi.rs` receive scalar config values and rebuild
-the Rust config structs from Python-owned values.
+- Rust `c2-config` is the canonical source for env-file parsing, environment
+  variables, defaults, derived values, and validation.
+- Python exposes typed override-only surfaces and does not carry its own
+  default matrix.
+- `shm_threshold` is a process transport policy override, not a role-level IPC
+  override.
+- `max_pool_memory` is a derived output. If it appears as an IPC override input,
+  it is handled by the normal unknown-option path rather than a compatibility
+  special case.
 
 **Why this hurts cross-language support:**
 
-Future SDKs would have to either copy Python's config builder behavior or use
-Rust defaults that the code comments explicitly say are not authoritative.
-That creates default drift and makes `c2-config` a shared struct crate rather
-than a true configuration authority.
+The original finding was that future SDKs would have had to copy Python's
+config builder behavior. The resolved model gives future SDKs a single contract:
+send explicit code-level overrides into Rust and let Rust resolve the runtime
+configuration.
 
 **Discussion questions:**
 
-- Should `c2-config` become the canonical default and validation authority for
-  all SDKs?
-- Should SDKs pass only explicit overrides into Rust and let Rust merge them
-  with canonical defaults?
-- Should env parsing live in Rust for shared runtime variables, or should each
-  SDK parse env vars but use Rust-generated defaults?
+- Are there any remaining Python-side config classes that still own defaults or
+  env parsing?
+- Are all new SDK-facing override surfaces typed and default-free?
 
 ### 2. Relay ownership and idle-timeout defaults are now unified
 
@@ -201,10 +196,9 @@ limitation, not as a cross-language architecture finding.
 
 ## Proposed Discussion Order
 
-1. Decide configuration authority (`c2-config` vs SDK-owned defaults).
-2. Move root/CLI workflow-policy tests out of the Python SDK tree.
-3. Rewrite Python-first core comments into language-neutral docs.
-4. Reposition root README language once the desired product framing is clear.
+1. Move root/CLI workflow-policy tests out of the Python SDK tree.
+2. Rewrite Python-first core comments into language-neutral docs.
+3. Reposition root README language once the desired product framing is clear.
 
 Relay idle-timeout defaults were resolved separately: the canonical default is
 60 seconds, and `0` explicitly disables time-based eviction.
@@ -215,45 +209,33 @@ GitHub issue creation was attempted for these items, but the connected GitHub
 integration returned `403 Resource not accessible by integration`. The drafts
 below are ready to paste into GitHub once issue write access is available.
 
-### Issue 1: Decide canonical IPC configuration ownership for cross-language SDKs
+### Issue 1: Canonical IPC configuration ownership for cross-language SDKs is resolved
 
 **Labels:** `architecture`, `cross-language`
 
 #### Problem
 
-IPC configuration currently has two competing authorities.
+This issue has been resolved in the current implementation.
 
-`core/foundation/c2-config/src/lib.rs` describes `c2-config` as the shared
-configuration source of truth, but `core/foundation/c2-config/src/ipc.rs` says
-Rust defaults exist only for Rust-side testing and that Python is authoritative
-at runtime.
-
-At the same time, `sdk/python/src/c_two/config/ipc.py` duplicates IPC defaults,
-validation, env merging, clamping, and derived `max_pool_memory` behavior. PyO3
-constructors in `sdk/python/native/src/server_ffi.rs` and
-`sdk/python/native/src/client_ffi.rs` receive scalar config values and rebuild
-Rust config structs from Python-owned values.
+Rust `c2-config` owns env-file parsing, environment variables, defaults,
+derived values, and validation. SDKs provide typed code-level overrides only.
+Python no longer owns a parallel default matrix.
 
 #### Why this matters
 
-Future SDKs would either need to copy Python's config builder behavior or use
-Rust defaults that the Rust comments say are not authoritative. That creates
-default drift and prevents `c2-config` from serving as a true cross-language
-configuration authority.
+The current design prevents default drift: future SDKs do not need to copy
+Python behavior, and Python does not need compatibility shims for removed config
+inputs.
 
 #### Discussion questions
 
-- Should `c2-config` become the canonical default and validation authority for
-  all SDKs?
-- Should SDKs pass only explicit overrides into Rust and let Rust merge them
-  with canonical defaults?
-- Should env parsing live in Rust for shared runtime variables, or should each
-  SDK parse env vars but use Rust-generated defaults?
+- Are any SDK override APIs still accepting untyped dictionaries?
+- Are any env variables still parsed outside Rust resolver/catalog code?
 
 #### Candidate acceptance criteria
 
 - One documented authority for IPC defaults and validation.
-- Python SDK no longer has to duplicate the full default matrix manually.
+- Python SDK does not duplicate the full default matrix manually.
 - Future SDKs have a clear path to obtain identical runtime defaults.
 
 ### Issue 2: Align standalone relay idle-timeout defaults and ownership

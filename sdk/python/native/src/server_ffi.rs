@@ -244,22 +244,25 @@ impl PyServer {
 
         // Register requires async; use a short-lived runtime if the main
         // one hasn't started, or block_on the existing runtime's handle.
-        py.detach(move || {
+        py.detach(move || -> PyResult<()> {
             let rt_guard = self.rt.lock();
             if let Some(rt) = rt_guard.as_ref() {
-                rt.block_on(server.register_route(route));
+                rt.block_on(server.register_route(route))
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             } else {
                 // Server not started yet — create a temporary runtime for registration.
                 let tmp_rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
-                    .map_err(|e| format!("failed to create runtime: {e}"))
-                    .unwrap();
-                tmp_rt.block_on(server.register_route(route));
+                    .map_err(|e| {
+                        PyRuntimeError::new_err(format!("failed to create runtime: {e}"))
+                    })?;
+                tmp_rt
+                    .block_on(server.register_route(route))
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             }
-        });
-
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Start the server on a background thread with a tokio runtime.

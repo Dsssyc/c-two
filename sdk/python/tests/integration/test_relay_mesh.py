@@ -88,7 +88,10 @@ class TestSingleRelay:
         base = relay.url
 
         # Register a mock upstream.
-        req = _http_post(f"{base}/_register", {"name": "grid", "address": "ipc://test_grid"})
+        req = _http_post(
+            f"{base}/_register",
+            {"name": "grid", "server_id": "test-grid", "address": "ipc://test_grid"},
+        )
         with urllib.request.urlopen(req, timeout=5) as resp:
             assert resp.status == 201
 
@@ -98,7 +101,10 @@ class TestSingleRelay:
         assert routes[0]["name"] == "grid"
 
         # Unregister.
-        req = _http_post(f"{base}/_unregister", {"name": "grid"})
+        req = _http_post(
+            f"{base}/_unregister",
+            {"name": "grid", "server_id": "test-grid"},
+        )
         with urllib.request.urlopen(req, timeout=5) as resp:
             assert resp.status == 200
 
@@ -132,7 +138,10 @@ class TestTwoRelayMesh:
         _wait_for_peer(url_a, "relay-b")
 
         # Register on relay A.
-        req = _http_post(f"{url_a}/_register", {"name": "grid", "address": "ipc://grid_a"})
+        req = _http_post(
+            f"{url_a}/_register",
+            {"name": "grid", "server_id": "grid-a", "address": "ipc://grid_a"},
+        )
         urllib.request.urlopen(req, timeout=5)
 
         # Resolve on relay B should find "grid".
@@ -160,7 +169,10 @@ class TestTwoRelayMesh:
         _wait_for_peer(url_a, "relay-b")
 
         # Register on A.
-        req = _http_post(f"{url_a}/_register", {"name": "net", "address": "ipc://net_a"})
+        req = _http_post(
+            f"{url_a}/_register",
+            {"name": "net", "server_id": "net-a", "address": "ipc://net_a"},
+        )
         urllib.request.urlopen(req, timeout=5)
 
         # Verify B can resolve.
@@ -168,7 +180,10 @@ class TestTwoRelayMesh:
         assert len(routes) >= 1
 
         # Unregister on A.
-        req = _http_post(f"{url_a}/_unregister", {"name": "net"})
+        req = _http_post(
+            f"{url_a}/_unregister",
+            {"name": "net", "server_id": "net-a"},
+        )
         urllib.request.urlopen(req, timeout=5)
 
         # Resolve on B should now 404.
@@ -216,7 +231,7 @@ class TestTwoRelayMesh:
         # Register on A.
         req = _http_post(
             f"{url_a}/_register",
-            {"name": "solver", "address": "ipc://solver_a"},
+            {"name": "solver", "server_id": "solver-a", "address": "ipc://solver_a"},
         )
         urllib.request.urlopen(req, timeout=5)
 

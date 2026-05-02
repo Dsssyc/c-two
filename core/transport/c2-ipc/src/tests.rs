@@ -15,7 +15,7 @@ mod client_tests {
     fn encode_v2_inline_call() {
         // Verify that an inline v2 call frame has the expected layout:
         // [16B header (flags=FLAG_CALL_V2)] [call_control] [data]
-        let ctrl = encode_call_control("grid", 0);
+        let ctrl = encode_call_control("grid", 0).unwrap();
         let data = b"hello";
         let mut payload = Vec::new();
         payload.extend_from_slice(&ctrl);
@@ -75,7 +75,7 @@ mod client_tests {
     fn handshake_client_message() {
         // Client sends: [version][segments][cap_flags]
         let segments = vec![("seg0".into(), 268_435_456u32)];
-        let encoded = encode_client_handshake(&segments, CAP_CALL_V2 | CAP_METHOD_IDX, "");
+        let encoded = encode_client_handshake(&segments, CAP_CALL_V2 | CAP_METHOD_IDX, "").unwrap();
         let frame_bytes = frame::encode_frame(0, flags::FLAG_HANDSHAKE, &encoded);
 
         let (hdr, payload) = frame::decode_frame(&frame_bytes).unwrap();
@@ -112,7 +112,7 @@ mod client_tests {
         let buddy_bytes = encode_buddy_payload(&bp);
         assert_eq!(buddy_bytes.len(), BUDDY_PAYLOAD_SIZE);
 
-        let ctrl = encode_call_control("grid", 3);
+        let ctrl = encode_call_control("grid", 3).unwrap();
         let mut payload = Vec::new();
         payload.extend_from_slice(&buddy_bytes);
         payload.extend_from_slice(&ctrl);
@@ -152,7 +152,7 @@ mod client_tests {
             is_dedicated: true,
         };
         let buddy_bytes = encode_buddy_payload(&bp);
-        let ctrl = encode_call_control("net", 1);
+        let ctrl = encode_call_control("net", 1).unwrap();
 
         let mut payload = Vec::new();
         payload.extend_from_slice(&buddy_bytes);
@@ -178,7 +178,7 @@ mod client_tests {
         let total_chunks: u16 = 3;
         let request_id: u64 = 42;
 
-        let ctrl = encode_call_control(route, method_idx);
+        let ctrl = encode_call_control(route, method_idx).unwrap();
         let chunk_data = b"chunk_payload_data";
 
         // ── Chunk 0: [chunk_header][call_control][data] ──
@@ -284,7 +284,7 @@ mod client_tests {
         use c2_wire::chunk::encode_chunk_header;
 
         let chunk_hdr = encode_chunk_header(0, 1);
-        let ctrl = encode_call_control("route", 0);
+        let ctrl = encode_call_control("route", 0).unwrap();
         let data = vec![0xABu8; 128];
 
         let mut payload = Vec::new();
@@ -346,7 +346,7 @@ mod client_tests {
             ("seg_b".into(), 256 * 1024 * 1024u32),
         ];
         let cap = CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED;
-        let encoded = encode_client_handshake(&segments, cap, "test_prefix");
+        let encoded = encode_client_handshake(&segments, cap, "test_prefix").unwrap();
         let frame_bytes = frame::encode_frame(0, flags::FLAG_HANDSHAKE, &encoded);
 
         let (hdr, payload) = frame::decode_frame(&frame_bytes).unwrap();

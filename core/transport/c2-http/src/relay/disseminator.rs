@@ -2,6 +2,7 @@ use tokio::task::JoinHandle;
 
 use crate::relay::peer::PeerEnvelope;
 use crate::relay::types::PeerSnapshot;
+use crate::relay::url::peer_endpoint_url;
 
 /// Trait for broadcasting gossip messages to peers.
 pub trait Disseminator: Send + Sync {
@@ -38,7 +39,7 @@ impl FullBroadcast {
             crate::relay::peer::PeerMessage::DigestDiff { .. } => "/_peer/digest",
             crate::relay::peer::PeerMessage::Unknown => return,
         };
-        let full_url = format!("{url}{endpoint}");
+        let full_url = peer_endpoint_url(url, endpoint);
         let _ = client.post(&full_url).json(envelope).send().await;
     }
 }

@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use c2_ipc::IpcClient;
@@ -25,7 +24,6 @@ struct UpstreamSlot {
 struct SlotInner {
     address: String,
     client: Option<Arc<IpcClient>>,
-    generation: u64,
     last_activity: u64,
     active_requests: usize,
     state: SlotState,
@@ -43,31 +41,28 @@ enum SlotState {
 #[derive(Debug)]
 pub enum AcquireError {
     NotFound,
-    Unreachable(c2_ipc::IpcError),
+    Unreachable {
+        address: String,
+        error: c2_ipc::IpcError,
+    },
 }
 
 pub struct UpstreamLease {
     slot: Arc<UpstreamSlot>,
     client: Arc<IpcClient>,
-    generation: u64,
+}
+
+pub enum CachedClient {
+    Ready { address: String },
+    Evicted { address: String },
+    Disconnected { address: String },
+    Missing,
 }
 
 #[derive(Clone)]
-pub enum CachedClient {
-    Ready {
-        client: Arc<IpcClient>,
-        address: String,
-        generation: u64,
-    },
-    Evicted {
-        address: String,
-        generation: u64,
-    },
-    Disconnected {
-        address: String,
-        generation: u64,
-    },
-    Missing,
+pub struct OwnerToken {
+    slot: Arc<UpstreamSlot>,
+    address: String,
 }
 
 /// Pool of IPC connections keyed by route name.
@@ -76,27 +71,22 @@ pub enum CachedClient {
 /// connection lifecycle. Supports lazy reconnection and idle eviction.
 pub struct ConnectionPool {
     entries: Mutex<HashMap<String, Arc<UpstreamSlot>>>,
-    next_generation: AtomicU64,
 }
 
 impl ConnectionPool {
     pub fn new() -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
-            next_generation: AtomicU64::new(1),
         }
-    }
-
-    fn allocate_generation(&self) -> u64 {
-        self.next_generation
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current.checked_add(1)
-            })
-            .expect("connection generation exhausted")
     }
 
     fn slot(&self, name: &str) -> Option<Arc<UpstreamSlot>> {
         self.entries.lock().get(name).cloned()
+    }
+
+    fn slot_matches(&self, name: &str, expected: &Arc<UpstreamSlot>) -> bool {
+        self.slot(name)
+            .is_some_and(|current| Arc::ptr_eq(&current, expected))
     }
 
     pub async fn acquire_with<C, Fut>(
@@ -116,15 +106,9 @@ impl ConnectionPool {
 
     /// Insert a pre-connected client for a route name.
     pub fn insert(&self, name: String, address: String, client: Arc<IpcClient>) {
-        let generation = self.allocate_generation();
         let old_slot = self.entries.lock().insert(
             name,
-            Arc::new(UpstreamSlot::new(
-                address,
-                Some(client),
-                generation,
-                SlotState::Ready,
-            )),
+            Arc::new(UpstreamSlot::new(address, Some(client), SlotState::Ready)),
         );
         if let Some(old_slot) = old_slot {
             if let Some(client) = old_slot.retire() {
@@ -140,33 +124,17 @@ impl ConnectionPool {
         slot.lookup()
     }
 
-    /// Begin an upstream request against a connected client.
-    pub fn begin_request(&self, name: &str) -> Option<(Arc<IpcClient>, u64)> {
-        self.slot(name)?.begin_request()
-    }
-
-    /// End an upstream request and refresh activity.
-    pub fn end_request(&self, name: &str, generation: u64) {
-        if let Some(slot) = self.slot(name) {
-            slot.end_request(generation);
-        }
-    }
-
     /// Get stored address for reconnection.
+    #[cfg(test)]
     pub fn get_address(&self, name: &str) -> Option<String> {
         self.slot(name).map(|slot| slot.address())
     }
 
-    /// Capture the current reconnect identity before awaiting a new connection.
-    pub fn reconnect_candidate(&self, name: &str) -> Option<(String, u64)> {
-        self.slot(name).map(|slot| slot.reconnect_candidate())
-    }
-
-    /// Touch activity timestamp.
-    pub fn touch(&self, name: &str) {
-        if let Some(slot) = self.slot(name) {
-            slot.touch();
-        }
+    /// Capture the current owner identity before awaiting a probe.
+    pub fn owner_token(&self, name: &str) -> Option<OwnerToken> {
+        let slot = self.slot(name)?;
+        let address = slot.address();
+        Some(OwnerToken { slot, address })
     }
 
     /// Names of entries to evict (dead or idle beyond timeout_ms).
@@ -194,33 +162,23 @@ impl ConnectionPool {
     }
 
     /// Evict a client — returns old Arc for async close.
+    #[cfg(test)]
     pub fn evict(&self, name: &str) -> Option<Arc<IpcClient>> {
         self.slot(name)?.evict()
     }
 
-    /// Evict a client only if the current entry matches the request generation.
-    pub fn evict_generation(&self, name: &str, generation: u64) -> Option<Arc<IpcClient>> {
-        self.slot(name)?.evict_generation(generation)
+    /// Evict a request client only if it is still the current cached client.
+    #[cfg(test)]
+    pub fn evict_client(&self, name: &str, client: &Arc<IpcClient>) -> Option<Arc<IpcClient>> {
+        self.slot(name)?.evict_client(client)
     }
 
     /// Re-attach a freshly connected client.
+    #[cfg(test)]
     pub fn reconnect(&self, name: &str, client: Arc<IpcClient>) {
         if let Some(slot) = self.slot(name) {
             slot.reconnect(client);
         }
-    }
-
-    /// Re-attach a freshly connected client only if the entry still matches.
-    pub fn reconnect_generation(
-        &self,
-        name: &str,
-        generation: u64,
-        address: &str,
-        client: Arc<IpcClient>,
-    ) -> bool {
-        self.slot(name)
-            .map(|slot| slot.reconnect_generation(generation, address, client))
-            .unwrap_or(false)
     }
 
     /// Remove entry entirely.
@@ -232,12 +190,28 @@ impl ConnectionPool {
     }
 
     /// List route names with addresses.
+    #[cfg(test)]
     pub fn list_connections(&self) -> Vec<(String, String)> {
         self.entries
             .lock()
             .iter()
             .map(|(n, slot)| (n.clone(), slot.address()))
             .collect()
+    }
+
+    pub fn matches_owner_token(&self, name: &str, token: &OwnerToken) -> bool {
+        self.slot_matches(name, &token.slot) && token.slot.address() == token.address
+    }
+
+    pub fn can_replace_owner_token(&self, name: &str, token: &OwnerToken) -> bool {
+        self.slot_matches(name, &token.slot)
+            && token.slot.address() == token.address
+            && token.slot.is_replaceable()
+    }
+
+    #[cfg(test)]
+    fn begin_request_for_test(&self, name: &str) -> Option<UpstreamLease> {
+        self.slot(name)?.begin_request_for_test()
     }
 }
 
@@ -248,17 +222,11 @@ fn close_replaced_client(client: Arc<IpcClient>) {
 }
 
 impl UpstreamSlot {
-    fn new(
-        address: String,
-        client: Option<Arc<IpcClient>>,
-        generation: u64,
-        state: SlotState,
-    ) -> Self {
+    fn new(address: String, client: Option<Arc<IpcClient>>, state: SlotState) -> Self {
         Self {
             inner: Mutex::new(SlotInner {
                 address,
                 client,
-                generation,
                 last_activity: now_millis(),
                 active_requests: 0,
                 state,
@@ -291,7 +259,6 @@ impl UpstreamSlot {
                                 return Ok(UpstreamLease {
                                     slot: self.clone(),
                                     client,
-                                    generation: inner.generation,
                                 });
                             }
                         }
@@ -308,33 +275,28 @@ impl UpstreamSlot {
             };
 
             match address {
-                Some(address) => match connector(address).await {
+                Some(address) => match connector(address.clone()).await {
                     Ok(client) => {
                         let acquire = {
                             let mut inner = self.inner.lock();
                             if inner.state == SlotState::Retired {
                                 None
                             } else {
-                                inner.generation = inner
-                                    .generation
-                                    .checked_add(1)
-                                    .expect("connection generation exhausted");
                                 inner.client = Some(client.clone());
                                 inner.state = SlotState::Ready;
                                 inner.active_requests += 1;
                                 inner.last_activity = now_millis();
-                                Some(inner.generation)
+                                Some(())
                             }
                         };
-                        let Some(generation) = acquire else {
+                        if acquire.is_none() {
                             client.close_shared().await;
                             return Err(AcquireError::NotFound);
-                        };
+                        }
                         self.notify.notify_waiters();
                         return Ok(UpstreamLease {
                             slot: self.clone(),
                             client,
-                            generation,
                         });
                     }
                     Err(err) => {
@@ -348,7 +310,10 @@ impl UpstreamSlot {
                         inner.last_activity = now_millis();
                         drop(inner);
                         self.notify.notify_waiters();
-                        return Err(AcquireError::Unreachable(err));
+                        return Err(AcquireError::Unreachable {
+                            address,
+                            error: err,
+                        });
                     }
                 },
                 None => {
@@ -363,32 +328,27 @@ impl UpstreamSlot {
         match inner.state {
             SlotState::Ready => match &inner.client {
                 Some(client) if client.is_connected() => CachedClient::Ready {
-                    client: client.clone(),
                     address: inner.address.clone(),
-                    generation: inner.generation,
                 },
                 Some(_) => CachedClient::Disconnected {
                     address: inner.address.clone(),
-                    generation: inner.generation,
                 },
                 None => CachedClient::Evicted {
                     address: inner.address.clone(),
-                    generation: inner.generation,
                 },
             },
             SlotState::Evicted => CachedClient::Evicted {
                 address: inner.address.clone(),
-                generation: inner.generation,
             },
             SlotState::Disconnected | SlotState::Reconnecting => CachedClient::Disconnected {
                 address: inner.address.clone(),
-                generation: inner.generation,
             },
             SlotState::Retired => CachedClient::Missing,
         }
     }
 
-    fn begin_request(&self) -> Option<(Arc<IpcClient>, u64)> {
+    #[cfg(test)]
+    fn begin_request_for_test(self: Arc<Self>) -> Option<UpstreamLease> {
         let mut inner = self.inner.lock();
         if inner.state != SlotState::Ready {
             return None;
@@ -401,14 +361,12 @@ impl UpstreamSlot {
         }
         inner.active_requests += 1;
         inner.last_activity = now_millis();
-        Some((client, inner.generation))
+        drop(inner);
+        Some(UpstreamLease { slot: self, client })
     }
 
-    fn end_request(&self, generation: u64) {
+    fn end_request(&self) {
         let mut inner = self.inner.lock();
-        if inner.generation != generation {
-            return;
-        }
         if inner.active_requests == 0 {
             debug_assert!(false, "end_request called without begin_request");
         } else {
@@ -419,15 +377,6 @@ impl UpstreamSlot {
 
     fn address(&self) -> String {
         self.inner.lock().address.clone()
-    }
-
-    fn reconnect_candidate(&self) -> (String, u64) {
-        let inner = self.inner.lock();
-        (inner.address.clone(), inner.generation)
-    }
-
-    fn touch(&self) {
-        self.inner.lock().last_activity = now_millis();
     }
 
     fn is_idle_candidate(&self, idle_timeout_ms: u64) -> bool {
@@ -469,6 +418,7 @@ impl UpstreamSlot {
         client
     }
 
+    #[cfg(test)]
     fn evict(&self) -> Option<Arc<IpcClient>> {
         let mut inner = self.inner.lock();
         if inner.state == SlotState::Retired {
@@ -481,12 +431,15 @@ impl UpstreamSlot {
         client
     }
 
-    fn evict_generation(&self, generation: u64) -> Option<Arc<IpcClient>> {
+    fn evict_client(&self, expected: &Arc<IpcClient>) -> Option<Arc<IpcClient>> {
         let mut inner = self.inner.lock();
         if inner.state == SlotState::Retired {
             return None;
         }
-        if inner.generation != generation {
+        let Some(current) = inner.client.as_ref() else {
+            return None;
+        };
+        if !Arc::ptr_eq(current, expected) {
             return None;
         }
         let client = inner.client.take();
@@ -496,41 +449,28 @@ impl UpstreamSlot {
         client
     }
 
+    fn is_replaceable(&self) -> bool {
+        let inner = self.inner.lock();
+        match inner.state {
+            SlotState::Evicted | SlotState::Disconnected => true,
+            SlotState::Ready => inner
+                .client
+                .as_ref()
+                .is_none_or(|client| !client.is_connected()),
+            SlotState::Reconnecting | SlotState::Retired => false,
+        }
+    }
+
+    #[cfg(test)]
     fn reconnect(&self, client: Arc<IpcClient>) {
         let mut inner = self.inner.lock();
         if inner.state == SlotState::Retired {
             return;
         }
-        inner.generation = inner
-            .generation
-            .checked_add(1)
-            .expect("connection generation exhausted");
         inner.client = Some(client);
         inner.state = SlotState::Ready;
-        inner.active_requests = 0;
         inner.last_activity = now_millis();
         self.notify.notify_waiters();
-    }
-
-    fn reconnect_generation(&self, generation: u64, address: &str, client: Arc<IpcClient>) -> bool {
-        let mut inner = self.inner.lock();
-        if inner.state == SlotState::Retired {
-            return false;
-        }
-        if inner.generation != generation || inner.address != address {
-            return false;
-        }
-        inner.generation = inner
-            .generation
-            .checked_add(1)
-            .expect("connection generation exhausted");
-        inner.client = Some(client);
-        inner.state = SlotState::Ready;
-        inner.active_requests = 0;
-        inner.last_activity = now_millis();
-        drop(inner);
-        self.notify.notify_waiters();
-        true
     }
 
     fn retire(&self) -> Option<Arc<IpcClient>> {
@@ -548,18 +488,18 @@ impl UpstreamLease {
         self.client.clone()
     }
 
-    pub fn generation(&self) -> u64 {
-        self.generation
-    }
-
     pub fn address(&self) -> String {
         self.slot.address()
+    }
+
+    pub fn evict_current_client(&self) -> Option<Arc<IpcClient>> {
+        self.slot.evict_client(&self.client)
     }
 }
 
 impl Drop for UpstreamLease {
     fn drop(&mut self) {
-        self.slot.end_request(self.generation);
+        self.slot.end_request();
     }
 }
 
@@ -567,6 +507,7 @@ impl Drop for UpstreamLease {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn new_pool_is_empty() {
@@ -601,33 +542,20 @@ mod tests {
         pool.evict("evicted");
 
         match pool.lookup("ready") {
-            CachedClient::Ready {
-                address,
-                generation,
-                ..
-            } => {
+            CachedClient::Ready { address, .. } => {
                 assert_eq!(address, "ipc://ready");
-                assert!(generation > 0);
             }
             _ => panic!("ready connection should be explicit"),
         }
         match pool.lookup("evicted") {
-            CachedClient::Evicted {
-                address,
-                generation,
-            } => {
+            CachedClient::Evicted { address } => {
                 assert_eq!(address, "ipc://evicted");
-                assert!(generation > 0);
             }
             _ => panic!("evicted connection should be explicit"),
         }
         match pool.lookup("disconnected") {
-            CachedClient::Disconnected {
-                address,
-                generation,
-            } => {
+            CachedClient::Disconnected { address } => {
                 assert_eq!(address, "ipc://disconnected");
-                assert!(generation > 0);
             }
             _ => panic!("disconnected connection should be explicit"),
         }
@@ -685,9 +613,10 @@ mod tests {
         client.force_connected(true);
         pool.insert("grid".into(), "ipc://active".into(), client);
 
-        assert!(pool.begin_request("grid").is_some());
+        let lease = pool.begin_request_for_test("grid").unwrap();
 
         assert!(pool.idle_entries(0).is_empty());
+        drop(lease);
     }
 
     #[test]
@@ -707,8 +636,8 @@ mod tests {
         client.force_connected(true);
         pool.insert("grid".into(), "ipc://active".into(), client);
 
-        let (_, generation) = pool.begin_request("grid").unwrap();
-        pool.end_request("grid", generation);
+        let lease = pool.begin_request_for_test("grid").unwrap();
+        drop(lease);
 
         assert_eq!(pool.idle_entries(0), vec!["grid".to_string()]);
     }
@@ -724,52 +653,52 @@ mod tests {
     }
 
     #[test]
-    fn stale_generation_end_after_reinsert_leaves_new_entry_idle() {
+    fn stale_lease_drop_after_reinsert_does_not_touch_new_slot() {
         let pool = ConnectionPool::new();
         let old_client = Arc::new(IpcClient::new("ipc://old"));
         old_client.force_connected(true);
         pool.insert("grid".into(), "ipc://old".into(), old_client);
-        let (_, old_generation) = pool.begin_request("grid").unwrap();
+        let old_lease = pool.begin_request_for_test("grid").unwrap();
 
         pool.remove("grid");
 
         let new_client = Arc::new(IpcClient::new("ipc://new"));
         new_client.force_connected(true);
         pool.insert("grid".into(), "ipc://new".into(), new_client);
-        pool.end_request("grid", old_generation);
+        drop(old_lease);
 
         assert_eq!(pool.idle_entries(0), vec!["grid".to_string()]);
     }
 
     #[test]
-    fn stale_generation_end_after_reinsert_does_not_release_new_active_request() {
+    fn stale_lease_drop_after_reinsert_does_not_release_new_active_request() {
         let pool = ConnectionPool::new();
         let old_client = Arc::new(IpcClient::new("ipc://old"));
         old_client.force_connected(true);
         pool.insert("grid".into(), "ipc://old".into(), old_client);
-        let (_, old_generation) = pool.begin_request("grid").unwrap();
+        let old_lease = pool.begin_request_for_test("grid").unwrap();
 
         pool.remove("grid");
 
         let new_client = Arc::new(IpcClient::new("ipc://new"));
         new_client.force_connected(true);
         pool.insert("grid".into(), "ipc://new".into(), new_client);
-        let (_, new_generation) = pool.begin_request("grid").unwrap();
+        let new_lease = pool.begin_request_for_test("grid").unwrap();
 
-        pool.end_request("grid", old_generation);
+        drop(old_lease);
         assert!(pool.idle_entries(0).is_empty());
 
-        pool.end_request("grid", new_generation);
+        drop(new_lease);
         assert_eq!(pool.idle_entries(0), vec!["grid".to_string()]);
     }
 
     #[test]
-    fn stale_generation_evict_after_reinsert_does_not_evict_new_entry() {
+    fn stale_lease_evict_after_reinsert_does_not_evict_new_entry() {
         let pool = ConnectionPool::new();
         let old_client = Arc::new(IpcClient::new("ipc://old"));
         old_client.force_connected(true);
         pool.insert("grid".into(), "ipc://old".into(), old_client);
-        let (_, old_generation) = pool.begin_request("grid").unwrap();
+        let old_lease = pool.begin_request_for_test("grid").unwrap();
 
         pool.remove("grid");
 
@@ -777,69 +706,69 @@ mod tests {
         new_client.force_connected(true);
         pool.insert("grid".into(), "ipc://new".into(), new_client);
 
-        assert!(pool.evict_generation("grid", old_generation).is_none());
+        assert!(pool.evict_client("grid", &old_lease.client()).is_none());
         assert!(matches!(pool.lookup("grid"), CachedClient::Ready { .. }));
     }
 
     #[test]
-    fn matching_generation_evict_removes_current_entry_client() {
+    fn matching_client_evict_removes_current_entry_client() {
         let pool = ConnectionPool::new();
         let client = Arc::new(IpcClient::new("ipc://current"));
         client.force_connected(true);
         pool.insert("grid".into(), "ipc://current".into(), client);
-        let (_, generation) = pool.begin_request("grid").unwrap();
+        let lease = pool.begin_request_for_test("grid").unwrap();
 
-        assert!(pool.evict_generation("grid", generation).is_some());
+        assert!(pool.evict_client("grid", &lease.client()).is_some());
         assert!(matches!(pool.lookup("grid"), CachedClient::Evicted { .. }));
     }
 
     #[test]
-    fn stale_generation_evict_after_reconnect_does_not_evict_reconnected_client() {
+    fn stale_client_evict_after_reconnect_does_not_evict_reconnected_client() {
         let pool = ConnectionPool::new();
         let old_client = Arc::new(IpcClient::new("ipc://old"));
         old_client.force_connected(true);
         pool.insert("grid".into(), "ipc://old".into(), old_client);
-        let (_, old_generation) = pool.begin_request("grid").unwrap();
+        let old_lease = pool.begin_request_for_test("grid").unwrap();
 
-        assert!(pool.evict_generation("grid", old_generation).is_some());
+        assert!(pool.evict_client("grid", &old_lease.client()).is_some());
 
         let new_client = Arc::new(IpcClient::new("ipc://new"));
         new_client.force_connected(true);
         pool.reconnect("grid", new_client);
 
-        assert!(pool.evict_generation("grid", old_generation).is_none());
+        assert!(pool.evict_client("grid", &old_lease.client()).is_none());
         assert!(matches!(pool.lookup("grid"), CachedClient::Ready { .. }));
     }
 
     #[test]
-    fn stale_generation_end_after_reconnect_does_not_release_new_active_request() {
+    fn stale_lease_drop_after_reconnect_does_not_release_new_active_request() {
         let pool = ConnectionPool::new();
         let old_client = Arc::new(IpcClient::new("ipc://old"));
         old_client.force_connected(true);
         pool.insert("grid".into(), "ipc://old".into(), old_client);
-        let (_, old_generation) = pool.begin_request("grid").unwrap();
+        let old_lease = pool.begin_request_for_test("grid").unwrap();
 
         let new_client = Arc::new(IpcClient::new("ipc://new"));
         new_client.force_connected(true);
         pool.reconnect("grid", new_client);
-        assert_eq!(pool.idle_entries(0), vec!["grid".to_string()]);
-
-        let (_, new_generation) = pool.begin_request("grid").unwrap();
-
-        pool.end_request("grid", old_generation);
         assert!(pool.idle_entries(0).is_empty());
 
-        pool.end_request("grid", new_generation);
+        let new_lease = pool.begin_request_for_test("grid").unwrap();
+
+        drop(old_lease);
+        assert!(pool.idle_entries(0).is_empty());
+
+        drop(new_lease);
         assert_eq!(pool.idle_entries(0), vec!["grid".to_string()]);
     }
 
     #[test]
-    fn stale_generation_reconnect_after_reinsert_does_not_replace_new_entry() {
+    fn stale_owner_token_after_reinsert_does_not_match_new_entry() {
         let pool = ConnectionPool::new();
         let old_client = Arc::new(IpcClient::new("ipc://old"));
         old_client.force_connected(true);
         pool.insert("grid".into(), "ipc://old".into(), old_client);
-        let (address, old_generation) = pool.reconnect_candidate("grid").unwrap();
+        let token = pool.owner_token("grid").unwrap();
 
         pool.remove("grid");
 
@@ -851,51 +780,45 @@ mod tests {
             current_client.clone(),
         );
 
-        let stale_client = Arc::new(IpcClient::new("ipc://stale"));
-        stale_client.force_connected(true);
-        assert!(!pool.reconnect_generation("grid", old_generation, &address, stale_client));
+        assert!(!pool.matches_owner_token("grid", &token));
 
-        let (client, current_generation) = pool.begin_request("grid").unwrap();
-        assert!(Arc::ptr_eq(&client, &current_client));
-        assert_ne!(current_generation, old_generation);
+        let lease = pool.begin_request_for_test("grid").unwrap();
+        assert!(Arc::ptr_eq(&lease.client(), &current_client));
         assert!(matches!(pool.lookup("grid"), CachedClient::Ready { .. }));
     }
 
     #[test]
-    fn matching_generation_reconnect_attaches_client_and_advances_generation() {
+    fn owner_token_matches_same_slot_after_reconnect() {
         let pool = ConnectionPool::new();
         let old_client = Arc::new(IpcClient::new("ipc://old"));
         old_client.force_connected(true);
         pool.insert("grid".into(), "ipc://old".into(), old_client);
-        let (address, old_generation) = pool.reconnect_candidate("grid").unwrap();
+        let token = pool.owner_token("grid").unwrap();
 
         let new_client = Arc::new(IpcClient::new("ipc://new"));
         new_client.force_connected(true);
-        assert!(pool.reconnect_generation("grid", old_generation, &address, new_client.clone()));
+        pool.reconnect("grid", new_client.clone());
 
-        let (client, new_generation) = pool.begin_request("grid").unwrap();
-        assert!(Arc::ptr_eq(&client, &new_client));
-        assert_ne!(new_generation, old_generation);
-
-        assert!(pool.evict_generation("grid", old_generation).is_none());
-        pool.end_request("grid", old_generation);
-        assert!(pool.idle_entries(0).is_empty());
-
-        pool.end_request("grid", new_generation);
-        assert_eq!(pool.idle_entries(0), vec!["grid".to_string()]);
+        let lease = pool.begin_request_for_test("grid").unwrap();
+        assert!(Arc::ptr_eq(&lease.client(), &new_client));
+        assert!(pool.matches_owner_token("grid", &token));
     }
 
     #[test]
-    #[should_panic(expected = "connection generation exhausted")]
-    fn generation_allocator_panics_instead_of_reusing_on_overflow() {
+    fn owner_token_does_not_match_reinsert_with_same_address() {
         let pool = ConnectionPool::new();
-        pool.next_generation.store(u64::MAX, Ordering::Release);
+        let old_client = Arc::new(IpcClient::new("ipc://same"));
+        old_client.force_connected(true);
+        pool.insert("grid".into(), "ipc://same".into(), old_client);
+        let token = pool.owner_token("grid").unwrap();
 
-        let c1 = Arc::new(IpcClient::new("ipc://max"));
-        pool.insert("max".into(), "ipc://max".into(), c1);
+        pool.remove("grid");
 
-        let c2 = Arc::new(IpcClient::new("ipc://overflow"));
-        pool.insert("overflow".into(), "ipc://overflow".into(), c2);
+        let new_client = Arc::new(IpcClient::new("ipc://same"));
+        new_client.force_connected(true);
+        pool.insert("grid".into(), "ipc://same".into(), new_client);
+
+        assert!(!pool.matches_owner_token("grid", &token));
     }
 
     #[tokio::test]
@@ -1033,7 +956,7 @@ mod tests {
             acquire.await.unwrap(),
             Err(AcquireError::NotFound)
         ));
-        let (current, _) = pool.begin_request("grid").unwrap();
-        assert!(Arc::ptr_eq(&current, &replacement));
+        let current = pool.begin_request_for_test("grid").unwrap();
+        assert!(Arc::ptr_eq(&current.client(), &replacement));
     }
 }

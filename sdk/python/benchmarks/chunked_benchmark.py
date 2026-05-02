@@ -88,8 +88,14 @@ def main() -> None:
 
     _ProcessRegistry.reset()
 
-    cc.set_server(segment_size=SEGMENT_SIZE, max_segments=4)
-    cc.set_client(segment_size=SEGMENT_SIZE, max_segments=4)
+    cc.set_server(ipc_overrides={
+        'pool_segment_size': SEGMENT_SIZE,
+        'max_pool_segments': 4,
+    })
+    cc.set_client(ipc_overrides={
+        'pool_segment_size': SEGMENT_SIZE,
+        'max_pool_segments': 4,
+    })
     cc.register(BenchChunk, BenchChunkImpl(), name='bench')
     address = cc.server_address()
 

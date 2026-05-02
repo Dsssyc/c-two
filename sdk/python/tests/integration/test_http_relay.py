@@ -57,6 +57,7 @@ def relay_stack(start_c3_relay):
     cc.register(Hello, HelloImpl(), name='hello')
     cc.register(Counter, CounterImpl(), name='counter')
     ipc_addr = cc.server_address()
+    server_id = cc.server_id()
 
     relay = start_c3_relay()
     relay_url = relay.url
@@ -65,7 +66,7 @@ def relay_stack(start_c3_relay):
         for name in ('hello', 'counter'):
             resp = http.post(
                 f'{relay_url}/_register',
-                json={'name': name, 'address': ipc_addr},
+                json={'name': name, 'server_id': server_id, 'address': ipc_addr},
             )
             assert resp.status_code == 201
 
@@ -250,13 +251,14 @@ class TestCcConnectHttp:
         slashed_name = 'toodle/grid/0'
         cc.register(Hello, HelloImpl(), name=slashed_name)
         ipc_addr = cc.server_address()
+        server_id = cc.server_id()
 
         relay = start_c3_relay()
         relay_url = relay.url
         with httpx.Client(trust_env=False, timeout=5.0) as http:
             resp = http.post(
                 f'{relay_url}/_register',
-                json={'name': slashed_name, 'address': ipc_addr},
+                json={'name': slashed_name, 'server_id': server_id, 'address': ipc_addr},
             )
             assert resp.status_code == 201
 
@@ -271,8 +273,8 @@ class TestCcConnectHttp:
         """All relay HTTP traffic must ignore HTTP_PROXY by default.
 
         Regression: when a user sets HTTP_PROXY/HTTPS_PROXY (e.g. a corporate
-        forward proxy or a docker host proxy), Python urllib previously routed
-        relay control traffic through it, and proxies are known to normalize
+        forward proxy or a docker host proxy), relay control traffic must not
+        flow through it by default. Proxies are known to normalize
         percent-encoded ``%2F`` in URL paths to ``/`` — which then breaks
         resource names containing ``/``. This test points HTTP_PROXY at a
         black-hole address and verifies that name resolution + a CRM call
@@ -295,11 +297,11 @@ class TestCcConnectHttp:
         crm = None
         try:
             registrar.set_relay(relay_url)
-            # Registration must use _relay_register via Python _relay_urlopen.
+            # Registration uses the Rust relay control client and must bypass proxies.
             registrar.register(Hello, HelloImpl(), name=name)
             resolver.set_relay(relay_url)
 
-            # No-address connect must resolve through _resolve_via_relay.
+            # No-address connect resolves through the Rust relay control client.
             crm = resolver.connect(Hello, name=name)
             # reqwest call must succeed (Rust HttpClient builder bypasses proxy).
             assert crm.greeting('NoProxy') == 'Hello, NoProxy!'
@@ -319,10 +321,22 @@ class TestCcConnectHttp:
 class TestRelayControlPlane:
     """Test the relay control-plane endpoints (/_register, /_unregister, /_routes)."""
 
+    def test_native_control_client_exposes_status_code_for_missing_route(self, start_c3_relay):
+        from c_two._native import RustRelayControlClient
+
+        relay = start_c3_relay()
+        client = RustRelayControlClient(relay.url)
+
+        with pytest.raises(Exception) as exc_info:
+            client.resolve('missing/native')
+
+        assert getattr(exc_info.value, 'status_code', None) == 404
+
     def test_register_via_http_control(self, start_c3_relay):
         """POST /_register adds an upstream and allows calls."""
         cc.register(Hello, HelloImpl(), name='hello')
         ipc_addr = cc.server_address()
+        server_id = cc.server_id()
 
         relay = start_c3_relay()
         relay_url = relay.url
@@ -331,7 +345,7 @@ class TestRelayControlPlane:
             # Register via control endpoint.
             resp = http.post(
                 f'{relay_url}/_register',
-                json={'name': 'hello', 'address': ipc_addr},
+                json={'name': 'hello', 'server_id': server_id, 'address': ipc_addr},
             )
             assert resp.status_code == 201
             assert resp.json()['registered'] == 'hello'
@@ -341,6 +355,9 @@ class TestRelayControlPlane:
             assert resp.status_code == 200
             routes = resp.json()['routes']
             assert any(r['name'] == 'hello' for r in routes)
+            route = next(r for r in routes if r['name'] == 'hello')
+            assert 'server_id' not in route
+            assert 'ipc_address' not in route
 
         # Verify data-plane call works.
         client = _acquire_http(relay_url)
@@ -355,6 +372,7 @@ class TestRelayControlPlane:
         """POST /_register with same name upserts (returns 201)."""
         cc.register(Hello, HelloImpl(), name='hello')
         ipc_addr = cc.server_address()
+        server_id = cc.server_id()
 
         relay = start_c3_relay()
         relay_url = relay.url
@@ -362,21 +380,22 @@ class TestRelayControlPlane:
         with httpx.Client(trust_env=False, timeout=5.0) as http:
             resp = http.post(
                 f'{relay_url}/_register',
-                json={'name': 'hello', 'address': ipc_addr},
+                json={'name': 'hello', 'server_id': server_id, 'address': ipc_addr},
             )
             assert resp.status_code == 201
 
             # Same-relay duplicate registration uses upsert semantics.
             resp = http.post(
                 f'{relay_url}/_register',
-                json={'name': 'hello', 'address': ipc_addr},
+                json={'name': 'hello', 'server_id': server_id, 'address': ipc_addr},
             )
-            assert resp.status_code == 201
+            assert resp.status_code == 200
 
     def test_unregister_removes_route(self, start_c3_relay):
         """POST /_unregister removes the route; calls return 404."""
         cc.register(Hello, HelloImpl(), name='hello')
         ipc_addr = cc.server_address()
+        server_id = cc.server_id()
 
         relay = start_c3_relay()
         relay_url = relay.url
@@ -385,11 +404,11 @@ class TestRelayControlPlane:
             # Register, then unregister.
             http.post(
                 f'{relay_url}/_register',
-                json={'name': 'hello', 'address': ipc_addr},
+                json={'name': 'hello', 'server_id': server_id, 'address': ipc_addr},
             )
             resp = http.post(
                 f'{relay_url}/_unregister',
-                json={'name': 'hello'},
+                json={'name': 'hello', 'server_id': server_id},
             )
             assert resp.status_code == 200
 
@@ -413,7 +432,7 @@ class TestRelayControlPlane:
         with httpx.Client(trust_env=False, timeout=5.0) as http:
             resp = http.post(
                 f'{relay_url}/_unregister',
-                json={'name': 'nonexistent'},
+                json={'name': 'nonexistent', 'server_id': 'missing-server'},
             )
             assert resp.status_code == 404
 
@@ -422,6 +441,7 @@ class TestRelayControlPlane:
         cc.register(Hello, HelloImpl(), name='hello')
         cc.register(Counter, CounterImpl(), name='counter')
         ipc_addr = cc.server_address()
+        server_id = cc.server_id()
 
         relay = start_c3_relay()
         relay_url = relay.url
@@ -430,7 +450,7 @@ class TestRelayControlPlane:
             for name in ('hello', 'counter'):
                 resp = http.post(
                     f'{relay_url}/_register',
-                    json={'name': name, 'address': ipc_addr},
+                    json={'name': name, 'server_id': server_id, 'address': ipc_addr},
                 )
                 assert resp.status_code == 201
 
@@ -450,4 +470,6 @@ class TestRelayControlPlane:
                 content=b'data',
             )
             assert resp.status_code == 404
-            assert 'nonexistent' in resp.json()['error']
+            data = resp.json()
+            assert data['error'] == 'ResourceNotFound'
+            assert data['route'] == 'nonexistent'

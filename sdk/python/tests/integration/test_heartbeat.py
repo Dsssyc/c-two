@@ -9,8 +9,7 @@ import pytest
 
 import c_two as cc
 from c_two.transport import Server
-from c_two.config.ipc import ServerIPCConfig
-from c_two.transport.client.util import ping
+from c_two.transport.client.util import _socket_path_from_address, ping
 
 from tests.fixtures.hello import HelloImpl
 from tests.fixtures.ihello import Hello
@@ -53,9 +52,14 @@ class TestHeartbeatIntegration:
 
     def test_active_connection_survives_heartbeat(self):
         """An active client is NOT disconnected by heartbeat probes."""
-        config = ServerIPCConfig(heartbeat_interval=0.3, heartbeat_timeout=0.8)
         address = f'ipc://{_unique_region()}'
-        server = Server(address, Hello, HelloImpl(), ipc_config=config, name='hello')
+        server = Server(
+            address,
+            Hello,
+            HelloImpl(),
+            ipc_overrides={'heartbeat_interval': 0.3, 'heartbeat_timeout': 0.8},
+            name='hello',
+        )
         server.start()
         try:
             _wait_for_server(address)
@@ -76,9 +80,14 @@ class TestHeartbeatIntegration:
 
     def test_idle_client_survives_heartbeat_with_pong(self):
         """An idle client that responds to PING survives heartbeat probes."""
-        config = ServerIPCConfig(heartbeat_interval=0.2, heartbeat_timeout=0.6)
         address = f'ipc://{_unique_region()}'
-        server = Server(address, Hello, HelloImpl(), ipc_config=config, name='hello')
+        server = Server(
+            address,
+            Hello,
+            HelloImpl(),
+            ipc_overrides={'heartbeat_interval': 0.2, 'heartbeat_timeout': 0.6},
+            name='hello',
+        )
         server.start()
         try:
             _wait_for_server(address)
@@ -104,15 +113,18 @@ class TestHeartbeatIntegration:
         and clean up dead connections without crashing.
         """
         import socket
-        config = ServerIPCConfig(heartbeat_interval=0.1, heartbeat_timeout=0.3)
         address = f'ipc://{_unique_region()}'
-        server = Server(address, Hello, HelloImpl(), ipc_config=config, name='hello')
+        server = Server(
+            address,
+            Hello,
+            HelloImpl(),
+            ipc_overrides={'heartbeat_interval': 0.1, 'heartbeat_timeout': 0.3},
+            name='hello',
+        )
         server.start()
         try:
             _wait_for_server(address)
-            region_id = address.replace('ipc://', '')
-            _ipc_sock_dir = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
-            sock_path = os.path.join(_ipc_sock_dir, f'{region_id}.sock')
+            sock_path = _socket_path_from_address(address)
             raw_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             raw_sock.connect(sock_path)
             raw_sock.settimeout(1.0)
@@ -133,9 +145,14 @@ class TestHeartbeatIntegration:
 
     def test_heartbeat_disabled(self):
         """When heartbeat_interval=0, no probes are sent."""
-        config = ServerIPCConfig(heartbeat_interval=0, heartbeat_timeout=30)
         address = f'ipc://{_unique_region()}'
-        server = Server(address, Hello, HelloImpl(), ipc_config=config, name='hello')
+        server = Server(
+            address,
+            Hello,
+            HelloImpl(),
+            ipc_overrides={'heartbeat_interval': 0, 'heartbeat_timeout': 30},
+            name='hello',
+        )
         server.start()
         try:
             _wait_for_server(address)

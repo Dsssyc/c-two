@@ -187,7 +187,8 @@ cc.register(Counter, CounterImpl(), name='counter')
 cc.serve()                                     # 阻塞；Ctrl-C 触发优雅关闭
 ```
 
-- **地址**（`ipc://...`）是本地传输端点。Server 首次注册时会自动绑定一个 IPC 地址；同主机进程需要直连时可用 `cc.server_address()` 查看。
+- **Server ID** 标识本地 IPC server 实例。C-Two 会在首次注册时自动生成；也可以在注册前调用 `cc.set_server(server_id=...)` 显式设置。
+- **地址**（`ipc://...`）是由 Server ID 推导出的内部本地传输端点；只有同主机进程需要直连时才需要用 `cc.server_address()` 查看。
 - **`cc.serve()` 是可选的** — 如果宿主进程已有自己的事件循环（Web 服务、GUI、模拟器），你可以只注册资源，让它们在后台服务，同时你的主循环照常运行。
 - 一个进程可以**同时**是 server 和 client（注册一些资源，同时连接另一些）。
 
@@ -200,11 +201,19 @@ cc.serve()                                     # 阻塞；Ctrl-C 触发优雅关
 Python SDK 不内嵌也不启动中继服务器；请单独启动 `c3 relay`、Docker
 Compose 或编排系统中的中继，再通过 `C2_RELAY_ADDRESS` 或
 `cc.set_relay()` 让 Python 代码连接它。
+relay-aware 客户端会在首次调用前预检 route，并在收到结构化 stale-route
+响应时重新解析路由；可通过 `C2_RELAY_ROUTE_MAX_ATTEMPTS` 调整最大 route
+acquisition 尝试次数（默认 `3`，有效范围 `1..=32`，`0` 按 `1` 处理）。
+语义不明确的数据面失败不会被自动重放。
 
 ```bash
 # 在网络可达的任意节点启动中继
 c3 relay --bind 0.0.0.0:8080
 ```
+
+Relay HTTP 与 mesh 端点应只暴露在可信网络边界内。不要将其直接暴露到公网；
+生产部署应通过私有网络、防火墙、Kubernetes NetworkPolicy、service mesh
+策略或 ingress 认证等基础设施限制访问。
 
 ```python
 # 服务端 — 将资源通告给中继
@@ -397,6 +406,7 @@ class MeshStore:
         print('MeshStore shutting down')
 
 cc.register(MeshStore, MeshStore(), name='mesh')
+print(cc.server_id())
 print(cc.server_address())
 cc.serve()  # blocks until interrupted
 ```
@@ -445,6 +455,9 @@ cc.serve()  # 阻塞，直到 Ctrl-C
 c3 relay --bind 0.0.0.0:8080
 ```
 
+Relay HTTP 只应暴露在可信部署边界内。中继 mesh 协议依赖基础设施层访问控制，
+不应被直接放到公网可达的位置。
+
 **客户端** (`client.py`)：
 ```python
 import c_two as cc
@@ -470,6 +483,9 @@ c3 relay --bind 0.0.0.0:8080 --relay-id relay-a \
 c3 relay --bind 0.0.0.0:8080 --relay-id relay-b \
     --advertise-url http://relay-b:8080 --seeds http://relay-a:8080
 ```
+
+Mesh peer 端点（`/_peer/*`）会接收来自已配置 peer 的路由 gossip，应与 relay
+HTTP API 一样由可信网络边界保护。
 
 CRM 进程向本地中继注册，网格自动传播路由。客户端可通过网格中的**任意**中继连接。
 

@@ -131,10 +131,14 @@ impl ServerPoolState {
 pub enum IpcError {
     /// I/O error on the UDS connection.
     Io(std::io::Error),
+    /// Invalid client configuration or IPC address.
+    Config(String),
     /// Wire protocol decoding error.
     Decode(DecodeError),
     /// Handshake failed or incompatible server.
     Handshake(String),
+    /// Requested route no longer exists on the connected IPC server.
+    RouteNotFound(String),
     /// CRM method returned an error (serialized error bytes).
     CrmError(Vec<u8>),
     /// Client is closed or connection lost.
@@ -147,8 +151,10 @@ impl std::fmt::Display for IpcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(e) => write!(f, "IPC I/O error: {e}"),
+            Self::Config(msg) => write!(f, "IPC config error: {msg}"),
             Self::Decode(e) => write!(f, "IPC decode error: {e}"),
             Self::Handshake(msg) => write!(f, "IPC handshake failed: {msg}"),
+            Self::RouteNotFound(route) => write!(f, "IPC route not found: {route}"),
             Self::CrmError(_) => write!(f, "CRM method error"),
             Self::Closed => write!(f, "IPC client closed"),
             Self::Pool(msg) => write!(f, "Pool error: {msg}"),
@@ -167,6 +173,12 @@ impl From<std::io::Error> for IpcError {
 impl From<DecodeError> for IpcError {
     fn from(e: DecodeError) -> Self {
         Self::Decode(e)
+    }
+}
+
+impl From<c2_wire::control::EncodeError> for IpcError {
+    fn from(e: c2_wire::control::EncodeError) -> Self {
+        Self::Handshake(e.to_string())
     }
 }
 
@@ -210,6 +222,7 @@ type PendingMap = HashMap<u32, oneshot::Sender<Result<ResponseData, IpcError>>>;
 /// handshake, and multiplexes concurrent CRM calls.
 pub struct IpcClient {
     socket_path: PathBuf,
+    address_error: Option<String>,
     writer: Arc<Mutex<Option<tokio::io::WriteHalf<UnixStream>>>>,
     pending: Arc<StdMutex<PendingMap>>,
     rid_counter: AtomicU32,
@@ -247,6 +260,32 @@ static REASSEMBLY_POOL_GEN: AtomicU64 = AtomicU64::new(0);
 /// Monotonic counter so each IpcClient gets a unique conn_id.
 static CLIENT_CONN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+const IPC_SOCK_DIR: &str = "/tmp/c_two_ipc";
+
+fn socket_path_from_address(address: &str) -> (PathBuf, Option<String>) {
+    match region_from_address(address).and_then(validate_region_id) {
+        Ok(region) => (
+            PathBuf::from(IPC_SOCK_DIR).join(format!("{region}.sock")),
+            None,
+        ),
+        Err(error) => (
+            PathBuf::from(IPC_SOCK_DIR).join("invalid.sock"),
+            Some(error),
+        ),
+    }
+}
+
+fn region_from_address(address: &str) -> Result<&str, String> {
+    address
+        .strip_prefix("ipc://")
+        .ok_or_else(|| format!("invalid IPC address: {address}"))
+}
+
+fn validate_region_id(region: &str) -> Result<&str, String> {
+    c2_config::validate_ipc_region_id(region)?;
+    Ok(region)
+}
+
 impl IpcClient {
     fn make_chunk_registry(config: &ClientIpcConfig) -> Arc<ChunkRegistry> {
         let seg_size = config.reassembly_segment_size as usize;
@@ -268,13 +307,13 @@ impl IpcClient {
     /// Create a new IPC client targeting the given address.
     ///
     /// The address should be like `ipc://name` — the socket path is
-    /// derived as `/tmp/c_two_ipc/{name}.sock` (matching Python Server).
+    /// derived as `/tmp/c_two_ipc/{name}.sock`.
     pub fn new(address: &str) -> Self {
-        let name = address.strip_prefix("ipc://").unwrap_or(address);
-        let socket_path = PathBuf::from(format!("/tmp/c_two_ipc/{name}.sock"));
+        let (socket_path, address_error) = socket_path_from_address(address);
 
         Self {
             socket_path,
+            address_error,
             writer: Arc::new(Mutex::new(None)),
             pending: Arc::new(StdMutex::new(HashMap::new())),
             rid_counter: AtomicU32::new(1),
@@ -295,11 +334,11 @@ impl IpcClient {
     /// The pool is used for outgoing buddy allocations when data exceeds
     /// `config.shm_threshold`.
     pub fn with_pool(address: &str, pool: Arc<StdMutex<MemPool>>, config: ClientIpcConfig) -> Self {
-        let name = address.strip_prefix("ipc://").unwrap_or(address);
-        let socket_path = PathBuf::from(format!("/tmp/c_two_ipc/{name}.sock"));
+        let (socket_path, address_error) = socket_path_from_address(address);
 
         Self {
             socket_path,
+            address_error,
             writer: Arc::new(Mutex::new(None)),
             pending: Arc::new(StdMutex::new(HashMap::new())),
             rid_counter: AtomicU32::new(1),
@@ -317,6 +356,9 @@ impl IpcClient {
 
     /// Connect and perform handshake.
     pub async fn connect(&mut self) -> Result<(), IpcError> {
+        if let Some(error) = self.address_error.clone() {
+            return Err(IpcError::Config(error));
+        }
         let stream = UnixStream::connect(&self.socket_path).await?;
         let (reader, mut writer) = tokio::io::split(stream);
 
@@ -396,7 +438,8 @@ impl IpcClient {
             (vec![], String::new(), CAP_CALL_V2 | CAP_METHOD_IDX)
         };
 
-        let payload = encode_client_handshake(&segments, cap_flags, &prefix);
+        let payload = encode_client_handshake(&segments, cap_flags, &prefix)
+            .map_err(|e| IpcError::Handshake(e.to_string()))?;
         let frame_bytes = frame::encode_frame(0, flags::FLAG_HANDSHAKE, &payload);
         writer.write_all(&frame_bytes).await?;
 
@@ -559,7 +602,7 @@ impl IpcClient {
                     frame::HEADER_SIZE,
                     route_name,
                     method_idx,
-                );
+                )?;
                 let data_off = frame::HEADER_SIZE + ctrl_written;
                 buf[data_off..data_off + data.len()].copy_from_slice(data);
                 writer.write_all(&buf[..frame_size]).await?;
@@ -569,7 +612,7 @@ impl IpcClient {
                 hdr_buf[0..4].copy_from_slice(&total_len.to_le_bytes());
                 hdr_buf[4..12].copy_from_slice(&(rid as u64).to_le_bytes());
                 hdr_buf[12..16].copy_from_slice(&flags::FLAG_CALL_V2.to_le_bytes());
-                let ctrl = encode_call_control(route_name, method_idx);
+                let ctrl = encode_call_control(route_name, method_idx)?;
                 writer.write_all(&hdr_buf).await?;
                 writer.write_all(&ctrl).await?;
                 writer.write_all(data).await?;
@@ -634,7 +677,7 @@ impl IpcClient {
         let buddy_bytes = encode_buddy_payload(&bp);
 
         // Build call control.
-        let ctrl = encode_call_control(route_name, method_idx);
+        let ctrl = encode_call_control(route_name, method_idx)?;
 
         // Assemble frame payload: [11B buddy][call_control]
         let payload_len = buddy_bytes.len() + ctrl.len();
@@ -709,7 +752,7 @@ impl IpcClient {
         let buddy_bytes = encode_buddy_payload(&bp);
 
         // Build call control.
-        let ctrl = encode_call_control(route_name, method_idx);
+        let ctrl = encode_call_control(route_name, method_idx)?;
 
         // Assemble frame payload: [11B buddy][call_control]
         let payload_len = buddy_bytes.len() + ctrl.len();
@@ -785,7 +828,7 @@ impl IpcClient {
         }
 
         // Build call control (included only in chunk 0).
-        let ctrl = encode_call_control(route_name, method_idx);
+        let ctrl = encode_call_control(route_name, method_idx)?;
 
         let send_result: Result<(), IpcError> = async {
             let mut writer_guard = self.writer.lock().await;
@@ -836,6 +879,11 @@ impl IpcClient {
     /// Get the method table for a route.
     pub fn route_table(&self, name: &str) -> Option<&MethodTable> {
         self.route_tables.get(name)
+    }
+
+    /// Whether the handshake route table contains a route.
+    pub fn has_route(&self, name: &str) -> bool {
+        self.route_tables.contains_key(name)
     }
 
     /// Get all route names.
@@ -1082,12 +1130,14 @@ fn decode_response(hdr: &FrameHeader, payload: &[u8]) -> Result<ResponseData, Ip
                 data_size: bp.data_size,
                 is_dedicated: bp.is_dedicated,
             }),
+            ReplyControl::RouteNotFound(route) => Err(IpcError::RouteNotFound(route)),
             ReplyControl::Error(err_data) => Err(IpcError::CrmError(err_data)),
         }
     } else {
         let (ctrl, consumed) = decode_reply_control(payload, 0)?;
         match ctrl {
             ReplyControl::Success => Ok(ResponseData::Inline(payload[consumed..].to_vec())),
+            ReplyControl::RouteNotFound(route) => Err(IpcError::RouteNotFound(route)),
             ReplyControl::Error(err_data) => Err(IpcError::CrmError(err_data)),
         }
     }
@@ -1115,5 +1165,30 @@ mod tests {
             "prefix exceeds SHM name limit: {}",
             prefix1.len()
         );
+    }
+
+    #[tokio::test]
+    async fn client_rejects_path_like_ipc_region_before_connecting() {
+        for address in [
+            "ipc://../escape",
+            "ipc://bad/name",
+            "ipc://bad\\name",
+            "ipc://.",
+            "ipc://..",
+            "ipc:// leading",
+            "ipc://trailing ",
+            "ipc://bad\nname",
+            "tcp://not-ipc",
+        ] {
+            let mut client = IpcClient::new(address);
+            let error = client
+                .connect()
+                .await
+                .expect_err("invalid IPC address should not attempt UDS connect");
+            assert!(
+                matches!(error, IpcError::Config(_)),
+                "expected config error for {address:?}, got {error:?}"
+            );
+        }
     }
 }

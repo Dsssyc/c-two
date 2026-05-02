@@ -97,7 +97,7 @@ cli/
 sdk/python/src/c_two/
 ├── crm/          # CRM contracts, @transferable, decorators
 ├── transport/    # Registry, proxy, server bridge, scheduler
-├── config/       # Settings (pydantic), IPC config
+├── config/       # Python override facades backed by Rust config resolution
 └── mem/          # Python wrappers for Rust memory subsystem
 sdk/python/native/
 └── src/          # PyO3 extension crate for c_two._native

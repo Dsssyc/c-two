@@ -11,34 +11,19 @@ use axum::{
     routing::{get, post},
 };
 
+use crate::relay::authority::{ControlError, RegisterPreparation, RouteAuthority};
 use crate::relay::conn_pool::{AcquireError, UpstreamLease};
-use crate::relay::peer::{PeerEnvelope, PeerMessage};
+use crate::relay::gossip::{broadcast_route_announce, broadcast_route_withdraw};
 use crate::relay::peer_handlers;
-use crate::relay::state::{
-    LocalOwnerStatus, OwnerReplacementToken, RegisterCommitResult, RelayState,
-};
+use crate::relay::state::{RegisterCommitResult, RelayState};
 use c2_ipc::IpcClient;
 
-enum RegisterOwnerCheck {
-    Available {
-        replacement: Option<OwnerReplacementToken>,
-    },
-    SameOwner,
-    DuplicateAlive {
-        existing_address: String,
-    },
-}
+const CONTROL_BODY_LIMIT_BYTES: usize = 64 * 1024;
 
 enum RequestClient {
     Ready { lease: UpstreamLease },
     NotFound,
     Unreachable,
-}
-
-enum OwnerProbe {
-    Alive,
-    Dead,
-    Stale,
 }
 
 fn duplicate_route_response(name: &str, existing_address: &str) -> Response {
@@ -55,11 +40,12 @@ fn duplicate_route_response(name: &str, existing_address: &str) -> Response {
 
 /// Build the relay axum router with control-plane and data-plane endpoints.
 pub fn build_router(state: Arc<RelayState>) -> Router {
-    Router::new()
+    let control_router = Router::new()
         .route("/_register", post(handle_register))
         .route("/_unregister", post(handle_unregister))
         .route("/_routes", get(handle_list_routes))
-        .route("/_resolve/{name}", get(handle_resolve))
+        .route("/_resolve/{*name}", get(handle_resolve))
+        .route("/_probe/{*name}", get(handle_probe))
         .route("/_peers", get(handle_peers))
         .route("/_peer/announce", post(peer_handlers::handle_peer_announce))
         .route("/_peer/join", post(peer_handlers::handle_peer_join))
@@ -71,17 +57,24 @@ pub fn build_router(state: Arc<RelayState>) -> Router {
         .route("/_peer/leave", post(peer_handlers::handle_peer_leave))
         .route("/_peer/digest", post(peer_handlers::handle_peer_digest))
         .route("/health", get(handle_health))
+        .layer(DefaultBodyLimit::max(CONTROL_BODY_LIMIT_BYTES));
+
+    let data_router = Router::new()
         .route("/_echo", post(echo_handler))
         .route("/{route_name}/{method_name}", post(call_handler))
+        .layer(DefaultBodyLimit::disable());
+
+    Router::new()
+        .merge(control_router)
+        .merge(data_router)
         .with_state(state)
-        .layer(DefaultBodyLimit::disable())
 }
 
 // -- Control-plane handlers -----------------------------------------------
 
 /// `POST /_register` — register a new upstream CRM.
 ///
-/// Body: `{"name": "grid", "address": "ipc://...", "crm_ns": "...", "crm_ver": "..."}`
+/// Body: `{"name": "grid", "server_id": "...", "address": "ipc://...", "crm_ns": "...", "crm_ver": "..."}`
 /// Returns: 201 on success, 409 on duplicate, 502 on connection failure.
 async fn handle_register(
     State(state): State<Arc<RelayState>>,
@@ -95,6 +88,10 @@ async fn handle_register(
         Some(a) => a.to_string(),
         None => return (StatusCode::BAD_REQUEST, "Missing \"address\"").into_response(),
     };
+    let server_id = match body.get("server_id").and_then(|v| v.as_str()) {
+        Some(id) => id.to_string(),
+        None => return (StatusCode::BAD_REQUEST, "Missing \"server_id\"").into_response(),
+    };
     let crm_ns = body
         .get("crm_ns")
         .and_then(|v| v.as_str())
@@ -106,11 +103,34 @@ async fn handle_register(
         .unwrap_or("")
         .to_string();
 
-    let replacement = match check_local_owner_for_register(&state, &name, &address).await {
-        RegisterOwnerCheck::Available { replacement } => replacement,
-        RegisterOwnerCheck::SameOwner => None,
-        RegisterOwnerCheck::DuplicateAlive { existing_address } => {
+    let replacement = match RouteAuthority::new(&state)
+        .prepare_register(&name, &server_id, &address)
+        .await
+    {
+        Ok(RegisterPreparation::Available { replacement }) => {
+            replacement.map(|r| crate::relay::state::OwnerReplacementToken {
+                existing_address: r.existing_address,
+                token: r.token,
+            })
+        }
+        Ok(RegisterPreparation::SameOwner) => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({"registered": name})),
+            )
+                .into_response();
+        }
+        Ok(RegisterPreparation::DuplicateAlive { existing_address })
+        | Err(ControlError::AddressMismatch { existing_address })
+        | Err(ControlError::DuplicateRoute { existing_address }) => {
             return duplicate_route_response(&name, &existing_address);
+        }
+        Err(ControlError::InvalidName { reason })
+        | Err(ControlError::InvalidServerId { reason }) => {
+            return (StatusCode::BAD_REQUEST, reason).into_response();
+        }
+        Err(ControlError::OwnerMismatch) | Err(ControlError::NotFound) => {
+            return (StatusCode::CONFLICT, "Route owner is not replaceable").into_response();
         }
     };
 
@@ -131,6 +151,7 @@ async fn handle_register(
     let commit_client = client.clone();
     let entry = match state.commit_register_upstream(
         name.clone(),
+        server_id,
         address,
         crm_ns,
         crm_ver,
@@ -142,28 +163,14 @@ async fn handle_register(
             close_arc_client(client);
             entry
         }
-        RegisterCommitResult::Duplicate { existing_address } => {
+        RegisterCommitResult::Duplicate { existing_address }
+        | RegisterCommitResult::ConflictingOwner { existing_address } => {
             close_arc_client(client);
             return duplicate_route_response(&name, &existing_address);
         }
     };
 
-    // Gossip announce to peers — strip ipc_address since it's a local UDS
-    // path on THIS relay's filesystem and is meaningless to remote peers.
-    let envelope = PeerEnvelope::new(
-        state.relay_id(),
-        PeerMessage::RouteAnnounce {
-            name: entry.name.clone(),
-            relay_id: entry.relay_id.clone(),
-            relay_url: entry.relay_url.clone(),
-            ipc_address: None,
-            crm_ns: entry.crm_ns.clone(),
-            crm_ver: entry.crm_ver.clone(),
-            registered_at: entry.registered_at,
-        },
-    );
-    let peers = state.list_peers();
-    state.disseminator().broadcast(envelope, &peers);
+    broadcast_route_announce(&state, &entry);
 
     (
         StatusCode::CREATED,
@@ -176,77 +183,10 @@ fn close_arc_client(arc_client: Arc<IpcClient>) {
     tokio::spawn(async move { arc_client.close_shared().await });
 }
 
-async fn check_local_owner_for_register(
-    state: &RelayState,
-    name: &str,
-    address: &str,
-) -> RegisterOwnerCheck {
-    let mut last_stale_owner = None;
-    for _ in 0..3 {
-        match state.check_local_owner(name, address) {
-            LocalOwnerStatus::NoOwner => {
-                return RegisterOwnerCheck::Available { replacement: None };
-            }
-            LocalOwnerStatus::SameAddress => return RegisterOwnerCheck::SameOwner,
-            LocalOwnerStatus::DifferentAddressReady {
-                existing_address, ..
-            } => return RegisterOwnerCheck::DuplicateAlive { existing_address },
-            LocalOwnerStatus::DifferentAddressNeedsProbe {
-                existing_address,
-                generation,
-            } => match probe_owner(state, name, &existing_address, generation).await {
-                OwnerProbe::Alive => {
-                    return RegisterOwnerCheck::DuplicateAlive { existing_address };
-                }
-                OwnerProbe::Dead => {
-                    return RegisterOwnerCheck::Available {
-                        replacement: Some(OwnerReplacementToken {
-                            existing_address,
-                            generation,
-                        }),
-                    };
-                }
-                OwnerProbe::Stale => {
-                    last_stale_owner = Some(existing_address);
-                }
-            },
-        }
-    }
-    RegisterOwnerCheck::DuplicateAlive {
-        existing_address: last_stale_owner.unwrap_or_else(|| "<unknown>".to_string()),
-    }
-}
-
-async fn probe_owner(
-    state: &RelayState,
-    name: &str,
-    existing_address: &str,
-    generation: u64,
-) -> OwnerProbe {
-    let mut client = IpcClient::new(existing_address);
-    match client.connect().await {
-        Ok(()) => {
-            if state
-                .reconnect_candidate(name)
-                .is_some_and(|(address, current_generation)| {
-                    address == existing_address && current_generation == generation
-                })
-            {
-                client.close().await;
-                OwnerProbe::Alive
-            } else {
-                client.close().await;
-                OwnerProbe::Stale
-            }
-        }
-        Err(_) => OwnerProbe::Dead,
-    }
-}
-
 /// `POST /_unregister` — remove a CRM upstream.
 ///
-/// Body: `{"name": "grid"}`
-/// Returns: 200 on success, 404 on missing.
+/// Body: `{"name": "grid", "server_id": "..."}`
+/// Returns: 200 on success, 403 on owner mismatch, 404 on missing.
 async fn handle_unregister(
     State(state): State<Arc<RelayState>>,
     Json(body): Json<serde_json::Value>,
@@ -255,24 +195,29 @@ async fn handle_unregister(
         Some(n) => n.to_string(),
         None => return (StatusCode::BAD_REQUEST, "Missing \"name\"").into_response(),
     };
+    let server_id = match body.get("server_id").and_then(|v| v.as_str()) {
+        Some(id) => id.to_string(),
+        None => return (StatusCode::BAD_REQUEST, "Missing \"server_id\"").into_response(),
+    };
 
-    match state.unregister_upstream(&name) {
-        Some((entry, old_client)) => {
+    if let Err(ControlError::InvalidServerId { reason }) =
+        RouteAuthority::new(&state).validate_server_id(&server_id)
+    {
+        return (StatusCode::BAD_REQUEST, reason).into_response();
+    }
+
+    match state.unregister_upstream(&name, &server_id) {
+        crate::relay::state::UnregisterResult::Removed {
+            entry,
+            removed_at,
+            client,
+        } => {
             // Close old client asynchronously
-            if let Some(arc_client) = old_client {
+            if let Some(arc_client) = client {
                 close_arc_client(arc_client);
             }
 
-            // Gossip withdraw to peers
-            let envelope = PeerEnvelope::new(
-                state.relay_id(),
-                PeerMessage::RouteWithdraw {
-                    name: entry.name.clone(),
-                    relay_id: entry.relay_id.clone(),
-                },
-            );
-            let peers = state.list_peers();
-            state.disseminator().broadcast(envelope, &peers);
+            broadcast_route_withdraw(&state, &entry, removed_at);
 
             (
                 StatusCode::OK,
@@ -280,7 +225,20 @@ async fn handle_unregister(
             )
                 .into_response()
         }
-        None => (
+        crate::relay::state::UnregisterResult::AlreadyRemoved => (
+            StatusCode::OK,
+            Json(serde_json::json!({"unregistered": name})),
+        )
+            .into_response(),
+        crate::relay::state::UnregisterResult::OwnerMismatch => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "OwnerMismatch",
+                "name": name,
+            })),
+        )
+            .into_response(),
+        crate::relay::state::UnregisterResult::NotFound => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": format!("Route name not registered: '{name}'")})),
         )
@@ -290,9 +248,9 @@ async fn handle_unregister(
 
 /// `GET /_routes` — list all registered routes.
 ///
-/// Intentionally omits `ipc_address` even for LOCAL routes: this endpoint is
-/// reachable by anyone who can hit the relay's HTTP port, and the local UDS
-/// path is filesystem-private to the owning host.
+/// Intentionally omits `server_id` and `ipc_address` even for LOCAL routes:
+/// this endpoint is reachable by anyone who can hit the relay's HTTP port, and
+/// owner identity plus local UDS path are private to this relay.
 async fn handle_list_routes(State(state): State<Arc<RelayState>>) -> impl IntoResponse {
     let routes: Vec<serde_json::Value> = state
         .list_routes()
@@ -348,6 +306,35 @@ async fn handle_peers(State(state): State<Arc<RelayState>>) -> impl IntoResponse
     Json(state.list_peers()).into_response()
 }
 
+/// `GET /_probe/{name}` — verify that a route's local upstream is reachable.
+async fn handle_probe(
+    Path(route_name): Path<String>,
+    State(state): State<Arc<RelayState>>,
+) -> Response {
+    match acquire_request_client(state, &route_name).await {
+        RequestClient::Ready { lease } => {
+            drop(lease);
+            StatusCode::OK.into_response()
+        }
+        RequestClient::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "ResourceNotFound",
+                "route": route_name,
+            })),
+        )
+            .into_response(),
+        RequestClient::Unreachable => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": "UpstreamUnavailable",
+                "route": route_name,
+            })),
+        )
+            .into_response(),
+    }
+}
+
 /// `POST /{route_name}/{method_name}` — relay CRM call to upstream.
 ///
 /// If the upstream was evicted by the idle sweeper, attempts a lazy
@@ -363,7 +350,8 @@ async fn call_handler(
             return (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({
-                    "error": format!("No upstream registered for route: '{route_name}'")
+                    "error": "ResourceNotFound",
+                    "route": route_name,
                 })),
             )
                 .into_response();
@@ -372,14 +360,14 @@ async fn call_handler(
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({
-                    "error": format!("Upstream '{route_name}' is registered but unreachable")
+                    "error": "UpstreamUnavailable",
+                    "route": route_name,
                 })),
             )
                 .into_response();
         }
     };
     let client = lease.client();
-    let request_generation = lease.generation();
 
     match client.call(&route_name, &method_name, &body).await {
         Ok(result) => {
@@ -399,9 +387,24 @@ async fn call_handler(
             err_bytes,
         )
             .into_response(),
+        Err(c2_ipc::IpcError::RouteNotFound(route)) => {
+            let address = lease.address();
+            drop(lease);
+            remove_unreachable_route(&state, &route, &address);
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "ResourceNotFound",
+                    "route": route,
+                })),
+            )
+                .into_response()
+        }
         Err(e) => {
             // Evict dead client so next request triggers reconnect.
-            state.evict_connection_generation(&route_name, request_generation);
+            if let Some(old_client) = lease.evict_current_client() {
+                close_arc_client(old_client);
+            }
             (
                 StatusCode::BAD_GATEWAY,
                 [("content-type", "text/plain")],
@@ -416,10 +419,25 @@ async fn acquire_request_client(state: Arc<RelayState>, route_name: &str) -> Req
     match state.acquire_upstream(route_name).await {
         Ok(lease) => RequestClient::Ready { lease },
         Err(AcquireError::NotFound) => RequestClient::NotFound,
-        Err(AcquireError::Unreachable(e)) => {
-            eprintln!("[relay] Failed to acquire upstream '{route_name}': {e}");
-            RequestClient::Unreachable
+        Err(AcquireError::Unreachable { address, error }) => {
+            eprintln!("[relay] Failed to acquire upstream '{route_name}': {error}");
+            remove_unreachable_route(&state, route_name, &address);
+            match error {
+                c2_ipc::IpcError::RouteNotFound(_) => RequestClient::NotFound,
+                _ => RequestClient::Unreachable,
+            }
         }
+    }
+}
+
+fn remove_unreachable_route(state: &Arc<RelayState>, route_name: &str, address: &str) {
+    if let Some((entry, removed_at, client)) =
+        state.remove_unreachable_local_upstream(route_name, address)
+    {
+        if let Some(client) = client {
+            close_arc_client(client);
+        }
+        broadcast_route_withdraw(state, &entry, removed_at);
     }
 }
 
@@ -436,7 +454,7 @@ async fn echo_handler(body: Bytes) -> Response {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
@@ -449,6 +467,8 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use tower::ServiceExt;
+
+    use crate::relay::peer::PeerEnvelope;
 
     struct NoopDisseminator;
 
@@ -476,7 +496,7 @@ mod tests {
         }
     }
 
-    fn test_state() -> Arc<RelayState> {
+    pub(crate) fn test_state_for_client() -> Arc<RelayState> {
         let config = RelayConfig {
             relay_id: "test-relay".into(),
             skip_ipc_validation: false,
@@ -488,11 +508,27 @@ mod tests {
         ))
     }
 
-    fn register_body(name: &str, address: &str) -> Body {
-        Body::from(serde_json::json!({ "name": name, "address": address }).to_string())
+    fn test_state() -> Arc<RelayState> {
+        test_state_for_client()
     }
 
-    async fn post_register(state: Arc<RelayState>, name: &str, address: &str) -> StatusCode {
+    fn register_body(name: &str, server_id: &str, address: &str) -> Body {
+        Body::from(
+            serde_json::json!({
+                "name": name,
+                "server_id": server_id,
+                "address": address,
+            })
+            .to_string(),
+        )
+    }
+
+    async fn post_register(
+        state: Arc<RelayState>,
+        name: &str,
+        server_id: &str,
+        address: &str,
+    ) -> StatusCode {
         let app = build_router(state);
         let response = app
             .oneshot(
@@ -500,7 +536,7 @@ mod tests {
                     .method("POST")
                     .uri("/_register")
                     .header("content-type", "application/json")
-                    .body(register_body(name, address))
+                    .body(register_body(name, server_id, address))
                     .unwrap(),
             )
             .await
@@ -510,11 +546,200 @@ mod tests {
         status
     }
 
-    async fn start_live_server(address: &str) -> Arc<Server> {
-        let server = Arc::new(Server::new(address, ServerIpcConfig::default()).unwrap());
+    async fn post_unregister(state: Arc<RelayState>, name: &str, server_id: &str) -> StatusCode {
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_unregister")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": name,
+                            "server_id": server_id,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        status
+    }
+
+    async fn post_call(state: Arc<RelayState>, name: &str, method: &str) -> StatusCode {
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/{name}/{method}"))
+                    .body(Body::from(Vec::new()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        status
+    }
+
+    async fn get_probe(state: Arc<RelayState>, name: &str) -> StatusCode {
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/_probe/{name}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        status
+    }
+
+    async fn get_resolve(state: Arc<RelayState>, name: &str) -> StatusCode {
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/_resolve/{name}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        status
+    }
+
+    #[tokio::test]
+    async fn register_rejects_invalid_server_id_at_control_boundary() {
+        let state = test_state();
+        assert_eq!(
+            post_register(state.clone(), "grid", " ", "ipc://grid").await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            post_register(state, "grid", "bad/path", "ipc://grid").await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn register_rejects_route_name_that_cannot_fit_wire_control() {
+        let state = test_state();
+        let long_name = "x".repeat(c2_wire::control::MAX_CALL_ROUTE_NAME_BYTES + 1);
+
+        assert_eq!(
+            post_register(state, &long_name, "server-grid", "ipc://grid").await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn call_unreachable_upstream_removes_stale_local_route() {
+        let state = test_state();
+
+        assert_eq!(
+            post_register(state.clone(), "grid", "server-grid", "ipc://missing-grid").await,
+            StatusCode::BAD_GATEWAY
+        );
+
+        let stale_client = Arc::new(IpcClient::new("ipc://missing-grid"));
+        stale_client.force_connected(false);
+        state.commit_register_upstream(
+            "grid".into(),
+            "server-grid".into(),
+            "ipc://missing-grid".into(),
+            String::new(),
+            String::new(),
+            stale_client,
+            None,
+        );
+
+        assert_eq!(
+            post_call(state.clone(), "grid", "step").await,
+            StatusCode::BAD_GATEWAY
+        );
+        assert!(state.resolve("grid").is_empty());
+    }
+
+    #[tokio::test]
+    async fn unregister_rejects_invalid_server_id_at_control_boundary() {
+        let state = test_state();
+        assert_eq!(
+            post_unregister(state.clone(), "grid", " ").await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            post_unregister(state, "grid", "bad\\path").await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_control_plane_body_is_rejected() {
+        let state = test_state();
+        let app = build_router(state);
+        let oversized = serde_json::json!({
+            "name": "grid",
+            "server_id": "server-grid",
+            "address": "ipc://grid",
+            "padding": "x".repeat(2 * 1024 * 1024),
+        })
+        .to_string();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(oversized))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn data_plane_echo_allows_large_payloads() {
+        let state = test_state();
+        let app = build_router(state);
+        let payload = vec![b'x'; 2 * 1024 * 1024];
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_echo")
+                    .header("content-type", "application/octet-stream")
+                    .body(Body::from(payload.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.len(), payload.len());
+    }
+
+    async fn register_echo_route(server: &Arc<Server>, name: &str) {
         server
             .register_route(CrmRoute {
-                name: "grid".into(),
+                name: name.into(),
                 scheduler: Arc::new(Scheduler::new(
                     ConcurrencyMode::ReadParallel,
                     HashMap::new(),
@@ -522,7 +747,13 @@ mod tests {
                 callback: Arc::new(Echo),
                 method_names: vec!["ping".into()],
             })
-            .await;
+            .await
+            .unwrap();
+    }
+
+    async fn start_live_server(address: &str) -> Arc<Server> {
+        let server = Arc::new(Server::new(address, ServerIpcConfig::default()).unwrap());
+        register_echo_route(&server, "grid").await;
         let run_server = server.clone();
         tokio::spawn(async move {
             let _ = run_server.run().await;
@@ -542,6 +773,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn register_allows_replacement_when_idle_evicted_server_no_longer_serves_route() {
+        let state = test_state();
+        let old_address = format!(
+            "ipc://relay_route_removed_owner_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let new_address = format!(
+            "ipc://relay_route_replacement_owner_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let old_server = start_live_server(&old_address).await;
+        register_echo_route(&old_server, "counter").await;
+        let new_server = start_live_server(&new_address).await;
+
+        assert_eq!(
+            post_register(state.clone(), "grid", "server-old", &old_address).await,
+            StatusCode::CREATED
+        );
+        state.evict_connection("grid");
+        assert!(old_server.unregister_route("grid").await);
+
+        assert_eq!(
+            post_register(state.clone(), "grid", "server-new", &new_address).await,
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            state.get_address("grid").as_deref(),
+            Some(new_address.as_str())
+        );
+
+        old_server.shutdown();
+        new_server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn probe_unreachable_upstream_removes_stale_local_route() {
+        let state = test_state();
+        let stale_address = format!(
+            "ipc://relay_probe_stale_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let stale_server = start_live_server(&stale_address).await;
+
+        assert_eq!(
+            post_register(state.clone(), "grid", "server-grid", &stale_address).await,
+            StatusCode::CREATED
+        );
+        state.evict_connection("grid");
+        stale_server.shutdown();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        assert_eq!(
+            get_probe(state.clone(), "grid").await,
+            StatusCode::BAD_GATEWAY
+        );
+        assert!(state.local_route("grid").is_none());
+        assert_eq!(
+            get_probe(state.clone(), "grid").await,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_missing_upstream_route_removes_stale_local_route() {
+        let state = test_state();
+        let stale_address = format!(
+            "ipc://relay_probe_missing_route_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let stale_server = start_live_server(&stale_address).await;
+
+        assert_eq!(
+            post_register(state.clone(), "grid", "server-grid", &stale_address).await,
+            StatusCode::CREATED
+        );
+        state.evict_connection("grid");
+        assert!(stale_server.unregister_route("grid").await);
+
+        assert_eq!(
+            get_probe(state.clone(), "grid").await,
+            StatusCode::NOT_FOUND
+        );
+        assert!(state.local_route("grid").is_none());
+        assert_eq!(
+            get_resolve(state.clone(), "grid").await,
+            StatusCode::NOT_FOUND
+        );
+
+        stale_server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn call_missing_upstream_route_removes_stale_local_route() {
+        let state = test_state();
+        let stale_address = format!(
+            "ipc://relay_call_missing_route_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let stale_server = start_live_server(&stale_address).await;
+
+        assert_eq!(
+            post_register(state.clone(), "grid", "server-grid", &stale_address).await,
+            StatusCode::CREATED
+        );
+        assert!(stale_server.unregister_route("grid").await);
+
+        assert_eq!(
+            post_call(state.clone(), "grid", "ping").await,
+            StatusCode::NOT_FOUND
+        );
+        assert!(state.local_route("grid").is_none());
+        assert_eq!(
+            get_resolve(state.clone(), "grid").await,
+            StatusCode::NOT_FOUND
+        );
+
+        stale_server.shutdown();
+    }
+
+    #[tokio::test]
     async fn register_rejects_different_address_when_idle_evicted_owner_is_alive() {
         let state = test_state();
         let old_address = format!(
@@ -558,13 +914,13 @@ mod tests {
         let new_server = start_live_server(&new_address).await;
 
         assert_eq!(
-            post_register(state.clone(), "grid", &old_address).await,
+            post_register(state.clone(), "grid", "server-old", &old_address).await,
             StatusCode::CREATED
         );
         state.evict_connection("grid");
 
         assert_eq!(
-            post_register(state.clone(), "grid", &new_address).await,
+            post_register(state.clone(), "grid", "server-new", &new_address).await,
             StatusCode::CONFLICT
         );
         assert_eq!(
@@ -593,7 +949,7 @@ mod tests {
         let new_server = start_live_server(&new_address).await;
 
         assert_eq!(
-            post_register(state.clone(), "grid", &old_address).await,
+            post_register(state.clone(), "grid", "server-old", &old_address).await,
             StatusCode::CREATED
         );
         state.evict_connection("grid");
@@ -601,7 +957,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
         assert_eq!(
-            post_register(state.clone(), "grid", &new_address).await,
+            post_register(state.clone(), "grid", "server-new", &new_address).await,
             StatusCode::CREATED
         );
         assert_eq!(
@@ -623,7 +979,7 @@ mod tests {
         let server = start_live_server(&address).await;
 
         assert_eq!(
-            post_register(state.clone(), "grid", &address).await,
+            post_register(state.clone(), "grid", "server-grid", &address).await,
             StatusCode::CREATED
         );
         state.evict_connection("grid");
@@ -680,12 +1036,16 @@ mod tests {
         let first = {
             let state = state.clone();
             let first_address = first_address.clone();
-            tokio::spawn(async move { post_register(state, "grid", &first_address).await })
+            tokio::spawn(async move {
+                post_register(state, "grid", "server-first", &first_address).await
+            })
         };
         let second = {
             let state = state.clone();
             let second_address = second_address.clone();
-            tokio::spawn(async move { post_register(state, "grid", &second_address).await })
+            tokio::spawn(async move {
+                post_register(state, "grid", "server-second", &second_address).await
+            })
         };
 
         let statuses = vec![first.await.unwrap(), second.await.unwrap()];
@@ -714,6 +1074,87 @@ mod tests {
 
         first_server.shutdown();
         second_server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn unregister_rejects_wrong_server_id_without_removing_route() {
+        let state = test_state();
+        let address = format!(
+            "ipc://relay_unregister_owner_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let server = start_live_server(&address).await;
+
+        assert_eq!(
+            post_register(state.clone(), "grid", "server-grid", &address).await,
+            StatusCode::CREATED
+        );
+
+        assert_eq!(
+            post_unregister(state.clone(), "grid", "server-other").await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(state.get_address("grid").as_deref(), Some(address.as_str()));
+
+        assert_eq!(
+            post_unregister(state.clone(), "grid", "server-grid").await,
+            StatusCode::OK
+        );
+
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn unregister_is_idempotent_after_success_for_same_server_id() {
+        let state = test_state();
+        let address = format!(
+            "ipc://relay_unregister_idempotent_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let server = start_live_server(&address).await;
+
+        assert_eq!(
+            post_register(state.clone(), "grid", "server-grid", &address).await,
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            post_unregister(state.clone(), "grid", "server-grid").await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_unregister(state.clone(), "grid", "server-grid").await,
+            StatusCode::OK
+        );
+
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn unregister_tombstone_does_not_authorize_different_server_id() {
+        let state = test_state();
+        let address = format!(
+            "ipc://relay_unregister_wrong_idempotent_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let server = start_live_server(&address).await;
+
+        assert_eq!(
+            post_register(state.clone(), "grid", "server-grid", &address).await,
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            post_unregister(state.clone(), "grid", "server-grid").await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            post_unregister(state.clone(), "grid", "server-other").await,
+            StatusCode::NOT_FOUND
+        );
+
+        server.shutdown();
     }
 
     fn unique_suffix() -> u64 {

@@ -14,11 +14,29 @@ pub struct RouteEntry {
     pub name: String,
     pub relay_id: String,
     pub relay_url: String,
+    pub server_id: Option<String>,
     pub ipc_address: Option<String>,
     pub crm_ns: String,
     pub crm_ver: String,
     pub locality: Locality,
     pub registered_at: f64,
+}
+
+fn observed_now() -> Instant {
+    Instant::now()
+}
+
+/// Negative route state used to propagate deletions through gossip and
+/// anti-entropy without letting old announcements resurrect stale routes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteTombstone {
+    pub name: String,
+    pub relay_id: String,
+    pub removed_at: f64,
+    #[serde(skip)]
+    pub server_id: Option<String>,
+    #[serde(skip, default = "observed_now")]
+    pub observed_at: Instant,
 }
 
 /// Resolution result returned to clients via /_resolve.
@@ -71,6 +89,8 @@ pub struct PeerInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FullSync {
     pub routes: Vec<RouteEntry>,
+    #[serde(default)]
+    pub tombstones: Vec<RouteTombstone>,
     pub peers: Vec<PeerSnapshot>,
 }
 
@@ -84,17 +104,30 @@ pub struct PeerSnapshot {
 }
 
 /// Convert a DigestDiffEntry into a PEER RouteEntry.
-impl From<crate::relay::peer::DigestDiffEntry> for RouteEntry {
-    fn from(d: crate::relay::peer::DigestDiffEntry) -> Self {
-        Self {
-            name: d.name,
-            relay_id: d.relay_id,
-            relay_url: d.relay_url,
-            ipc_address: d.ipc_address,
-            crm_ns: d.crm_ns,
-            crm_ver: d.crm_ver,
-            locality: Locality::Peer,
-            registered_at: d.registered_at,
+impl TryFrom<crate::relay::peer::DigestDiffEntry> for RouteEntry {
+    type Error = ();
+
+    fn try_from(d: crate::relay::peer::DigestDiffEntry) -> Result<Self, Self::Error> {
+        match d {
+            crate::relay::peer::DigestDiffEntry::Active {
+                name,
+                relay_id,
+                relay_url,
+                crm_ns,
+                crm_ver,
+                registered_at,
+            } => Ok(Self {
+                name,
+                relay_id,
+                relay_url,
+                server_id: None,
+                ipc_address: None,
+                crm_ns,
+                crm_ver,
+                locality: Locality::Peer,
+                registered_at,
+            }),
+            crate::relay::peer::DigestDiffEntry::Deleted { .. } => Err(()),
         }
     }
 }

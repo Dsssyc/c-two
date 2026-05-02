@@ -40,6 +40,9 @@ python tools/dev/c3_tool.py --build --link
 
 The resource and client use `http://127.0.0.1:8300` by default. Set
 `C2_RELAY_ADDRESS` only if you start the relay at a different address.
+For multi-host runs, keep relay HTTP and `/_peer/*` mesh endpoints inside a
+trusted network boundary. Do not expose this demo relay directly to the public
+internet.
 
 ```bash
 # Terminal 1 — start the relay server

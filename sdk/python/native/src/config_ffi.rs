@@ -8,20 +8,15 @@ use c2_config::{
 };
 
 #[pyfunction]
-#[pyo3(signature = (global_overrides=None))]
-fn resolve_relay_client_config(
-    py: Python<'_>,
-    global_overrides: Option<&Bound<'_, PyDict>>,
-) -> PyResult<Py<PyAny>> {
-    let mut overrides = RuntimeConfigOverrides::default();
-    apply_relay_client_overrides(&mut overrides, global_overrides)?;
-    let resolved = ConfigResolver::resolve_relay_client(overrides, ConfigSources::from_process())
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+fn resolve_relay_address() -> PyResult<Option<String>> {
+    c2_config::ConfigResolver::resolve_relay_address(ConfigSources::from_process())
+        .map_err(|e| PyValueError::new_err(e.to_string()))
+}
 
-    let dict = PyDict::new(py);
-    dict.set_item("relay_address", resolved.relay_address)?;
-    dict.set_item("relay_use_proxy", resolved.relay_use_proxy)?;
-    Ok(dict.into_any().unbind())
+#[pyfunction]
+fn resolve_relay_use_proxy() -> PyResult<bool> {
+    c2_config::ConfigResolver::resolve_relay_use_proxy(ConfigSources::from_process())
+        .map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
 #[pyfunction]
@@ -71,16 +66,14 @@ fn resolve_client_ipc_config(
     Ok(client_ipc_to_dict(py, &resolved)?.into_any().unbind())
 }
 
-fn apply_relay_client_overrides(
-    overrides: &mut RuntimeConfigOverrides,
-    global: Option<&Bound<'_, PyDict>>,
-) -> PyResult<()> {
-    let Some(global) = global else {
-        return Ok(());
-    };
-    overrides.relay_address = get_opt(global, "relay_address")?;
-    overrides.relay_use_proxy = get_opt(global, "relay_use_proxy")?;
-    Ok(())
+#[pyfunction]
+fn validate_server_id(server_id: &str) -> PyResult<()> {
+    c2_config::validate_server_id(server_id).map_err(PyValueError::new_err)
+}
+
+#[pyfunction]
+fn validate_ipc_region_id(region_id: &str) -> PyResult<()> {
+    c2_config::validate_ipc_region_id(region_id).map_err(PyValueError::new_err)
 }
 
 fn apply_shm_overrides(
@@ -98,34 +91,26 @@ fn server_overrides(dict: Option<&Bound<'_, PyDict>>) -> PyResult<ServerIpcConfi
     let Some(dict) = dict else {
         return Ok(ServerIpcConfigOverrides::default());
     };
-    reject_derived_fields(dict)?;
+    reject_forbidden_ipc_fields(dict)?;
+    reject_unknown_ipc_fields(dict, SERVER_IPC_KEYS)?;
     Ok(ServerIpcConfigOverrides {
-        shm_threshold: get_opt(dict, "shm_threshold")?,
         pool_enabled: get_opt(dict, "pool_enabled")?,
         pool_segment_size: get_opt(dict, "pool_segment_size")?,
         max_pool_segments: get_opt(dict, "max_pool_segments")?,
         reassembly_segment_size: get_opt(dict, "reassembly_segment_size")?,
         reassembly_max_segments: get_opt(dict, "reassembly_max_segments")?,
         max_total_chunks: get_opt(dict, "max_total_chunks")?,
-        chunk_gc_interval_secs: get_opt_alias(dict, "chunk_gc_interval_secs", "chunk_gc_interval")?,
+        chunk_gc_interval_secs: get_opt(dict, "chunk_gc_interval")?,
         chunk_threshold_ratio: get_opt(dict, "chunk_threshold_ratio")?,
-        chunk_assembler_timeout_secs: get_opt_alias(
-            dict,
-            "chunk_assembler_timeout_secs",
-            "chunk_assembler_timeout",
-        )?,
+        chunk_assembler_timeout_secs: get_opt(dict, "chunk_assembler_timeout")?,
         max_reassembly_bytes: get_opt(dict, "max_reassembly_bytes")?,
         chunk_size: get_opt(dict, "chunk_size")?,
         max_frame_size: get_opt(dict, "max_frame_size")?,
         max_payload_size: get_opt(dict, "max_payload_size")?,
         max_pending_requests: get_opt(dict, "max_pending_requests")?,
         pool_decay_seconds: get_opt(dict, "pool_decay_seconds")?,
-        heartbeat_interval_secs: get_opt_alias(
-            dict,
-            "heartbeat_interval_secs",
-            "heartbeat_interval",
-        )?,
-        heartbeat_timeout_secs: get_opt_alias(dict, "heartbeat_timeout_secs", "heartbeat_timeout")?,
+        heartbeat_interval_secs: get_opt(dict, "heartbeat_interval")?,
+        heartbeat_timeout_secs: get_opt(dict, "heartbeat_timeout")?,
         ..Default::default()
     })
 }
@@ -134,33 +119,77 @@ fn client_overrides(dict: Option<&Bound<'_, PyDict>>) -> PyResult<ClientIpcConfi
     let Some(dict) = dict else {
         return Ok(ClientIpcConfigOverrides::default());
     };
-    reject_derived_fields(dict)?;
+    reject_forbidden_ipc_fields(dict)?;
+    reject_unknown_ipc_fields(dict, CLIENT_IPC_KEYS)?;
     Ok(ClientIpcConfigOverrides {
-        shm_threshold: get_opt(dict, "shm_threshold")?,
         pool_enabled: get_opt(dict, "pool_enabled")?,
         pool_segment_size: get_opt(dict, "pool_segment_size")?,
         max_pool_segments: get_opt(dict, "max_pool_segments")?,
         reassembly_segment_size: get_opt(dict, "reassembly_segment_size")?,
         reassembly_max_segments: get_opt(dict, "reassembly_max_segments")?,
         max_total_chunks: get_opt(dict, "max_total_chunks")?,
-        chunk_gc_interval_secs: get_opt_alias(dict, "chunk_gc_interval_secs", "chunk_gc_interval")?,
+        chunk_gc_interval_secs: get_opt(dict, "chunk_gc_interval")?,
         chunk_threshold_ratio: get_opt(dict, "chunk_threshold_ratio")?,
-        chunk_assembler_timeout_secs: get_opt_alias(
-            dict,
-            "chunk_assembler_timeout_secs",
-            "chunk_assembler_timeout",
-        )?,
+        chunk_assembler_timeout_secs: get_opt(dict, "chunk_assembler_timeout")?,
         max_reassembly_bytes: get_opt(dict, "max_reassembly_bytes")?,
         chunk_size: get_opt(dict, "chunk_size")?,
         ..Default::default()
     })
 }
 
-fn reject_derived_fields(dict: &Bound<'_, PyDict>) -> PyResult<()> {
-    if dict.contains("max_pool_memory")? {
+const BASE_IPC_KEYS: &[&str] = &[
+    "pool_enabled",
+    "pool_segment_size",
+    "max_pool_segments",
+    "reassembly_segment_size",
+    "reassembly_max_segments",
+    "max_total_chunks",
+    "chunk_gc_interval",
+    "chunk_threshold_ratio",
+    "chunk_assembler_timeout",
+    "max_reassembly_bytes",
+    "chunk_size",
+];
+
+const SERVER_IPC_KEYS: &[&str] = &[
+    "pool_enabled",
+    "pool_segment_size",
+    "max_pool_segments",
+    "reassembly_segment_size",
+    "reassembly_max_segments",
+    "max_total_chunks",
+    "chunk_gc_interval",
+    "chunk_threshold_ratio",
+    "chunk_assembler_timeout",
+    "max_reassembly_bytes",
+    "chunk_size",
+    "max_frame_size",
+    "max_payload_size",
+    "max_pending_requests",
+    "pool_decay_seconds",
+    "heartbeat_interval",
+    "heartbeat_timeout",
+];
+
+const CLIENT_IPC_KEYS: &[&str] = BASE_IPC_KEYS;
+
+fn reject_forbidden_ipc_fields(dict: &Bound<'_, PyDict>) -> PyResult<()> {
+    if dict.contains("shm_threshold")? {
         return Err(PyValueError::new_err(
-            "max_pool_memory is derived from pool_segment_size * max_pool_segments",
+            "shm_threshold is a global transport policy; use set_transport_policy(shm_threshold=...)",
         ));
+    }
+    Ok(())
+}
+
+fn reject_unknown_ipc_fields(dict: &Bound<'_, PyDict>, allowed: &[&str]) -> PyResult<()> {
+    for item in dict.keys().iter() {
+        let key: String = item.extract()?;
+        if !allowed.contains(&key.as_str()) {
+            return Err(PyValueError::new_err(format!(
+                "unknown IPC override option: {key}"
+            )));
+        }
     }
     Ok(())
 }
@@ -172,16 +201,6 @@ where
     match dict.get_item(key)? {
         Some(value) if !value.is_none() => Ok(Some(value.extract::<T>()?)),
         _ => Ok(None),
-    }
-}
-
-fn get_opt_alias<T>(dict: &Bound<'_, PyDict>, primary: &str, alias: &str) -> PyResult<Option<T>>
-where
-    T: for<'a, 'py> FromPyObject<'a, 'py, Error = PyErr>,
-{
-    match get_opt(dict, primary)? {
-        Some(value) => Ok(Some(value)),
-        None => get_opt(dict, alias),
     }
 }
 
@@ -224,9 +243,12 @@ fn base_ipc_to_dict<'py>(
 }
 
 pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(resolve_relay_client_config, m)?)?;
+    m.add_function(wrap_pyfunction!(resolve_relay_address, m)?)?;
+    m.add_function(wrap_pyfunction!(resolve_relay_use_proxy, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_shm_threshold, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_server_ipc_config, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_client_ipc_config, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_server_id, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_ipc_region_id, m)?)?;
     Ok(())
 }

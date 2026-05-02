@@ -302,6 +302,44 @@ class TestErrors:
         assert 'hello' not in registry.names
         assert cc.server_address() is None
 
+    def test_unreachable_relay_registration_rolls_back_local_registration(self):
+        registry = _ProcessRegistry.get()
+        previous_relay = settings.relay_address
+        try:
+            registry.set_relay('http://127.0.0.1:9')
+            with pytest.raises(Exception, match='Relay registration failed'):
+                registry.register(Hello, HelloImpl(), name='hello')
+
+            assert 'hello' not in registry.names
+            assert registry.get_server_address() is None
+        finally:
+            settings.relay_address = previous_relay
+
+    def test_set_relay_clears_existing_relay_control_client(self):
+        registry = _ProcessRegistry()
+        previous_relay = settings.relay_address
+
+        class FakeRelayControlClient:
+            def __init__(self):
+                self.cleared = False
+
+            def clear_cache(self):
+                self.cleared = True
+
+        client = FakeRelayControlClient()
+
+        try:
+            registry._relay_control_client = client  # noqa: SLF001
+            registry._relay_control_address = 'http://relay-a.test'  # noqa: SLF001
+            registry.set_relay('http://relay-b.test')
+
+            assert client.cleared is True
+            assert registry._relay_control_client is None  # noqa: SLF001
+            assert registry._relay_control_address is None  # noqa: SLF001
+        finally:
+            registry.shutdown()
+            settings.relay_address = previous_relay
+
     def test_relay_rejects_duplicate_name_from_second_registry(self, start_c3_relay):
         relay = start_c3_relay()
         relay_url = relay.url

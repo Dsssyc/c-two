@@ -6,6 +6,7 @@ use std::time::Duration;
 use crate::{BaseIpcConfig, ClientIpcConfig, RelayConfig, ServerIpcConfig};
 
 pub type EnvMap = BTreeMap<String, String>;
+const MAX_RELAY_ROUTE_ATTEMPTS: u64 = 32;
 
 #[derive(Debug, Clone)]
 pub enum EnvFilePolicy {
@@ -91,7 +92,6 @@ pub struct BaseIpcConfigOverrides {
 #[derive(Debug, Clone, Default)]
 pub struct ServerIpcConfigOverrides {
     pub base: BaseIpcConfigOverrides,
-    pub shm_threshold: Option<u64>,
     pub pool_enabled: Option<bool>,
     pub pool_segment_size: Option<u64>,
     pub max_pool_segments: Option<u32>,
@@ -114,7 +114,6 @@ pub struct ServerIpcConfigOverrides {
 #[derive(Debug, Clone, Default)]
 pub struct ClientIpcConfigOverrides {
     pub base: BaseIpcConfigOverrides,
-    pub shm_threshold: Option<u64>,
     pub pool_enabled: Option<bool>,
     pub pool_segment_size: Option<u64>,
     pub max_pool_segments: Option<u32>,
@@ -170,6 +169,7 @@ pub struct ResolvedRelayConfig {
 pub struct ResolvedRelayClientConfig {
     pub relay_address: Option<String>,
     pub relay_use_proxy: bool,
+    pub relay_route_max_attempts: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,25 +229,36 @@ impl ConfigResolver {
     ) -> Result<ResolvedRelayConfig, ConfigError> {
         let catalog = EnvCatalog::load(sources)?;
         let relay = resolve_relay_server_config(&catalog, overrides.relay.clone())?;
-        let relay_client = resolve_relay_client_config(&catalog, &overrides)?;
+        let relay_address = overrides
+            .relay_address
+            .clone()
+            .or_else(|| catalog.optional_string("C2_RELAY_ADDRESS"));
+        let relay_use_proxy = resolve_relay_use_proxy(&catalog, &overrides)?;
         let relay = RelayConfig {
-            use_proxy: relay_client.relay_use_proxy,
+            use_proxy: relay_use_proxy,
             ..relay
         };
 
         Ok(ResolvedRelayConfig {
-            relay_address: relay_client.relay_address,
+            relay_address,
             relay,
-            relay_use_proxy: relay_client.relay_use_proxy,
+            relay_use_proxy,
         })
     }
 
-    pub fn resolve_relay_client(
-        overrides: RuntimeConfigOverrides,
-        sources: ConfigSources,
-    ) -> Result<ResolvedRelayClientConfig, ConfigError> {
+    pub fn resolve_relay_address(sources: ConfigSources) -> Result<Option<String>, ConfigError> {
         let catalog = EnvCatalog::load(sources)?;
-        resolve_relay_client_config(&catalog, &overrides)
+        Ok(catalog.optional_string("C2_RELAY_ADDRESS"))
+    }
+
+    pub fn resolve_relay_use_proxy(sources: ConfigSources) -> Result<bool, ConfigError> {
+        let catalog = EnvCatalog::load(sources)?;
+        resolve_relay_use_proxy(&catalog, &RuntimeConfigOverrides::default())
+    }
+
+    pub fn resolve_relay_route_max_attempts(sources: ConfigSources) -> Result<usize, ConfigError> {
+        let catalog = EnvCatalog::load(sources)?;
+        resolve_relay_route_max_attempts(&catalog)
     }
 
     pub fn resolve_server_ipc(
@@ -287,18 +298,41 @@ fn resolve_relay_client_config(
         .relay_address
         .clone()
         .or_else(|| catalog.optional_string("C2_RELAY_ADDRESS"));
-    let relay_use_proxy = match overrides.relay_use_proxy {
-        Some(value) => value,
-        None => catalog
-            .optional_bool("C2_RELAY_USE_PROXY")
-            .transpose()?
-            .unwrap_or(false),
-    };
+    let relay_use_proxy = resolve_relay_use_proxy(catalog, overrides)?;
+    let relay_route_max_attempts = resolve_relay_route_max_attempts(catalog)?;
 
     Ok(ResolvedRelayClientConfig {
         relay_address,
         relay_use_proxy,
+        relay_route_max_attempts,
     })
+}
+
+fn resolve_relay_use_proxy(
+    catalog: &EnvCatalog,
+    overrides: &RuntimeConfigOverrides,
+) -> Result<bool, ConfigError> {
+    match overrides.relay_use_proxy {
+        Some(value) => Ok(value),
+        None => Ok(catalog
+            .optional_bool("C2_RELAY_USE_PROXY")
+            .transpose()?
+            .unwrap_or(false)),
+    }
+}
+
+fn resolve_relay_route_max_attempts(catalog: &EnvCatalog) -> Result<usize, ConfigError> {
+    let attempts = catalog
+        .optional_u64("C2_RELAY_ROUTE_MAX_ATTEMPTS")
+        .transpose()?
+        .unwrap_or(3)
+        .max(1);
+    if attempts > MAX_RELAY_ROUTE_ATTEMPTS {
+        return Err(ConfigError::new(format!(
+            "C2_RELAY_ROUTE_MAX_ATTEMPTS must be <= {MAX_RELAY_ROUTE_ATTEMPTS}"
+        )));
+    }
+    Ok(attempts as usize)
 }
 
 fn resolve_env(sources: ConfigSources) -> Result<EnvMap, ConfigError> {
@@ -445,9 +479,6 @@ fn resolve_server_ipc_config(
 
     apply_base_overrides(&mut cfg.base, &overrides.base);
     apply_flat_base_overrides_to_server(&mut cfg, &overrides);
-    if let Some(v) = overrides.shm_threshold {
-        cfg.shm_threshold = v;
-    }
     if let Some(v) = overrides.max_frame_size {
         cfg.max_frame_size = v;
     }
@@ -483,9 +514,6 @@ fn resolve_client_ipc_config(
     apply_base_env(&mut cfg.base, catalog)?;
     apply_base_overrides(&mut cfg.base, &overrides.base);
     apply_flat_base_overrides_to_client(&mut cfg, &overrides);
-    if let Some(v) = overrides.shm_threshold {
-        cfg.shm_threshold = v;
-    }
 
     derive_base(&mut cfg.base)?;
     cfg.validate().map_err(ConfigError::new)?;
@@ -1018,6 +1046,28 @@ mod tests {
     }
 
     #[test]
+    fn global_shm_threshold_is_injected_into_scoped_ipc_configs() {
+        let mut global = RuntimeConfigOverrides::default();
+        global.shm_threshold = Some(16_384);
+
+        let server = ConfigResolver::resolve_server_ipc(
+            ServerIpcConfigOverrides::default(),
+            global.clone(),
+            ConfigSources::empty(),
+        )
+        .expect("server IPC should resolve");
+        let client = ConfigResolver::resolve_client_ipc(
+            ClientIpcConfigOverrides::default(),
+            global,
+            ConfigSources::empty(),
+        )
+        .expect("client IPC should resolve");
+
+        assert_eq!(server.shm_threshold, 16_384);
+        assert_eq!(client.shm_threshold, 16_384);
+    }
+
+    #[test]
     fn relay_seeds_and_proxy_are_parsed() {
         let sources = ConfigSources {
             env_file: EnvFilePolicy::Disabled,
@@ -1039,25 +1089,63 @@ mod tests {
     }
 
     #[test]
-    fn relay_client_resolution_ignores_relay_server_env() {
+    fn relay_address_resolution_ignores_relay_server_env() {
+        let sources = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[
+                ("C2_RELAY_ADDRESS", "http://127.0.0.1:8080"),
+                ("C2_RELAY_IDLE_TIMEOUT", "not-a-number"),
+            ]),
+        };
+
+        let resolved = ConfigResolver::resolve_relay_address(sources)
+            .expect("relay address should not parse relay server-only env");
+
+        assert_eq!(resolved.as_deref(), Some("http://127.0.0.1:8080"));
+    }
+
+    #[test]
+    fn relay_use_proxy_resolution_ignores_relay_address_and_ipc_env() {
         let sources = ConfigSources {
             env_file: EnvFilePolicy::Disabled,
             process_env: env(&[
                 ("C2_RELAY_ADDRESS", "http://127.0.0.1:8080"),
                 ("C2_RELAY_USE_PROXY", "yes"),
-                ("C2_RELAY_IDLE_TIMEOUT", "not-a-number"),
+                ("C2_IPC_POOL_SEGMENT_SIZE", "not-a-number"),
             ]),
         };
 
-        let resolved =
-            ConfigResolver::resolve_relay_client(RuntimeConfigOverrides::default(), sources)
-                .expect("relay client config should not parse relay server-only env");
+        let use_proxy = ConfigResolver::resolve_relay_use_proxy(sources)
+            .expect("relay proxy policy should not parse IPC env");
 
-        assert_eq!(
-            resolved.relay_address.as_deref(),
-            Some("http://127.0.0.1:8080")
-        );
-        assert!(resolved.relay_use_proxy);
+        assert!(use_proxy);
+    }
+
+    #[test]
+    fn relay_route_max_attempts_resolves_from_env() {
+        let sources = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[("C2_RELAY_ROUTE_MAX_ATTEMPTS", "5")]),
+        };
+
+        let attempts =
+            ConfigResolver::resolve_relay_route_max_attempts(sources).expect("resolve attempts");
+
+        assert_eq!(attempts, 5);
+    }
+
+    #[test]
+    fn relay_route_max_attempts_is_bounded() {
+        let sources = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[("C2_RELAY_ROUTE_MAX_ATTEMPTS", "33")]),
+        };
+
+        let err = ConfigResolver::resolve_relay_route_max_attempts(sources)
+            .expect_err("unbounded relay route attempts should fail");
+
+        assert!(err.to_string().contains("C2_RELAY_ROUTE_MAX_ATTEMPTS"));
+        assert!(err.to_string().contains("32"));
     }
 
     #[test]
@@ -1071,6 +1159,17 @@ mod tests {
             .expect_err("relay server config should parse idle timeout");
 
         assert!(err.to_string().contains("C2_RELAY_IDLE_TIMEOUT"));
+    }
+
+    #[test]
+    fn relay_server_resolution_ignores_relay_route_attempt_env() {
+        let sources = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[("C2_RELAY_ROUTE_MAX_ATTEMPTS", "not-a-number")]),
+        };
+
+        ConfigResolver::resolve_relay_server(RuntimeConfigOverrides::default(), sources)
+            .expect("relay server config should not parse client route attempts");
     }
 
     #[test]

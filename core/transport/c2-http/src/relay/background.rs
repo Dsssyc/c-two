@@ -10,9 +10,11 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::relay::peer::{DigestEntry, PeerEnvelope, PeerMessage};
+use crate::relay::authority::{RouteAuthority, RouteCommand};
+use crate::relay::peer::{DigestDiffEntry, DigestEntry, PeerEnvelope, PeerMessage};
 use crate::relay::state::RelayState;
 use crate::relay::types::*;
+use crate::relay::url::peer_endpoint_url;
 
 /// Spawn all periodic background tasks based on config.
 /// Returns handles so the caller can await them on shutdown.
@@ -53,6 +55,10 @@ pub fn spawn_background_tasks(
         handles.push(tokio::spawn(seed_retry_loop(s, c)));
     }
 
+    let s = state.clone();
+    let c = cancel.clone();
+    handles.push(tokio::spawn(tombstone_gc_loop(s, c)));
+
     handles
 }
 
@@ -79,6 +85,36 @@ async fn heartbeat_loop(state: Arc<RelayState>, cancel: CancellationToken) {
         let peers = state.list_peers();
         state.disseminator().broadcast(envelope, &peers);
     }
+}
+
+async fn tombstone_gc_loop(state: Arc<RelayState>, cancel: CancellationToken) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(60));
+    ticker.tick().await;
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = ticker.tick() => {}
+        }
+
+        let retention = tombstone_retention(&state);
+        let removed = state.gc_tombstones(retention);
+        if removed > 0 {
+            eprintln!("[relay] GC removed {removed} route tombstones");
+        }
+    }
+}
+
+fn tombstone_retention(state: &RelayState) -> Duration {
+    const MIN_RETENTION: Duration = Duration::from_secs(600);
+    let alive_peer_count = state.with_route_table(|rt| rt.alive_peers().len()).max(1);
+    let rounds = alive_peer_count.saturating_mul(2).min(u32::MAX as usize) as u32;
+    let anti_entropy_window = state
+        .config()
+        .anti_entropy_interval
+        .checked_mul(rounds)
+        .unwrap_or(Duration::MAX);
+    MIN_RETENTION.max(anti_entropy_window)
 }
 
 /// Detect failed peers: Alive→Suspect→Dead with route removal.
@@ -113,7 +149,9 @@ async fn failure_detection_loop(state: Arc<RelayState>, cancel: CancellationToke
                     if let Some(p) = rt.get_peer_mut(&relay_id) {
                         p.status = PeerStatus::Dead;
                     }
-                    rt.remove_routes_by_relay(&relay_id);
+                });
+                let _ = RouteAuthority::new(&state).execute(RouteCommand::RemovePeerRoutes {
+                    relay_id: relay_id.clone(),
                 });
             } else if status == PeerStatus::Alive && elapsed > suspect_deadline {
                 state.with_route_table_mut(|rt| {
@@ -156,25 +194,50 @@ async fn anti_entropy_loop(state: Arc<RelayState>, cancel: CancellationToken) {
 
         let idx = round_robin_idx % alive.len();
         round_robin_idx = round_robin_idx.wrapping_add(1);
-        let (_peer_id, peer_url) = &alive[idx];
+        let (peer_id, peer_url) = &alive[idx];
 
         let digest = build_digest(&state);
         let envelope = PeerEnvelope::new(state.relay_id(), PeerMessage::DigestExchange { digest });
 
-        let url = format!("{peer_url}/_peer/digest");
+        let url = peer_endpoint_url(peer_url, "/_peer/digest");
         if let Ok(resp) = client.post(&url).json(&envelope).send().await {
             if let Ok(resp_env) = resp.json::<PeerEnvelope>().await {
-                if let PeerMessage::DigestDiff { entries, extra: _ } = resp_env.message {
+                if resp_env.sender_relay_id != *peer_id {
+                    continue;
+                }
+                if let PeerMessage::DigestDiff { entries } = resp_env.message {
                     for diff_entry in entries {
-                        // Defense-in-depth: scrub ipc_address from incoming
-                        // peer routes — the path is local to the sender.
-                        let mut entry: crate::relay::types::RouteEntry = diff_entry.into();
-                        entry.ipc_address = None;
-                        state.register_peer_route(entry);
+                        apply_digest_diff(&state, peer_id, diff_entry);
                     }
                 }
             }
         }
+    }
+}
+
+fn apply_digest_diff(state: &RelayState, peer_id: &str, diff_entry: DigestDiffEntry) {
+    match diff_entry {
+        DigestDiffEntry::Active { ref relay_id, .. } if relay_id == peer_id => {
+            if let Ok(entry) = diff_entry.try_into() {
+                let _ = RouteAuthority::new(state).execute(RouteCommand::AnnouncePeer {
+                    sender_relay_id: peer_id.to_string(),
+                    entry,
+                });
+            }
+        }
+        DigestDiffEntry::Deleted {
+            name,
+            relay_id,
+            removed_at,
+        } if relay_id == peer_id => {
+            let _ = RouteAuthority::new(state).execute(RouteCommand::WithdrawPeer {
+                sender_relay_id: peer_id.to_string(),
+                name,
+                relay_id,
+                removed_at,
+            });
+        }
+        _ => {}
     }
 }
 
@@ -183,9 +246,10 @@ fn build_digest(state: &RelayState) -> Vec<DigestEntry> {
     state
         .route_digest()
         .into_iter()
-        .map(|((name, relay_id), hash)| DigestEntry {
+        .map(|((name, relay_id, deleted), hash)| DigestEntry {
             name,
             relay_id,
+            deleted,
             hash,
         })
         .collect()
@@ -216,7 +280,7 @@ async fn dead_peer_probe_loop(state: Arc<RelayState>, cancel: CancellationToken)
         });
 
         for (relay_id, url) in dead {
-            let health_url = format!("{url}/health");
+            let health_url = peer_endpoint_url(&url, "/health");
             let probe_ok = match client.get(&health_url).send().await {
                 Ok(resp) => resp.status().is_success(),
                 Err(_) => false,
@@ -234,14 +298,15 @@ async fn dead_peer_probe_loop(state: Arc<RelayState>, cancel: CancellationToken)
                 let digest = build_digest(&state);
                 let envelope =
                     PeerEnvelope::new(state.relay_id(), PeerMessage::DigestExchange { digest });
-                let digest_url = format!("{url}/_peer/digest");
+                let digest_url = peer_endpoint_url(&url, "/_peer/digest");
                 if let Ok(resp) = client.post(&digest_url).json(&envelope).send().await {
                     if let Ok(resp_env) = resp.json::<PeerEnvelope>().await {
-                        if let PeerMessage::DigestDiff { entries, extra: _ } = resp_env.message {
+                        if resp_env.sender_relay_id != relay_id {
+                            continue;
+                        }
+                        if let PeerMessage::DigestDiff { entries } = resp_env.message {
                             for diff_entry in entries {
-                                let mut entry: crate::relay::types::RouteEntry = diff_entry.into();
-                                entry.ipc_address = None;
-                                state.register_peer_route(entry);
+                                apply_digest_diff(&state, &relay_id, diff_entry);
                             }
                         }
                     }
@@ -276,7 +341,7 @@ async fn seed_retry_loop(state: Arc<RelayState>, cancel: CancellationToken) {
         }
 
         for seed_url in &seeds {
-            let join_url = format!("{seed_url}/_peer/join");
+            let join_url = peer_endpoint_url(seed_url, "/_peer/join");
             let envelope = PeerEnvelope::new(
                 state.relay_id(),
                 PeerMessage::RelayJoin {

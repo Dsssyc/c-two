@@ -12,9 +12,9 @@ pub struct RelayArgs {
     #[arg(long, short = 'b')]
     pub bind: Option<String>,
 
-    /// Pre-register an upstream CRM as NAME=ADDRESS. Repeatable.
+    /// Pre-register an upstream CRM as NAME=SERVER_ID@ADDRESS. Repeatable.
     #[arg(long = "upstream", short = 'u', value_parser = parse_upstream)]
-    pub upstreams: Vec<(String, String)>,
+    pub upstreams: Vec<(String, String, String)>,
 
     /// Disconnect idle upstream IPC connections after this many seconds. 0 disables eviction.
     #[arg(long = "idle-timeout")]
@@ -41,19 +41,28 @@ pub struct RelayArgs {
     pub skip_ipc_validation: bool,
 }
 
-pub fn parse_upstream(value: &str) -> Result<(String, String), String> {
-    let Some((name, address)) = value.split_once('=') else {
-        return Err(format!("Invalid upstream {value:?}. Expected NAME=ADDRESS"));
+pub fn parse_upstream(value: &str) -> Result<(String, String, String), String> {
+    let Some((name, owner_and_address)) = value.split_once('=') else {
+        return Err(format!(
+            "Invalid upstream {value:?}. Expected NAME=SERVER_ID@ADDRESS"
+        ));
+    };
+    let Some((server_id, address)) = owner_and_address.split_once('@') else {
+        return Err(format!(
+            "Invalid upstream {value:?}. Expected NAME=SERVER_ID@ADDRESS"
+        ));
     };
     let name = name.trim();
+    let server_id = server_id;
     let address = address.trim();
     if name.is_empty() {
         return Err("Upstream name cannot be empty".to_string());
     }
+    c2_config::validate_server_id(server_id).map_err(|reason| format!("Upstream {reason}"))?;
     if address.is_empty() {
         return Err("Upstream address cannot be empty".to_string());
     }
-    Ok((name.to_string(), address.to_string()))
+    Ok((name.to_string(), server_id.to_string(), address.to_string()))
 }
 
 pub fn run(args: RelayArgs) -> Result<()> {
@@ -89,8 +98,8 @@ pub fn run(args: RelayArgs) -> Result<()> {
         for seed in &config.seeds {
             println!("seed={seed}");
         }
-        for (name, address) in &args.upstreams {
-            println!("upstream={name}={address}");
+        for (name, server_id, address) in &args.upstreams {
+            println!("upstream={name} server_id={server_id} address={address}");
         }
         return Ok(());
     }
@@ -104,9 +113,9 @@ pub fn run(args: RelayArgs) -> Result<()> {
 
     let mut relay =
         RelayServer::start(config).map_err(|e| anyhow!("failed to start relay: {e}"))?;
-    for (name, address) in args.upstreams {
+    for (name, server_id, address) in args.upstreams {
         relay
-            .register_upstream(&name, &address)
+            .register_upstream(&name, &server_id, &address)
             .map_err(|e| anyhow!("failed to register upstream {name:?}: {e}"))?;
     }
 

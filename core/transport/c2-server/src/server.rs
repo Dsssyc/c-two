@@ -43,8 +43,8 @@ use c2_wire::flags::{
 };
 use c2_wire::frame::{self, decode_frame_body, encode_frame};
 use c2_wire::handshake::{
-    CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX, MethodEntry, RouteInfo, decode_handshake,
-    encode_server_handshake,
+    CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX, MAX_METHODS, MAX_ROUTES, MethodEntry, RouteInfo,
+    decode_handshake, encode_server_handshake, validate_name_len,
 };
 use c2_wire::msg_type::{DISCONNECT_ACK_BYTES, MsgType, PONG_BYTES, SHUTDOWN_ACK_BYTES};
 
@@ -174,8 +174,18 @@ impl Server {
     }
 
     /// Register a CRM route with the dispatcher.
-    pub async fn register_route(&self, route: CrmRoute) {
-        self.dispatcher.write().await.register(route);
+    pub async fn register_route(&self, route: CrmRoute) -> Result<(), ServerError> {
+        validate_route_for_wire(&route)?;
+        let mut dispatcher = self.dispatcher.write().await;
+        if dispatcher.len() >= MAX_ROUTES && dispatcher.resolve(&route.name).is_none() {
+            return Err(ServerError::Protocol(format!(
+                "route count exceeds wire limit: {} > {}",
+                dispatcher.len() + 1,
+                MAX_ROUTES
+            )));
+        }
+        dispatcher.register(route);
+        Ok(())
     }
 
     /// Remove a CRM route. Returns `true` if it existed.
@@ -266,6 +276,23 @@ impl Server {
     }
 }
 
+fn validate_route_for_wire(route: &CrmRoute) -> Result<(), ServerError> {
+    validate_name_len("route name", &route.name)
+        .map_err(|e| ServerError::Protocol(e.to_string()))?;
+    if route.method_names.len() > MAX_METHODS {
+        return Err(ServerError::Protocol(format!(
+            "method count exceeds wire limit: {} > {}",
+            route.method_names.len(),
+            MAX_METHODS
+        )));
+    }
+    for method_name in &route.method_names {
+        validate_name_len("method name", method_name)
+            .map_err(|e| ServerError::Protocol(e.to_string()))?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Address helpers
 // ---------------------------------------------------------------------------
@@ -274,10 +301,12 @@ fn parse_socket_path(address: &str) -> Result<PathBuf, ServerError> {
     let region = address
         .strip_prefix("ipc://")
         .ok_or_else(|| ServerError::Config(format!("invalid IPC address: {address}")))?;
-    if region.is_empty() {
-        return Err(ServerError::Config("empty region ID".into()));
-    }
+    validate_region_id(region).map_err(ServerError::Config)?;
     Ok(PathBuf::from(IPC_SOCK_DIR).join(format!("{region}.sock")))
+}
+
+fn validate_region_id(region: &str) -> Result<(), String> {
+    c2_config::validate_ipc_region_id(region)
 }
 
 // ---------------------------------------------------------------------------
@@ -453,7 +482,8 @@ async fn handle_handshake(
     drop(dispatcher);
 
     let cap = CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED;
-    let hs_bytes = encode_server_handshake(&server_segments, cap, &routes, &server_prefix);
+    let hs_bytes = encode_server_handshake(&server_segments, cap, &routes, &server_prefix)
+        .map_err(|e| ServerError::Protocol(e.to_string()))?;
     let frame = encode_frame(request_id, FLAG_HANDSHAKE | FLAG_RESPONSE, &hs_bytes);
 
     writer.lock().await.write_all(&frame).await?;
@@ -517,8 +547,12 @@ async fn dispatch_call(
     let route = match route {
         Some(r) => r,
         None => {
-            let msg = format!("route not found: {}", ctrl.route_name);
-            write_reply(writer, request_id, &ReplyControl::Error(msg.into_bytes())).await;
+            write_reply(
+                writer,
+                request_id,
+                &ReplyControl::RouteNotFound(ctrl.route_name),
+            )
+            .await;
             conn.flight_dec();
             return;
         }
@@ -663,8 +697,12 @@ async fn dispatch_buddy_call(
         Some(r) => r,
         None => {
             cleanup_request(request);
-            let msg = format!("route not found: {}", ctrl.route_name);
-            write_reply(writer, request_id, &ReplyControl::Error(msg.into_bytes())).await;
+            write_reply(
+                writer,
+                request_id,
+                &ReplyControl::RouteNotFound(ctrl.route_name),
+            )
+            .await;
             conn.flight_dec();
             return;
         }
@@ -856,8 +894,7 @@ async fn dispatch_chunked_call(
             Some(r) => r,
             None => {
                 cleanup_request(request);
-                let msg = format!("route not found: {route_name}");
-                write_reply(writer, request_id, &ReplyControl::Error(msg.into_bytes())).await;
+                write_reply(writer, request_id, &ReplyControl::RouteNotFound(route_name)).await;
                 return;
             }
         };
@@ -1159,6 +1196,25 @@ mod tests {
         assert!(parse_socket_path("ipc://").is_err());
     }
 
+    #[test]
+    fn parse_rejects_path_like_region() {
+        for address in [
+            "ipc://../escape",
+            "ipc://bad/name",
+            "ipc://bad\\name",
+            "ipc://.",
+            "ipc://..",
+            "ipc:// leading",
+            "ipc://trailing ",
+            "ipc://bad\nname",
+        ] {
+            assert!(
+                parse_socket_path(address).is_err(),
+                "address should be rejected: {address:?}"
+            );
+        }
+    }
+
     // -- server construction --
 
     #[test]
@@ -1212,11 +1268,54 @@ mod tests {
     async fn register_unregister_route() {
         let s = Arc::new(Server::new("ipc://reg_test", ServerIpcConfig::default()).unwrap());
 
-        s.register_route(make_route("grid")).await;
+        s.register_route(make_route("grid")).await.unwrap();
         assert!(s.dispatcher.read().await.resolve("grid").is_some());
 
         assert!(s.unregister_route("grid").await);
         assert!(s.dispatcher.read().await.resolve("grid").is_none());
+    }
+
+    #[tokio::test]
+    async fn register_route_rejects_wire_invalid_route_name() {
+        let s = Arc::new(Server::new("ipc://long_route_test", ServerIpcConfig::default()).unwrap());
+        let route = make_route(&"x".repeat(c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES + 1));
+
+        let err = s.register_route(route).await.unwrap_err();
+
+        assert!(err.to_string().contains("route name"));
+        assert!(s.dispatcher.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn register_route_rejects_too_many_methods() {
+        let s =
+            Arc::new(Server::new("ipc://method_count_test", ServerIpcConfig::default()).unwrap());
+        let mut route = make_route("grid");
+        route.method_names = (0..=c2_wire::handshake::MAX_METHODS)
+            .map(|i| format!("m{i}"))
+            .collect();
+
+        let err = s.register_route(route).await.unwrap_err();
+
+        assert!(err.to_string().contains("method count"));
+        assert!(s.dispatcher.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn register_route_rejects_route_count_overflow_under_write_lock() {
+        let s =
+            Arc::new(Server::new("ipc://route_count_test", ServerIpcConfig::default()).unwrap());
+
+        for i in 0..c2_wire::handshake::MAX_ROUTES {
+            s.register_route(make_route(&format!("route_{i}")))
+                .await
+                .unwrap();
+        }
+
+        let err = s.register_route(make_route("overflow")).await.unwrap_err();
+
+        assert!(err.to_string().contains("route count"));
+        assert!(s.dispatcher.read().await.resolve("overflow").is_none());
     }
 
     // -- shutdown --
@@ -1255,7 +1354,7 @@ mod tests {
             is_dedicated: false,
         };
         let bp_bytes = encode_buddy_payload(&bp);
-        let ctrl_bytes = encode_call_control("grid", 1);
+        let ctrl_bytes = encode_call_control("grid", 1).unwrap();
 
         let mut payload = Vec::new();
         payload.extend_from_slice(&bp_bytes);
@@ -1334,7 +1433,7 @@ mod tests {
 
         let segments = vec![("seg0".into(), 4096u32), ("seg1".into(), 8192u32)];
         let cap = CAP_CALL_V2 | CAP_CHUNKED;
-        let hs_bytes = encode_client_handshake(&segments, cap, "/cc3b_test");
+        let hs_bytes = encode_client_handshake(&segments, cap, "/cc3b_test").unwrap();
 
         let decoded = decode_handshake(&hs_bytes).unwrap();
         assert_eq!(decoded.prefix, "/cc3b_test");

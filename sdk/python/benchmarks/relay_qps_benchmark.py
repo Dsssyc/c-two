@@ -75,12 +75,20 @@ def _post_json(url: str, payload: dict[str, str], timeout: float = 5.0) -> None:
             raise OSError(f'HTTP {resp.status}')
 
 
-def _register_relay_upstream(relay_url: str, name: str, address: str) -> None:
-    _post_json(f'{relay_url}/_register', {'name': name, 'address': address})
+def _register_relay_upstream(
+    relay_url: str,
+    name: str,
+    address: str,
+    server_id: str,
+) -> None:
+    _post_json(
+        f'{relay_url}/_register',
+        {'name': name, 'server_id': server_id, 'address': address},
+    )
 
 
-def _unregister_relay_upstream(relay_url: str, name: str) -> None:
-    _post_json(f'{relay_url}/_unregister', {'name': name})
+def _unregister_relay_upstream(relay_url: str, name: str, server_id: str) -> None:
+    _post_json(f'{relay_url}/_unregister', {'name': name, 'server_id': server_id})
 
 
 def _stdout_tail(stdout: str, limit: int = 1200) -> str:
@@ -106,9 +114,13 @@ def _run_hey(label: str, args: list[str]) -> subprocess.CompletedProcess[str]:
     return result
 
 
-def _best_effort_unregister_relay_upstream(relay_url: str, name: str) -> None:
+def _best_effort_unregister_relay_upstream(
+    relay_url: str,
+    name: str,
+    server_id: str,
+) -> None:
     try:
-        _unregister_relay_upstream(relay_url, name)
+        _unregister_relay_upstream(relay_url, name, server_id)
     except urllib.error.HTTPError as exc:
         if exc.code != 404:
             print(f'Warning: failed to unregister relay route {name!r}: {exc}', file=sys.stderr)
@@ -136,6 +148,7 @@ def main():
     _require_external_relay(relay_url)
     route_name = f'hello_bench_{os.getpid()}'
     route_registered = False
+    server_id: str | None = None
 
     # Write payload file for hey
     with open(PAYLOAD_FILE, 'wb') as f:
@@ -144,8 +157,11 @@ def main():
     try:
         cc.register(Hello, HelloImpl(), name=route_name)
         ipc_addr = cc.server_address()
+        server_id = cc.server_id()
+        if server_id is None:
+            raise RuntimeError('registered server did not expose server_id')
 
-        _register_relay_upstream(relay_url, route_name, ipc_addr)
+        _register_relay_upstream(relay_url, route_name, ipc_addr, server_id)
         route_registered = True
 
         # Warmup with hey
@@ -183,8 +199,8 @@ def main():
             if any(k in line for k in ['Average:', 'Fastest:', 'Slowest:', '50%', '99%', 'Status']):
                 print(f'  {line}')
     finally:
-        if route_registered:
-            _best_effort_unregister_relay_upstream(relay_url, route_name)
+        if route_registered and server_id is not None:
+            _best_effort_unregister_relay_upstream(relay_url, route_name, server_id)
         cc.shutdown()
         _ProcessRegistry.reset()
         cleanup_stale()

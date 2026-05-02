@@ -187,7 +187,8 @@ cc.register(Counter, CounterImpl(), name='counter')
 cc.serve()                                     # blocks; Ctrl-C triggers graceful shutdown
 ```
 
-- **Address** (`ipc://...`) is the local transport endpoint. Servers auto-bind one on first registration; inspect it with `cc.server_address()` when a same-host process needs to connect directly.
+- **Server ID** identifies the local IPC server instance. C-Two generates one on first registration unless you call `cc.set_server(server_id=...)` before registering.
+- **Address** (`ipc://...`) is the internal local transport endpoint derived from the server ID. Inspect it with `cc.server_address()` only when a same-host process needs to connect directly.
 - **`cc.serve()`** is optional — if your host process has its own event loop (web server, GUI, simulation), you can register resources and let them serve in the background while your main loop runs.
 - A process can be both a server and a client at the same time (register some resources, connect to others).
 
@@ -201,11 +202,20 @@ build and link a local development binary with
 The Python SDK does not embed or start the relay server; start `c3 relay`,
 Docker Compose, or your orchestrator separately, then point Python code at it
 with `C2_RELAY_ADDRESS` or `cc.set_relay()`.
+Relay-aware clients preflight routes before the first call and re-resolve
+structured stale-route responses; set `C2_RELAY_ROUTE_MAX_ATTEMPTS` to tune the
+maximum route acquisition attempts (default `3`, valid range `1..=32`, `0` is
+treated as `1`). Ambiguous data-plane failures are not replayed.
 
 ```bash
 # Start a relay anywhere reachable on your network
 c3 relay --bind 0.0.0.0:8080
 ```
+
+Relay HTTP and mesh endpoints are intended for a trusted network boundary. Do
+not expose them directly to the public internet; production deployments should
+restrict access with infrastructure such as private networking, firewalls,
+Kubernetes NetworkPolicy, service mesh policy, or ingress authentication.
 
 ```python
 # Server side — announce resources to the relay
@@ -398,6 +408,7 @@ class MeshStore:
         print('MeshStore shutting down')
 
 cc.register(MeshStore, MeshStore(), name='mesh')
+print(cc.server_id())
 print(cc.server_address())
 cc.serve()  # blocks until interrupted
 ```
@@ -446,6 +457,10 @@ cc.serve()  # blocks until Ctrl-C
 c3 relay --bind 0.0.0.0:8080
 ```
 
+Expose relay HTTP only inside a trusted deployment boundary. The relay mesh
+protocol assumes infrastructure-level access control, not public internet
+reachability.
+
 **Client** (`client.py`):
 ```python
 import c_two as cc
@@ -471,6 +486,9 @@ c3 relay --bind 0.0.0.0:8080 --relay-id relay-a \
 c3 relay --bind 0.0.0.0:8080 --relay-id relay-b \
     --advertise-url http://relay-b:8080 --seeds http://relay-a:8080
 ```
+
+Mesh peer endpoints (`/_peer/*`) accept route gossip from configured peers and
+must be protected by the same trusted network boundary as the relay HTTP API.
 
 CRM processes register with their local relay; the mesh propagates routes automatically. Clients can connect through **any** relay in the mesh.
 

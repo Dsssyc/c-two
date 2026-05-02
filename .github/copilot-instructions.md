@@ -54,7 +54,7 @@ uv sync --group examples
 
 # CLI tool
 c3 --version
-c3 relay --upstream grid=ipc://my_server --bind 0.0.0.0:8080
+c3 relay --upstream grid=server-grid@ipc://my_server --bind 0.0.0.0:8080
 ```
 
 Tests use **pytest** with a 30-second per-test timeout. Tests live under `sdk/python/tests/unit/` and `sdk/python/tests/integration/`, with shared fixtures in `sdk/python/tests/fixtures/` (see `Hello` CRM contract and `HelloImpl` resource).
@@ -86,8 +86,8 @@ and default values. Relay server configuration belongs to the standalone Rust
 
 | File | Purpose |
 |------|---------|
-| `settings.py` | `C2Settings` facade for SDK code overrides such as `cc.set_relay()` and `cc.set_config()` |
-| `ipc.py` | Frozen dataclasses: `BaseIPCConfig`, `ServerIPCConfig`, `ClientIPCConfig` + `build_server_config()` / `build_client_config()` |
+| `settings.py` | `C2Settings` facade for SDK code overrides such as `cc.set_relay()` and global transport policy |
+| `ipc.py` | Typed override schemas: `BaseIPCOverrides`, `ServerIPCOverrides`, `ClientIPCOverrides`; Rust `c2-config` owns defaults and validation |
 
 Config priority chain: explicit kwargs (`cc.set_*()`) → process environment / `.env` via the resolver → Rust defaults.
 
@@ -236,7 +236,8 @@ import c_two as cc
 
 # Server side
 cc.set_relay('http://relay-host:8080')                   # optional: relay for name resolution
-cc.set_server(pool_segment_size=2*1024*1024*1024)        # optional: tune IPC config
+cc.set_transport_policy(shm_threshold=64*1024)           # optional: process-wide transport policy
+cc.set_server(ipc_overrides={'pool_segment_size': 2*1024*1024*1024})  # optional: server IPC overrides
 cc.register(Grid, grid_instance, name='grid')           # register a Grid resource
 cc.register(Network, net_instance, name='network')      # multiple resources in one process
 cc.serve()                                               # block until Ctrl-C
@@ -247,7 +248,7 @@ grid.some_method(arg)
 cc.close(grid)
 
 # Client side (remote process → IPC, direct address)
-cc.set_client(pool_segment_size=2*1024*1024*1024)        # optional: tune client config
+cc.set_client(ipc_overrides={'pool_segment_size': 2*1024*1024*1024})  # optional: client IPC overrides
 grid = cc.connect(Grid, name='grid', address='ipc://my_server')
 grid.some_method(arg)
 cc.close(grid)

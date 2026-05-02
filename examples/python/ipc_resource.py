@@ -6,7 +6,7 @@ Run:
 Copy the printed IPC address, then in another terminal:
     uv run python examples/python/ipc_client.py ipc://...
 """
-from __future__ import annotations
+# from __future__ import annotations
 
 import logging
 import sys

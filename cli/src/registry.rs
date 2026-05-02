@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use c2_config::{ConfigResolver, ConfigSources, RuntimeConfigOverrides};
+use c2_config::{ConfigResolver, ConfigSources};
 use clap::{Args, Subcommand};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::Value;
@@ -73,9 +73,7 @@ fn get_json(relay: &str, path: &str) -> Result<Value> {
 }
 
 fn resolve_relay_use_proxy(sources: ConfigSources) -> Result<bool> {
-    let resolved = ConfigResolver::resolve_relay_client(RuntimeConfigOverrides::default(), sources)
-        .map_err(|e| anyhow!("{e}"))?;
-    Ok(resolved.relay_use_proxy)
+    ConfigResolver::resolve_relay_use_proxy(sources).map_err(|e| anyhow!("{e}"))
 }
 
 fn list_routes(relay: &str) -> Result<()> {

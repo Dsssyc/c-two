@@ -3,7 +3,8 @@
 Extends the IPC buddy protocol with:
 - ``FLAG_CALL`` / ``FLAG_REPLY`` frame flags for control-plane routing
 - Handshake with capability negotiation and method index exchange
-- Reply status codes (success / error, no per-byte overhead in SHM)
+- Reply status codes (success / error / route-not-found, no per-byte overhead
+  in SHM)
 
 Frame flag bit allocation (32-bit LE flags field in the 16-byte frame header):
 
@@ -38,6 +39,7 @@ from c_two._native import (  # noqa: F401 — re-export
     HANDSHAKE_VERSION,
     STATUS_SUCCESS,
     STATUS_ERROR,
+    STATUS_ROUTE_NOT_FOUND,
     # Capability flags
     CAP_CALL,
     CAP_METHOD_IDX,

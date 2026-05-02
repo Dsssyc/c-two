@@ -3,11 +3,13 @@
 //! This crate is the single source of truth for all configuration structs
 //! used across the C-Two transport layer (IPC, relay, memory pool).
 
+mod identity;
 mod ipc;
 mod pool;
 mod relay;
 mod resolver;
 
+pub use identity::{validate_ipc_region_id, validate_server_id};
 pub use ipc::{BaseIpcConfig, ClientIpcConfig, ServerIpcConfig};
 pub use pool::PoolConfig;
 pub use relay::RelayConfig;

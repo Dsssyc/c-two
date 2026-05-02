@@ -5,20 +5,19 @@
 //! c2-http = { path = "...", features = ["relay"] }
 //! ```
 
-pub mod background;
-pub mod config;
-pub mod conn_pool;
-pub mod disseminator;
-pub mod peer;
-pub mod peer_handlers;
-pub mod route_table;
-pub mod router;
+pub(crate) mod authority;
+pub(crate) mod background;
+pub(crate) mod conn_pool;
+pub(crate) mod disseminator;
+pub(crate) mod gossip;
+pub(crate) mod peer;
+pub(crate) mod peer_handlers;
+pub(crate) mod route_table;
+pub(crate) mod router;
 pub mod server;
-pub mod state;
-pub mod types;
+pub(crate) mod state;
+pub(crate) mod types;
+pub(crate) mod url;
 
-pub use config::RelayConfig;
-pub use route_table::RouteTable;
-pub use server::RelayServer;
-pub use state::RelayState;
-pub use types::*;
+pub use c2_config::RelayConfig;
+pub use server::{RelayControlError, RelayServer};

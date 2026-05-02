@@ -11,10 +11,10 @@ __all__ = [
     'CRMProxy',
     'Server', 'CRMSlot',
     'Scheduler', 'ConcurrencyConfig', 'ConcurrencyMode',
-    'set_config', 'set_server', 'set_client',
+    'set_transport_policy', 'set_server', 'set_client',
     'set_relay',
     'register', 'connect', 'close',
-    'unregister', 'server_address', 'shutdown', 'serve',
+    'unregister', 'server_address', 'server_id', 'shutdown', 'serve',
 ]
 
 _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
@@ -24,7 +24,7 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     'Scheduler':         ('.server.scheduler',    'Scheduler'),
     'ConcurrencyConfig': ('.server.scheduler',    'ConcurrencyConfig'),
     'ConcurrencyMode':   ('.server.scheduler',    'ConcurrencyMode'),
-    'set_config':        ('.registry',            'set_config'),
+    'set_transport_policy': ('.registry',         'set_transport_policy'),
     'set_server':        ('.registry',            'set_server'),
     'set_client':        ('.registry',            'set_client'),
     'set_relay':         ('.registry',            'set_relay'),
@@ -33,6 +33,7 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     'close':             ('.registry',            'close'),
     'unregister':        ('.registry',            'unregister'),
     'server_address':    ('.registry',            'server_address'),
+    'server_id':         ('.registry',            'server_id'),
     'shutdown':          ('.registry',            'shutdown'),
     'serve':             ('.registry',            'serve'),
 }

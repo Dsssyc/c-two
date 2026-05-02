@@ -9,11 +9,16 @@ from __future__ import annotations
 
 import os
 import uuid
+from unittest.mock import patch
 
 import pytest
 
+from c_two.config import settings
 from c_two.transport import Server, ConcurrencyConfig, ConcurrencyMode
 from c_two.transport.registry import _ProcessRegistry
+from c_two.transport.server import native as native_module
+from c_two.transport.server.native import CRMSlot, NativeServerBridge
+from c_two.transport.wire import MethodTable
 
 from tests.fixtures.ihello import Hello
 from tests.fixtures.hello import HelloImpl
@@ -82,6 +87,112 @@ class TestServerNameCollision:
             server.unregister_crm('does_not_exist')
         server.shutdown()
 
+    def test_unregister_removes_rust_route_before_python_shutdown(self):
+        """Rust route removal happens before Python CRM shutdown callbacks."""
+        events: list[str] = []
+
+        class FakeRustServer:
+            def unregister_route(self, name: str) -> bool:
+                events.append(f'rust_unregister:{name}')
+                return True
+
+        class FakeScheduler:
+            def shutdown(self) -> None:
+                events.append('scheduler_shutdown')
+
+        class FakeResource:
+            def cleanup(self) -> None:
+                events.append('crm_shutdown')
+
+        class FakeCRM:
+            resource = FakeResource()
+
+        bridge = object.__new__(NativeServerBridge)
+        bridge._slots = {  # noqa: SLF001
+            'grid': CRMSlot(
+                name='grid',
+                crm_instance=FakeCRM(),
+                direct_instance=FakeResource(),
+                method_table=MethodTable(),
+                scheduler=FakeScheduler(),
+                methods=[],
+                shutdown_method='cleanup',
+            ),
+        }
+        bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
+        bridge._default_name = 'grid'  # noqa: SLF001
+        bridge._rust_server = FakeRustServer()  # noqa: SLF001
+
+        bridge.unregister_crm('grid')
+
+        assert events == [
+            'rust_unregister:grid',
+            'crm_shutdown',
+            'scheduler_shutdown',
+        ]
+        assert bridge.names == []
+
+    def test_register_rolls_back_python_slot_when_rust_registration_fails(self, monkeypatch):
+        events: list[str] = []
+
+        class FakeRustServer:
+            def register_route(self, *_args, **_kwargs):
+                events.append('rust_register')
+                raise RuntimeError('boom')
+
+            def unregister_route(self, name: str) -> bool:
+                events.append(f'rust_unregister:{name}')
+                return True
+
+            def is_started(self) -> bool:
+                return True
+
+        class FakeScheduler:
+            def __init__(self, _config):
+                pass
+
+            def shutdown(self) -> None:
+                events.append('scheduler_shutdown')
+
+        class FakeCRM:
+            pass
+
+        monkeypatch.setattr(native_module, 'Scheduler', FakeScheduler)
+
+        bridge = object.__new__(NativeServerBridge)
+        bridge._slots = {}  # noqa: SLF001
+        bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
+        bridge._default_name = None  # noqa: SLF001
+        bridge._started = False  # noqa: SLF001
+        bridge._hold_registry = object()  # noqa: SLF001
+        bridge._hold_sweep_interval = 10  # noqa: SLF001
+        bridge._shm_threshold = 1024  # noqa: SLF001
+        bridge._default_concurrency = ConcurrencyConfig(max_workers=1)  # noqa: SLF001
+        bridge._rust_server = FakeRustServer()  # noqa: SLF001
+
+        def fake_create(_crm_class, crm_instance):
+            return crm_instance
+
+        def fake_discover(_crm_class):
+            return []
+
+        def fake_extract_namespace(_crm_class):
+            return 'unit'
+
+        def fake_make_dispatcher(route_name, slot):  # noqa: ARG001
+            return lambda *_args, **_kwargs: None
+
+        bridge._create_crm_instance = fake_create  # noqa: SLF001
+        bridge._discover_methods = fake_discover  # noqa: SLF001
+        bridge._extract_namespace = fake_extract_namespace  # noqa: SLF001
+        bridge._make_dispatcher = fake_make_dispatcher  # noqa: SLF001
+
+        with pytest.raises(RuntimeError, match='boom'):
+            bridge.register_crm(FakeCRM, FakeCRM(), name='grid')
+
+        assert events == ['rust_register', 'scheduler_shutdown']
+        assert bridge.names == []
+
 
 # ---------------------------------------------------------------------------
 # Registry-level name collision
@@ -93,8 +204,10 @@ class TestRegistryNameCollision:
     def _clean_registry(self):
         """Reset the global registry before/after each test."""
         _ProcessRegistry.reset()
+        settings.relay_address = None
         yield
         _ProcessRegistry.reset()
+        settings.relay_address = None
 
     def test_duplicate_name_raises(self):
         registry = _ProcessRegistry.get()
@@ -119,6 +232,55 @@ class TestRegistryNameCollision:
         registry.register(Hello, HelloImpl(), name='temp')
         registry.unregister('temp')
         registry.register(Counter, CounterImpl(), name='temp')
+        assert registry.names == ['temp']
+
+    @patch.object(_ProcessRegistry, '_relay_register')
+    @patch.object(_ProcessRegistry, '_relay_unregister')
+    def test_unregister_does_not_touch_relay_when_local_unregister_fails(
+        self,
+        mock_unreg,
+        _mock_reg,
+    ):
+        registry = _ProcessRegistry.get()
+        registry.register(Hello, HelloImpl(), name='temp')
+
+        class FailingServer:
+            @property
+            def names(self) -> list[str]:
+                return ['temp']
+
+            def unregister_crm(self, name: str) -> None:  # noqa: ARG002
+                raise RuntimeError('rust unregister failed')
+
+            def shutdown(self) -> None:
+                pass
+
+        registry._server = FailingServer()  # noqa: SLF001
+
+        with pytest.raises(RuntimeError, match='rust unregister failed'):
+            registry.unregister('temp')
+
+        assert registry.names == ['temp']
+        mock_unreg.assert_not_called()
+
+    def test_rollback_keeps_server_registration_when_rust_unregister_fails(self):
+        registry = _ProcessRegistry.get()
+
+        class FailingServer:
+            @property
+            def names(self) -> list[str]:
+                return ['temp']
+
+            def unregister_crm(self, name: str) -> None:  # noqa: ARG002
+                raise RuntimeError('rust unregister failed')
+
+            def shutdown(self) -> None:
+                raise AssertionError('server should not shut down after failed rollback')
+
+        registry._server = FailingServer()  # noqa: SLF001
+
+        registry._rollback_registration('temp')  # noqa: SLF001
+
         assert registry.names == ['temp']
 
     def test_unregister_nonexistent_raises(self):

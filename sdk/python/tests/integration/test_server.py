@@ -67,15 +67,16 @@ def server_addr():
 
 
 @pytest.fixture
-def server_small_shm():
+def server_small_shm(monkeypatch):
     """Server with small SHM threshold (forces inline path more often)."""
     addr = f'ipc://{_unique_region("small")}'
+    monkeypatch.setenv('C2_ENV_FILE', '')
+    monkeypatch.setenv('C2_SHM_THRESHOLD', '16')
     server = Server(
         bind_address=addr,
         crm_class=Hello,
         crm_instance=HelloImpl(),
         name='hello',
-        shm_threshold=16,
     )
     server.start()
     _wait_for_server(addr)

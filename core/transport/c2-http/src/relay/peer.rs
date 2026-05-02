@@ -19,13 +19,16 @@ pub enum PeerMessage {
         name: String,
         relay_id: String,
         relay_url: String,
-        ipc_address: Option<String>,
         crm_ns: String,
         crm_ver: String,
         registered_at: f64,
     },
     /// A CRM route was unregistered.
-    RouteWithdraw { name: String, relay_id: String },
+    RouteWithdraw {
+        name: String,
+        relay_id: String,
+        removed_at: f64,
+    },
     /// A relay wants to join the mesh.
     RelayJoin { relay_id: String, url: String },
     /// A relay is gracefully leaving the mesh.
@@ -35,11 +38,7 @@ pub enum PeerMessage {
     /// Anti-entropy digest exchange (request or response).
     DigestExchange { digest: Vec<DigestEntry> },
     /// Anti-entropy diff: entries the sender has that recipient was missing.
-    DigestDiff {
-        entries: Vec<DigestDiffEntry>,
-        /// Routes the sender doesn't have but recipient does — should be deleted.
-        extra: Vec<(String, String)>,
-    },
+    DigestDiff { entries: Vec<DigestDiffEntry> },
     /// Unknown message type from a newer protocol version.
     #[serde(other)]
     Unknown,
@@ -50,19 +49,28 @@ pub enum PeerMessage {
 pub struct DigestEntry {
     pub name: String,
     pub relay_id: String,
+    #[serde(default)]
+    pub deleted: bool,
     pub hash: u64,
 }
 
-/// Route data sent to repair digest differences.
+/// Route state sent to repair digest differences.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DigestDiffEntry {
-    pub name: String,
-    pub relay_id: String,
-    pub relay_url: String,
-    pub ipc_address: Option<String>,
-    pub crm_ns: String,
-    pub crm_ver: String,
-    pub registered_at: f64,
+#[serde(tag = "state")]
+pub enum DigestDiffEntry {
+    Active {
+        name: String,
+        relay_id: String,
+        relay_url: String,
+        crm_ns: String,
+        crm_ver: String,
+        registered_at: f64,
+    },
+    Deleted {
+        name: String,
+        relay_id: String,
+        removed_at: f64,
+    },
 }
 
 impl PeerEnvelope {
@@ -112,7 +120,6 @@ mod tests {
                 name: "grid".into(),
                 relay_id: "relay-a".into(),
                 relay_url: "http://relay-a:8080".into(),
-                ipc_address: Some("ipc://grid".into()),
                 crm_ns: "cc.demo".into(),
                 crm_ver: "0.1.0".into(),
                 registered_at: 1000.0,

@@ -1,9 +1,6 @@
 """Process-level configuration facade for Python code overrides."""
 from __future__ import annotations
 
-from typing import Any
-
-
 class C2Settings:
     """Process-level facade for SDK code overrides.
 
@@ -27,7 +24,7 @@ class C2Settings:
     def relay_address(self) -> str | None:
         if self._relay_address is not None:
             return self._relay_address
-        return _resolve_relay_client_config().get('relay_address')
+        return _resolve_relay_address()
 
     @relay_address.setter
     def relay_address(self, value: str | None) -> None:
@@ -49,10 +46,8 @@ class C2Settings:
             raise ValueError(f'shm_threshold must be > 0, got {value}')
         self._shm_threshold = value
 
-    def _global_overrides(self) -> dict[str, Any]:
-        overrides: dict[str, Any] = {}
-        if self._relay_address is not None:
-            overrides['relay_address'] = self._relay_address
+    def _shm_overrides(self) -> dict[str, int]:
+        overrides: dict[str, int] = {}
         if self._shm_threshold is not None:
             overrides['shm_threshold'] = self._shm_threshold
         return overrides
@@ -68,19 +63,14 @@ def _clean_optional_str(value: str | None) -> str | None:
 def _resolve_shm_threshold() -> int:
     from c_two._native import resolve_shm_threshold
 
-    global_overrides = settings._global_overrides()  # noqa: SLF001
-    return int(resolve_shm_threshold(global_overrides))
+    shm_overrides = settings._shm_overrides()  # noqa: SLF001
+    return int(resolve_shm_threshold(shm_overrides))
 
 
-def _resolve_relay_client_config() -> dict[str, Any]:
-    from c_two._native import resolve_relay_client_config
+def _resolve_relay_address() -> str | None:
+    from c_two._native import resolve_relay_address
 
-    global_overrides = settings._global_overrides()  # noqa: SLF001
-    resolved = resolve_relay_client_config(global_overrides)
-    return {
-        'relay_address': resolved.get('relay_address'),
-        'relay_use_proxy': resolved.get('relay_use_proxy', False),
-    }
+    return resolve_relay_address()
 
 
 settings = C2Settings()

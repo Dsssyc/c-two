@@ -9,6 +9,10 @@ use crate::client::{HttpClient, HttpError};
 
 // ── Pool entry ──────────────────────────────────────────────────────────
 
+fn canonical_base_url(base_url: &str) -> String {
+    base_url.trim().trim_end_matches('/').to_owned()
+}
+
 struct PoolEntry {
     client: Arc<HttpClient>,
     ref_count: usize,
@@ -60,27 +64,33 @@ impl HttpClientPool {
         use_proxy: bool,
     ) -> Result<Arc<HttpClient>, HttpError> {
         self.sweep_expired();
+        let key = canonical_base_url(base_url);
 
         let mut entries = self.entries.lock();
 
-        if let Some(entry) = entries.get_mut(base_url) {
-            if entry.use_proxy == use_proxy || entry.ref_count > 0 {
+        if let Some(entry) = entries.get_mut(&key) {
+            if entry.use_proxy == use_proxy {
                 entry.ref_count += 1;
                 entry.last_release = None;
                 return Ok(Arc::clone(&entry.client));
+            }
+            if entry.ref_count > 0 {
+                return Err(HttpError::Transport(format!(
+                    "active pooled HTTP client for {base_url} has proxy policy mismatch"
+                )));
             }
         }
 
         // Create a new client (lock held — HttpClient::new is fast).
         let client = Arc::new(HttpClient::new_with_proxy_policy(
-            base_url,
+            &key,
             self.default_timeout,
             self.default_max_connections,
             use_proxy,
         )?);
 
         entries.insert(
-            base_url.to_owned(),
+            key,
             PoolEntry {
                 client: Arc::clone(&client),
                 ref_count: 1,
@@ -94,8 +104,9 @@ impl HttpClientPool {
 
     /// Decrement reference count; mark for grace-period cleanup at 0.
     pub fn release(&self, base_url: &str) {
+        let key = canonical_base_url(base_url);
         let mut entries = self.entries.lock();
-        if let Some(entry) = entries.get_mut(base_url) {
+        if let Some(entry) = entries.get_mut(&key) {
             if entry.ref_count == 0 {
                 eprintln!("HttpClientPool::release: ref_count already 0 for {base_url}");
                 return;
@@ -136,7 +147,10 @@ impl HttpClientPool {
 
     /// Reference count for a specific URL.
     pub fn refcount(&self, base_url: &str) -> usize {
-        self.entries.lock().get(base_url).map_or(0, |e| e.ref_count)
+        self.entries
+            .lock()
+            .get(&canonical_base_url(base_url))
+            .map_or(0, |e| e.ref_count)
     }
 }
 
@@ -187,6 +201,63 @@ mod tests {
 
         pool.release(url);
         assert_eq!(pool.refcount(url), 0);
+    }
+
+    #[test]
+    fn trailing_slash_variants_share_one_pool_entry() {
+        let pool = HttpClientPool::new(60.0);
+
+        let first = pool
+            .acquire_with_proxy_policy("http://localhost:9998", false)
+            .unwrap();
+        let second = pool
+            .acquire_with_proxy_policy("http://localhost:9998/", false)
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(pool.active_count(), 1);
+        assert_eq!(pool.refcount("http://localhost:9998"), 2);
+        assert_eq!(pool.refcount("http://localhost:9998/"), 2);
+
+        pool.release("http://localhost:9998/");
+        assert_eq!(pool.refcount("http://localhost:9998"), 1);
+        pool.release("http://localhost:9998");
+        assert_eq!(pool.refcount("http://localhost:9998/"), 0);
+    }
+
+    #[test]
+    fn active_proxy_policy_mismatch_is_rejected_without_refcount_change() {
+        let pool = HttpClientPool::new(60.0);
+        let url = "http://localhost:9995";
+
+        let _client = pool.acquire_with_proxy_policy(url, false).unwrap();
+        let err = match pool.acquire_with_proxy_policy(url, true) {
+            Ok(_) => panic!("active client with different proxy policy must be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("proxy policy mismatch"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(pool.refcount(url), 1);
+    }
+
+    #[test]
+    fn released_proxy_policy_mismatch_replaces_idle_entry() {
+        let pool = HttpClientPool::new(60.0);
+        let url = "http://localhost:9994";
+
+        let first = pool.acquire_with_proxy_policy(url, false).unwrap();
+        pool.release(url);
+
+        let second = pool.acquire_with_proxy_policy(url, true).unwrap();
+
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "idle entry with stale proxy policy should be replaced"
+        );
+        assert_eq!(pool.refcount(url), 1);
     }
 
     #[test]

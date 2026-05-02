@@ -23,7 +23,7 @@ fn encode_segment(s: &str) -> String {
 
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
-fn runtime() -> &'static tokio::runtime::Runtime {
+pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -139,16 +139,37 @@ impl HttpClient {
     /// Health check — GET /health.
     pub fn health(&self) -> Result<bool, HttpError> {
         let handle = runtime().handle();
-        handle.block_on(async {
-            let url = format!("{}/health", self.base_url);
-            let resp = self
-                .client
-                .get(&url)
-                .send()
-                .await
-                .map_err(|e| HttpError::Transport(e.to_string()))?;
-            Ok(resp.status().as_u16() == 200)
-        })
+        handle.block_on(self.health_async())
+    }
+
+    /// Async health check — GET /health.
+    pub async fn health_async(&self) -> Result<bool, HttpError> {
+        let url = format!("{}/health", self.base_url);
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| HttpError::Transport(e.to_string()))?;
+        Ok(resp.status().as_u16() == 200)
+    }
+
+    /// Async route probe — GET /_probe/{route_name}.
+    pub async fn probe_route_async(&self, route_name: &str) -> Result<(), HttpError> {
+        let url = format!("{}/_probe/{}", self.base_url, encode_segment(route_name));
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| HttpError::Transport(e.to_string()))?;
+        match resp.status().as_u16() {
+            200 => Ok(()),
+            code => {
+                let text = resp.text().await.unwrap_or_default();
+                Err(HttpError::ServerError(code, text))
+            }
+        }
     }
 
     /// Base URL of this client.

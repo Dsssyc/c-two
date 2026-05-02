@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from ...crm.meta import MethodAccess, get_method_access, get_shutdown_method
-from c_two.config.ipc import ServerIPCConfig
+from c_two.config.ipc import ServerIPCOverrides, _resolve_server_ipc_config
 from ..wire import MethodTable
 from .scheduler import ConcurrencyConfig, Scheduler
 from .reply import unpack_resource_result
@@ -46,6 +46,7 @@ class CRMSlot:
 
     name: str
     crm_instance: object
+    direct_instance: object
     method_table: MethodTable
     scheduler: Scheduler
     methods: list[str]
@@ -78,17 +79,16 @@ class NativeServerBridge:
         bind_address: str,
         crm_class: type | None = None,
         crm_instance: object | None = None,
-        ipc_config: ServerIPCConfig | None = None,
         concurrency: ConcurrencyConfig | None = None,
         max_workers: int = 4,
         *,
+        ipc_overrides: ServerIPCOverrides | None = None,
         name: str | None = None,
-        shm_threshold: int = 4096,
         hold_warn_seconds: float = 60.0,
     ) -> None:
-        self._config = ipc_config or ServerIPCConfig()
+        self._config = _resolve_server_ipc_config(ipc_overrides)
         self._address = bind_address
-        self._shm_threshold = shm_threshold
+        self._shm_threshold = int(self._config['shm_threshold'])
         self._default_concurrency = concurrency or ConcurrencyConfig(
             max_workers=max_workers,
         )
@@ -105,24 +105,24 @@ class NativeServerBridge:
 
         self._rust_server = RustServer(
             address=bind_address,
-            shm_threshold=shm_threshold,
-            pool_enabled=self._config.pool_enabled,
-            pool_segment_size=self._config.pool_segment_size,
-            max_pool_segments=self._config.max_pool_segments,
-            reassembly_segment_size=self._config.reassembly_segment_size,
-            reassembly_max_segments=self._config.reassembly_max_segments,
-            max_frame_size=self._config.max_frame_size,
-            max_payload_size=self._config.max_payload_size,
-            max_pending_requests=self._config.max_pending_requests,
-            pool_decay_seconds=self._config.pool_decay_seconds,
-            heartbeat_interval=self._config.heartbeat_interval,
-            heartbeat_timeout=self._config.heartbeat_timeout,
-            max_total_chunks=self._config.max_total_chunks,
-            chunk_gc_interval=self._config.chunk_gc_interval,
-            chunk_threshold_ratio=self._config.chunk_threshold_ratio,
-            chunk_assembler_timeout=self._config.chunk_assembler_timeout,
-            max_reassembly_bytes=self._config.max_reassembly_bytes,
-            chunk_size=self._config.chunk_size,
+            shm_threshold=self._shm_threshold,
+            pool_enabled=self._config['pool_enabled'],
+            pool_segment_size=self._config['pool_segment_size'],
+            max_pool_segments=self._config['max_pool_segments'],
+            reassembly_segment_size=self._config['reassembly_segment_size'],
+            reassembly_max_segments=self._config['reassembly_max_segments'],
+            max_frame_size=self._config['max_frame_size'],
+            max_payload_size=self._config['max_payload_size'],
+            max_pending_requests=self._config['max_pending_requests'],
+            pool_decay_seconds=self._config['pool_decay_seconds'],
+            heartbeat_interval=self._config['heartbeat_interval'],
+            heartbeat_timeout=self._config['heartbeat_timeout'],
+            max_total_chunks=self._config['max_total_chunks'],
+            chunk_gc_interval=self._config['chunk_gc_interval'],
+            chunk_threshold_ratio=self._config['chunk_threshold_ratio'],
+            chunk_assembler_timeout=self._config['chunk_assembler_timeout'],
+            max_reassembly_bytes=self._config['max_reassembly_bytes'],
+            chunk_size=self._config['chunk_size'],
         )
 
         # Register initial CRM if provided (compat with old Server constructor).
@@ -159,6 +159,7 @@ class NativeServerBridge:
         slot = CRMSlot(
             name=routing_name,
             crm_instance=instance,
+            direct_instance=crm_instance,
             method_table=method_table,
             scheduler=scheduler,
             methods=methods,
@@ -186,21 +187,40 @@ class NativeServerBridge:
             if self._default_name is None:
                 self._default_name = routing_name
 
-        self._rust_server.register_route(
-            routing_name, dispatcher, methods, access_map,
-        )
+        try:
+            self._rust_server.register_route(
+                routing_name, dispatcher, methods, access_map,
+            )
+        except Exception:
+            with self._slots_lock:
+                removed = self._slots.pop(routing_name, None)
+                if removed is not None and self._default_name == routing_name:
+                    self._default_name = next(iter(self._slots), None)
+            if removed is not None:
+                removed.scheduler.shutdown()
+            else:
+                scheduler.shutdown()
+            raise
         return routing_name
 
     def unregister_crm(self, name: str) -> None:
         with self._slots_lock:
-            slot = self._slots.pop(name, None)
+            slot = self._slots.get(name)
             if slot is None:
                 raise KeyError(f'Name not registered: {name!r}')
+
+        unregistered = self._rust_server.unregister_route(name)
+        if not unregistered:
+            raise KeyError(f'Name not registered in Rust server: {name!r}')
+
+        with self._slots_lock:
+            slot = self._slots.pop(name, None)
+            if slot is None:
+                return
             if self._default_name == name:
                 self._default_name = next(iter(self._slots), None)
         self._invoke_shutdown(slot)
         slot.scheduler.shutdown()
-        self._rust_server.unregister_route(name)
 
     def get_slot_info(
         self, name: str,
@@ -214,6 +234,20 @@ class NativeServerBridge:
             for mname, (_, access, _bm) in slot._dispatch_table.items()
         }
         return slot.scheduler, access_map
+
+    def get_local_slot_info(
+        self, name: str,
+    ) -> tuple[object, Scheduler, dict[str, MethodAccess]] | None:
+        """Return Python dispatch glue for same-process fast-path calls."""
+        with self._slots_lock:
+            slot = self._slots.get(name)
+        if slot is None:
+            return None
+        access_map = {
+            mname: access
+            for mname, (_, access, _bm) in slot._dispatch_table.items()
+        }
+        return slot.direct_instance, slot.scheduler, access_map
 
     @property
     def names(self) -> list[str]:

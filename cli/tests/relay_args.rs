@@ -21,7 +21,32 @@ fn relay_rejects_invalid_upstream_format() {
     cmd.args(["relay", "--upstream", "grid-ipc://server", "--dry-run"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("Expected NAME=ADDRESS"));
+        .stderr(predicate::str::contains("Expected NAME=SERVER_ID@ADDRESS"));
+}
+
+#[test]
+fn relay_rejects_ambiguous_upstream_without_server_id() {
+    let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.args(["relay", "--upstream", "grid=ipc://server", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Expected NAME=SERVER_ID@ADDRESS"));
+}
+
+#[test]
+fn relay_rejects_invalid_upstream_server_id() {
+    let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.args([
+        "relay",
+        "--upstream",
+        "grid= server @ipc://server",
+        "--dry-run",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains(
+        "server_id cannot contain leading or trailing whitespace",
+    ));
 }
 
 #[test]
@@ -40,13 +65,15 @@ fn relay_dry_run_accepts_valid_configuration() {
         "--advertise-url",
         "http://relay-a:9999",
         "--upstream",
-        "grid=ipc://server",
+        "grid=server-grid@ipc://server",
         "--dry-run",
     ])
     .assert()
     .success()
     .stdout(predicate::str::contains("relay-a"))
-    .stdout(predicate::str::contains("grid=ipc://server"));
+    .stdout(predicate::str::contains(
+        "upstream=grid server_id=server-grid address=ipc://server",
+    ));
 }
 
 #[test]

@@ -75,6 +75,11 @@ Start a relay:
 c3 relay --bind 0.0.0.0:8080
 ```
 
+Relay HTTP and mesh endpoints are not public-facing APIs. Bind to
+`0.0.0.0` only inside a trusted deployment boundary, and restrict access with
+private networking, firewall rules, Kubernetes NetworkPolicy, service mesh
+policy, or ingress authentication.
+
 Useful options:
 
 | Option | Environment | Default | Purpose |
@@ -84,13 +89,14 @@ Useful options:
 | `--seeds`, `-s` | `C2_RELAY_SEEDS` | empty | Comma-separated seed relay URLs for mesh mode. |
 | `--relay-id` | `C2_RELAY_ID` | generated | Stable relay identifier for the mesh protocol. |
 | `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | derived | Public URL other relays should use to reach this relay. |
-| `--upstream`, `-u` | none | empty | Pre-register an upstream as `NAME=ADDRESS`. Repeatable. |
+| none | `C2_RELAY_ROUTE_MAX_ATTEMPTS` | `3` | Maximum relay-aware route acquisition attempts before reporting failure; valid range is `1..=32` and `0` is treated as `1`. |
+| `--upstream`, `-u` | none | empty | Pre-register an upstream as `NAME=SERVER_ID@ADDRESS`. Repeatable. |
 
 Examples:
 
 ```bash
 c3 relay --bind 127.0.0.1:8080
-c3 relay --bind 0.0.0.0:8080 --upstream grid=ipc://server
+c3 relay --bind 0.0.0.0:8080 --upstream grid=server-grid@ipc://server
 c3 relay --relay-id relay-a --advertise-url http://relay-a:8080 --seeds http://relay-b:8080,http://relay-c:8080
 ```
 

@@ -14,6 +14,10 @@ fn decode_err(e: c2_wire::frame::DecodeError) -> PyErr {
     PyValueError::new_err(e.to_string())
 }
 
+fn encode_err(e: c2_wire::control::EncodeError) -> PyErr {
+    PyValueError::new_err(e.to_string())
+}
+
 // ── PyO3 classes ────────────────────────────────────────────────────────
 
 /// A single method in a route's method table.
@@ -142,8 +146,8 @@ fn decode_frame(body: &[u8]) -> PyResult<(u64, u32, Vec<u8>)> {
 
 /// Encode V2 call control: `[1B name_len][route UTF-8][2B method_idx LE]`.
 #[pyfunction]
-fn encode_call_control(name: &str, method_idx: u16) -> Vec<u8> {
-    c2_wire::control::encode_call_control(name, method_idx)
+fn encode_call_control(name: &str, method_idx: u16) -> PyResult<Vec<u8>> {
+    c2_wire::control::encode_call_control(name, method_idx).map_err(encode_err)
 }
 
 /// Decode V2 call control from `data[offset..]`.
@@ -158,14 +162,21 @@ fn decode_call_control(data: &[u8], offset: usize) -> PyResult<(String, u16, usi
 
 /// Encode V2 reply control.
 ///
-/// `status=0` → success (no body), `status=1` → error with optional data.
+/// `status=0` → success (no body), `status=1` → error with optional data,
+/// `status=2` → route-not-found with route name bytes.
 #[pyfunction]
-fn encode_reply_control(status: u8, error_data: Option<&[u8]>) -> Vec<u8> {
+fn encode_reply_control(status: u8, error_data: Option<&[u8]>) -> PyResult<Vec<u8>> {
     let ctrl = match status {
         c2_wire::control::STATUS_SUCCESS => c2_wire::control::ReplyControl::Success,
+        c2_wire::control::STATUS_ROUTE_NOT_FOUND => {
+            let route = std::str::from_utf8(error_data.unwrap_or(&[]))
+                .map_err(|e| PyValueError::new_err(e.to_string()))?
+                .to_string();
+            c2_wire::control::ReplyControl::RouteNotFound(route)
+        }
         _ => c2_wire::control::ReplyControl::Error(error_data.unwrap_or(&[]).to_vec()),
     };
-    c2_wire::control::encode_reply_control(&ctrl)
+    Ok(c2_wire::control::encode_reply_control(&ctrl))
 }
 
 /// Decode V2 reply control from `data[offset..]`.
@@ -179,6 +190,11 @@ fn decode_reply_control(data: &[u8], offset: usize) -> PyResult<(u8, Option<Vec<
         c2_wire::control::ReplyControl::Success => {
             Ok((c2_wire::control::STATUS_SUCCESS, None, consumed))
         }
+        c2_wire::control::ReplyControl::RouteNotFound(route) => Ok((
+            c2_wire::control::STATUS_ROUTE_NOT_FOUND,
+            Some(route.into_bytes()),
+            consumed,
+        )),
         c2_wire::control::ReplyControl::Error(err_data) => {
             Ok((c2_wire::control::STATUS_ERROR, Some(err_data), consumed))
         }
@@ -276,8 +292,9 @@ fn encode_client_handshake(
     segments: Vec<(String, u32)>,
     capability_flags: u16,
     prefix: &str,
-) -> Vec<u8> {
+) -> PyResult<Vec<u8>> {
     c2_wire::handshake::encode_client_handshake(&segments, capability_flags, prefix)
+        .map_err(encode_err)
 }
 
 /// Encode server→client handshake ACK (includes route tables).
@@ -287,7 +304,7 @@ fn encode_server_handshake(
     capability_flags: u16,
     routes: Vec<Py<PyRouteInfo>>,
     prefix: &str,
-) -> Vec<u8> {
+) -> PyResult<Vec<u8>> {
     let rust_routes: Vec<c2_wire::handshake::RouteInfo> = routes
         .iter()
         .map(|r| {
@@ -310,6 +327,7 @@ fn encode_server_handshake(
         })
         .collect();
     c2_wire::handshake::encode_server_handshake(&segments, capability_flags, &rust_routes, prefix)
+        .map_err(encode_err)
 }
 
 /// Decode handshake payload (both client and server directions).
@@ -405,6 +423,10 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // ── Status codes ────────────────────────────────────────────────
     m.add("STATUS_SUCCESS", c2_wire::control::STATUS_SUCCESS)?;
     m.add("STATUS_ERROR", c2_wire::control::STATUS_ERROR)?;
+    m.add(
+        "STATUS_ROUTE_NOT_FOUND",
+        c2_wire::control::STATUS_ROUTE_NOT_FOUND,
+    )?;
 
     // ── Handshake constants ─────────────────────────────────────────
     m.add("HANDSHAKE_VERSION", c2_wire::handshake::HANDSHAKE_VERSION)?;
