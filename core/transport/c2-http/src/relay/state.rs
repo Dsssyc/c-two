@@ -281,6 +281,7 @@ impl RelayState {
 
     // -- Peer management --
 
+    #[cfg(test)]
     pub fn register_peer(&self, info: PeerInfo) {
         self.route_table.write().register_peer(info);
     }

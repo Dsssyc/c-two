@@ -1,0 +1,439 @@
+# AGENTS.md
+
+This file contains repository-specific guidance for Codex and other coding
+agents working on C-Two. Follow these instructions together with the user's
+current request.
+
+## Project Overview
+
+C-Two is a resource-oriented RPC framework for Python that enables remote
+invocation of stateful resource classes across processes and machines. It is
+designed for distributed scientific computation, not traditional microservices.
+
+The core abstraction is resources, not services.
+
+- CRM (Core Resource Model): the contract class decorated with
+  `@cc.crm(...)`. It declares remotely callable methods. Method bodies are
+  `...`.
+- Resource: the runtime instance implementing a CRM contract. It is a plain
+  Python class, not decorated. Name it by domain semantics.
+- Client: any code that calls `cc.connect(...)` to consume a resource. There is
+  no separate "Component" abstraction.
+
+## Build, Test, And Run
+
+Package manager: `uv`, not direct `pip`. Build backend: `maturin`, which
+compiles the Rust native extension through PyO3.
+
+```bash
+# Install dependencies and compile the Rust native extension
+uv sync
+
+# Force rebuild after Rust source changes
+uv sync --reinstall-package c-two
+
+# Run the full Python test suite. Empty C2_RELAY_ADDRESS avoids env interference.
+C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30
+
+# Run one test file
+uv run pytest sdk/python/tests/unit/test_wire.py -q
+
+# Run one test class or function
+uv run pytest sdk/python/tests/unit/test_transferable.py::TestTransferableDecorator::test_hello_data_round_trip -q
+
+# Rust core tests
+cargo test --manifest-path core/Cargo.toml --workspace
+
+# Python SDK native extension and tests
+uv sync --reinstall-package c-two
+C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30
+
+# Single-process example with thread preference
+uv run python examples/python/local.py
+
+# IPC example, two terminals
+uv run python examples/python/crm_process.py
+uv run python examples/python/client.py <address>
+
+# Relay mesh example, three terminals
+python tools/dev/c3_tool.py --build --link
+c3 relay --bind 0.0.0.0:8300
+uv run python examples/python/relay_mesh/resource.py
+uv run python examples/python/relay_mesh/client.py
+
+# Example dependencies such as pandas and pyarrow
+uv sync --group examples
+
+# CLI tool
+c3 --version
+c3 relay --upstream grid=server-grid@ipc://my_server --bind 0.0.0.0:8080
+```
+
+Tests use `pytest` with a 30-second per-test timeout. Tests live under
+`sdk/python/tests/unit/` and `sdk/python/tests/integration/`, with shared
+fixtures under `sdk/python/tests/fixtures/`.
+
+## Architecture
+
+C-Two is a two-language system. Python owns domain logic, CRM contracts,
+resource scheduling, and serialization orchestration. Rust owns transport,
+memory, wire codec, HTTP relay, and configuration resolution. PyO3/maturin
+bridges Rust into Python as `c_two._native`.
+
+### CRM Layer
+
+Path: `sdk/python/src/c_two/crm/`
+
+- CRM contracts are interface classes decorated with
+  `@cc.crm(namespace='...', version='...')`.
+- Only methods in the contract are exposed remotely.
+- Resource implementations are plain Python classes and are not decorated.
+- `@transferable` marks custom data types that cross the wire. It converts the
+  class into a dataclass and registers `serialize`, `deserialize`, and optional
+  `from_buffer`.
+- `from_buffer` enables zero-copy buffer views for hold mode.
+- CRM methods can use `@cc.read` or `@cc.write`; writes are the default.
+- `@cc.transfer()` is metadata-only for CRM contract methods. It does not wrap
+  the function.
+- `@on_shutdown` marks one public method as a shutdown callback. It is not
+  exposed through RPC.
+
+### Client Layer
+
+Any code that calls `cc.connect(CRMClass, name='...', address='...')` is a
+client. The returned proxy is a typed object matching the CRM contract and
+supports context-manager close:
+
+```python
+with cc.connect(Grid, name='grid', address='ipc://server') as grid:
+    result = grid.subdivide_grids([1], [0])
+```
+
+There is no separate `compo/` module, no `@cc.runtime.connect` decorator, and no
+"Component" type.
+
+### Config Layer
+
+Paths: `sdk/python/src/c_two/config/`, `core/foundation/c2-config/`
+
+Unified configuration is resolved by the Rust `c2-config` resolver. Python
+stores SDK code-level overrides and asks the native resolver for environment,
+`.env`, and default values. Relay server configuration belongs to the standalone
+Rust `c3 relay` runtime.
+
+| File | Purpose |
+| --- | --- |
+| `settings.py` | `C2Settings` facade for SDK code overrides such as `cc.set_relay()` and process transport policy |
+| `ipc.py` | Typed override schemas: `BaseIPCOverrides`, `ServerIPCOverrides`, `ClientIPCOverrides`; Rust owns defaults and validation |
+
+Config priority chain:
+
+```text
+explicit kwargs / cc.set_*() > process environment / .env > Rust defaults
+```
+
+Do not reintroduce Python-side default validation for IPC or relay internals.
+SDKs should provide typed override facades and leave environment/default
+resolution to Rust.
+
+### Transport Layer
+
+Path: `sdk/python/src/c_two/transport/`
+
+The Python transport layer is a thin orchestration shell around a Rust-native
+core. Python handles CRM registration, scheduling, and serialization; Rust
+handles IPC, wire framing, SHM, HTTP relay transport, and relay-aware route
+fallback.
+
+| File | Purpose |
+| --- | --- |
+| `registry.py` | SOTA API: `cc.register()`, `cc.connect()`, `cc.close()`, `cc.shutdown()`, `cc.set_server()`, `cc.set_client()` |
+| `protocol.py` | Re-export facade for Rust handshake codec, route info, and flag constants |
+| `wire.py` | `MethodTable` and thin FFI wrappers for wire control functions |
+| `server/native.py` | `NativeServerBridge` exported as `Server` |
+| `server/scheduler.py` | Read/write-aware resource method scheduler |
+| `server/reply.py` | `unpack_icrm_result` and `wrap_error` |
+| `server/hold_registry.py` | Weakref-based tracking of hold-mode SHM buffers |
+| `client/proxy.py` | `CRMProxy` for thread-local, IPC, and HTTP modes |
+| `client/util.py` | Standalone `ping()` and `shutdown()` probes over raw UDS |
+
+Transport modes:
+
+- Thread-local: same-process `cc.connect()` returns a zero-serialization proxy.
+- IPC (`ipc://`): UDS control channel plus POSIX SHM data plane through Rust.
+- HTTP (`http://`): relay-based cross-machine transport through Rust.
+
+Python resource servers create an auto-generated `ipc://` address. Use
+`cc.server_address()` after registration only when a same-host process needs to
+connect directly.
+
+Relay priority:
+
+```text
+cc.set_relay() > C2_RELAY_ADDRESS > none
+```
+
+The Python SDK does not embed or start a relay server. Start `c3 relay` outside
+the SDK, through the CLI, Docker Compose, Kubernetes, or other orchestration.
+Do not add SDK APIs that embed, start, or manage relay-server lifecycle.
+
+### Rust Native Layer
+
+Paths: `core/`, `sdk/python/native/`
+
+`core/` is a language-neutral Cargo workspace. The Python SDK owns its PyO3
+extension crate under `sdk/python/native/`.
+
+| Layer | Crate | Purpose |
+| --- | --- | --- |
+| foundation | `c2-config` | Unified IPC and relay configuration structs/resolvers |
+| foundation | `c2-mem` | Buddy allocator, SHM regions, unified memory pool |
+| protocol | `c2-wire` | Wire protocol codec, frames, chunk assembler, chunk registry |
+| transport | `c2-ipc` | Async IPC client, UDS, SHM, chunked transfer |
+| transport | `c2-server` | Tokio UDS server with per-connection state and peer SHM lazy-open |
+| transport | `c2-http` | HTTP client, relay-aware client, and HTTP relay server behind `relay` feature |
+| sdk/python/native | `c2-python-native` | PyO3 bindings for `c_two._native` |
+
+Memory subsystem:
+
+- Allocation tiers: buddy SHM, dedicated SHM, file spill.
+- `MemHandle` abstracts buddy, dedicated, and file-spill handles.
+- SHM segment names are deterministic:
+  `{prefix}_b{idx:04x}` for buddy and `{prefix}_d{idx:04x}` for dedicated.
+- Server lazy-opens peer segments from prefix and index. There is no explicit
+  segment announcement protocol.
+
+### CLI
+
+The `c3` command is implemented by the root `cli/` Rust package. Python does
+not own CLI behavior. For source-checkout development, build and link a local
+`c3` with:
+
+```bash
+python tools/dev/c3_tool.py --build --link
+```
+
+Do not add CLI command behavior under `sdk/python/src/c_two`.
+
+`c3 relay` options:
+
+| Option | Env var | Default | Purpose |
+| --- | --- | --- | --- |
+| `--bind` | `C2_RELAY_BIND` | `0.0.0.0:8080` | HTTP listen address |
+| `--seeds` | `C2_RELAY_SEEDS` | empty | Comma-separated seed relay URLs for mesh |
+| `--relay-id` | `C2_RELAY_ID` | auto UUID | Stable relay identifier |
+| `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | derived | Publicly reachable URL for peers |
+| `--idle-timeout` | `C2_RELAY_IDLE_TIMEOUT` | `60` | IPC idle disconnect timeout in seconds; `0` disables time-based eviction |
+| `--upstream` | none | empty | Pre-register upstream as `NAME=SERVER_ID@ADDRESS` |
+
+Relay-aware clients use `C2_RELAY_ROUTE_MAX_ATTEMPTS` to cap route acquisition
+attempts before reporting failure. This setting belongs to the client side, not
+the relay server resolver.
+
+## Key Conventions
+
+### Import Style
+
+Import the package as `c_two` and alias it as `cc`:
+
+```python
+import c_two as cc
+```
+
+### CRM Contract Pattern
+
+CRM contract classes are interfaces. Method bodies are `...`. The `@cc.crm()`
+decorator requires `namespace` and `version`. Do not use an `I` prefix on the
+contract class name.
+
+```python
+@cc.crm(namespace='cc.demo', version='0.1.0')
+class Grid:
+    def some_method(self, arg: int) -> str:
+        ...
+```
+
+### Transferable Pattern
+
+`serialize`, `deserialize`, and `from_buffer` are written as regular methods.
+The `TransferableMeta` metaclass converts them to static methods. Do not add
+`@staticmethod` yourself.
+
+```python
+@cc.transferable
+class MyData:
+    value: int
+
+    def serialize(data: 'MyData') -> bytes:
+        ...
+
+    def deserialize(data: bytes) -> 'MyData':
+        ...
+
+    def from_buffer(buf: memoryview) -> 'MyData':
+        ...
+```
+
+### Transfer Decorator Pattern
+
+`@cc.transfer()` is metadata-only. It attaches `__cc_transfer__` to CRM contract
+methods and does not wrap the function.
+
+```python
+@cc.crm(namespace='ns', version='0.1.0')
+class MyResource:
+    @cc.transfer(input=MyData, output=MyData, buffer='hold')
+    def process(self, data: MyData) -> MyData:
+        ...
+```
+
+### Hold Mode Pattern
+
+`cc.hold()` wraps a CRM proxy bound method for client-side SHM retention. It
+returns `HeldResult` with `.value` and `.release()`. Safety layers are explicit
+release, context manager, and `__del__` fallback.
+
+```python
+with cc.hold(proxy.method)(args) as held:
+    data = held.value
+
+a = cc.hold(proxy.method)(args_a)
+b = cc.hold(proxy.method)(args_b)
+try:
+    process(a.value, b.value)
+finally:
+    a.release()
+    b.release()
+```
+
+When `@cc.transfer(buffer=None)`, the framework checks whether the input
+transferable has `from_buffer`. If yes, it uses hold mode; otherwise it uses
+view mode.
+
+### SOTA API Pattern
+
+The registry exposes a flat top-level API on the `cc` namespace:
+
+```python
+import c_two as cc
+
+# Server side
+cc.set_relay('http://relay-host:8080')
+cc.set_transport_policy(shm_threshold=64 * 1024)
+cc.set_server(ipc_overrides={'pool_segment_size': 2 * 1024 * 1024 * 1024})
+cc.register(Grid, grid_instance, name='grid')
+cc.register(Network, net_instance, name='network')
+cc.serve()
+
+# Client side, same process: thread preference
+grid = cc.connect(Grid, name='grid')
+grid.some_method(arg)
+cc.close(grid)
+
+# Client side, direct IPC
+cc.set_client(ipc_overrides={'pool_segment_size': 2 * 1024 * 1024 * 1024})
+grid = cc.connect(Grid, name='grid', address='ipc://my_server')
+grid.some_method(arg)
+cc.close(grid)
+
+# Client side, relay-based name resolution and routing
+cc.set_relay('http://relay-host:8080')
+grid = cc.connect(Grid, name='grid')
+grid.some_method(arg)
+cc.close(grid)
+
+# Cleanup
+cc.unregister('grid')
+cc.shutdown()
+```
+
+The `name` parameter in `cc.register()` is a user-chosen routing key. It is not
+the CRM namespace. Multiple resources using different CRM contracts, or the
+same CRM contract with different instances, can coexist under distinct names.
+
+### Error Handling
+
+Errors are modeled as `CCError` subclasses with numeric `ERROR_Code` values.
+Errors serialize to and from bytes for wire transfer. Error classes are named
+by location, for example `ResourceDeserializeInput`, `ClientSerializeInput`,
+`ResourceExecuteFunction`, and `ClientCallResource`. Enum values live under
+`ERROR_AT_RESOURCE_*` and `ERROR_AT_CLIENT_*`.
+
+### Naming
+
+- CRM contract classes: plain names, no `I` prefix.
+- Resource implementation classes: domain names such as `NestedGrid` or
+  `PostgresVectorLayer`; `{ContractName}Impl` is acceptable for generated code.
+- Transferable classes: descriptive data names such as `GridAttribute`.
+- Routing names: user-chosen strings passed to `cc.register(name=...)` and
+  `cc.connect(name=...)`; distinct from CRM `namespace`.
+
+### Performance-Sensitive Code
+
+Wire codec and transport code in Rust (`c2-wire`, `c2-ipc`, `c2-mem`) prioritize
+zero-copy and single-allocation patterns. Python `wire.py` retains `MethodTable`,
+`payload_total_size`, and thin FFI wrappers. The thread-local transport skips
+serialization entirely. SHM segment names are deterministic for lazy peer-side
+opening. The buddy allocator's `alloc()` and `free_at()` are thread-safe.
+
+## Environment Variables
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `C2_RELAY_ADDRESS` | HTTP relay URL for CRM registration and client name resolution | none |
+| `C2_RELAY_ROUTE_MAX_ATTEMPTS` | Relay-aware client route acquisition attempts | `3` |
+| `C2_RELAY_BIND` | Relay HTTP listen address for `c3 relay --bind` | `0.0.0.0:8080` |
+| `C2_RELAY_ID` | Stable relay identifier for mesh protocol | auto UUID |
+| `C2_RELAY_ADVERTISE_URL` | Publicly reachable URL announced to mesh peers | derived |
+| `C2_RELAY_SEEDS` | Comma-separated seed relay URLs for mesh mode | none |
+| `C2_RELAY_IDLE_TIMEOUT` | Upstream IPC idle disconnect timeout in seconds; `0` disables time-based eviction | `60` |
+| `C2_RELAY_ANTI_ENTROPY_INTERVAL` | Anti-entropy digest exchange interval in seconds | `60.0` |
+| `C2_RELAY_USE_PROXY` | Use system proxy variables for relay HTTP clients | `false` |
+| `C2_SHM_THRESHOLD` | Payload size threshold for SHM vs inline | `4096` |
+| `C2_IPC_POOL_SEGMENT_SIZE` | Buddy pool segment size in bytes | `268435456` |
+| `C2_IPC_MAX_POOL_SEGMENTS` | Max buddy pool segments, 1 to 255 | `4` |
+| `C2_IPC_POOL_DECAY_SECONDS` | Idle segment decay time | `60.0` |
+| `C2_IPC_POOL_ENABLED` | Enable or disable SHM pool | `true` |
+| `C2_IPC_MAX_FRAME_SIZE` | Max inline frame size | `2147483648` |
+| `C2_IPC_MAX_PAYLOAD_SIZE` | Max single-call payload size | `17179869184` |
+| `C2_IPC_MAX_PENDING_REQUESTS` | Max concurrent pending requests per connection | `1024` |
+| `C2_IPC_HEARTBEAT_INTERVAL` | Heartbeat interval seconds; `0` disables | `15.0` |
+| `C2_IPC_HEARTBEAT_TIMEOUT` | Heartbeat timeout seconds | `30.0` |
+| `C2_IPC_MAX_TOTAL_CHUNKS` | Max total in-flight chunks across all connections | `512` |
+| `C2_IPC_CHUNK_GC_INTERVAL` | Chunk GC sweep interval seconds | `5.0` |
+| `C2_IPC_CHUNK_THRESHOLD_RATIO` | Fraction of max frame size that triggers chunking | `0.9` |
+| `C2_IPC_CHUNK_ASSEMBLER_TIMEOUT` | Chunk assembler timeout seconds | `60.0` |
+| `C2_IPC_MAX_REASSEMBLY_BYTES` | Max reassembly buffer memory | `8589934592` |
+| `C2_IPC_CHUNK_SIZE` | Individual chunk size | `131072` |
+| `C2_IPC_REASSEMBLY_SEGMENT_SIZE` | Reassembly pool segment size | `67108864` |
+| `C2_IPC_REASSEMBLY_MAX_SEGMENTS` | Max reassembly pool segments | `4` |
+| `C2_ENV_FILE` | Path to `.env`; empty string disables env-file loading | `.env` |
+
+The Rust `c2-config` resolver loads `.env` and process environment values.
+Precedence is explicit code overrides, then process environment / `.env`, then
+defaults. See `.env.example` for the full reference.
+
+Do not add environment variables for values that can be derived from existing
+canonical settings. Pool memory limits should be derived from segment size and
+segment count.
+
+## Python Version
+
+Requires Python 3.10 or newer. Use modern type hints such as `list[int]`,
+`str | None`, and `tuple[...]`. Free-threading Python is a target platform; be
+cautious with C extensions, shared mutable state, and GIL assumptions.
+
+## Agent Working Rules
+
+- Read the existing code before changing it.
+- Prefer `rg` and `rg --files` for repository searches.
+- Keep Python SDKs as glue around Rust mechanisms. Do not move shared transport,
+  resolver, route fallback, or protocol mechanisms into Python SDK code.
+- Use Rust core crates for cross-language behavior so later SDKs do not have to
+  reimplement mechanisms independently.
+- For bug fixes and behavior changes, add or update focused tests first when
+  feasible, then implement the minimal code needed to pass.
+- Do not revert unrelated user changes in a dirty worktree.
+- Avoid destructive git commands unless the user explicitly asks for them.
+- For reviews, lead with concrete findings ordered by severity and include file
+  and line references.

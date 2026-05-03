@@ -380,35 +380,16 @@ impl UpstreamSlot {
     }
 
     fn is_idle_candidate(&self, idle_timeout_ms: u64) -> bool {
-        let cutoff = now_millis().saturating_sub(idle_timeout_ms);
         let inner = self.inner.lock();
-        match &inner.client {
-            Some(client) if !client.is_connected() => true,
-            Some(_) => {
-                inner.state == SlotState::Ready
-                    && inner.active_requests == 0
-                    && inner.last_activity <= cutoff
-            }
-            None => false,
-        }
+        should_evict(&inner, idle_timeout_ms)
     }
 
     fn evict_if_idle(&self, idle_timeout_ms: u64) -> Option<Arc<IpcClient>> {
-        let cutoff = now_millis().saturating_sub(idle_timeout_ms);
         let mut inner = self.inner.lock();
         if inner.state == SlotState::Retired {
             return None;
         }
-        let should_evict = match &inner.client {
-            Some(client) if !client.is_connected() => true,
-            Some(_) => {
-                inner.state == SlotState::Ready
-                    && inner.active_requests == 0
-                    && inner.last_activity <= cutoff
-            }
-            None => false,
-        };
-        if !should_evict {
+        if !should_evict(&inner, idle_timeout_ms) {
             return None;
         }
         let client = inner.client.take();
@@ -480,6 +461,18 @@ impl UpstreamSlot {
         drop(inner);
         self.notify.notify_waiters();
         client
+    }
+}
+
+fn should_evict(inner: &SlotInner, idle_timeout_ms: u64) -> bool {
+    if inner.active_requests > 0 {
+        return false;
+    }
+    let cutoff = now_millis().saturating_sub(idle_timeout_ms);
+    match &inner.client {
+        Some(client) if !client.is_connected() => true,
+        Some(_) => inner.state == SlotState::Ready && inner.last_activity <= cutoff,
+        None => false,
     }
 }
 
@@ -649,6 +642,23 @@ mod tests {
         client.force_connected(false);
         pool.insert("grid".into(), "ipc://dead".into(), client);
 
+        assert_eq!(pool.idle_entries(u64::MAX), vec!["grid".to_string()]);
+    }
+
+    #[test]
+    fn active_disconnected_client_is_not_evicted_until_request_finishes() {
+        let pool = ConnectionPool::new();
+        let client = Arc::new(IpcClient::new("ipc://active-dead"));
+        client.force_connected(true);
+        pool.insert("grid".into(), "ipc://active-dead".into(), client.clone());
+
+        let lease = pool.begin_request_for_test("grid").unwrap();
+        client.force_connected(false);
+
+        assert!(pool.idle_entries(u64::MAX).is_empty());
+        assert_eq!(pool.evict_idle(u64::MAX).len(), 0);
+
+        drop(lease);
         assert_eq!(pool.idle_entries(u64::MAX), vec!["grid".to_string()]);
     }
 

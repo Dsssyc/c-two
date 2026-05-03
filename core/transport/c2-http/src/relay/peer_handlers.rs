@@ -139,23 +139,7 @@ pub async fn handle_peer_join(
         if relay_id == state.relay_id() {
             return (StatusCode::OK, Json(serde_json::json!({"status": "self"}))).into_response();
         }
-        if state.has_peer(&relay_id) {
-            state.with_route_table_mut(|rt| {
-                if let Some(peer) = rt.get_peer_mut(&relay_id) {
-                    peer.url = url.clone();
-                    peer.last_heartbeat = std::time::Instant::now();
-                    peer.status = PeerStatus::Alive;
-                }
-            });
-        } else {
-            state.register_peer(PeerInfo {
-                relay_id: relay_id.clone(),
-                url,
-                route_count: 0,
-                last_heartbeat: std::time::Instant::now(),
-                status: PeerStatus::Alive,
-            });
-        }
+        state.with_route_table_mut(|rt| rt.record_peer_join(relay_id, url));
         Json(canonical_peer_snapshot(&state)).into_response()
     } else {
         StatusCode::BAD_REQUEST.into_response()
@@ -524,6 +508,45 @@ mod tests {
                 .find(|peer| peer.relay_id == "relay-b")
                 .unwrap()
                 .url,
+            "http://relay-b-new:8080"
+        );
+    }
+
+    #[tokio::test]
+    async fn join_updates_existing_peer_route_urls() {
+        let state = test_state();
+        known_peer(&state, "relay-b");
+        announce_peer_route(
+            &state,
+            RouteEntry {
+                name: "grid".into(),
+                relay_id: "relay-b".into(),
+                relay_url: "http://spoofed:8080".into(),
+                server_id: None,
+                ipc_address: None,
+                crm_ns: "test.ns".into(),
+                crm_ver: "0.1.0".into(),
+                locality: Locality::Peer,
+                registered_at: 1000.0,
+            },
+        );
+        assert_eq!(state.resolve("grid")[0].relay_url, "http://relay-b:8080");
+
+        let envelope = PeerEnvelope::new(
+            "relay-b",
+            PeerMessage::RelayJoin {
+                relay_id: "relay-b".into(),
+                url: "http://relay-b-new:8080".into(),
+            },
+        );
+
+        let response = handle_peer_join(State(state.clone()), Json(envelope))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            state.resolve("grid")[0].relay_url,
             "http://relay-b-new:8080"
         );
     }

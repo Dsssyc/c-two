@@ -265,8 +265,36 @@ impl RouteTable {
 
     // -- Peer operations --
 
+    #[cfg(test)]
     pub fn register_peer(&mut self, info: PeerInfo) {
-        self.peers.insert(info.relay_id.clone(), info);
+        let relay_id = info.relay_id.clone();
+        let url = info.url.clone();
+        self.peers.insert(relay_id.clone(), info);
+        self.sync_peer_route_urls(&relay_id, &url);
+    }
+
+    pub fn record_peer_join(&mut self, relay_id: String, url: String) {
+        let now = Instant::now();
+        match self.peers.get_mut(&relay_id) {
+            Some(peer) => {
+                peer.url = url.clone();
+                peer.last_heartbeat = now;
+                peer.status = PeerStatus::Alive;
+            }
+            None => {
+                self.peers.insert(
+                    relay_id.clone(),
+                    PeerInfo {
+                        relay_id: relay_id.clone(),
+                        url: url.clone(),
+                        route_count: 0,
+                        last_heartbeat: now,
+                        status: PeerStatus::Alive,
+                    },
+                );
+            }
+        }
+        self.sync_peer_route_urls(&relay_id, &url);
     }
 
     pub fn unregister_peer(&mut self, relay_id: &str) -> Option<PeerInfo> {
@@ -307,6 +335,14 @@ impl RouteTable {
             .values()
             .filter(|p| p.status == PeerStatus::Dead)
             .collect()
+    }
+
+    fn sync_peer_route_urls(&mut self, relay_id: &str, url: &str) {
+        for entry in self.routes.values_mut() {
+            if entry.locality == Locality::Peer && entry.relay_id == relay_id {
+                entry.relay_url = url.to_string();
+            }
+        }
     }
 
     // -- Snapshot operations (for join protocol + anti-entropy) --
@@ -417,6 +453,8 @@ impl RouteTable {
             if ps.relay_id == self.relay_id {
                 continue; // Don't add ourselves.
             }
+            let relay_id = ps.relay_id.clone();
+            let url = ps.url.clone();
             self.peers
                 .entry(ps.relay_id.clone())
                 .and_modify(|existing| {
@@ -434,6 +472,7 @@ impl RouteTable {
                     last_heartbeat: Instant::now(),
                     status: ps.status,
                 });
+            self.sync_peer_route_urls(&relay_id, &url);
         }
     }
 
