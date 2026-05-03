@@ -2,7 +2,8 @@
 //!
 //! The relay only needs to **read** from server-side SHM segments (for
 //! buddy-allocated reply payloads). It does **not** need to allocate or
-//! manage buddy blocks — all allocation is done by the Python ServerV2.
+//! manage buddy blocks — all allocation is done by the producer-side IPC
+//! server.
 
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;

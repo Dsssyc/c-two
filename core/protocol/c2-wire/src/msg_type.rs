@@ -59,7 +59,7 @@ impl MsgType {
 /// Size of a signal payload (always 1 byte).
 pub const SIGNAL_SIZE: usize = 1;
 
-// Pre-encoded signal bytes (matching Python msg_type.py constants).
+// Pre-encoded signal bytes from the canonical wire protocol.
 pub const PING_BYTES: [u8; 1] = [MsgType::Ping as u8];
 pub const PONG_BYTES: [u8; 1] = [MsgType::Pong as u8];
 pub const SHUTDOWN_CLIENT_BYTES: [u8; 1] = [MsgType::ShutdownClient as u8];

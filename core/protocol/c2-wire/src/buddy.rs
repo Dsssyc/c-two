@@ -6,7 +6,7 @@
 //! [2B seg_idx LE][4B offset LE][4B data_size LE][1B flags]
 //! ```
 //!
-//! Matches Python `buddy.BUDDY_PAYLOAD_STRUCT = struct.Struct('<HII B')`.
+//! This layout is part of the canonical wire protocol and is shared by all SDKs.
 
 /// Size of the buddy payload header in bytes.
 pub const BUDDY_PAYLOAD_SIZE: usize = 11;

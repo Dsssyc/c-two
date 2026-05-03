@@ -1,8 +1,7 @@
 //! UDS server — accept loop, per-connection frame handler, CRM dispatch.
 //!
-//! Replaces the Python asyncio server (`transport/server/core.py`).
-//! CRM method execution is delegated to [`CrmCallback`] (implemented
-//! by PyO3 wrappers in c2-ffi).
+//! CRM method execution is delegated to [`CrmCallback`] implementations
+//! supplied by language bindings or native runtime adapters.
 //!
 //! ## Lock conventions
 //!

@@ -46,8 +46,8 @@ pub enum ResponseMeta {
 
 /// Input data for a CRM method call.
 ///
-/// Pure Rust types — no PyO3 dependency. The `PyCrmCallback` impl in c2-ffi
-/// converts these into Python objects (ShmBuffer/bytes) under GIL.
+/// Pure Rust types with no language-binding dependency. Binding-specific
+/// callback implementations convert these into SDK-visible objects.
 pub enum RequestData {
     /// SHM coordinates from peer (buddy or dedicated).
     /// ShmBuffer.release() frees via pool.free_at().
@@ -111,11 +111,11 @@ impl std::fmt::Debug for RequestData {
 
 /// Trait for calling CRM methods from Rust.
 ///
-/// `invoke()` acquires the GIL internally (in PyCrmCallback impl),
-/// so callers must NOT hold the GIL when calling this.
+/// Implementations may enter language runtimes internally, so callers should
+/// not hold unrelated runtime locks while invoking this callback.
 ///
-/// Uses pure Rust types (RequestData, ResponseMeta) — no PyO3 types
-/// in the trait interface. PyCrmCallback converts to/from Python objects.
+/// Uses pure Rust types (`RequestData`, `ResponseMeta`) in the trait
+/// interface; language bindings handle conversion at the boundary.
 pub trait CrmCallback: Send + Sync + 'static {
     fn invoke(
         &self,

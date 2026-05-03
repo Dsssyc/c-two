@@ -1,6 +1,6 @@
 //! Synchronous IPC client — embeds a tokio runtime handle.
 //!
-//! Wraps [`IpcClient`] for blocking calls from Python (via PyO3).
+//! Wraps [`IpcClient`] for blocking calls from SDK bindings.
 //! Multiple `SyncClient` instances share a single tokio runtime.
 
 use parking_lot::{Mutex, RwLock};
@@ -33,15 +33,15 @@ fn get_or_create_runtime() -> &'static tokio::runtime::Runtime {
 
 /// Synchronous IPC client — embeds a tokio runtime handle.
 ///
-/// Wraps `IpcClient` for blocking calls from Python (via PyO3).
+/// Wraps `IpcClient` for blocking calls from SDK bindings.
 /// Multiple SyncClients share a single tokio runtime.
 pub struct SyncClient {
     inner: IpcClient,
     rt: tokio::runtime::Handle,
 }
 
-// Compile-time assertion: SyncClient must be Send+Sync for PyO3
-// `#[pyclass(frozen)]`.
+// Compile-time assertion: SyncClient must be Send+Sync for binding wrappers
+// that may be shared across threads.
 const _: () = {
     fn _assert_send<T: Send>() {}
     fn _assert_sync<T: Sync>() {}

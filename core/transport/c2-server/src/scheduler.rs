@@ -42,7 +42,7 @@ impl Scheduler {
 
     /// Execute a CRM method under the appropriate concurrency guard.
     ///
-    /// `f` runs inside `spawn_blocking` (Python GIL acquisition happens there).
+    /// `f` runs inside `spawn_blocking`; language-runtime entry happens there.
     /// The lock guard is held on the async task until `spawn_blocking` returns,
     /// preventing concurrent writes while a CRM method executes.
     pub async fn execute<F, R>(&self, method_idx: u16, f: F) -> R

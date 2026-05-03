@@ -1,6 +1,6 @@
 //! Frame flag bit definitions.
 //!
-//! Matches Python `ipc_protocol.py` and `protocol.py` flag constants.
+//! Defines the canonical frame flag constants shared by all SDKs.
 //! All flags occupy the 4-byte LE `flags` field of the frame header.
 
 /// Payload references a per-request SharedMemory segment (legacy).

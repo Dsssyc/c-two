@@ -1,4 +1,4 @@
-//! Async IPC client — connects to Python ServerV2 via UDS.
+//! Async IPC client — connects to a C-Two IPC server via UDS.
 //!
 //! Performs handshake, then multiplexes concurrent requests over
 //! a single UDS connection using request IDs.
@@ -74,9 +74,9 @@ impl ServerPoolState {
 
     /// Lazy-open the segment for the given coordinates if not yet mapped.
     ///
-    /// Called transparently by `PyResponseBuffer` before any SHM access
-    /// (`__getbuffer__`, `release`, `Drop`).  Python never needs to know
-    /// about segment management — this keeps it entirely inside Rust.
+    /// Called transparently by language binding response buffers before any
+    /// SHM access. SDKs do not need to know about segment management; this
+    /// keeps it entirely inside Rust.
     pub fn ensure_segment(
         &mut self,
         seg_idx: u16,
@@ -218,7 +218,7 @@ type PendingMap = HashMap<u32, oneshot::Sender<Result<ResponseData, IpcError>>>;
 
 /// Async IPC client for the C-Two relay.
 ///
-/// Connects to a Python `ServerV2` via Unix Domain Socket, performs
+/// Connects to a C-Two IPC server via Unix Domain Socket, performs
 /// handshake, and multiplexes concurrent CRM calls.
 pub struct IpcClient {
     socket_path: PathBuf,
@@ -242,8 +242,8 @@ pub struct IpcClient {
 
 // Compile-time assertion: IpcClient is Send+Sync because all fields are
 // Arc-wrapped (Send+Sync), atomic (Send+Sync), or standard collections
-// of Send+Sync types. This is required for safe use from PyO3 frozen
-// pyclass wrappers under Python 3.14t free-threading.
+// of Send+Sync types. This is required for safe use from language
+// bindings that share clients across threads.
 const _: () = {
     fn _assert_send<T: Send>() {}
     fn _assert_sync<T: Sync>() {}
@@ -945,7 +945,7 @@ impl IpcClient {
 
 // ── Recv loop ────────────────────────────────────────────────────────────
 
-/// Signal byte constants (match Python `MsgType` enum).
+/// Signal byte constants from the canonical wire protocol.
 const SIG_PING: u8 = 0x01;
 const SIG_PONG: u8 = 0x02;
 const SIG_DISCONNECT: u8 = 0x08;
