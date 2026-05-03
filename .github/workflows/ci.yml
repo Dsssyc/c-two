@@ -116,6 +116,7 @@ jobs:
           --with pytest-timeout
           --with packaging
           pytest
+          --confcutdir=sdk/python/tests/unit
           sdk/python/tests/unit/test_cli_release_workflow.py
           sdk/python/tests/unit/test_python_package_release_workflow.py
           sdk/python/tests/unit/test_check_version.py::TestCheckVersion
