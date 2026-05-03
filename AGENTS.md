@@ -6,9 +6,9 @@ current request.
 
 ## Project Overview
 
-C-Two is a resource-oriented RPC framework for Python that enables remote
-invocation of stateful resource classes across processes and machines. It is
-designed for distributed scientific computation, not traditional microservices.
+C-Two is a resource-oriented RPC runtime that enables remote invocation of
+stateful resource classes across processes and machines. It is designed for
+distributed scientific computation, not traditional microservices.
 
 The core abstraction is resources, not services.
 
@@ -75,10 +75,11 @@ fixtures under `sdk/python/tests/fixtures/`.
 
 ## Architecture
 
-C-Two is a two-language system. Python owns domain logic, CRM contracts,
-resource scheduling, and serialization orchestration. Rust owns transport,
-memory, wire codec, HTTP relay, and configuration resolution. PyO3/maturin
-bridges Rust into Python as `c_two._native`.
+C-Two has a language-neutral Rust core and a Python SDK. The Python SDK owns
+Python domain logic, CRM contracts, resource scheduling, and serialization
+orchestration. Rust owns shared transport, memory, wire codec, HTTP relay, and
+configuration resolution. PyO3/maturin bridges Rust into Python as
+`c_two._native`.
 
 ### CRM Layer
 

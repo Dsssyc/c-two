@@ -5,7 +5,7 @@
 <h1 align="center">C-Two</h1>
 
 <p align="center">
-  A resource-oriented RPC runtime — turn stateful classes into location-transparent distributed resources. Python is the first SDK.
+  A resource-oriented RPC runtime — turn stateful classes into location-transparent distributed resources.
 </p>
 
 <p align="center">
@@ -24,11 +24,11 @@
 
 ## Basic Idea
 
-- **Resources, not services** — C-Two does not expose RPC endpoints. It exposes stateful resource objects through language SDKs. The current Python SDK makes Python classes remotely accessible while preserving their object-oriented nature.
+- **Resources, not services** — C-Two does not expose RPC endpoints. It exposes stateful resource objects through language SDKs. The Python SDK makes Python classes remotely accessible while preserving their object-oriented nature.
 
 - **Zero-copy from process to data** — Same-process calls skip serialization entirely. Cross-process IPC can hold shared-memory buffers alive, letting you read columnar data (NumPy, Arrow, …) directly from SHM — no deserialization, no copies.
 
-- **Built first for scientific Python workloads** — The Python SDK has native support for Apache Arrow, NumPy arrays, and large payloads (chunked streaming for data beyond 256 MB). Designed for computational workloads, not microservices.
+- **Built for scientific workloads** — The Python SDK has native support for Apache Arrow, NumPy arrays, and large payloads (chunked streaming for data beyond 256 MB). Designed for computational workloads, not microservices.
 
 - **Rust-powered core** — Shared transport, memory, wire codec, relay, and configuration live in Rust so future SDKs reuse one runtime contract.
 
@@ -549,7 +549,7 @@ The IPC transport uses a **control-plane / data-plane separation**: method routi
 
 ### Rust Native Layer
 
-Python is currently the production SDK. The core runtime is language-neutral Rust; new SDKs should bind to the same core contracts rather than reimplement transport behavior. Performance-critical components are implemented in Rust and exposed to Python through a native extension built with [PyO3](https://pyo3.rs) + [maturin](https://www.maturin.rs):
+The core runtime is language-neutral Rust; SDKs bind to the same core contracts rather than reimplement transport behavior. Performance-critical components are implemented in Rust and exposed to Python through a native extension built with [PyO3](https://pyo3.rs) + [maturin](https://www.maturin.rs):
 
 The Rust workspace contains 7 crates organized in 4 layers (foundation → protocol → transport → bridge):
 
@@ -626,4 +626,4 @@ See the [full roadmap](docs/plans/c-two-rpc-v2-roadmap.md) for details.
 
 ---
 
-<p align="center">Built for resource-oriented computation. Python SDK first. Powered by Rust.</p>
+<p align="center">Built for resource-oriented computation. Powered by Rust.</p>
