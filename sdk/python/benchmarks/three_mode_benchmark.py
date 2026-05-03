@@ -3,7 +3,7 @@
 Measures P50 round-trip latency for echo across three transport modes:
   - Thread-local: same process, zero serialization
   - IPC: full serialize + SHM + UDS
-  - Relay: HTTP → NativeRelay → IPC → CRM → reverse
+  - Relay: HTTP -> external c3 relay -> IPC -> CRM -> reverse
 
 Two payload types compared:
   - bytes: identity fast path (skips pickle)
@@ -22,13 +22,16 @@ from __future__ import annotations
 import argparse
 import gc
 import glob
+import json
 import math
 import os
 import statistics
+import sys
 import time
+import urllib.error
+import urllib.request
 
 import c_two as cc
-from c_two._native import NativeRelay
 from c_two.transport.registry import _ProcessRegistry
 
 # Configurable via CLI --segment-size (bytes)
@@ -87,6 +90,77 @@ WARMUP = 3
 _IPC_SOCK_DIR = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
 _ipc_counter = 0
 _relay_port = 19960 + (os.getpid() % 100)
+
+_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _relay_help(relay_url: str) -> str:
+    bind = relay_url.removeprefix('http://').removeprefix('https://')
+    return (
+        f'External c3 relay is not reachable at {relay_url}. '
+        f'Start it first with `c3 relay --bind {bind}` after running '
+        '`python tools/dev/c3_tool.py --build --link` from the source checkout.'
+    )
+
+
+def _require_external_relay(relay_url: str) -> None:
+    try:
+        with _NO_PROXY_OPENER.open(f'{relay_url}/health', timeout=5) as resp:
+            if resp.status >= 400:
+                raise OSError(f'HTTP {resp.status}')
+    except Exception as exc:
+        raise SystemExit(_relay_help(relay_url)) from exc
+
+
+def _post_json(url: str, payload: dict[str, str], timeout: float = 5.0) -> int:
+    data = json.dumps(payload).encode('utf-8')
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method='POST',
+        headers={'Content-Type': 'application/json'},
+    )
+    with _NO_PROXY_OPENER.open(req, timeout=timeout) as resp:
+        if resp.status >= 400:
+            raise OSError(f'HTTP {resp.status}')
+        return resp.status
+
+
+def _register_relay_upstream(
+    relay_url: str,
+    name: str,
+    address: str,
+    server_id: str,
+) -> None:
+    _post_json(
+        f'{relay_url}/_register',
+        {'name': name, 'server_id': server_id, 'address': address},
+    )
+
+
+def _unregister_relay_upstream(relay_url: str, name: str, server_id: str) -> None:
+    _post_json(f'{relay_url}/_unregister', {'name': name, 'server_id': server_id})
+
+
+def _best_effort_unregister_relay_upstream(
+    relay_url: str,
+    name: str,
+    server_id: str,
+) -> None:
+    try:
+        _unregister_relay_upstream(relay_url, name, server_id)
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            print(f'Warning: failed to unregister relay route {name!r}: {exc}', file=sys.stderr)
+    except Exception as exc:
+        print(f'Warning: failed to unregister relay route {name!r}: {exc}', file=sys.stderr)
+
+
+def _best_effort_unregister_local(name: str) -> None:
+    try:
+        cc.unregister(name)
+    except Exception as exc:
+        print(f'Warning: failed to unregister local route {name!r}: {exc}', file=sys.stderr)
 
 
 def _cleanup():
@@ -162,8 +236,12 @@ def bench_ipc(payload_size: int) -> float:
     _ipc_counter += 1
     _ProcessRegistry.reset()
 
-    cc.set_server(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
-    cc.set_client(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
+    ipc_overrides = {
+        'pool_segment_size': _SEGMENT_SIZE,
+        'max_pool_segments': _MAX_SEGMENTS,
+    }
+    cc.set_server(ipc_overrides=ipc_overrides)
+    cc.set_client(ipc_overrides=ipc_overrides)
     cc.register(Echo, EchoImpl(), name='echo_ipc')
     address = cc.server_address()
     _wait_sock(address)
@@ -184,38 +262,48 @@ def bench_ipc(payload_size: int) -> float:
 # ---------------------------------------------------------------------------
 
 def bench_relay(payload_size: int) -> float | None:
-    global _ipc_counter, _relay_port
+    global _ipc_counter
     _ipc_counter += 1
-    _relay_port += 1
     _ProcessRegistry.reset()
-    relay_addr = f'127.0.0.1:{_relay_port}'
+    relay_url = f'http://127.0.0.1:{_relay_port}'
+    _require_external_relay(relay_url)
+    route_name = f'echo_relay_{os.getpid()}_{_ipc_counter}'
+    local_registered = False
+    route_registered = False
+    server_id: str | None = None
 
-    cc.set_server(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
-    cc.set_client(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
-    cc.register(Echo, EchoImpl(), name='echo_relay')
-    address = cc.server_address()
-    _wait_sock(address)
-
-    relay = NativeRelay(relay_addr)
-    relay.start()
-    relay.register_upstream('echo_relay', address)
-    time.sleep(0.3)
-
-    payload = b'\xAB' * payload_size
     try:
-        crm = cc.connect(Echo, name='echo_relay', address=f'http://{relay_addr}')
-        result_ms = _measure(crm, payload, _rounds(payload_size))
-        cc.close(crm)
-        return result_ms
-    except Exception as exc:
-        print(f'  [relay FAILED: {exc}]', file=sys.stderr)
-        return None
-    finally:
+        ipc_overrides = {
+            'pool_segment_size': _SEGMENT_SIZE,
+            'max_pool_segments': _MAX_SEGMENTS,
+        }
+        cc.set_server(ipc_overrides=ipc_overrides)
+        cc.set_client(ipc_overrides=ipc_overrides)
+        cc.register(Echo, EchoImpl(), name=route_name)
+        local_registered = True
+        address = cc.server_address()
+        server_id = cc.server_id()
+        if server_id is None:
+            raise RuntimeError('registered server did not expose server_id')
+        _wait_sock(address)
+
+        _register_relay_upstream(relay_url, route_name, address, server_id)
+        route_registered = True
+
+        payload = b'\xAB' * payload_size
         try:
-            relay.stop()
-        except Exception:
-            pass
-        cc.unregister('echo_relay')
+            crm = cc.connect(Echo, name=route_name, address=relay_url)
+            result_ms = _measure(crm, payload, _rounds(payload_size))
+            cc.close(crm)
+            return result_ms
+        except Exception as exc:
+            print(f'  [relay FAILED: {exc}]', file=sys.stderr)
+            return None
+    finally:
+        if route_registered and server_id is not None:
+            _best_effort_unregister_relay_upstream(relay_url, route_name, server_id)
+        if local_registered:
+            _best_effort_unregister_local(route_name)
         cc.shutdown()
 
 
@@ -239,8 +327,12 @@ def bench_ipc_dict(payload_size: int) -> float | None:
     _ipc_counter += 1
     _ProcessRegistry.reset()
 
-    cc.set_server(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
-    cc.set_client(pool_segment_size=_SEGMENT_SIZE, max_pool_segments=_MAX_SEGMENTS)
+    ipc_overrides = {
+        'pool_segment_size': _SEGMENT_SIZE,
+        'max_pool_segments': _MAX_SEGMENTS,
+    }
+    cc.set_server(ipc_overrides=ipc_overrides)
+    cc.set_client(ipc_overrides=ipc_overrides)
     cc.register(DictEcho, DictEchoImpl(), name='echo_dict')
     address = cc.server_address()
     _wait_sock(address)

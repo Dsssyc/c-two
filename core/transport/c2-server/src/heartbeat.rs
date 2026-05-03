@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::sync::Mutex;
-use tokio::time::{interval, Duration};
+use tokio::time::{Duration, interval};
 use tracing::warn;
 
 use crate::config::ServerIpcConfig;
@@ -156,8 +156,8 @@ mod tests {
 
         let conn = Arc::new(Connection::new(1));
         let config = ServerIpcConfig {
-            heartbeat_interval_secs: 0.1,  // 100ms
-            heartbeat_timeout_secs: 10.0,  // far away
+            heartbeat_interval_secs: 0.1, // 100ms
+            heartbeat_timeout_secs: 10.0, // far away
             ..ServerIpcConfig::default()
         };
 
@@ -167,17 +167,12 @@ mod tests {
         let writer = Arc::new(Mutex::new(write_half));
 
         let conn2 = Arc::clone(&conn);
-        let hb = tokio::spawn(async move {
-            run_heartbeat(conn2, writer, &config).await
-        });
+        let hb = tokio::spawn(async move { run_heartbeat(conn2, writer, &config).await });
 
         // Wait enough time for the heartbeat to fire and send a PING.
         let mut buf = [0u8; 17];
-        let result = tokio::time::timeout(
-            Duration::from_secs(2),
-            read_b.read_exact(&mut buf),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), read_b.read_exact(&mut buf)).await;
 
         assert!(result.is_ok(), "should receive PING frame");
         let read_result = result.unwrap();
@@ -204,13 +199,14 @@ mod tests {
         let (_read_a, write_half) = sock_a.into_split();
         let writer = Arc::new(Mutex::new(write_half));
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(2),
-            run_heartbeat(conn, writer, &config),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), run_heartbeat(conn, writer, &config))
+                .await;
 
-        assert!(result.is_ok(), "heartbeat should return before outer timeout");
+        assert!(
+            result.is_ok(),
+            "heartbeat should return before outer timeout"
+        );
         assert_eq!(result.unwrap(), HeartbeatResult::TimedOut);
     }
 }

@@ -1,238 +1,361 @@
-"""Unit tests for c_two.config.ipc frozen dataclasses."""
+"""Unit tests for the Python IPC override facade."""
 from __future__ import annotations
 
+from typing import get_type_hints
+
 import pytest
-from c_two.config.ipc import (
-    BaseIPCConfig,
-    ServerIPCConfig,
-    ClientIPCConfig,
-    build_server_config,
-    build_client_config,
-)
+
+import c_two as cc
+import c_two.config as config
+import c_two.config.ipc as ipc_config
+from c_two.config.settings import settings
+from c_two.error import ResourceNotFound
+from c_two.transport import Server
+from c_two.transport.registry import _ProcessRegistry
 
 
-class TestBaseIPCConfig:
-    def test_defaults(self):
-        cfg = BaseIPCConfig()
-        assert cfg.pool_segment_size == 268_435_456
-        assert cfg.max_pool_segments == 4
-        assert cfg.chunk_size == 131_072
-
-    def test_frozen(self):
-        cfg = BaseIPCConfig()
-        with pytest.raises(AttributeError):
-            cfg.pool_segment_size = 0  # type: ignore[misc]
-
-    def test_reject_zero_segment_size(self):
-        with pytest.raises(ValueError, match='pool_segment_size'):
-            BaseIPCConfig(pool_segment_size=0)
-
-    def test_reject_oversized_segment(self):
-        with pytest.raises(ValueError):
-            BaseIPCConfig(pool_segment_size=0xFFFFFFFF + 1)
-
-    def test_reject_bad_pool_segments(self):
-        with pytest.raises(ValueError, match='max_pool_segments'):
-            BaseIPCConfig(max_pool_segments=0)
-        with pytest.raises(ValueError, match='max_pool_segments'):
-            BaseIPCConfig(max_pool_segments=256)
-
-    def test_reject_bad_threshold_ratio(self):
-        with pytest.raises(ValueError, match='chunk_threshold_ratio'):
-            BaseIPCConfig(chunk_threshold_ratio=0.0)
-        with pytest.raises(ValueError, match='chunk_threshold_ratio'):
-            BaseIPCConfig(chunk_threshold_ratio=1.5)
-
-    def test_reject_bad_gc_interval(self):
-        with pytest.raises(ValueError, match='chunk_gc_interval'):
-            BaseIPCConfig(chunk_gc_interval=0.0)
-
-    def test_reject_bad_assembler_timeout(self):
-        with pytest.raises(ValueError, match='chunk_assembler_timeout'):
-            BaseIPCConfig(chunk_assembler_timeout=-1.0)
-
-    def test_reject_bad_reassembly_segments(self):
-        with pytest.raises(ValueError, match='reassembly_max_segments'):
-            BaseIPCConfig(reassembly_max_segments=0)
-        with pytest.raises(ValueError, match='reassembly_max_segments'):
-            BaseIPCConfig(reassembly_max_segments=256)
-
-    def test_reject_bad_reassembly_size(self):
-        with pytest.raises(ValueError, match='reassembly_segment_size'):
-            BaseIPCConfig(reassembly_segment_size=0)
+@cc.crm(namespace='unit.config', version='0.1.0')
+class IUnitConfigCRM:
+    def ping(self) -> str:
+        ...
 
 
-class TestServerIPCConfig:
-    def test_defaults(self):
-        cfg = ServerIPCConfig()
-        assert cfg.max_frame_size == 2_147_483_648
-        assert cfg.max_payload_size == 17_179_869_184
-        assert cfg.heartbeat_interval == 15.0
-        assert cfg.heartbeat_timeout == 30.0
+class UnitConfigCRM:
+    def ping(self) -> str:
+        return 'pong'
 
-    def test_inherits_base(self):
-        cfg = ServerIPCConfig()
-        assert cfg.pool_segment_size == 268_435_456
-        assert cfg.reassembly_segment_size == 268_435_456  # NOT 64 MB
 
-    def test_heartbeat_disabled(self):
-        cfg = ServerIPCConfig(heartbeat_interval=0.0)
-        assert cfg.heartbeat_interval == 0.0  # 0 = disabled, no error
+@pytest.fixture(autouse=True)
+def _reset_registry_and_settings(monkeypatch):
+    cc.shutdown()
+    _ProcessRegistry.reset()
+    settings.relay_address = None
+    settings.shm_threshold = None
+    monkeypatch.setenv('C2_ENV_FILE', '')
+    for key in (
+        'C2_SHM_THRESHOLD',
+        'C2_IPC_POOL_SEGMENT_SIZE',
+        'C2_IPC_REASSEMBLY_SEGMENT_SIZE',
+        'C2_RELAY_ADDRESS',
+        'C2_RELAY_USE_PROXY',
+        'C2_RELAY_ROUTE_MAX_ATTEMPTS',
+    ):
+        monkeypatch.delenv(key, raising=False)
+    yield
+    cc.shutdown()
+    _ProcessRegistry.reset()
+    settings.relay_address = None
+    settings.shm_threshold = None
 
-    def test_heartbeat_negative_rejected(self):
-        with pytest.raises(ValueError, match='heartbeat_interval'):
-            ServerIPCConfig(heartbeat_interval=-1.0)
 
-    def test_heartbeat_timeout_must_exceed_interval(self):
-        with pytest.raises(ValueError, match='heartbeat_timeout'):
-            ServerIPCConfig(heartbeat_interval=10.0, heartbeat_timeout=10.0)
+def test_public_config_exports_only_override_schemas():
+    removed = {
+        'BaseIPCConfig',
+        'ServerIPCConfig',
+        'ClientIPCConfig',
+        'build_server_config',
+        'build_client_config',
+    }
+    for name in removed:
+        assert not hasattr(config, name)
 
-    def test_max_pool_memory_check(self):
-        with pytest.raises(ValueError, match='max_pool_memory'):
-            ServerIPCConfig(max_pool_memory=1, pool_segment_size=1024)
+    assert hasattr(config, 'BaseIPCOverrides')
+    assert hasattr(config, 'ServerIPCOverrides')
+    assert hasattr(config, 'ClientIPCOverrides')
 
-    def test_max_frame_size_check(self):
-        with pytest.raises(ValueError, match='max_frame_size'):
-            ServerIPCConfig(max_frame_size=16)
 
-    def test_max_payload_size_check(self):
-        with pytest.raises(ValueError, match='max_payload_size'):
-            ServerIPCConfig(max_payload_size=0)
+def test_ipc_module_exports_only_override_schemas():
+    assert set(ipc_config.__all__) == {
+        'BaseIPCOverrides',
+        'ServerIPCOverrides',
+        'ClientIPCOverrides',
+    }
 
-    def test_custom_values(self):
-        cfg = ServerIPCConfig(
-            pool_segment_size=1 << 20,
-            max_pool_segments=2,
-            max_pool_memory=2 << 20,
-            max_frame_size=1 << 20,
-            max_payload_size=1 << 30,
-            heartbeat_interval=5.0,
-            heartbeat_timeout=10.0,
+
+def test_override_schemas_are_typed_and_do_not_include_derived_or_global_fields():
+    base = get_type_hints(config.BaseIPCOverrides)
+    server = get_type_hints(config.ServerIPCOverrides)
+    client = get_type_hints(config.ClientIPCOverrides)
+
+    assert base['pool_enabled'] is bool
+    assert base['pool_segment_size'] is int
+    assert base['chunk_gc_interval'] is float
+    assert server['heartbeat_interval'] is float
+    assert server['max_pending_requests'] is int
+    assert client['reassembly_segment_size'] is int
+
+    for hints in (base, server, client):
+        assert 'shm_threshold' not in hints
+        assert 'max_pool_memory' not in hints
+
+
+def test_low_level_server_uses_env_for_ipc_defaults(monkeypatch):
+    monkeypatch.setenv('C2_IPC_POOL_SEGMENT_SIZE', str(2 * 1024 * 1024))
+
+    server = Server(bind_address='ipc://unit_env_server')
+    try:
+        assert server._config['pool_segment_size'] == 2 * 1024 * 1024  # noqa: SLF001
+    finally:
+        server.shutdown()
+
+
+def test_low_level_server_uses_env_for_global_transport_policy(monkeypatch):
+    monkeypatch.setenv('C2_SHM_THRESHOLD', '8192')
+
+    server = Server(bind_address='ipc://unit_env_threshold')
+    try:
+        assert server._shm_threshold == 8192  # noqa: SLF001
+        assert server._config['shm_threshold'] == 8192  # noqa: SLF001
+    finally:
+        server.shutdown()
+
+
+def test_transport_policy_override_beats_env(monkeypatch):
+    monkeypatch.setenv('C2_SHM_THRESHOLD', '8192')
+
+    cc.set_transport_policy(shm_threshold=16384)
+
+    server = Server(bind_address='ipc://unit_policy_override')
+    try:
+        assert server._shm_threshold == 16384  # noqa: SLF001
+        assert server._config['shm_threshold'] == 16384  # noqa: SLF001
+    finally:
+        server.shutdown()
+
+
+def test_shm_override_helper_only_contains_shm_threshold():
+    settings.shm_threshold = 4096
+    assert settings._shm_overrides() == {'shm_threshold': 4096}  # noqa: SLF001
+
+
+def test_server_ipc_overrides_beat_env(monkeypatch):
+    monkeypatch.setenv('C2_IPC_POOL_SEGMENT_SIZE', str(2 * 1024 * 1024))
+
+    server = Server(
+        bind_address='ipc://unit_server_override',
+        ipc_overrides={'pool_segment_size': 4 * 1024 * 1024},
+    )
+    try:
+        assert server._config['pool_segment_size'] == 4 * 1024 * 1024  # noqa: SLF001
+    finally:
+        server.shutdown()
+
+
+def test_client_ipc_overrides_beat_env(monkeypatch):
+    monkeypatch.setenv('C2_IPC_REASSEMBLY_SEGMENT_SIZE', str(32 * 1024 * 1024))
+
+    cc.set_client(ipc_overrides={'reassembly_segment_size': 16 * 1024 * 1024})
+    registry = _ProcessRegistry.get()
+    registry._ensure_pool_config()  # noqa: SLF001
+
+    assert registry._client_config['reassembly_segment_size'] == 16 * 1024 * 1024  # noqa: SLF001
+
+
+@pytest.mark.parametrize('key', ['shm_threshold'])
+def test_forbidden_server_ipc_override_fields_are_rejected(key):
+    with pytest.raises((TypeError, ValueError), match=key):
+        Server(bind_address='ipc://unit_bad_server_override', ipc_overrides={key: 1})
+
+
+@pytest.mark.parametrize('key', ['shm_threshold'])
+def test_forbidden_client_ipc_override_fields_are_rejected(key):
+    with pytest.raises((TypeError, ValueError), match=key):
+        cc.set_client(ipc_overrides={key: 1})
+        _ProcessRegistry.get()._ensure_pool_config()  # noqa: SLF001
+
+
+def test_removed_max_pool_memory_override_is_unknown():
+    with pytest.raises(TypeError, match='unknown IPC override'):
+        Server(
+            bind_address='ipc://unit_removed_max_pool_memory',
+            ipc_overrides={'max_pool_memory': 1024},
         )
-        assert cfg.pool_segment_size == 1 << 20
-        assert cfg.max_pool_segments == 2
-        assert cfg.heartbeat_interval == 5.0
+
+    with pytest.raises(TypeError, match='unknown IPC override'):
+        cc.set_client(ipc_overrides={'max_pool_memory': 1024})
+        _ProcessRegistry.get()._ensure_pool_config()  # noqa: SLF001
 
 
-class TestClientIPCConfig:
-    def test_reassembly_override(self):
-        cfg = ClientIPCConfig()
-        assert cfg.reassembly_segment_size == 67_108_864  # 64 MB
+def test_native_resolver_treats_max_pool_memory_as_unknown_override():
+    native = ipc_config._native_resolver()  # noqa: SLF001
 
-    def test_base_defaults_preserved(self):
-        cfg = ClientIPCConfig()
-        assert cfg.pool_segment_size == 268_435_456  # 256 MB from Base
+    with pytest.raises(ValueError, match='unknown IPC override option: max_pool_memory'):
+        native.resolve_server_ipc_config({'max_pool_memory': 1024}, None)
 
-    def test_custom_reassembly(self):
-        cfg = ClientIPCConfig(reassembly_segment_size=1 << 28)
-        assert cfg.reassembly_segment_size == 1 << 28
+    with pytest.raises(ValueError, match='unknown IPC override option: max_pool_memory'):
+        native.resolve_client_ipc_config({'max_pool_memory': 1024}, None)
 
 
-class TestBuildServerConfig:
-    def test_defaults(self):
-        cfg = build_server_config()
-        assert cfg.pool_segment_size == 268_435_456
-        assert cfg.heartbeat_interval == 15.0
+def test_unknown_ipc_override_field_is_rejected():
+    with pytest.raises(TypeError, match='unknown IPC override'):
+        Server(bind_address='ipc://unit_unknown_override', ipc_overrides={'not_real': 1})
 
-    def test_kwargs_override(self):
-        cfg = build_server_config(pool_segment_size=1 << 30)
-        assert cfg.pool_segment_size == 1 << 30
+    with pytest.raises(TypeError, match='unknown IPC override'):
+        cc.set_server(ipc_overrides={'not_real': 1})
 
-    def test_env_override(self, monkeypatch):
-        monkeypatch.setenv('C2_ENV_FILE', '')
-        monkeypatch.setenv('C2_IPC_POOL_SEGMENT_SIZE', '536870912')
-        from c_two.config.settings import C2Settings
-        s = C2Settings()
-        cfg = build_server_config(settings=s)
-        assert cfg.pool_segment_size == 536_870_912
-
-    def test_kwargs_beat_env(self, monkeypatch):
-        monkeypatch.setenv('C2_ENV_FILE', '')
-        monkeypatch.setenv('C2_IPC_POOL_SEGMENT_SIZE', '536870912')
-        from c_two.config.settings import C2Settings
-        s = C2Settings()
-        cfg = build_server_config(settings=s, pool_segment_size=1 << 20)
-        assert cfg.pool_segment_size == 1 << 20
-
-    def test_clamping(self):
-        cfg = build_server_config(
-            pool_segment_size=100 * (1 << 30),  # 100 GB
-            max_payload_size=1 * (1 << 30),      # 1 GB
-        )
-        assert cfg.pool_segment_size == 1 * (1 << 30)  # clamped
-
-    def test_auto_max_pool_memory(self):
-        cfg = build_server_config(pool_segment_size=1 << 20, max_pool_segments=2)
-        assert cfg.max_pool_memory == 2 * (1 << 20)
+    with pytest.raises(TypeError, match='unknown IPC override'):
+        cc.set_client(ipc_overrides={'not_real': 1})
 
 
-class TestBuildClientConfig:
-    def test_defaults(self):
-        cfg = build_client_config()
-        assert cfg.reassembly_segment_size == 67_108_864  # 64 MB
+def test_high_level_ipc_overrides_are_copied_when_set():
+    overrides = {'pool_segment_size': 2 * 1024 * 1024}
+    cc.set_server(ipc_overrides=overrides)
+    overrides['pool_segment_size'] = 4 * 1024 * 1024
 
-    def test_kwargs_override(self):
-        cfg = build_client_config(reassembly_segment_size=1 << 28)
-        assert cfg.reassembly_segment_size == 1 << 28
-
-    def test_env_override(self, monkeypatch):
-        monkeypatch.setenv('C2_ENV_FILE', '')
-        monkeypatch.setenv('C2_IPC_REASSEMBLY_SEGMENT_SIZE', '33554432')
-        from c_two.config.settings import C2Settings
-        s = C2Settings()
-        cfg = build_client_config(settings=s)
-        assert cfg.reassembly_segment_size == 33_554_432
+    registry = _ProcessRegistry.get()
+    assert registry._server_ipc_overrides == {'pool_segment_size': 2 * 1024 * 1024}  # noqa: SLF001
 
 
-class TestRuntimeProtection:
-    """Test that set_server/set_client warn when called too late."""
+def test_server_id_override_drives_auto_address():
+    cc.set_server(server_id='unit-server')
+    cc.register(IUnitConfigCRM, UnitConfigCRM(), name='unit-route')
+    try:
+        assert cc.server_id() == 'unit-server'
+        assert cc.server_address() == 'ipc://unit-server'
+    finally:
+        cc.unregister('unit-route')
 
-    def test_set_server_after_register_warns(self):
-        import warnings
-        import c_two as cc
-        from tests.fixtures.ihello import Hello
-        from tests.fixtures.hello import HelloImpl
 
-        registered = False
-        try:
-            cc.register(Hello, HelloImpl(), name='rp_hello')
-            registered = True
+def test_server_id_rejects_empty_or_path_like_values():
+    with pytest.raises(ValueError, match='server_id cannot be empty'):
+        cc.set_server(server_id='')
 
-            with warnings.catch_warnings(record=True) as w:
-                warnings.simplefilter('always')
-                cc.set_server(pool_segment_size=1 << 30)
-                assert len(w) == 1
-                assert 'set_server()' in str(w[0].message)
-                assert issubclass(w[0].category, UserWarning)
-        finally:
-            if registered:
-                cc.unregister('rp_hello')
-            cc.shutdown()
+    with pytest.raises(ValueError, match='leading or trailing whitespace'):
+        cc.set_server(server_id=' ')
 
-    def test_set_client_after_connect_warns(self):
-        import warnings
-        import c_two as cc
-        from tests.fixtures.ihello import Hello
-        from tests.fixtures.hello import HelloImpl
+    with pytest.raises(ValueError, match='leading or trailing whitespace'):
+        cc.set_server(server_id=' unit ')
 
-        registered = False
-        proxy = None
-        try:
-            cc.register(Hello, HelloImpl(), name='rp_hello2')
-            registered = True
-            server_addr = cc.server_address()
-            proxy = cc.connect(Hello, name='rp_hello2',
-                               address=server_addr)
+    with pytest.raises(ValueError, match='path separators'):
+        cc.set_server(server_id='bad/name')
 
-            with warnings.catch_warnings(record=True) as w:
-                warnings.simplefilter('always')
-                cc.set_client(pool_segment_size=1 << 30)
-                assert len(w) == 1
-                assert 'set_client()' in str(w[0].message)
-                assert issubclass(w[0].category, UserWarning)
-        finally:
-            if proxy is not None:
-                cc.close(proxy)
-            if registered:
-                cc.unregister('rp_hello2')
-            cc.shutdown()
+    with pytest.raises(ValueError, match='path separators'):
+        cc.set_server(server_id='.')
+
+    with pytest.raises(ValueError, match='path separators'):
+        cc.set_server(server_id='..')
+
+    with pytest.raises(ValueError, match='control characters'):
+        cc.set_server(server_id='bad\nid')
+
+
+def test_relay_resolved_connect_delegates_route_validation_to_rust(monkeypatch):
+    registry = _ProcessRegistry.get()
+    settings.relay_address = 'http://registry-relay.test'
+    calls = []
+
+    class FakeRelayAwareClient:
+        def __init__(self, relay_url: str, route_name: str):
+            calls.append((relay_url, route_name))
+
+        def close(self):
+            pass
+
+    import c_two._native as native
+
+    monkeypatch.setattr(native, 'RustRelayAwareHttpClient', FakeRelayAwareClient)
+
+    crm = registry.connect(IUnitConfigCRM, name='unit-route')
+
+    assert registry._pool_config_applied is False  # noqa: SLF001
+    assert calls == [('http://registry-relay.test', 'unit-route')]
+    assert crm.client._client.__class__ is FakeRelayAwareClient  # noqa: SLF001
+
+
+def test_relay_resolved_connect_uses_rust_relay_aware_client(monkeypatch):
+    registry = _ProcessRegistry.get()
+    settings.relay_address = 'http://registry-relay.test'
+    calls = []
+
+    class FakeRelayAwareClient:
+        def __init__(self, relay_url: str, route_name: str):
+            calls.append((relay_url, route_name))
+
+        def close(self):
+            pass
+
+    import c_two._native as native
+
+    monkeypatch.setattr(native, 'RustRelayAwareHttpClient', FakeRelayAwareClient)
+
+    crm = registry.connect(IUnitConfigCRM, name='unit-route')
+
+    assert calls == [('http://registry-relay.test', 'unit-route')]
+    assert crm.client._client.__class__ is FakeRelayAwareClient  # noqa: SLF001
+
+
+def test_relay_resolved_connect_maps_preflight_404_to_resource_not_found(monkeypatch):
+    registry = _ProcessRegistry.get()
+    settings.relay_address = 'http://registry-relay.test'
+
+    class FakeRelayAwareClient:
+        def __init__(self, relay_url: str, route_name: str):  # noqa: ARG002
+            err = RuntimeError('HTTP 404')
+            err.status_code = 404
+            raise err
+
+    import c_two._native as native
+
+    monkeypatch.setattr(native, 'RustRelayAwareHttpClient', FakeRelayAwareClient)
+
+    with pytest.raises(ResourceNotFound, match="Resource 'unit-route' not found"):
+        registry.connect(IUnitConfigCRM, name='unit-route')
+
+
+def test_removed_low_level_server_parameters_are_rejected():
+    with pytest.raises(TypeError, match='ipc_config'):
+        Server(bind_address='ipc://unit_removed_ipc_config', ipc_config=object())
+
+    with pytest.raises(TypeError, match='shm_threshold'):
+        Server(bind_address='ipc://unit_removed_shm_threshold', shm_threshold=8192)
+
+
+def test_removed_high_level_flat_config_api_is_rejected():
+    assert not hasattr(cc, 'set_config')
+
+    with pytest.raises(TypeError, match='pool_segment_size'):
+        cc.set_server(pool_segment_size=1024)
+
+    with pytest.raises(TypeError, match='pool_segment_size'):
+        cc.set_client(pool_segment_size=1024)
+
+
+def test_proxy_policy_reads_env_file(tmp_path, monkeypatch):
+    env_file = tmp_path / '.env'
+    env_file.write_text('C2_RELAY_USE_PROXY=1\n', encoding='utf-8')
+    monkeypatch.setenv('C2_ENV_FILE', str(env_file))
+    monkeypatch.delenv('C2_RELAY_USE_PROXY', raising=False)
+
+    from c_two._native import resolve_relay_use_proxy
+
+    assert resolve_relay_use_proxy() is True
+
+
+def test_proxy_policy_does_not_resolve_ipc_env(monkeypatch):
+    monkeypatch.setenv('C2_RELAY_USE_PROXY', '1')
+    monkeypatch.setenv('C2_IPC_POOL_SEGMENT_SIZE', 'not-a-number')
+
+    from c_two._native import resolve_relay_use_proxy
+
+    assert resolve_relay_use_proxy() is True
+
+
+def test_relay_settings_do_not_resolve_ipc_env(monkeypatch):
+    monkeypatch.setenv('C2_RELAY_ADDRESS', 'http://127.0.0.1:8080')
+    monkeypatch.setenv('C2_IPC_POOL_SEGMENT_SIZE', 'not-a-number')
+
+    assert settings.relay_address == 'http://127.0.0.1:8080'
+
+
+def test_relay_address_resolution_ignores_relay_proxy_policy(monkeypatch):
+    monkeypatch.setenv('C2_RELAY_ADDRESS', 'http://127.0.0.1:8080')
+    monkeypatch.setenv('C2_RELAY_USE_PROXY', 'not-a-bool')
+
+    assert settings.relay_address == 'http://127.0.0.1:8080'
+
+
+def test_shm_threshold_resolution_does_not_parse_ipc_env(monkeypatch):
+    monkeypatch.setenv('C2_SHM_THRESHOLD', '8192')
+    monkeypatch.setenv('C2_IPC_POOL_SEGMENT_SIZE', 'not-a-number')
+
+    assert settings.shm_threshold == 8192

@@ -1,4 +1,4 @@
-//! Embeddable relay server — can be driven from Python via PyO3.
+//! Relay server runtime used by the `c3 relay` CLI and Rust callers.
 //!
 //! Runs axum + tokio in a background thread. Provides synchronous
 //! control methods (start, stop, register_upstream, etc.) that send
@@ -6,8 +6,8 @@
 //!
 //! Includes a configurable idle sweeper that periodically evicts
 //! upstream connections that have not been used recently. Evicted
-//! upstreams are lazily reconnected on the next HTTP request (see
-//! `router::try_reconnect`).
+//! upstreams are lazily reconnected through the route's upstream slot
+//! on the next HTTP request.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -16,14 +16,17 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use c2_ipc::IpcClient;
-use c2_config::RelayConfig;
+use crate::relay::authority::{ControlError, RegisterPreparation, RouteAuthority};
 use crate::relay::background::spawn_background_tasks;
+use crate::relay::gossip::{broadcast_route_announce, broadcast_route_withdraw};
 use crate::relay::peer::{PeerEnvelope, PeerMessage};
 use crate::relay::router;
-use crate::relay::state::RelayState;
+use crate::relay::state::{RegisterCommitResult, RelayState, UnregisterResult};
+use crate::relay::url::peer_endpoint_url;
+use c2_config::RelayConfig;
+use c2_ipc::IpcClient;
 
-/// Errors from the embeddable relay control API.
+/// Errors from the relay control API.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelayControlError {
     DuplicateRoute { name: String },
@@ -71,11 +74,13 @@ impl From<&str> for RelayControlError {
 enum Command {
     RegisterUpstream {
         name: String,
+        server_id: String,
         address: String,
         reply: oneshot::Sender<Result<(), RelayControlError>>,
     },
     UnregisterUpstream {
         name: String,
+        server_id: String,
         reply: oneshot::Sender<Result<(), String>>,
     },
     ListRoutes {
@@ -86,7 +91,7 @@ enum Command {
     },
 }
 
-/// Embeddable relay server with a synchronous control API.
+/// Relay server with a synchronous control API.
 #[allow(dead_code)]
 pub struct RelayServer {
     cmd_tx: Option<mpsc::Sender<Command>>,
@@ -98,12 +103,19 @@ pub struct RelayServer {
 impl RelayServer {
     /// Start the relay server on a background thread.
     pub fn start(config: RelayConfig) -> Result<Self, String> {
-        let addr: SocketAddr = config.bind.parse()
+        config
+            .validate()
+            .map_err(|e| format!("Invalid relay config: {e}"))?;
+
+        let addr: SocketAddr = config
+            .bind
+            .parse()
             .map_err(|e| format!("Invalid bind address '{}': {e}", config.bind))?;
 
         let config = Arc::new(config);
-        let disseminator: Arc<dyn crate::relay::disseminator::Disseminator> =
-            Arc::new(crate::relay::disseminator::FullBroadcast::new());
+        let disseminator: Arc<dyn crate::relay::disseminator::Disseminator> = Arc::new(
+            crate::relay::disseminator::FullBroadcast::with_proxy_policy(config.use_proxy),
+        );
         let state = Arc::new(RelayState::new(config.clone(), disseminator));
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>(64);
@@ -123,7 +135,15 @@ impl RelayServer {
                     .expect("Failed to create tokio runtime");
 
                 rt.block_on(async move {
-                    Self::run(addr, server_state, cmd_rx, ready_tx, idle_timeout_secs, cancel_clone).await;
+                    Self::run(
+                        addr,
+                        server_state,
+                        cmd_rx,
+                        ready_tx,
+                        idle_timeout_secs,
+                        cancel_clone,
+                    )
+                    .await;
                 });
             })
             .map_err(|e| format!("Failed to spawn relay thread: {e}"))?;
@@ -142,11 +162,17 @@ impl RelayServer {
         })
     }
 
-    /// Register a new upstream IPC connection.
-    pub fn register_upstream(&self, name: &str, address: &str) -> Result<(), RelayControlError> {
+    /// Register a new upstream IPC connection with an explicit server identity.
+    pub fn register_upstream(
+        &self,
+        name: &str,
+        server_id: &str,
+        address: &str,
+    ) -> Result<(), RelayControlError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.send_cmd(Command::RegisterUpstream {
             name: name.to_string(),
+            server_id: server_id.to_string(),
             address: address.to_string(),
             reply: reply_tx,
         })
@@ -157,10 +183,11 @@ impl RelayServer {
     }
 
     /// Unregister an upstream by name.
-    pub fn unregister_upstream(&self, name: &str) -> Result<(), String> {
+    pub fn unregister_upstream(&self, name: &str, server_id: &str) -> Result<(), String> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.send_cmd(Command::UnregisterUpstream {
             name: name.to_string(),
+            server_id: server_id.to_string(),
             reply: reply_tx,
         })?;
         reply_rx
@@ -231,12 +258,12 @@ impl RelayServer {
         if !state.config().seeds.is_empty() {
             let s = state.clone();
             tokio::spawn(async move {
-                let client = crate::relay_client_builder()
+                let client = crate::relay_client_builder_with_proxy(s.config().use_proxy)
                     .timeout(std::time::Duration::from_secs(5))
-            .build()
+                    .build()
                     .expect("c-two: failed to build reqwest Client for relay traffic");
                 for seed_url in &s.config().seeds {
-                    let join_url = format!("{seed_url}/_peer/join");
+                    let join_url = peer_endpoint_url(seed_url, "/_peer/join");
                     let envelope = PeerEnvelope::new(
                         s.relay_id(),
                         PeerMessage::RelayJoin {
@@ -275,7 +302,9 @@ impl RelayServer {
         // Shutdown: broadcast leave, cancel background tasks
         let leave = PeerEnvelope::new(
             state.relay_id(),
-            PeerMessage::RelayLeave { relay_id: state.relay_id().to_string() },
+            PeerMessage::RelayLeave {
+                relay_id: state.relay_id().to_string(),
+            },
         );
         let peers = state.list_peers();
         let leave_handle = state.disseminator().broadcast(leave, &peers);
@@ -313,13 +342,7 @@ impl RelayServer {
             for (name, old_client) in evicted {
                 if let Some(arc_client) = old_client {
                     let dead = !arc_client.is_connected();
-                    tokio::spawn(async move {
-                        let mut client = match Arc::try_unwrap(arc_client) {
-                            Ok(c) => c,
-                            Err(_arc) => return,
-                        };
-                        client.close().await;
-                    });
+                    tokio::spawn(async move { arc_client.close_shared().await });
                     if dead {
                         eprintln!("[relay] Evicted dead upstream: {name}");
                     } else {
@@ -330,48 +353,115 @@ impl RelayServer {
         }
     }
 
-    async fn command_loop(
-        state: Arc<RelayState>,
-        cmd_rx: &mut mpsc::Receiver<Command>,
-    ) {
+    async fn command_loop(state: Arc<RelayState>, cmd_rx: &mut mpsc::Receiver<Command>) {
         while let Some(cmd) = cmd_rx.recv().await {
             match cmd {
-                Command::RegisterUpstream { name, address, reply } => {
-                    if state.has_local_route(&name) {
-                        let _ = reply.send(Err(RelayControlError::DuplicateRoute { name }));
-                        continue;
-                    }
-                    let mut client = IpcClient::new(&address);
-                    let result = match client.connect().await {
-                        Ok(()) => {
-                            state.register_upstream(name, address, String::new(), String::new(), Arc::new(client));
-                            Ok(())
+                Command::RegisterUpstream {
+                    name,
+                    server_id,
+                    address,
+                    reply,
+                } => {
+                    let replacement = match RouteAuthority::new(&state)
+                        .prepare_register(&name, &server_id, &address)
+                        .await
+                    {
+                        Ok(RegisterPreparation::Available { replacement }) => {
+                            replacement.map(|r| crate::relay::state::OwnerReplacementToken {
+                                existing_address: r.existing_address,
+                                token: r.token,
+                            })
                         }
-                        Err(e) => Err(RelayControlError::Other(format!("Failed to connect: {e}"))),
+                        Ok(RegisterPreparation::SameOwner) => {
+                            let _ = reply.send(Ok(()));
+                            continue;
+                        }
+                        Ok(RegisterPreparation::DuplicateAlive { .. })
+                        | Err(ControlError::AddressMismatch { .. })
+                        | Err(ControlError::DuplicateRoute { .. }) => {
+                            let _ = reply.send(Err(RelayControlError::DuplicateRoute { name }));
+                            continue;
+                        }
+                        Err(ControlError::InvalidName { reason })
+                        | Err(ControlError::InvalidServerId { reason }) => {
+                            let _ = reply.send(Err(RelayControlError::Other(reason.to_string())));
+                            continue;
+                        }
+                        Err(ControlError::OwnerMismatch) | Err(ControlError::NotFound) => {
+                            let _ = reply.send(Err(RelayControlError::DuplicateRoute { name }));
+                            continue;
+                        }
+                    };
+                    let result = {
+                        let mut client = IpcClient::new(&address);
+                        let connect_result = if state.config().skip_ipc_validation {
+                            Ok(())
+                        } else {
+                            client.connect().await
+                        };
+                        match connect_result {
+                            Ok(()) => {
+                                let client = Arc::new(client);
+                                match state.commit_register_upstream(
+                                    name.clone(),
+                                    server_id,
+                                    address,
+                                    String::new(),
+                                    String::new(),
+                                    client.clone(),
+                                    replacement,
+                                ) {
+                                    RegisterCommitResult::Registered { entry } => {
+                                        broadcast_route_announce(&state, &entry);
+                                        Ok(())
+                                    }
+                                    RegisterCommitResult::SameOwner { .. } => {
+                                        tokio::spawn(async move { client.close_shared().await });
+                                        Ok(())
+                                    }
+                                    RegisterCommitResult::Duplicate { .. }
+                                    | RegisterCommitResult::ConflictingOwner { .. } => {
+                                        tokio::spawn(async move { client.close_shared().await });
+                                        Err(RelayControlError::DuplicateRoute { name })
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                Err(RelayControlError::Other(format!("Failed to connect: {e}")))
+                            }
+                        }
                     };
                     let _ = reply.send(result);
                 }
-                Command::UnregisterUpstream { name, reply } => {
-                    match state.unregister_upstream(&name) {
-                        Some((_entry, old_client)) => {
-                            if let Some(arc_client) = old_client {
-                                tokio::spawn(async move {
-                                    let mut client = match Arc::try_unwrap(arc_client) {
-                                        Ok(c) => c,
-                                        Err(_) => return,
-                                    };
-                                    client.close().await;
-                                });
-                            }
-                            let _ = reply.send(Ok(()));
+                Command::UnregisterUpstream {
+                    name,
+                    server_id,
+                    reply,
+                } => match state.unregister_upstream(&name, &server_id) {
+                    UnregisterResult::Removed {
+                        entry,
+                        removed_at,
+                        client,
+                    } => {
+                        if let Some(arc_client) = client {
+                            tokio::spawn(async move { arc_client.close_shared().await });
                         }
-                        None => {
-                            let _ = reply.send(Err(format!("Route name not registered: '{name}'")));
-                        }
+                        broadcast_route_withdraw(&state, &entry, removed_at);
+                        let _ = reply.send(Ok(()));
                     }
-                }
+                    UnregisterResult::AlreadyRemoved => {
+                        let _ = reply.send(Ok(()));
+                    }
+                    UnregisterResult::OwnerMismatch => {
+                        let _ = reply.send(Err(format!("Server id does not own route: '{name}'")));
+                    }
+                    UnregisterResult::NotFound => {
+                        let _ = reply.send(Err(format!("Route name not registered: '{name}'")));
+                    }
+                },
                 Command::ListRoutes { reply } => {
-                    let routes: Vec<(String, String)> = state.list_routes()
+                    let routes: Vec<(String, String)> = state
+                        .list_routes()
                         .into_iter()
                         .map(|r| (r.name, r.ipc_address.unwrap_or_default()))
                         .collect();
@@ -394,7 +484,62 @@ impl Drop for RelayServer {
 
 #[cfg(test)]
 mod tests {
-    use super::RelayControlError;
+    use std::sync::{Arc, Mutex};
+
+    use super::{Command, RelayControlError, RelayServer};
+    use c2_config::RelayConfig;
+    use tokio::sync::{mpsc, oneshot};
+
+    use crate::relay::disseminator::Disseminator;
+    use crate::relay::peer::{PeerEnvelope, PeerMessage};
+    use crate::relay::state::RelayState;
+    use crate::relay::types::PeerSnapshot;
+
+    #[derive(Default)]
+    struct RecordingDisseminator {
+        envelopes: Mutex<Vec<PeerEnvelope>>,
+    }
+
+    impl RecordingDisseminator {
+        fn envelopes(&self) -> Vec<PeerEnvelope> {
+            self.envelopes.lock().unwrap().clone()
+        }
+    }
+
+    impl Disseminator for RecordingDisseminator {
+        fn broadcast(
+            &self,
+            envelope: PeerEnvelope,
+            _peers: &[PeerSnapshot],
+        ) -> Option<tokio::task::JoinHandle<()>> {
+            self.envelopes.lock().unwrap().push(envelope);
+            None
+        }
+    }
+
+    fn command_loop_state() -> (
+        Arc<RelayState>,
+        Arc<RecordingDisseminator>,
+        mpsc::Sender<Command>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let disseminator = Arc::new(RecordingDisseminator::default());
+        let state = Arc::new(RelayState::new(
+            Arc::new(RelayConfig {
+                relay_id: "relay-a".into(),
+                advertise_url: "http://relay-a:8080".into(),
+                skip_ipc_validation: true,
+                ..RelayConfig::default()
+            }),
+            disseminator.clone(),
+        ));
+        let (tx, mut rx) = mpsc::channel(8);
+        let task_state = state.clone();
+        let task = tokio::spawn(async move {
+            RelayServer::command_loop(task_state, &mut rx).await;
+        });
+        (state, disseminator, tx, task)
+    }
 
     #[test]
     fn duplicate_route_error_has_stable_variant_and_message() {
@@ -420,5 +565,116 @@ mod tests {
 
         assert_eq!(c2.code, c2_error::ErrorCode::ResourceAlreadyRegistered);
         assert_eq!(c2.message, "Route name already registered: 'grid'");
+    }
+
+    #[test]
+    fn relay_start_rejects_idle_timeout_millisecond_overflow() {
+        let config = RelayConfig {
+            bind: "127.0.0.1:0".to_string(),
+            idle_timeout_secs: u64::MAX,
+            ..RelayConfig::default()
+        };
+
+        let err = match RelayServer::start(config) {
+            Ok(mut server) => {
+                let _ = server.stop();
+                panic!("invalid relay config should fail");
+            }
+            Err(err) => err,
+        };
+
+        assert!(err.contains("Invalid relay config"));
+        assert!(err.contains("idle_timeout_secs"));
+        assert!(err.contains("milliseconds"));
+    }
+
+    #[test]
+    fn relay_control_unregister_rejects_wrong_server_id() {
+        let config = RelayConfig {
+            bind: "127.0.0.1:0".to_string(),
+            skip_ipc_validation: true,
+            ..RelayConfig::default()
+        };
+        let relay = RelayServer::start(config).expect("relay starts");
+
+        relay
+            .register_upstream("grid", "server-grid", "ipc://missing-grid")
+            .expect("test relay skips IPC validation");
+
+        assert!(relay.unregister_upstream("grid", "server-other").is_err());
+        assert!(relay.unregister_upstream("grid", "server-grid").is_ok());
+    }
+
+    #[tokio::test]
+    async fn command_register_broadcasts_route_announce() {
+        let (_state, disseminator, tx, task) = command_loop_state();
+        let (reply, result) = oneshot::channel();
+
+        tx.send(Command::RegisterUpstream {
+            name: "grid".into(),
+            server_id: "server-grid".into(),
+            address: "ipc://grid".into(),
+            reply,
+        })
+        .await
+        .unwrap();
+
+        result.await.unwrap().unwrap();
+        drop(tx);
+        task.await.unwrap();
+
+        let envelopes = disseminator.envelopes();
+        assert_eq!(envelopes.len(), 1);
+        match &envelopes[0].message {
+            PeerMessage::RouteAnnounce {
+                name,
+                relay_id,
+                relay_url,
+                ..
+            } => {
+                assert_eq!(name, "grid");
+                assert_eq!(relay_id, "relay-a");
+                assert_eq!(relay_url, "http://relay-a:8080");
+            }
+            other => panic!("expected RouteAnnounce, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn command_unregister_broadcasts_route_withdraw() {
+        let (_state, disseminator, tx, task) = command_loop_state();
+        let (register_reply, register_result) = oneshot::channel();
+        tx.send(Command::RegisterUpstream {
+            name: "grid".into(),
+            server_id: "server-grid".into(),
+            address: "ipc://grid".into(),
+            reply: register_reply,
+        })
+        .await
+        .unwrap();
+        register_result.await.unwrap().unwrap();
+
+        let (unregister_reply, unregister_result) = oneshot::channel();
+        tx.send(Command::UnregisterUpstream {
+            name: "grid".into(),
+            server_id: "server-grid".into(),
+            reply: unregister_reply,
+        })
+        .await
+        .unwrap();
+
+        unregister_result.await.unwrap().unwrap();
+        drop(tx);
+        task.await.unwrap();
+
+        let envelopes = disseminator.envelopes();
+        assert_eq!(envelopes.len(), 2);
+        match &envelopes[1].message {
+            PeerMessage::RouteWithdraw { name, relay_id, .. } => {
+                assert_eq!(name, "grid");
+                assert_eq!(relay_id, "relay-a");
+            }
+            other => panic!("expected RouteWithdraw, got {other:?}"),
+        }
     }
 }

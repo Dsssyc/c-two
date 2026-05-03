@@ -28,6 +28,8 @@ pub struct RelayConfig {
     pub seed_retry_interval: Duration,
     /// Skip IPC validation in `/_register`. For testing only.
     pub skip_ipc_validation: bool,
+    /// Whether relay HTTP clients should honor system HTTP proxy variables.
+    pub use_proxy: bool,
 }
 
 impl Default for RelayConfig {
@@ -37,22 +39,28 @@ impl Default for RelayConfig {
             relay_id: Self::generate_relay_id(),
             advertise_url: String::new(),
             seeds: Vec::new(),
-            idle_timeout_secs: 0,
+            idle_timeout_secs: 60,
             anti_entropy_interval: Duration::from_secs(60),
             heartbeat_interval: Duration::from_secs(5),
             heartbeat_miss_threshold: 3,
             dead_peer_probe_interval: Duration::from_secs(30),
             seed_retry_interval: Duration::from_secs(10),
             skip_ipc_validation: false,
+            use_proxy: false,
         }
     }
 }
 
 impl RelayConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.idle_timeout_secs != 0 && self.idle_timeout_secs.checked_mul(1000).is_none() {
+            return Err("idle_timeout_secs must fit in milliseconds".into());
+        }
+        Ok(())
+    }
+
     pub fn generate_relay_id() -> String {
-        let host = gethostname::gethostname()
-            .to_string_lossy()
-            .to_string();
+        let host = gethostname::gethostname().to_string_lossy().to_string();
         let pid = std::process::id();
         let uuid = uuid::Uuid::new_v4();
         format!("{host}_{pid}_{}", &uuid.to_string()[..8])
@@ -65,10 +73,32 @@ impl RelayConfig {
         }
         let bind = &self.bind;
         if let Some((host, port)) = bind.rsplit_once(':') {
-            let host = if host == "0.0.0.0" || host == "::" { "127.0.0.1" } else { host };
+            let host = if host == "0.0.0.0" || host == "::" {
+                "127.0.0.1"
+            } else {
+                host
+            };
             format!("http://{host}:{port}")
         } else {
             format!("http://127.0.0.1:{bind}")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_timeout_must_fit_milliseconds() {
+        let mut config = RelayConfig::default();
+        config.idle_timeout_secs = u64::MAX;
+
+        let err = config
+            .validate()
+            .expect_err("idle timeout should reject millisecond overflow");
+
+        assert!(err.contains("idle_timeout_secs"));
+        assert!(err.contains("milliseconds"));
     }
 }

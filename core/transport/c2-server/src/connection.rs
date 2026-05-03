@@ -4,9 +4,9 @@
 //! `c_two.transport.server.connection` — tracks handshake status,
 //! SHM segments, activity timestamps, and in-flight request counting.
 
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::Arc;
 use parking_lot::{Mutex, RwLock};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::Instant;
 
 use tokio::sync::Notify;
@@ -249,7 +249,12 @@ impl Connection {
 
     /// Ensure the peer's SHM segment at `seg_idx` is mapped (lazy-open).
     /// Does NOT read data — just ensures the segment is available for ShmBuffer access.
-    pub fn ensure_peer_segment(&self, seg_idx: u16, data_size: u32, is_dedicated: bool) -> Result<(), String> {
+    pub fn ensure_peer_segment(
+        &self,
+        seg_idx: u16,
+        data_size: u32,
+        is_dedicated: bool,
+    ) -> Result<(), String> {
         let state = self.peer_shm.lock();
         if is_dedicated {
             state.ensure_dedicated_segment(seg_idx as u32, data_size as usize)
@@ -261,7 +266,10 @@ impl Connection {
     /// Ensure the peer's SHM segment is mapped and return the pool Arc.
     /// Combines `ensure_peer_segment` + `peer_pool_arc` under one lock.
     pub fn ensure_and_get_peer_pool(
-        &self, seg_idx: u16, data_size: u32, is_dedicated: bool
+        &self,
+        seg_idx: u16,
+        data_size: u32,
+        is_dedicated: bool,
     ) -> Result<Arc<RwLock<MemPool>>, String> {
         let state = self.peer_shm.lock();
         if is_dedicated {
@@ -269,7 +277,10 @@ impl Connection {
         } else {
             state.ensure_buddy_segment(seg_idx as u32)?;
         }
-        state.pool.clone().ok_or_else(|| "peer pool not initialised".to_string())
+        state
+            .pool
+            .clone()
+            .ok_or_else(|| "peer pool not initialised".to_string())
     }
 
     /// Read `data_size` bytes from the peer's SHM at `(seg_idx, offset)`.
@@ -318,8 +329,7 @@ impl Connection {
         if let Err(e) = lazy_res {
             warn!(
                 conn_id = self.conn_id,
-                seg_idx,
-                "lazy-open for free failed: {e}"
+                seg_idx, "lazy-open for free failed: {e}"
             );
             return FreeResult::Normal;
         }
@@ -330,9 +340,7 @@ impl Connection {
                 Err(e) => {
                     warn!(
                         conn_id = self.conn_id,
-                        seg_idx,
-                        offset,
-                        "peer free_at failed: {e}"
+                        seg_idx, offset, "peer free_at failed: {e}"
                     );
                 }
             }
@@ -356,10 +364,7 @@ impl Connection {
 
     /// Seconds elapsed since the last `touch()`.
     pub fn idle_seconds(&self) -> f64 {
-        self.last_activity
-            .lock()
-            .elapsed()
-            .as_secs_f64()
+        self.last_activity.lock().elapsed().as_secs_f64()
     }
 
     /// Mark a new request as in-flight.
@@ -448,10 +453,7 @@ mod tests {
         // Peer sends segment_size < 2*min_block_size. Should not panic;
         // init_peer_shm clamps to MIN_BUDDY_SEGMENT_SIZE instead.
         let conn = Connection::new(3);
-        conn.init_peer_shm(
-            "/cc3b_tiny".into(),
-            vec![("seg0".into(), 4096)],
-        );
+        conn.init_peer_shm("/cc3b_tiny".into(), vec![("seg0".into(), 4096)]);
         assert_eq!(conn.peer_prefix(), "/cc3b_tiny");
         assert_eq!(conn.remote_segment_names(), vec!["seg0"]);
         assert_eq!(

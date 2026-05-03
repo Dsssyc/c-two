@@ -14,16 +14,15 @@
 
 pub mod client;
 pub mod pool;
-pub mod shm;
 pub mod response;
+pub mod shm;
 pub mod sync_client;
 
 #[cfg(test)]
 mod tests;
 
-pub use client::{IpcClient, ClientIpcConfig, IpcError, MethodTable, ServerPoolState};
+pub use client::{ClientIpcConfig, IpcClient, IpcError, MethodTable, ServerPoolState};
 pub use pool::ClientPool;
 pub use response::ResponseData;
 pub use shm::{MappedSegment, SegmentCache, ShmError};
 pub use sync_client::SyncClient;
-

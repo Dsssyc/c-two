@@ -52,3 +52,14 @@ def test_python_pyproject_has_no_cli_entrypoint_or_packaged_binary():
     assert "c3 =" not in pyproject
     assert "src/c_two/_bin" not in pyproject
     assert "build-backend = \"maturin\"" in pyproject
+
+
+def test_python_pyproject_owns_native_binding_manifest():
+    pyproject = (_repo_root() / "sdk" / "python" / "pyproject.toml").read_text(
+        encoding="utf-8"
+    )
+    old_manifest_path = "/".join(("core", "bridge", "c2-ffi"))
+
+    assert 'manifest-path = "native/Cargo.toml"' in pyproject
+    assert old_manifest_path not in pyproject
+    assert 'module-name = "c_two._native"' in pyproject

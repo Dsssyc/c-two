@@ -6,7 +6,6 @@ types from ``examples/python/grid/``.
 Run (after starting relay.py):
     uv run python examples/python/relay_mesh/resource.py
 """
-import os
 import sys
 from pathlib import Path
 
@@ -18,8 +17,9 @@ import logging
 
 from grid.grid_contract import Grid
 from grid.nested_grid import NestedGrid
+from relay_config import ensure_http_relay_url, resolved_relay_url
 
-RELAY_URL = os.environ.get('C2_RELAY_ADDRESS', 'http://127.0.0.1:8300')
+RELAY_URL = ensure_http_relay_url(resolved_relay_url('http://127.0.0.1:8300'))
 
 logging.basicConfig(
     level=logging.INFO,

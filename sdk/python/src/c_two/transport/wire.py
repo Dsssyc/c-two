@@ -25,15 +25,19 @@ def decode_call_control(
     return _ffi_decode_call_control(bytes(data), offset)
 
 
-def encode_reply_control(status: int, error_data: bytes | None = None) -> bytes:
-    """Encode reply control payload."""
-    return _ffi_encode_reply_control(status, error_data)
+def encode_reply_control(status: int, payload: bytes | None = None) -> bytes:
+    """Encode reply control payload.
+
+    ``payload`` carries error bytes for ``STATUS_ERROR`` and route-name bytes
+    for ``STATUS_ROUTE_NOT_FOUND``.
+    """
+    return _ffi_encode_reply_control(status, payload)
 
 
 def decode_reply_control(
     data: bytes | memoryview, offset: int = 0,
 ) -> tuple[int, bytes | None, int]:
-    """Decode reply control -> (status, error_data_or_none, bytes_consumed)."""
+    """Decode reply control -> (status, payload_or_none, bytes_consumed)."""
     return _ffi_decode_reply_control(bytes(data), offset)
 
 

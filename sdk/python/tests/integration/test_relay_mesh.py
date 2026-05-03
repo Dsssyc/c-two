@@ -9,31 +9,11 @@ Tests cover:
 from __future__ import annotations
 
 import json
-import threading
 import time
 import urllib.error
 import urllib.request
 
 import pytest
-
-import c_two as cc
-from c_two._native import NativeRelay
-
-pytestmark = pytest.mark.skipif(
-    not hasattr(cc._native, "NativeRelay"),
-    reason="relay feature not compiled",
-)
-
-# Port allocation — use 19200+ range to avoid conflicts with other tests.
-_counter = 0
-_lock = threading.Lock()
-
-
-def _next_port() -> int:
-    global _counter
-    with _lock:
-        _counter += 1
-        return 19200 + _counter
 
 
 def _http_post(url: str, body: dict) -> urllib.request.Request:
@@ -50,212 +30,212 @@ def _http_get_json(url: str):
         return json.loads(resp.read())
 
 
+def _wait_for_json(getter, predicate, *, timeout: float = 8.0, interval: float = 0.1):
+    deadline = time.monotonic() + timeout
+    last_error: Exception | None = None
+    last_value = None
+    while time.monotonic() < deadline:
+        try:
+            value = getter()
+            last_value = value
+            if predicate(value):
+                return value
+        except Exception as exc:
+            last_error = exc
+        time.sleep(interval)
+    if last_error is not None:
+        raise AssertionError(f"Timed out waiting for state; last error: {last_error}") from last_error
+    raise AssertionError(f"Timed out waiting for state; last value: {last_value!r}")
+
+
+def _wait_for_route(url: str, name: str, *, timeout: float = 8.0):
+    return _wait_for_json(
+        lambda: _http_get_json(f"{url}/_resolve/{name}"),
+        lambda routes: any(route["name"] == name for route in routes),
+        timeout=timeout,
+    )
+
+
+def _wait_for_route_missing(url: str, name: str, *, timeout: float = 8.0) -> None:
+    deadline = time.monotonic() + timeout
+    last_routes = None
+    while time.monotonic() < deadline:
+        try:
+            last_routes = _http_get_json(f"{url}/_resolve/{name}")
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return
+            raise
+        if not any(route["name"] == name for route in last_routes):
+            return
+        time.sleep(0.1)
+    raise AssertionError(f"Timed out waiting for {name!r} to disappear; last routes: {last_routes!r}")
+
+
+def _wait_for_peer(url: str, relay_id: str, *, timeout: float = 8.0):
+    return _wait_for_json(
+        lambda: _http_get_json(f"{url}/_peers"),
+        lambda peers: any(peer["relay_id"] == relay_id for peer in peers),
+        timeout=timeout,
+    )
+
+
 class TestSingleRelay:
     """Tests with one relay — backward compatibility."""
 
-    def test_register_and_resolve(self):
-        port = _next_port()
-        relay = NativeRelay(f"127.0.0.1:{port}", skip_ipc_validation=True)
-        relay.start()
-        base = f"http://127.0.0.1:{port}"
-        try:
-            # Register a mock upstream.
-            req = _http_post(f"{base}/_register", {"name": "grid", "address": "ipc://test_grid"})
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                assert resp.status == 201
+    def test_register_and_resolve(self, start_c3_relay):
+        relay = start_c3_relay(skip_ipc_validation=True)
+        base = relay.url
 
-            # Resolve.
-            routes = _http_get_json(f"{base}/_resolve/grid")
-            assert len(routes) >= 1
-            assert routes[0]["name"] == "grid"
+        # Register a mock upstream.
+        req = _http_post(
+            f"{base}/_register",
+            {"name": "grid", "server_id": "test-grid", "address": "ipc://test_grid"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            assert resp.status == 201
 
-            # Unregister.
-            req = _http_post(f"{base}/_unregister", {"name": "grid"})
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                assert resp.status == 200
+        # Resolve.
+        routes = _http_get_json(f"{base}/_resolve/grid")
+        assert len(routes) >= 1
+        assert routes[0]["name"] == "grid"
 
-            # Resolve should now 404.
-            with pytest.raises(urllib.error.HTTPError, match="404"):
-                urllib.request.urlopen(f"{base}/_resolve/grid", timeout=5)
-        finally:
-            relay.stop()
+        # Unregister.
+        req = _http_post(
+            f"{base}/_unregister",
+            {"name": "grid", "server_id": "test-grid"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            assert resp.status == 200
 
-    def test_peers_empty(self):
-        port = _next_port()
-        relay = NativeRelay(f"127.0.0.1:{port}", skip_ipc_validation=True)
-        relay.start()
-        try:
-            peers = _http_get_json(f"http://127.0.0.1:{port}/_peers")
-            assert peers == []
-        finally:
-            relay.stop()
+        # Resolve should now 404.
+        with pytest.raises(urllib.error.HTTPError, match="404"):
+            urllib.request.urlopen(f"{base}/_resolve/grid", timeout=5)
+
+    def test_peers_empty(self, start_c3_relay):
+        relay = start_c3_relay(skip_ipc_validation=True)
+
+        peers = _http_get_json(f"{relay.url}/_peers")
+        assert peers == []
 
 
 class TestTwoRelayMesh:
     """Tests with two relays in a mesh."""
 
-    def test_gossip_route_propagation(self):
-        port_a = _next_port()
-        port_b = _next_port()
-        url_a = f"http://127.0.0.1:{port_a}"
-        url_b = f"http://127.0.0.1:{port_b}"
-
-        relay_a = NativeRelay(
-            f"127.0.0.1:{port_a}",
+    def test_gossip_route_propagation(self, start_c3_relay):
+        relay_a = start_c3_relay(
             relay_id="relay-a",
             skip_ipc_validation=True,
         )
-        relay_a.start()
+        url_a = relay_a.url
 
-        relay_b = NativeRelay(
-            f"127.0.0.1:{port_b}",
+        relay_b = start_c3_relay(
             relay_id="relay-b",
             seeds=[url_a],
             skip_ipc_validation=True,
         )
-        relay_b.start()
+        url_b = relay_b.url
+        _wait_for_peer(url_a, "relay-b")
 
-        try:
-            # Wait for join to complete.
-            time.sleep(2)
+        # Register on relay A.
+        req = _http_post(
+            f"{url_a}/_register",
+            {"name": "grid", "server_id": "grid-a", "address": "ipc://grid_a"},
+        )
+        urllib.request.urlopen(req, timeout=5)
 
-            # Register on relay A.
-            req = _http_post(f"{url_a}/_register", {"name": "grid", "address": "ipc://grid_a"})
-            urllib.request.urlopen(req, timeout=5)
+        # Resolve on relay B should find "grid".
+        routes = _wait_for_route(url_b, "grid")
+        assert len(routes) >= 1
+        assert routes[0]["name"] == "grid"
 
-            # Wait for gossip propagation.
-            time.sleep(3)
+        # Both relays should see each other as peers.
+        peers_a = _http_get_json(f"{url_a}/_peers")
+        assert any(p["relay_id"] == "relay-b" for p in peers_a)
 
-            # Resolve on relay B should find "grid".
-            routes = _http_get_json(f"{url_b}/_resolve/grid")
-            assert len(routes) >= 1
-            assert routes[0]["name"] == "grid"
-
-            # Both relays should see each other as peers.
-            peers_a = _http_get_json(f"{url_a}/_peers")
-            assert any(p["relay_id"] == "relay-b" for p in peers_a)
-        finally:
-            relay_b.stop()
-            relay_a.stop()
-
-    def test_route_withdraw_propagation(self):
-        port_a = _next_port()
-        port_b = _next_port()
-        url_a = f"http://127.0.0.1:{port_a}"
-        url_b = f"http://127.0.0.1:{port_b}"
-
-        relay_a = NativeRelay(
-            f"127.0.0.1:{port_a}",
+    def test_route_withdraw_propagation(self, start_c3_relay):
+        relay_a = start_c3_relay(
             relay_id="relay-a",
             skip_ipc_validation=True,
         )
-        relay_a.start()
+        url_a = relay_a.url
 
-        relay_b = NativeRelay(
-            f"127.0.0.1:{port_b}",
+        relay_b = start_c3_relay(
             relay_id="relay-b",
             seeds=[url_a],
             skip_ipc_validation=True,
         )
-        relay_b.start()
+        url_b = relay_b.url
+        _wait_for_peer(url_a, "relay-b")
 
-        try:
-            time.sleep(2)
+        # Register on A.
+        req = _http_post(
+            f"{url_a}/_register",
+            {"name": "net", "server_id": "net-a", "address": "ipc://net_a"},
+        )
+        urllib.request.urlopen(req, timeout=5)
 
-            # Register on A.
-            req = _http_post(f"{url_a}/_register", {"name": "net", "address": "ipc://net_a"})
-            urllib.request.urlopen(req, timeout=5)
-            time.sleep(2)
+        # Verify B can resolve.
+        routes = _wait_for_route(url_b, "net")
+        assert len(routes) >= 1
 
-            # Verify B can resolve.
-            routes = _http_get_json(f"{url_b}/_resolve/net")
-            assert len(routes) >= 1
+        # Unregister on A.
+        req = _http_post(
+            f"{url_a}/_unregister",
+            {"name": "net", "server_id": "net-a"},
+        )
+        urllib.request.urlopen(req, timeout=5)
 
-            # Unregister on A.
-            req = _http_post(f"{url_a}/_unregister", {"name": "net"})
-            urllib.request.urlopen(req, timeout=5)
-            time.sleep(2)
+        # Resolve on B should now 404.
+        _wait_for_route_missing(url_b, "net")
 
-            # Resolve on B should now 404.
-            with pytest.raises(urllib.error.HTTPError, match="404"):
-                urllib.request.urlopen(f"{url_b}/_resolve/net", timeout=5)
-        finally:
-            relay_b.stop()
-            relay_a.stop()
-
-    def test_peer_discovery_bidirectional(self):
+    def test_peer_discovery_bidirectional(self, start_c3_relay):
         """Both relays should discover each other after join."""
-        port_a = _next_port()
-        port_b = _next_port()
-        url_a = f"http://127.0.0.1:{port_a}"
-        url_b = f"http://127.0.0.1:{port_b}"
-
-        relay_a = NativeRelay(
-            f"127.0.0.1:{port_a}",
+        relay_a = start_c3_relay(
             relay_id="relay-a",
             skip_ipc_validation=True,
         )
-        relay_a.start()
+        url_a = relay_a.url
 
-        relay_b = NativeRelay(
-            f"127.0.0.1:{port_b}",
+        relay_b = start_c3_relay(
             relay_id="relay-b",
             seeds=[url_a],
             skip_ipc_validation=True,
         )
-        relay_b.start()
+        url_b = relay_b.url
 
-        try:
-            time.sleep(2)
+        # A sees B.
+        peers_a = _wait_for_peer(url_a, "relay-b")
+        assert any(p["relay_id"] == "relay-b" for p in peers_a)
 
-            # A sees B.
-            peers_a = _http_get_json(f"{url_a}/_peers")
-            assert any(p["relay_id"] == "relay-b" for p in peers_a)
+        # B sees A.
+        peers_b = _wait_for_peer(url_b, "relay-a")
+        assert any(p["relay_id"] == "relay-a" for p in peers_b)
 
-            # B sees A.
-            peers_b = _http_get_json(f"{url_b}/_peers")
-            assert any(p["relay_id"] == "relay-a" for p in peers_b)
-        finally:
-            relay_b.stop()
-            relay_a.stop()
-
-    def test_resolve_returns_relay_url(self):
+    def test_resolve_returns_relay_url(self, start_c3_relay):
         """/_resolve response includes the relay_url of the registering relay."""
-        port_a = _next_port()
-        port_b = _next_port()
-        url_a = f"http://127.0.0.1:{port_a}"
-        url_b = f"http://127.0.0.1:{port_b}"
-
-        relay_a = NativeRelay(
-            f"127.0.0.1:{port_a}",
+        relay_a = start_c3_relay(
             relay_id="relay-a",
             skip_ipc_validation=True,
         )
-        relay_a.start()
+        url_a = relay_a.url
 
-        relay_b = NativeRelay(
-            f"127.0.0.1:{port_b}",
+        relay_b = start_c3_relay(
             relay_id="relay-b",
             seeds=[url_a],
             skip_ipc_validation=True,
         )
-        relay_b.start()
+        url_b = relay_b.url
+        _wait_for_peer(url_a, "relay-b")
 
-        try:
-            time.sleep(2)
+        # Register on A.
+        req = _http_post(
+            f"{url_a}/_register",
+            {"name": "solver", "server_id": "solver-a", "address": "ipc://solver_a"},
+        )
+        urllib.request.urlopen(req, timeout=5)
 
-            # Register on A.
-            req = _http_post(
-                f"{url_a}/_register",
-                {"name": "solver", "address": "ipc://solver_a"},
-            )
-            urllib.request.urlopen(req, timeout=5)
-            time.sleep(2)
-
-            # Resolve on B — relay_url should point to A.
-            routes = _http_get_json(f"{url_b}/_resolve/solver")
-            assert len(routes) == 1
-            assert routes[0]["relay_url"] == url_a
-        finally:
-            relay_b.stop()
-            relay_a.stop()
+        # Resolve on B — relay_url should point to A.
+        routes = _wait_for_route(url_b, "solver")
+        assert len(routes) == 1
+        assert routes[0]["relay_url"] == url_a

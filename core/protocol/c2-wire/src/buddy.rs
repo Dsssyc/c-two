@@ -36,7 +36,11 @@ pub fn encode_buddy_payload(bp: &BuddyPayload) -> [u8; BUDDY_PAYLOAD_SIZE] {
     buf[0..2].copy_from_slice(&bp.seg_idx.to_le_bytes());
     buf[2..6].copy_from_slice(&bp.offset.to_le_bytes());
     buf[6..10].copy_from_slice(&bp.data_size.to_le_bytes());
-    buf[10] = if bp.is_dedicated { BUDDY_FLAG_DEDICATED } else { 0 };
+    buf[10] = if bp.is_dedicated {
+        BUDDY_FLAG_DEDICATED
+    } else {
+        0
+    };
     buf
 }
 

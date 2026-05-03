@@ -22,9 +22,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
   bypass system proxies for consistency with runtime traffic. If
   `reqwest::ClientBuilder::build()` ever fails, c-two now panics rather
   than silently falling back to a proxy-respecting `Client::default()`.
-  The `C2_RELAY_USE_PROXY` flag is read directly from `os.environ` /
-  `std::env` on every call so Python and Rust layers always see a
-  consistent view (no cached pydantic settings).
+  The `C2_RELAY_USE_PROXY` flag is resolved through the shared Rust
+  config layer so Python and Rust callers always see a consistent view
+  (no cached pydantic settings).
 
 ### Added
 

@@ -6,7 +6,7 @@ from .crm.meta import crm, read, write, on_shutdown
 from .crm.transferable import transferable
 from .crm.transferable import transfer, hold, HeldResult
 from .transport.registry import (
-    set_config,
+    set_transport_policy,
     set_server,
     set_client,
     set_relay,
@@ -15,6 +15,7 @@ from .transport.registry import (
     close,
     unregister,
     server_address,
+    server_id,
     shutdown,
     serve,
     hold_stats,

@@ -51,9 +51,7 @@ impl Scheduler {
         R: Send + 'static,
     {
         match self.mode {
-            ConcurrencyMode::Parallel => {
-                tokio::task::spawn_blocking(f).await.unwrap()
-            }
+            ConcurrencyMode::Parallel => tokio::task::spawn_blocking(f).await.unwrap(),
             ConcurrencyMode::Exclusive => {
                 let _guard = self.rw_lock.write().await;
                 tokio::task::spawn_blocking(f).await.unwrap()
@@ -82,8 +80,8 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     fn empty_map() -> HashMap<u16, AccessLevel> {
         HashMap::new()

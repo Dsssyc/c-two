@@ -1,6 +1,7 @@
 """Unit tests for the Rust memory pool Python bindings (c_two.mem)."""
 
 import multiprocessing.shared_memory as shm
+import math
 import random
 import threading
 
@@ -37,6 +38,15 @@ class TestPoolConfig:
     def test_segment_too_small_fails(self):
         with pytest.raises(ValueError, match='2x min_block_size'):
             PoolConfig(segment_size=4096, min_block_size=4096)
+
+    @pytest.mark.parametrize(
+        'field',
+        ['dedicated_crash_timeout_secs', 'buddy_idle_decay_secs'],
+    )
+    @pytest.mark.parametrize('value', [math.inf, 1e100])
+    def test_gc_delays_must_be_representable(self, field, value):
+        with pytest.raises(ValueError, match=field):
+            PoolConfig(**{field: value})
 
 
 # ------------------------------------------------------------------
@@ -486,7 +496,7 @@ class TestBuddyPanicSafety:
 
     def test_nan_gc_delay_rejected(self):
         """Config validation: NaN gc_delay_secs must be rejected."""
-        with pytest.raises(ValueError, match='NaN'):
+        with pytest.raises(ValueError, match='dedicated_crash_timeout_secs'):
             PoolConfig(dedicated_crash_timeout_secs=float('nan'))
 
     def test_non_power_of_two_segment_rejected(self):

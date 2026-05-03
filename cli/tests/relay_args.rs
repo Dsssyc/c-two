@@ -21,7 +21,32 @@ fn relay_rejects_invalid_upstream_format() {
     cmd.args(["relay", "--upstream", "grid-ipc://server", "--dry-run"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("Expected NAME=ADDRESS"));
+        .stderr(predicate::str::contains("Expected NAME=SERVER_ID@ADDRESS"));
+}
+
+#[test]
+fn relay_rejects_ambiguous_upstream_without_server_id() {
+    let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.args(["relay", "--upstream", "grid=ipc://server", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Expected NAME=SERVER_ID@ADDRESS"));
+}
+
+#[test]
+fn relay_rejects_invalid_upstream_server_id() {
+    let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.args([
+        "relay",
+        "--upstream",
+        "grid= server @ipc://server",
+        "--dry-run",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains(
+        "server_id cannot contain leading or trailing whitespace",
+    ));
 }
 
 #[test]
@@ -40,13 +65,15 @@ fn relay_dry_run_accepts_valid_configuration() {
         "--advertise-url",
         "http://relay-a:9999",
         "--upstream",
-        "grid=ipc://server",
+        "grid=server-grid@ipc://server",
         "--dry-run",
     ])
     .assert()
     .success()
     .stdout(predicate::str::contains("relay-a"))
-    .stdout(predicate::str::contains("grid=ipc://server"));
+    .stdout(predicate::str::contains(
+        "upstream=grid server_id=server-grid address=ipc://server",
+    ));
 }
 
 #[test]
@@ -69,6 +96,35 @@ fn relay_dry_run_loads_default_env_file() {
 }
 
 #[test]
+fn relay_dry_run_uses_canonical_idle_timeout_default() {
+    let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.env("C2_ENV_FILE", "")
+        .env_remove("C2_RELAY_IDLE_TIMEOUT")
+        .args(["relay", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("idle_timeout=60"));
+}
+
+#[test]
+fn relay_help_hides_skip_ipc_validation() {
+    let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.args(["relay", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--skip-ipc-validation").not());
+}
+
+#[test]
+fn relay_dry_run_accepts_hidden_skip_ipc_validation_for_tests() {
+    let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.env("C2_ENV_FILE", "")
+        .args(["relay", "--skip-ipc-validation", "--dry-run"])
+        .assert()
+        .success();
+}
+
+#[test]
 fn relay_dry_run_respects_custom_env_file() {
     let tempdir = tempfile::tempdir().unwrap();
     let env_file = tempdir.path().join("relay.env");
@@ -82,4 +138,49 @@ fn relay_dry_run_respects_custom_env_file() {
         .assert()
         .success()
         .stdout(predicate::str::contains("bind=127.0.0.1:9292"));
+}
+
+#[test]
+fn relay_dry_run_loads_proxy_policy_from_env_file() {
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::write(tempdir.path().join(".env"), "C2_RELAY_USE_PROXY=1\n").unwrap();
+
+    let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.current_dir(tempdir.path())
+        .env_remove("C2_RELAY_USE_PROXY")
+        .env_remove("C2_ENV_FILE")
+        .args(["relay", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("relay_use_proxy=true"));
+}
+
+#[test]
+fn relay_process_env_overrides_env_file() {
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tempdir.path().join(".env"),
+        "C2_RELAY_BIND=127.0.0.1:9191\n",
+    )
+    .unwrap();
+
+    let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.current_dir(tempdir.path())
+        .env("C2_RELAY_BIND", "127.0.0.1:9393")
+        .env_remove("C2_ENV_FILE")
+        .args(["relay", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("bind=127.0.0.1:9393"));
+}
+
+#[test]
+fn relay_cli_flag_overrides_process_env() {
+    let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.env("C2_RELAY_BIND", "127.0.0.1:9393")
+        .env("C2_ENV_FILE", "")
+        .args(["relay", "--bind", "127.0.0.1:9494", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("bind=127.0.0.1:9494"));
 }

@@ -265,23 +265,32 @@ mod tests {
 
     #[test]
     fn legacy_decode_known_code_returns_canonical_error() {
-        let err = C2Error::from_legacy_bytes(b"701:missing grid").unwrap().unwrap();
+        let err = C2Error::from_legacy_bytes(b"701:missing grid")
+            .unwrap()
+            .unwrap();
         assert_eq!(err.code, ErrorCode::ResourceNotFound);
         assert_eq!(err.message, "missing grid");
     }
 
     #[test]
     fn legacy_decode_preserves_colons_in_message() {
-        let err = C2Error::from_legacy_bytes(b"0:host:port:extra").unwrap().unwrap();
+        let err = C2Error::from_legacy_bytes(b"0:host:port:extra")
+            .unwrap()
+            .unwrap();
         assert_eq!(err.code, ErrorCode::Unknown);
         assert_eq!(err.message, "host:port:extra");
     }
 
     #[test]
     fn legacy_decode_unknown_code_degrades_to_unknown_with_context() {
-        let err = C2Error::from_legacy_bytes(b"9999:low-level relay failure").unwrap().unwrap();
+        let err = C2Error::from_legacy_bytes(b"9999:low-level relay failure")
+            .unwrap()
+            .unwrap();
         assert_eq!(err.code, ErrorCode::Unknown);
-        assert_eq!(err.message, "Unknown error code 9999: low-level relay failure");
+        assert_eq!(
+            err.message,
+            "Unknown error code 9999: low-level relay failure"
+        );
     }
 
     #[test]

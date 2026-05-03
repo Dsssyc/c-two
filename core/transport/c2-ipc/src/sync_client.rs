@@ -3,12 +3,12 @@
 //! Wraps [`IpcClient`] for blocking calls from Python (via PyO3).
 //! Multiple `SyncClient` instances share a single tokio runtime.
 
-use std::sync::{Arc, OnceLock};
 use parking_lot::{Mutex, RwLock};
+use std::sync::{Arc, OnceLock};
 
 use c2_mem::{MemPool, PoolAllocation};
 
-use crate::client::{IpcClient, ClientIpcConfig, IpcError, MethodTable, ServerPoolState};
+use crate::client::{ClientIpcConfig, IpcClient, IpcError, MethodTable, ServerPoolState};
 use crate::response::ResponseData;
 
 // ── Global shared runtime ────────────────────────────────────────────────
@@ -91,16 +91,19 @@ impl SyncClient {
     /// Returns the allocation coordinates. On error, the caller should
     /// fall back to the inline `call()` path.
     pub fn pool_alloc_and_write(&self, data: &[u8]) -> Result<PoolAllocation, IpcError> {
-        let pool_arc = self.inner.pool.as_ref()
+        let pool_arc = self
+            .inner
+            .pool
+            .as_ref()
             .ok_or_else(|| IpcError::Pool("no client pool".into()))?;
         let mut pool = pool_arc.lock();
-        let alloc = pool.alloc(data.len())
+        let alloc = pool
+            .alloc(data.len())
             .map_err(|e| IpcError::Pool(format!("alloc failed: {e}")))?;
-        let ptr = pool.data_ptr(&alloc)
-            .map_err(|e| {
-                let _ = pool.free(&alloc);
-                IpcError::Pool(format!("data_ptr failed: {e}"))
-            })?;
+        let ptr = pool.data_ptr(&alloc).map_err(|e| {
+            let _ = pool.free(&alloc);
+            IpcError::Pool(format!("data_ptr failed: {e}"))
+        })?;
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
         }
@@ -123,15 +126,18 @@ impl SyncClient {
         alloc: &PoolAllocation,
         data_size: usize,
     ) -> Result<ResponseData, IpcError> {
-        let table = self.inner
+        let table = self
+            .inner
             .route_tables
             .get(route_name)
             .ok_or_else(|| IpcError::Handshake(format!("unknown route: {route_name}")))?;
         let method_idx = table
             .index_of(method_name)
             .ok_or_else(|| IpcError::Handshake(format!("unknown method: {method_name}")))?;
-        self.rt
-            .block_on(self.inner.call_with_prealloc(route_name, method_idx, alloc, data_size))
+        self.rt.block_on(
+            self.inner
+                .call_with_prealloc(route_name, method_idx, alloc, data_size),
+        )
     }
 
     /// Get a reference to the server SHM pool (for FFI layer).

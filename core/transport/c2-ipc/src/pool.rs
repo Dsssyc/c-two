@@ -4,10 +4,10 @@
 //! `SyncClient`. When all references are released the client is
 //! kept alive for a grace period before being destroyed.
 
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
 use c2_mem::{MemPool, PoolConfig};
@@ -22,6 +22,14 @@ static CLIENT_POOL_GEN: AtomicU64 = AtomicU64::new(0);
 
 use crate::client::{ClientIpcConfig, IpcError};
 use crate::sync_client::SyncClient;
+
+pub(crate) fn pool_config_from_client_config(cfg: &ClientIpcConfig) -> PoolConfig {
+    PoolConfig {
+        segment_size: cfg.pool_segment_size as usize,
+        max_segments: cfg.max_pool_segments as usize,
+        ..PoolConfig::default()
+    }
+}
 
 // ── Pool entry ───────────────────────────────────────────────────────────
 
@@ -96,16 +104,11 @@ impl ClientPool {
         // Resolve config: explicit > default > ClientIpcConfig::default().
         let cfg = match config {
             Some(c) => c.clone(),
-            None => self
-                .default_config
-                .lock()
-                .clone()
-                .unwrap_or_default(),
+            None => self.default_config.lock().clone().unwrap_or_default(),
         };
 
-        // Create a fresh MemPool for the client, respecting pool_segment_size.
-        let mut pc = PoolConfig::default();
-        pc.segment_size = cfg.pool_segment_size as usize;
+        // Create a fresh MemPool for the client, respecting IPC pool sizing.
+        let pc = pool_config_from_client_config(&cfg);
         let counter = CLIENT_POOL_GEN.fetch_add(1, Ordering::Relaxed) as u32;
         let prefix = format!("/cc3c{:08x}{:08x}", std::process::id(), counter);
         let pool = Arc::new(Mutex::new(MemPool::new_with_prefix(pc, prefix)));
@@ -190,10 +193,7 @@ impl ClientPool {
 
     /// Reference count for an address (for testing).
     pub fn refcount(&self, address: &str) -> usize {
-        self.entries
-            .lock()
-            .get(address)
-            .map_or(0, |e| e.ref_count)
+        self.entries.lock().get(address).map_or(0, |e| e.ref_count)
     }
 
     /// Check if a client exists for the address (for testing).
@@ -282,7 +282,11 @@ mod tests {
         assert_eq!(pool.active_count(), 1);
 
         pool.sweep_expired();
-        assert_eq!(pool.active_count(), 1, "recently released entry should survive");
+        assert_eq!(
+            pool.active_count(),
+            1,
+            "recently released entry should survive"
+        );
     }
 
     #[test]
@@ -389,7 +393,10 @@ mod tests {
     fn test_pool_set_default_config() {
         let pool = ClientPool::new(Duration::from_secs(30));
         let cfg = ClientIpcConfig {
-            base: c2_config::BaseIpcConfig { chunk_size: 65536, ..c2_config::BaseIpcConfig::default() },
+            base: c2_config::BaseIpcConfig {
+                chunk_size: 65536,
+                ..c2_config::BaseIpcConfig::default()
+            },
             shm_threshold: 1024,
         };
         pool.set_default_config(cfg);
@@ -399,6 +406,23 @@ mod tests {
         let c = stored.as_ref().unwrap();
         assert_eq!(c.shm_threshold, 1024);
         assert_eq!(c.chunk_size, 65536);
+    }
+
+    #[test]
+    fn pool_config_from_client_config_uses_max_pool_segments() {
+        let cfg = ClientIpcConfig {
+            base: c2_config::BaseIpcConfig {
+                pool_segment_size: 65_536,
+                max_pool_segments: 3,
+                ..c2_config::BaseIpcConfig::default()
+            },
+            shm_threshold: 1024,
+        };
+
+        let pc = pool_config_from_client_config(&cfg);
+
+        assert_eq!(pc.segment_size, 65_536);
+        assert_eq!(pc.max_segments, 3);
     }
 
     // ── Helper ───────────────────────────────────────────────────────────

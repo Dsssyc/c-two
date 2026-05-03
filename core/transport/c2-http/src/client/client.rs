@@ -3,7 +3,7 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use thiserror::Error;
 
 /// Characters allowed unencoded in URL path segments — matches Python's
@@ -23,7 +23,7 @@ fn encode_segment(s: &str) -> String {
 
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
-fn runtime() -> &'static tokio::runtime::Runtime {
+pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -63,13 +63,14 @@ pub struct HttpClient {
 }
 
 impl HttpClient {
-    /// Create a new client targeting `base_url`.
-    pub fn new(
+    /// Create a new client with an explicit relay proxy policy.
+    pub fn new_with_proxy_policy(
         base_url: &str,
         timeout_secs: f64,
         max_connections: usize,
+        use_proxy: bool,
     ) -> Result<Self, HttpError> {
-        let client = crate::relay_client_builder()
+        let client = crate::relay_client_builder_with_proxy(use_proxy)
             .timeout(Duration::from_secs_f64(timeout_secs))
             .pool_max_idle_per_host(max_connections)
             .build()
@@ -138,16 +139,37 @@ impl HttpClient {
     /// Health check — GET /health.
     pub fn health(&self) -> Result<bool, HttpError> {
         let handle = runtime().handle();
-        handle.block_on(async {
-            let url = format!("{}/health", self.base_url);
-            let resp = self
-                .client
-                .get(&url)
-                .send()
-                .await
-                .map_err(|e| HttpError::Transport(e.to_string()))?;
-            Ok(resp.status().as_u16() == 200)
-        })
+        handle.block_on(self.health_async())
+    }
+
+    /// Async health check — GET /health.
+    pub async fn health_async(&self) -> Result<bool, HttpError> {
+        let url = format!("{}/health", self.base_url);
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| HttpError::Transport(e.to_string()))?;
+        Ok(resp.status().as_u16() == 200)
+    }
+
+    /// Async route probe — GET /_probe/{route_name}.
+    pub async fn probe_route_async(&self, route_name: &str) -> Result<(), HttpError> {
+        let url = format!("{}/_probe/{}", self.base_url, encode_segment(route_name));
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| HttpError::Transport(e.to_string()))?;
+        match resp.status().as_u16() {
+            200 => Ok(()),
+            code => {
+                let text = resp.text().await.unwrap_or_default();
+                Err(HttpError::ServerError(code, text))
+            }
+        }
     }
 
     /// Base URL of this client.

@@ -2,8 +2,8 @@
 
 #[cfg(test)]
 mod client_tests {
-    use c2_wire::buddy::{decode_buddy_payload, BUDDY_PAYLOAD_SIZE};
-    use c2_wire::chunk::{decode_chunk_header, CHUNK_HEADER_SIZE};
+    use c2_wire::buddy::{BUDDY_PAYLOAD_SIZE, decode_buddy_payload};
+    use c2_wire::chunk::{CHUNK_HEADER_SIZE, decode_chunk_header};
     use c2_wire::control::*;
     use c2_wire::flags;
     use c2_wire::frame;
@@ -15,7 +15,7 @@ mod client_tests {
     fn encode_v2_inline_call() {
         // Verify that an inline v2 call frame has the expected layout:
         // [16B header (flags=FLAG_CALL_V2)] [call_control] [data]
-        let ctrl = encode_call_control("grid", 0);
+        let ctrl = encode_call_control("grid", 0).unwrap();
         let data = b"hello";
         let mut payload = Vec::new();
         payload.extend_from_slice(&ctrl);
@@ -43,11 +43,8 @@ mod client_tests {
         let mut payload = Vec::new();
         payload.extend_from_slice(&ctrl);
         payload.extend_from_slice(data);
-        let frame_bytes = frame::encode_frame(
-            42,
-            flags::FLAG_RESPONSE | flags::FLAG_REPLY_V2,
-            &payload,
-        );
+        let frame_bytes =
+            frame::encode_frame(42, flags::FLAG_RESPONSE | flags::FLAG_REPLY_V2, &payload);
 
         let (hdr, frame_payload) = frame::decode_frame(&frame_bytes).unwrap();
         assert!(hdr.is_response());
@@ -63,11 +60,8 @@ mod client_tests {
     fn encode_v2_error_reply() {
         let err = b"3:test error".to_vec();
         let ctrl = encode_reply_control(&ReplyControl::Error(err.clone()));
-        let frame_bytes = frame::encode_frame(
-            42,
-            flags::FLAG_RESPONSE | flags::FLAG_REPLY_V2,
-            &ctrl,
-        );
+        let frame_bytes =
+            frame::encode_frame(42, flags::FLAG_RESPONSE | flags::FLAG_REPLY_V2, &ctrl);
 
         let (hdr, frame_payload) = frame::decode_frame(&frame_bytes).unwrap();
         assert!(hdr.is_response());
@@ -81,7 +75,7 @@ mod client_tests {
     fn handshake_client_message() {
         // Client sends: [version][segments][cap_flags]
         let segments = vec![("seg0".into(), 268_435_456u32)];
-        let encoded = encode_client_handshake(&segments, CAP_CALL_V2 | CAP_METHOD_IDX, "");
+        let encoded = encode_client_handshake(&segments, CAP_CALL_V2 | CAP_METHOD_IDX, "").unwrap();
         let frame_bytes = frame::encode_frame(0, flags::FLAG_HANDSHAKE, &encoded);
 
         let (hdr, payload) = frame::decode_frame(&frame_bytes).unwrap();
@@ -107,7 +101,7 @@ mod client_tests {
         // Build a buddy call frame as call_buddy would:
         // payload = [11B buddy_payload][call_control]
         // flags   = FLAG_CALL_V2 | FLAG_BUDDY
-        use c2_wire::buddy::{encode_buddy_payload, BuddyPayload};
+        use c2_wire::buddy::{BuddyPayload, encode_buddy_payload};
 
         let bp = BuddyPayload {
             seg_idx: 0,
@@ -118,7 +112,7 @@ mod client_tests {
         let buddy_bytes = encode_buddy_payload(&bp);
         assert_eq!(buddy_bytes.len(), BUDDY_PAYLOAD_SIZE);
 
-        let ctrl = encode_call_control("grid", 3);
+        let ctrl = encode_call_control("grid", 3).unwrap();
         let mut payload = Vec::new();
         payload.extend_from_slice(&buddy_bytes);
         payload.extend_from_slice(&ctrl);
@@ -142,15 +136,14 @@ mod client_tests {
         assert_eq!(bp_consumed, BUDDY_PAYLOAD_SIZE);
 
         // Decode call control after buddy payload.
-        let (decoded_ctrl, _) =
-            decode_call_control(frame_payload, BUDDY_PAYLOAD_SIZE).unwrap();
+        let (decoded_ctrl, _) = decode_call_control(frame_payload, BUDDY_PAYLOAD_SIZE).unwrap();
         assert_eq!(decoded_ctrl.route_name, "grid");
         assert_eq!(decoded_ctrl.method_idx, 3);
     }
 
     #[test]
     fn test_buddy_frame_dedicated_segment() {
-        use c2_wire::buddy::{encode_buddy_payload, BuddyPayload};
+        use c2_wire::buddy::{BuddyPayload, encode_buddy_payload};
 
         let bp = BuddyPayload {
             seg_idx: 5,
@@ -159,17 +152,13 @@ mod client_tests {
             is_dedicated: true,
         };
         let buddy_bytes = encode_buddy_payload(&bp);
-        let ctrl = encode_call_control("net", 1);
+        let ctrl = encode_call_control("net", 1).unwrap();
 
         let mut payload = Vec::new();
         payload.extend_from_slice(&buddy_bytes);
         payload.extend_from_slice(&ctrl);
 
-        let frame_bytes = frame::encode_frame(
-            7,
-            flags::FLAG_CALL_V2 | flags::FLAG_BUDDY,
-            &payload,
-        );
+        let frame_bytes = frame::encode_frame(7, flags::FLAG_CALL_V2 | flags::FLAG_BUDDY, &payload);
 
         let (hdr, frame_payload) = frame::decode_frame(&frame_bytes).unwrap();
         assert!(hdr.is_buddy());
@@ -189,7 +178,7 @@ mod client_tests {
         let total_chunks: u16 = 3;
         let request_id: u64 = 42;
 
-        let ctrl = encode_call_control(route, method_idx);
+        let ctrl = encode_call_control(route, method_idx).unwrap();
         let chunk_data = b"chunk_payload_data";
 
         // ── Chunk 0: [chunk_header][call_control][data] ──
@@ -215,8 +204,7 @@ mod client_tests {
         assert_eq!(ch_consumed, CHUNK_HEADER_SIZE);
 
         // Decode call control (present on chunk 0).
-        let (decoded_ctrl, ctrl_consumed) =
-            decode_call_control(fp_0, CHUNK_HEADER_SIZE).unwrap();
+        let (decoded_ctrl, ctrl_consumed) = decode_call_control(fp_0, CHUNK_HEADER_SIZE).unwrap();
         assert_eq!(decoded_ctrl.route_name, route);
         assert_eq!(decoded_ctrl.method_idx, method_idx);
 
@@ -265,7 +253,10 @@ mod client_tests {
         // verify the selection logic by checking threshold boundaries.
         let cfg = ClientIpcConfig {
             shm_threshold: 100,
-            base: c2_config::BaseIpcConfig { chunk_size: 500, ..c2_config::BaseIpcConfig::default() },
+            base: c2_config::BaseIpcConfig {
+                chunk_size: 500,
+                ..c2_config::BaseIpcConfig::default()
+            },
         };
 
         // Below shm_threshold → inline
@@ -293,7 +284,7 @@ mod client_tests {
         use c2_wire::chunk::encode_chunk_header;
 
         let chunk_hdr = encode_chunk_header(0, 1);
-        let ctrl = encode_call_control("route", 0);
+        let ctrl = encode_call_control("route", 0).unwrap();
         let data = vec![0xABu8; 128];
 
         let mut payload = Vec::new();
@@ -301,8 +292,7 @@ mod client_tests {
         payload.extend_from_slice(&ctrl);
         payload.extend_from_slice(&data);
 
-        let flags_last =
-            flags::FLAG_CALL_V2 | flags::FLAG_CHUNKED | flags::FLAG_CHUNK_LAST;
+        let flags_last = flags::FLAG_CALL_V2 | flags::FLAG_CHUNKED | flags::FLAG_CHUNK_LAST;
         let frame_bytes = frame::encode_frame(1, flags_last, &payload);
 
         let (hdr, fp) = frame::decode_frame(&frame_bytes).unwrap();
@@ -330,7 +320,10 @@ mod client_tests {
         // and the config should influence transport path selection.
         let cfg = ClientIpcConfig {
             shm_threshold: 512,
-            base: c2_config::BaseIpcConfig { chunk_size: 2048, ..c2_config::BaseIpcConfig::default() },
+            base: c2_config::BaseIpcConfig {
+                chunk_size: 2048,
+                ..c2_config::BaseIpcConfig::default()
+            },
         };
 
         // IpcClient::new uses default config.
@@ -338,9 +331,9 @@ mod client_tests {
         assert!(!c1.is_connected());
 
         // IpcClient::with_pool uses custom config.
-        let pool = std::sync::Arc::new(parking_lot::Mutex::new(
-            c2_mem::MemPool::new(c2_mem::PoolConfig::default()),
-        ));
+        let pool = std::sync::Arc::new(parking_lot::Mutex::new(c2_mem::MemPool::new(
+            c2_mem::PoolConfig::default(),
+        )));
         let c2 = crate::client::IpcClient::with_pool("ipc://test_prop_2", pool, cfg);
         assert!(!c2.is_connected());
     }
@@ -353,7 +346,7 @@ mod client_tests {
             ("seg_b".into(), 256 * 1024 * 1024u32),
         ];
         let cap = CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED;
-        let encoded = encode_client_handshake(&segments, cap, "test_prefix");
+        let encoded = encode_client_handshake(&segments, cap, "test_prefix").unwrap();
         let frame_bytes = frame::encode_frame(0, flags::FLAG_HANDSHAKE, &encoded);
 
         let (hdr, payload) = frame::decode_frame(&frame_bytes).unwrap();

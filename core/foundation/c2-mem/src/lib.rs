@@ -7,19 +7,19 @@
 //! - Pool layer — `MemPool` composing `BuddySegment` + `DedicatedSegment`
 
 pub mod alloc;
-pub mod segment;
 pub mod buddy_segment;
 pub mod config;
 pub mod dedicated;
-pub mod spill;
 pub mod handle;
 pub mod pool;
+pub mod segment;
+pub mod spill;
 
-pub use alloc::{BuddyAllocator, Allocation, SegmentHeader, ShmSpinlock};
-pub use segment::ShmRegion;
+pub use alloc::{Allocation, BuddyAllocator, SegmentHeader, ShmSpinlock};
 pub use buddy_segment::BuddySegment;
 pub use config::{PoolAllocation, PoolConfig, PoolStats};
 pub use dedicated::DedicatedSegment;
-pub use pool::{FreeResult, MemPool};
-pub use spill::{available_physical_memory, should_spill, create_file_spill};
 pub use handle::MemHandle;
+pub use pool::{FreeResult, MemPool};
+pub use segment::ShmRegion;
+pub use spill::{available_physical_memory, create_file_spill, should_spill};

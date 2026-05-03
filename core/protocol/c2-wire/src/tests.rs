@@ -77,8 +77,14 @@ mod frame_tests {
 
         // Check request_id
         let rid = u64::from_le_bytes([
-            encoded[4], encoded[5], encoded[6], encoded[7],
-            encoded[8], encoded[9], encoded[10], encoded[11],
+            encoded[4],
+            encoded[5],
+            encoded[6],
+            encoded[7],
+            encoded[8],
+            encoded[9],
+            encoded[10],
+            encoded[11],
         ]);
         assert_eq!(rid, 100);
 
@@ -150,7 +156,7 @@ mod control_tests {
 
     #[test]
     fn call_control_roundtrip() {
-        let encoded = encode_call_control("grid", 42);
+        let encoded = encode_call_control("grid", 42).unwrap();
         let (decoded, consumed) = decode_call_control(&encoded, 0).unwrap();
         assert_eq!(consumed, encoded.len());
         assert_eq!(decoded.route_name, "grid");
@@ -159,7 +165,7 @@ mod control_tests {
 
     #[test]
     fn call_control_empty_name() {
-        let encoded = encode_call_control("", 0);
+        let encoded = encode_call_control("", 0).unwrap();
         assert_eq!(encoded.len(), 3); // 1B name_len=0 + 2B idx
         let (decoded, consumed) = decode_call_control(&encoded, 0).unwrap();
         assert_eq!(consumed, 3);
@@ -170,7 +176,7 @@ mod control_tests {
     #[test]
     fn call_control_with_offset() {
         let mut buf = vec![0xAA, 0xBB]; // prefix
-        buf.extend_from_slice(&encode_call_control("net", 7));
+        buf.extend_from_slice(&encode_call_control("net", 7).unwrap());
         let (decoded, consumed) = decode_call_control(&buf, 2).unwrap();
         assert_eq!(decoded.route_name, "net");
         assert_eq!(decoded.method_idx, 7);
@@ -206,6 +212,24 @@ mod control_tests {
     }
 
     #[test]
+    fn reply_control_route_not_found_roundtrip() {
+        let encoded = encode_reply_control(&ReplyControl::RouteNotFound("grid".into()));
+        assert_eq!(encoded[0], STATUS_ROUTE_NOT_FOUND);
+        let (decoded, consumed) = decode_reply_control(&encoded, 0).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded, ReplyControl::RouteNotFound("grid".into()));
+    }
+
+    #[test]
+    fn reply_control_route_not_found_rejects_truncated_name() {
+        let mut encoded = vec![STATUS_ROUTE_NOT_FOUND];
+        encoded.extend_from_slice(&8u32.to_le_bytes());
+        encoded.extend_from_slice(b"grid");
+
+        assert!(decode_reply_control(&encoded, 0).is_err());
+    }
+
+    #[test]
     fn reply_control_invalid_status() {
         let buf = [0xFF];
         let result = decode_reply_control(&buf, 0);
@@ -218,8 +242,15 @@ mod control_tests {
         // = [4] + b"grid" + struct.pack('<H', 5)
         // = [0x04, 0x67, 0x72, 0x69, 0x64, 0x05, 0x00]
         let expected = vec![0x04, 0x67, 0x72, 0x69, 0x64, 0x05, 0x00];
-        let encoded = encode_call_control("grid", 5);
+        let encoded = encode_call_control("grid", 5).unwrap();
         assert_eq!(encoded, expected);
+    }
+
+    #[test]
+    fn call_control_rejects_route_name_longer_than_one_byte_length() {
+        let long_name = "x".repeat(MAX_CALL_ROUTE_NAME_BYTES + 1);
+        let err = encode_call_control(&long_name, 0).unwrap_err();
+        assert!(err.to_string().contains("route_name"));
     }
 }
 
@@ -232,7 +263,7 @@ mod handshake_tests {
             ("seg0".into(), 268_435_456u32),
             ("seg1".into(), 268_435_456u32),
         ];
-        let encoded = encode_client_handshake(&segments, CAP_CALL_V2 | CAP_METHOD_IDX, "");
+        let encoded = encode_client_handshake(&segments, CAP_CALL_V2 | CAP_METHOD_IDX, "").unwrap();
         let decoded = decode_handshake(&encoded).unwrap();
 
         assert_eq!(decoded.prefix, "");
@@ -250,20 +281,35 @@ mod handshake_tests {
             RouteInfo {
                 name: "grid".into(),
                 methods: vec![
-                    MethodEntry { name: "hello".into(), index: 0 },
-                    MethodEntry { name: "subdivide_grids".into(), index: 1 },
-                    MethodEntry { name: "get_grid_infos".into(), index: 2 },
+                    MethodEntry {
+                        name: "hello".into(),
+                        index: 0,
+                    },
+                    MethodEntry {
+                        name: "subdivide_grids".into(),
+                        index: 1,
+                    },
+                    MethodEntry {
+                        name: "get_grid_infos".into(),
+                        index: 2,
+                    },
                 ],
             },
             RouteInfo {
                 name: "counter".into(),
                 methods: vec![
-                    MethodEntry { name: "get".into(), index: 0 },
-                    MethodEntry { name: "increment".into(), index: 1 },
+                    MethodEntry {
+                        name: "get".into(),
+                        index: 0,
+                    },
+                    MethodEntry {
+                        name: "increment".into(),
+                        index: 1,
+                    },
                 ],
             },
         ];
-        let encoded = encode_server_handshake(&segments, CAP_CALL_V2, &routes, "");
+        let encoded = encode_server_handshake(&segments, CAP_CALL_V2, &routes, "").unwrap();
         let decoded = decode_handshake(&encoded).unwrap();
 
         assert_eq!(decoded.segments.len(), 1);
@@ -281,6 +327,33 @@ mod handshake_tests {
         let counter = &decoded.routes[1];
         assert_eq!(counter.name, "counter");
         assert_eq!(counter.methods.len(), 2);
+    }
+
+    #[test]
+    fn server_handshake_rejects_overlong_route_name() {
+        let routes = vec![RouteInfo {
+            name: "x".repeat(MAX_HANDSHAKE_NAME_BYTES + 1),
+            methods: vec![],
+        }];
+
+        let err = encode_server_handshake(&[], CAP_CALL_V2, &routes, "").unwrap_err();
+        assert!(err.to_string().contains("route name"));
+    }
+
+    #[test]
+    fn server_handshake_rejects_too_many_methods() {
+        let routes = vec![RouteInfo {
+            name: "grid".into(),
+            methods: (0..=MAX_METHODS)
+                .map(|i| MethodEntry {
+                    name: format!("m{i}"),
+                    index: i as u16,
+                })
+                .collect(),
+        }];
+
+        let err = encode_server_handshake(&[], CAP_CALL_V2, &routes, "").unwrap_err();
+        assert!(err.to_string().contains("method count"));
     }
 
     #[test]
@@ -394,7 +467,7 @@ mod cross_lang_tests {
     fn python_server_handshake_decode() {
         // v6: [06][00 prefix_len] then same body
         let bytes = hex_to_bytes(
-            "0600010000000008047372763003000100046772696402000568656c6c6f0000036164640100"
+            "0600010000000008047372763003000100046772696402000568656c6c6f0000036164640100",
         );
         let hs = decode_handshake(&bytes).unwrap();
         assert_eq!(hs.prefix, "");
@@ -413,7 +486,7 @@ mod cross_lang_tests {
 
     #[test]
     fn rust_encode_matches_python_call_control() {
-        let encoded = encode_call_control("hello", 7);
+        let encoded = encode_call_control("hello", 7).unwrap();
         let expected = hex_to_bytes("0568656c6c6f0700");
         assert_eq!(encoded, expected);
     }
@@ -435,7 +508,10 @@ mod cross_lang_tests {
     #[test]
     fn rust_encode_matches_python_buddy_payload() {
         let bp = BuddyPayload {
-            seg_idx: 2, offset: 4096, data_size: 512, is_dedicated: false,
+            seg_idx: 2,
+            offset: 4096,
+            data_size: 512,
+            is_dedicated: false,
         };
         let encoded = encode_buddy_payload(&bp);
         let expected = hex_to_bytes("0200001000000002000000");
@@ -445,7 +521,7 @@ mod cross_lang_tests {
     #[test]
     fn rust_encode_matches_python_client_handshake() {
         let segments = vec![("seg0".into(), 268_435_456u32)];
-        let encoded = encode_client_handshake(&segments, CAP_CALL_V2 | CAP_METHOD_IDX, "");
+        let encoded = encode_client_handshake(&segments, CAP_CALL_V2 | CAP_METHOD_IDX, "").unwrap();
         // v6: [06][00 prefix_len][01 00 seg_count][00 00 00 10 size][04 name_len][seg0][03 00 caps]
         let expected = hex_to_bytes("060001000000001004736567300300");
         assert_eq!(encoded, expected);
@@ -457,14 +533,21 @@ mod cross_lang_tests {
         let routes = vec![RouteInfo {
             name: "grid".into(),
             methods: vec![
-                MethodEntry { name: "hello".into(), index: 0 },
-                MethodEntry { name: "add".into(), index: 1 },
+                MethodEntry {
+                    name: "hello".into(),
+                    index: 0,
+                },
+                MethodEntry {
+                    name: "add".into(),
+                    index: 1,
+                },
             ],
         }];
-        let encoded = encode_server_handshake(&segments, CAP_CALL_V2 | CAP_METHOD_IDX, &routes, "");
+        let encoded =
+            encode_server_handshake(&segments, CAP_CALL_V2 | CAP_METHOD_IDX, &routes, "").unwrap();
         // v6: [06][00 prefix_len] then same body as v5
         let expected = hex_to_bytes(
-            "0600010000000008047372763003000100046772696402000568656c6c6f0000036164640100"
+            "0600010000000008047372763003000100046772696402000568656c6c6f0000036164640100",
         );
         assert_eq!(encoded, expected);
     }

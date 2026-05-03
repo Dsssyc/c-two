@@ -15,6 +15,7 @@ from c_two.transport.protocol import (
     CAP_METHOD_IDX,
     STATUS_SUCCESS,
     STATUS_ERROR,
+    STATUS_ROUTE_NOT_FOUND,
     MethodEntry,
     RouteInfo,
     encode_client_handshake,
@@ -251,6 +252,22 @@ class TestReplyControlBoundsChecking:
         status, dec_err, consumed = decode_reply_control(encoded)
         assert status == STATUS_ERROR
         assert dec_err == err_data
+
+    def test_route_not_found_with_name_roundtrip(self):
+        """Route-not-found is a structured system error, not CRM error data."""
+        route = b'grid'
+        encoded = encode_reply_control(STATUS_ROUTE_NOT_FOUND, route)
+        status, route_name, consumed = decode_reply_control(encoded)
+        assert status == STATUS_ROUTE_NOT_FOUND
+        assert route_name == route
+        assert consumed == len(encoded)
+
+    def test_route_not_found_len_exceeds_buffer(self):
+        buf = bytearray([STATUS_ROUTE_NOT_FOUND])
+        buf += struct.pack('<I', 1000)
+        buf += b'grid'
+        with pytest.raises(ValueError, match='need.*bytes|route'):
+            decode_reply_control(bytes(buf), 0)
 
 
 # ---------------------------------------------------------------------------

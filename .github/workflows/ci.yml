@@ -9,8 +9,69 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+  pull-requests: read
+
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    name: changes
+    outputs:
+      core: ${{ steps.filter.outputs.core }}
+      cli: ${{ steps.filter.outputs.cli }}
+      sdk: ${{ steps.filter.outputs.sdk }}
+      ci: ${{ steps.filter.outputs.ci }}
+      workflow_policy: ${{ steps.filter.outputs.workflow_policy }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dorny/paths-filter@v4
+        if: github.event_name == 'pull_request'
+        id: filter
+        with:
+          filters: |
+            core:
+              - 'core/**'
+            cli:
+              - 'cli/**'
+              - 'tools/dev/**'
+              - '.github/workflows/cli-release.yml'
+            sdk:
+              - 'sdk/python/**'
+              - 'examples/python/**'
+              - 'pyproject.toml'
+              - 'uv.lock'
+              - '.github/scripts/**'
+              - '.github/workflows/python-package-release.yml'
+            ci:
+              - '.github/workflows/ci.yml'
+            workflow_policy:
+              - '.github/workflows/**'
+              - '.github/scripts/**'
+              - '.github/dependabot.yml'
+              - 'tools/dev/**'
+
+  core:
+    needs: changes
+    if: github.event_name == 'merge_group' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    name: core
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core -> target
+
+      - name: Test Rust core
+        run: cargo test --manifest-path core/Cargo.toml --workspace
+
   cli:
+    needs: changes
+    if: github.event_name == 'merge_group' || needs.changes.outputs.cli == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true'
     runs-on: ubuntu-latest
     name: cli
     steps:
@@ -34,7 +95,37 @@ jobs:
           cli/target/debug/c3 relay --help
           cli/target/debug/c3 registry --help
 
+  workflow-policy:
+    needs: changes
+    if: github.event_name == 'merge_group' || needs.changes.outputs.workflow_policy == 'true' || needs.changes.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    name: workflow policy
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Run workflow policy tests
+        run: >-
+          uv run --no-project
+          --with pytest
+          --with pytest-timeout
+          --with packaging
+          pytest
+          --confcutdir=sdk/python/tests/unit
+          sdk/python/tests/unit/test_cli_release_workflow.py
+          sdk/python/tests/unit/test_python_package_release_workflow.py
+          sdk/python/tests/unit/test_check_version.py::TestCheckVersion
+          sdk/python/tests/unit/test_check_cli_release.py
+          sdk/python/tests/unit/test_c3_tool.py
+          -q --timeout=30
+
   test:
+    needs: changes
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -44,32 +135,36 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Skip full Python tests for unrelated changes
+        if: github.event_name != 'merge_group' && needs.changes.outputs.sdk != 'true' && needs.changes.outputs.core != 'true' && needs.changes.outputs.ci != 'true'
+        run: echo "Skipping full Python tests because this change does not touch sdk/python, examples/python, core, or CI."
+
       - name: Skip redundant Dependabot matrix leg
-        if: github.event_name == 'pull_request' && github.event.pull_request.user.login == 'dependabot[bot]' && matrix.python != '3.12'
+        if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && github.event_name == 'pull_request' && github.event.pull_request.user.login == 'dependabot[bot]' && matrix.python != '3.12'
         run: echo "Skipping this matrix leg for Dependabot pull requests"
 
       - uses: actions/setup-python@v5
-        if: github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12'
+        if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
         with:
           python-version: ${{ matrix.python }}
 
       - uses: dtolnay/rust-toolchain@stable
-        if: github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12'
+        if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
 
       - uses: Swatinem/rust-cache@v2
-        if: github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12'
+        if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
         with:
           workspaces: core -> target
 
       - uses: astral-sh/setup-uv@v6
-        if: github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12'
+        if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
 
       - name: Install dependencies & build native extension
-        if: github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12'
+        if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
         run: uv sync
 
       - name: Run tests
-        if: github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12'
+        if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
         run: uv run pytest sdk/python/tests -q --timeout=30
         env:
           C2_RELAY_ADDRESS: ""

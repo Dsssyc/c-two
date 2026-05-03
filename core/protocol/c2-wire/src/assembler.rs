@@ -4,8 +4,8 @@
 //! single Rust implementation that writes chunks directly into a unified
 //! [`MemHandle`] (buddy SHM, dedicated SHM, or file-backed mmap).
 
-use c2_mem::handle::MemHandle;
 use c2_mem::MemPool;
+use c2_mem::handle::MemHandle;
 
 /// Reassembles chunked payloads into a contiguous [`MemHandle`].
 ///
@@ -59,7 +59,8 @@ impl ChunkAssembler {
                 "total_chunks {total_chunks} exceeds limit {max_total_chunks}"
             ));
         }
-        let alloc_size = total_chunks.checked_mul(chunk_size)
+        let alloc_size = total_chunks
+            .checked_mul(chunk_size)
             .ok_or_else(|| "chunk allocation overflow".to_string())?;
         if alloc_size > max_reassembly_bytes {
             return Err(format!(
@@ -101,10 +102,13 @@ impl ChunkAssembler {
         if data.len() > self.chunk_size {
             return Err(format!(
                 "data length {} exceeds chunk_size {}",
-                data.len(), self.chunk_size
+                data.len(),
+                self.chunk_size
             ));
         }
-        let handle = self.handle.as_mut()
+        let handle = self
+            .handle
+            .as_mut()
             .ok_or("assembler handle already taken")?;
         let offset = chunk_idx * self.chunk_size;
         let slice = pool.handle_slice_mut(handle);
@@ -140,8 +144,7 @@ impl ChunkAssembler {
                 self.received, self.total_chunks
             ));
         }
-        let mut handle = self.handle.take()
-            .ok_or("assembler handle already taken")?;
+        let mut handle = self.handle.take().ok_or("assembler handle already taken")?;
         handle.set_len(self.written_end);
         Ok(handle)
     }
@@ -208,7 +211,7 @@ mod tests {
         let mut asm = ChunkAssembler::new(&mut pool, 3, 8, 512, 8 * (1 << 30)).unwrap();
         assert!(!asm.feed_chunk(&pool, 0, b"aaaaaaaa").unwrap()); // full
         assert!(!asm.feed_chunk(&pool, 1, b"bbbbbbbb").unwrap()); // full
-        assert!(asm.feed_chunk(&pool, 2, b"cc").unwrap());        // last, short
+        assert!(asm.feed_chunk(&pool, 2, b"cc").unwrap()); // last, short
         let handle = asm.finish().unwrap();
         assert_eq!(handle.len(), 18); // 8 + 8 + 2
         let slice = pool.handle_slice(&handle);

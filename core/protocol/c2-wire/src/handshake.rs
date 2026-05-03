@@ -23,6 +23,7 @@
 //! ]
 //! ```
 
+use crate::control::EncodeError;
 use crate::frame::DecodeError;
 
 /// Handshake version number.
@@ -41,9 +42,10 @@ pub const CAP_CHUNKED: u16 = 1 << 2;
 
 // ── Safety limits ────────────────────────────────────────────────────────
 
-const MAX_SEGMENTS: usize = 16;
-const MAX_ROUTES: usize = 64;
-const MAX_METHODS: usize = 256;
+pub const MAX_SEGMENTS: usize = 16;
+pub const MAX_ROUTES: usize = 64;
+pub const MAX_METHODS: usize = 256;
+pub const MAX_HANDSHAKE_NAME_BYTES: usize = u8::MAX as usize;
 
 // ── Data types ───────────────────────────────────────────────────────────
 
@@ -81,7 +83,15 @@ pub fn encode_client_handshake(
     segments: &[(String, u32)],
     capability_flags: u16,
     prefix: &str,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, EncodeError> {
+    validate_name_len("prefix", prefix)?;
+    if segments.len() > MAX_SEGMENTS {
+        return Err(EncodeError::FieldTooLong {
+            field: "segment count",
+            max: MAX_SEGMENTS,
+            actual: segments.len(),
+        });
+    }
     let mut buf = Vec::with_capacity(64);
     buf.push(HANDSHAKE_VERSION);
     // Prefix
@@ -91,13 +101,14 @@ pub fn encode_client_handshake(
     // Segments
     buf.extend_from_slice(&(segments.len() as u16).to_le_bytes());
     for (name, size) in segments {
+        validate_name_len("segment name", name)?;
         buf.extend_from_slice(&size.to_le_bytes());
         let name_b = name.as_bytes();
         buf.push(name_b.len() as u8);
         buf.extend_from_slice(name_b);
     }
     buf.extend_from_slice(&capability_flags.to_le_bytes());
-    buf
+    Ok(buf)
 }
 
 // ── Encoding: Server → Client (ACK) ─────────────────────────────────────
@@ -108,22 +119,50 @@ pub fn encode_server_handshake(
     capability_flags: u16,
     routes: &[RouteInfo],
     prefix: &str,
-) -> Vec<u8> {
-    let mut buf = encode_client_handshake(segments, capability_flags, prefix);
+) -> Result<Vec<u8>, EncodeError> {
+    if routes.len() > MAX_ROUTES {
+        return Err(EncodeError::FieldTooLong {
+            field: "route count",
+            max: MAX_ROUTES,
+            actual: routes.len(),
+        });
+    }
+    let mut buf = encode_client_handshake(segments, capability_flags, prefix)?;
     buf.extend_from_slice(&(routes.len() as u16).to_le_bytes());
     for route in routes {
+        validate_name_len("route name", &route.name)?;
+        if route.methods.len() > MAX_METHODS {
+            return Err(EncodeError::FieldTooLong {
+                field: "method count",
+                max: MAX_METHODS,
+                actual: route.methods.len(),
+            });
+        }
         let name_b = route.name.as_bytes();
         buf.push(name_b.len() as u8);
         buf.extend_from_slice(name_b);
         buf.extend_from_slice(&(route.methods.len() as u16).to_le_bytes());
         for m in &route.methods {
+            validate_name_len("method name", &m.name)?;
             let m_b = m.name.as_bytes();
             buf.push(m_b.len() as u8);
             buf.extend_from_slice(m_b);
             buf.extend_from_slice(&m.index.to_le_bytes());
         }
     }
-    buf
+    Ok(buf)
+}
+
+pub fn validate_name_len(field: &'static str, value: &str) -> Result<(), EncodeError> {
+    let actual = value.as_bytes().len();
+    if actual > MAX_HANDSHAKE_NAME_BYTES {
+        return Err(EncodeError::FieldTooLong {
+            field,
+            max: MAX_HANDSHAKE_NAME_BYTES,
+            actual,
+        });
+    }
+    Ok(())
 }
 
 // ── Decoding (both directions) ───────────────────────────────────────────
@@ -149,7 +188,8 @@ pub fn decode_handshake(buf: &[u8]) -> Result<Handshake, DecodeError> {
 
     // Prefix
     check_remaining(buf, off, 1, "prefix length")?;
-    let prefix_len = buf[off] as usize; off += 1;
+    let prefix_len = buf[off] as usize;
+    off += 1;
     check_remaining(buf, off, prefix_len, "prefix")?;
     let prefix = read_str(buf, off, prefix_len)?;
     off += prefix_len;
@@ -167,8 +207,10 @@ pub fn decode_handshake(buf: &[u8]) -> Result<Handshake, DecodeError> {
     let mut segments = Vec::with_capacity(seg_count);
     for _ in 0..seg_count {
         check_remaining(buf, off, 5, "segment entry")?;
-        let size = read_u32(buf, off); off += 4;
-        let name_len = buf[off] as usize; off += 1;
+        let size = read_u32(buf, off);
+        off += 4;
+        let name_len = buf[off] as usize;
+        off += 1;
         check_remaining(buf, off, name_len, "segment name")?;
         let name = read_str(buf, off, name_len)?;
         off += name_len;
@@ -194,13 +236,15 @@ pub fn decode_handshake(buf: &[u8]) -> Result<Handshake, DecodeError> {
         routes.reserve(route_count);
         for _ in 0..route_count {
             check_remaining(buf, off, 1, "route name_len")?;
-            let r_len = buf[off] as usize; off += 1;
+            let r_len = buf[off] as usize;
+            off += 1;
             check_remaining(buf, off, r_len, "route name")?;
             let r_name = read_str(buf, off, r_len)?;
             off += r_len;
 
             check_remaining(buf, off, 2, "method count")?;
-            let m_count = read_u16(buf, off) as usize; off += 2;
+            let m_count = read_u16(buf, off) as usize;
+            off += 2;
             if m_count > MAX_METHODS {
                 return Err(DecodeError::InvalidValue {
                     field: "method count",
@@ -210,27 +254,49 @@ pub fn decode_handshake(buf: &[u8]) -> Result<Handshake, DecodeError> {
             let mut methods = Vec::with_capacity(m_count);
             for _ in 0..m_count {
                 check_remaining(buf, off, 1, "method name_len")?;
-                let m_len = buf[off] as usize; off += 1;
+                let m_len = buf[off] as usize;
+                off += 1;
                 check_remaining(buf, off, m_len, "method name")?;
                 let m_name = read_str(buf, off, m_len)?;
                 off += m_len;
                 check_remaining(buf, off, 2, "method index")?;
-                let m_idx = read_u16(buf, off); off += 2;
-                methods.push(MethodEntry { name: m_name, index: m_idx });
+                let m_idx = read_u16(buf, off);
+                off += 2;
+                methods.push(MethodEntry {
+                    name: m_name,
+                    index: m_idx,
+                });
             }
-            routes.push(RouteInfo { name: r_name, methods });
+            routes.push(RouteInfo {
+                name: r_name,
+                methods,
+            });
         }
     }
 
-    Ok(Handshake { prefix, segments, capability_flags, routes })
+    Ok(Handshake {
+        prefix,
+        segments,
+        capability_flags,
+        routes,
+    })
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────
 
 #[inline]
-fn check_remaining(buf: &[u8], off: usize, need: usize, field: &'static str) -> Result<(), DecodeError> {
+fn check_remaining(
+    buf: &[u8],
+    off: usize,
+    need: usize,
+    field: &'static str,
+) -> Result<(), DecodeError> {
     if off + need > buf.len() {
-        Err(DecodeError::Truncated { field, need, have: buf.len() - off })
+        Err(DecodeError::Truncated {
+            field,
+            need,
+            have: buf.len() - off,
+        })
     } else {
         Ok(())
     }

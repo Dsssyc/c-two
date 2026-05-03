@@ -1,0 +1,26 @@
+[package]
+name = "c2-python-native"
+edition = "2024"
+version = "0.1.0"
+description = "PyO3 native extension for the C-Two Python SDK"
+
+[lib]
+name = "c2_ffi"
+crate-type = ["cdylib", "lib"]
+
+[features]
+default = ["python"]
+python = ["dep:pyo3"]
+
+[dependencies]
+c2-config = { path = "../../../core/foundation/c2-config" }
+c2-error = { path = "../../../core/foundation/c2-error" }
+c2-mem = { path = "../../../core/foundation/c2-mem" }
+c2-wire = { path = "../../../core/protocol/c2-wire" }
+c2-http = { path = "../../../core/transport/c2-http" }
+c2-ipc = { path = "../../../core/transport/c2-ipc" }
+c2-server = { path = "../../../core/transport/c2-server" }
+parking_lot = "0.12"
+pyo3 = { version = "0.28", features = ["extension-module"], optional = true }
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"

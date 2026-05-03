@@ -10,8 +10,7 @@
 
 <p align="center">
   <a href="https://pypi.org/project/c-two/"><img src="https://img.shields.io/pypi/v/c-two" alt="PyPI" /></a>
-  <a href="https://pypi.org/project/c-two/"><img src="https://img.shields.io/pypi/dm/c-two" alt="Downloads" /></a>
-  <a href="https://pypi.org/project/c-two/"><img src="https://img.shields.io/pypi/pyversions/c-two" alt="Python" /></a>
+  <a href="https://pypi.org/project/c-two/"><img src="https://img.shields.io/badge/Python-3.10%2B-blue" alt="Python 3.10+" /></a>
   <img src="https://img.shields.io/badge/free--threading-3.14t-blue" alt="Free-threading" />
   <a href="https://github.com/world-in-progress/c-two/actions/workflows/ci.yml"><img src="https://github.com/world-in-progress/c-two/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/github/license/world-in-progress/c-two" alt="License" /></a>
@@ -109,15 +108,16 @@ counter.value()          # → 0
 cc.close(counter)
 ```
 
-### Or remotely — same API, different address
+### Or remotely — same API, relay discovery
 
 ```python
 # Server process
-cc.set_address('ipc:///tmp/my_server')
+cc.set_relay('http://relay-host:8080')
 cc.register(Counter, CounterImpl(), name='counter')
 
 # Client process (separate terminal)
-counter = cc.connect(Counter, name='counter', address='ipc:///tmp/my_server')
+cc.set_relay('http://relay-host:8080')
+counter = cc.connect(Counter, name='counter')
 counter.increment(5)     # works identically
 cc.close(counter)
 ```
@@ -182,13 +182,13 @@ A **server** is any process that calls `cc.register(...)` to host one or more re
 ```python
 import c_two as cc
 
-cc.set_address('ipc://my_server')              # optional — default is auto UUID path
 cc.register(Greeter, GreeterImpl(), name='greeter')
 cc.register(Counter, CounterImpl(), name='counter')
 cc.serve()                                     # blocks; Ctrl-C triggers graceful shutdown
 ```
 
-- **Address** (`ipc://...`) is the local transport endpoint. Clients in the *same process* skip it entirely (zero serialization); clients in a *different process on the same host* connect to this address directly.
+- **Server ID** identifies the local IPC server instance. C-Two generates one on first registration unless you call `cc.set_server(server_id=...)` before registering.
+- **Address** (`ipc://...`) is the internal local transport endpoint derived from the server ID. Inspect it with `cc.server_address()` only when a same-host process needs to connect directly.
 - **`cc.serve()`** is optional — if your host process has its own event loop (web server, GUI, simulation), you can register resources and let them serve in the background while your main loop runs.
 - A process can be both a server and a client at the same time (register some resources, connect to others).
 
@@ -199,11 +199,23 @@ An **HTTP relay** (`c3 relay`) is a lightweight broker that lets clients reach s
 The `c3` command is C-Two's cross-language native CLI. From a source checkout,
 build and link a local development binary with
 `python tools/dev/c3_tool.py --build --link`.
+The Python SDK does not embed or start the relay server; start `c3 relay`,
+Docker Compose, or your orchestrator separately, then point Python code at it
+with `C2_RELAY_ADDRESS` or `cc.set_relay()`.
+Relay-aware clients preflight routes before the first call and re-resolve
+structured stale-route responses; set `C2_RELAY_ROUTE_MAX_ATTEMPTS` to tune the
+maximum route acquisition attempts (default `3`, valid range `1..=32`, `0` is
+treated as `1`). Ambiguous data-plane failures are not replayed.
 
 ```bash
 # Start a relay anywhere reachable on your network
 c3 relay --bind 0.0.0.0:8080
 ```
+
+Relay HTTP and mesh endpoints are intended for a trusted network boundary. Do
+not expose them directly to the public internet; production deployments should
+restrict access with infrastructure such as private networking, firewalls,
+Kubernetes NetworkPolicy, service mesh policy, or ingress authentication.
 
 ```python
 # Server side — announce resources to the relay
@@ -395,8 +407,9 @@ class MeshStore:
     def cleanup(self):
         print('MeshStore shutting down')
 
-cc.set_address('ipc://mesh_server')
 cc.register(MeshStore, MeshStore(), name='mesh')
+print(cc.server_id())
+print(cc.server_address())
 cc.serve()  # blocks until interrupted
 ```
 
@@ -406,7 +419,7 @@ import c_two as cc
 from types import MeshStore, Mesh
 import numpy as np
 
-mesh_store = cc.connect(MeshStore, name='mesh', address='ipc://mesh_server')
+mesh_store = cc.connect(MeshStore, name='mesh', address='ipc://<server-address>')
 
 # Upload data
 big_mesh = Mesh(n_vertices=1_000_000,
@@ -434,7 +447,6 @@ An HTTP relay bridges network requests to CRM processes running on IPC. CRM proc
 import c_two as cc
 
 cc.set_relay('http://relay-host:8080')
-cc.set_address('ipc://mesh_server')
 cc.register(MeshStore, MeshStore(), name='mesh')
 cc.serve()  # blocks until Ctrl-C
 ```
@@ -444,6 +456,10 @@ cc.serve()  # blocks until Ctrl-C
 # Bind address from CLI flag, env var C2_RELAY_BIND, or .env file
 c3 relay --bind 0.0.0.0:8080
 ```
+
+Expose relay HTTP only inside a trusted deployment boundary. The relay mesh
+protocol assumes infrastructure-level access control, not public internet
+reachability.
 
 **Client** (`client.py`):
 ```python
@@ -471,6 +487,9 @@ c3 relay --bind 0.0.0.0:8080 --relay-id relay-b \
     --advertise-url http://relay-b:8080 --seeds http://relay-a:8080
 ```
 
+Mesh peer endpoints (`/_peer/*`) accept route gossip from configured peers and
+must be protected by the same trusted network boundary as the relay HTTP API.
+
 CRM processes register with their local relay; the mesh propagates routes automatically. Clients can connect through **any** relay in the mesh.
 
 > **Best for:** multi-node clusters, high availability, geographic distribution.
@@ -495,7 +514,7 @@ stats = cc.hold_stats()
 In scientific computation, resources encapsulating complex state and domain-specific operations need to be organized into cohesive units. We call the contracts describing these resources **Core Resource Models (CRMs)**. Applications care more about *how to interact* with resources than *where they are located*. C-Two provides location transparency and uniform resource access, so any **client** can interact with a resource as if it were a local object.
 
 <p align="center">
-  <img src="docs/images/architecture.svg" alt="C-Two architecture diagram" width="100%">
+  <img src="docs/images/architecture.png" alt="C-Two architecture diagram" width="100%">
 </p>
 
 ### Client Layer
@@ -570,7 +589,7 @@ cd c-two
 cp .env.example .env               # configure environment (optional)
 uv sync                            # install dependencies + compile Rust extensions
 uv sync --group examples           # install examples dependencies (pandas, pyarrow)
-cargo build --manifest-path cli/Cargo.toml  # build the native c3 CLI in source checkouts
+python tools/dev/c3_tool.py --build --link  # build and link native c3 for source checkouts
 uv run pytest                      # run the test suite
 ```
 
@@ -589,7 +608,7 @@ uv run pytest                      # run the test suite
 | Chunked streaming (payloads > 256 MB) | ✅ Stable |
 | Heartbeat & connection management | ✅ Stable |
 | Read/write concurrency control | ✅ Stable |
-| Unified config architecture (Python SSOT) | ✅ Stable |
+| Unified config architecture (Rust resolver SSOT) | ✅ Stable |
 | CI/CD & multi-platform PyPI publishing | ✅ Stable |
 | Disk spill for extreme payloads | ✅ Stable |
 | Hold mode with `from_buffer` zero-copy | ✅ Stable |

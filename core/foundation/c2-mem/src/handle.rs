@@ -1,7 +1,7 @@
 //! Unified memory handle abstracting buddy, dedicated, and file-spill backends.
 
-use std::path::PathBuf;
 use memmap2::MmapMut;
+use std::path::PathBuf;
 
 /// A handle to an allocated memory region.
 ///
@@ -18,10 +18,7 @@ pub enum MemHandle {
         len: usize,
     },
     /// T3: dedicated SHM segment.
-    Dedicated {
-        seg_idx: u16,
-        len: usize,
-    },
+    Dedicated { seg_idx: u16, len: usize },
     /// T4: file-backed mmap (disk spill).
     FileSpill {
         mmap: MmapMut,
@@ -65,14 +62,25 @@ impl MemHandle {
 impl std::fmt::Debug for MemHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Buddy { seg_idx, offset, len } => {
-                write!(f, "MemHandle::Buddy(seg={seg_idx}, off={offset}, len={len})")
+            Self::Buddy {
+                seg_idx,
+                offset,
+                len,
+            } => {
+                write!(
+                    f,
+                    "MemHandle::Buddy(seg={seg_idx}, off={offset}, len={len})"
+                )
             }
             Self::Dedicated { seg_idx, len } => {
                 write!(f, "MemHandle::Dedicated(seg={seg_idx}, len={len})")
             }
             Self::FileSpill { path, len, .. } => {
-                write!(f, "MemHandle::FileSpill(path={}, len={len})", path.display())
+                write!(
+                    f,
+                    "MemHandle::FileSpill(path={}, len={len})",
+                    path.display()
+                )
             }
         }
     }
@@ -84,7 +92,11 @@ mod tests {
 
     #[test]
     fn test_buddy_handle_len() {
-        let h = MemHandle::Buddy { seg_idx: 0, offset: 1024, len: 4096 };
+        let h = MemHandle::Buddy {
+            seg_idx: 0,
+            offset: 1024,
+            len: 4096,
+        };
         assert_eq!(h.len(), 4096);
         assert!(h.is_buddy());
         assert!(!h.is_file_spill());
@@ -92,7 +104,10 @@ mod tests {
 
     #[test]
     fn test_dedicated_handle_len() {
-        let h = MemHandle::Dedicated { seg_idx: 8, len: 1_000_000 };
+        let h = MemHandle::Dedicated {
+            seg_idx: 8,
+            len: 1_000_000,
+        };
         assert_eq!(h.len(), 1_000_000);
         assert!(h.is_dedicated());
     }
@@ -101,7 +116,11 @@ mod tests {
     fn test_file_spill_handle() {
         let dir = std::env::temp_dir().join("c2_handle_test");
         let (mmap, path) = crate::spill::create_file_spill(4096, &dir).unwrap();
-        let h = MemHandle::FileSpill { mmap, path, len: 4096 };
+        let h = MemHandle::FileSpill {
+            mmap,
+            path,
+            len: 4096,
+        };
         assert_eq!(h.len(), 4096);
         assert!(h.is_file_spill());
         let dbg = format!("{:?}", h);

@@ -200,7 +200,6 @@ dependencies = [
  "c2-http",
  "clap",
  "ctrlc",
- "dotenvy",
  "percent-encoding",
  "predicates",
  "reqwest",
@@ -213,6 +212,7 @@ dependencies = [
 name = "c2-config"
 version = "0.1.0"
 dependencies = [
+ "dotenvy",
  "gethostname",
  "uuid",
 ]

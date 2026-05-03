@@ -1,74 +1,76 @@
-"""Process-level configuration read from environment variables."""
+"""Process-level configuration facade for Python code overrides."""
 from __future__ import annotations
 
-import os
+class C2Settings:
+    """Process-level facade for SDK code overrides.
 
-from pydantic_settings import BaseSettings, SettingsConfigDict
+    Environment variables and ``.env`` files are resolved by the Rust
+    ``c2-config`` resolver. This object only stores Python code-level
+    overrides such as ``cc.set_relay()``.
+    """
 
-_env_file = os.environ.get('C2_ENV_FILE', '.env') or None
-
-
-class C2Settings(BaseSettings):
-    """C-Two runtime settings sourced from environment variables."""
-
-    model_config = SettingsConfigDict(
-        env_file=_env_file,
-        env_prefix='C2_',
-        env_file_encoding='utf-8',
-        extra='ignore',
-    )
-
-    # Transport addresses
-    ipc_address: str | None = None
-    relay_address: str | None = None
-    relay_seeds: str = ""                       # C2_RELAY_SEEDS (comma-separated URLs)
-    relay_bind: str | None = None                # C2_RELAY_BIND (c3 relay --bind)
-    relay_id: str | None = None                  # C2_RELAY_ID (c3 relay --relay-id)
-    relay_advertise_url: str | None = None       # C2_RELAY_ADVERTISE_URL
-    relay_idle_timeout: int | None = None        # C2_RELAY_IDLE_TIMEOUT
-    relay_anti_entropy_interval: float = 60.0    # C2_RELAY_ANTI_ENTROPY_INTERVAL
-    # NOTE: C2_RELAY_USE_PROXY is read directly via os.environ in
-    # transport/registry.py and Rust crate::relay_use_proxy(). It is NOT a
-    # pydantic field here because both layers must agree on its value at
-    # call time, not at settings-instantiation time.
+    def __init__(
+        self,
+        *,
+        relay_address: str | None = None,
+        shm_threshold: int | None = None,
+    ) -> None:
+        self._relay_address = _clean_optional_str(relay_address)
+        self._shm_threshold: int | None = None
+        if shm_threshold is not None:
+            self.shm_threshold = shm_threshold
 
     @property
-    def relay_seed_list(self) -> list[str]:
-        """Parse comma-separated relay seeds into a list."""
-        if not self.relay_seeds:
-            return []
-        return [s.strip() for s in self.relay_seeds.split(",") if s.strip()]
+    def relay_address(self) -> str | None:
+        if self._relay_address is not None:
+            return self._relay_address
+        return _resolve_relay_address()
 
-    # Global hardware param
-    shm_threshold: int | None = None            # C2_SHM_THRESHOLD
+    @relay_address.setter
+    def relay_address(self, value: str | None) -> None:
+        self._relay_address = _clean_optional_str(value)
 
-    # IPC pool overrides (None = use class default)
-    ipc_pool_segment_size: int | None = None    # C2_IPC_POOL_SEGMENT_SIZE
-    ipc_max_pool_segments: int | None = None    # C2_IPC_MAX_POOL_SEGMENTS
-    ipc_max_pool_memory: int | None = None      # C2_IPC_MAX_POOL_MEMORY
-    ipc_pool_decay_seconds: float | None = None
-    ipc_pool_enabled: bool | None = None
+    @property
+    def shm_threshold(self) -> int:
+        if self._shm_threshold is not None:
+            return self._shm_threshold
+        return _resolve_shm_threshold()
 
-    # IPC frame/payload limits
-    ipc_max_frame_size: int | None = None
-    ipc_max_payload_size: int | None = None
-    ipc_max_pending_requests: int | None = None
+    @shm_threshold.setter
+    def shm_threshold(self, value: int | None) -> None:
+        if value is None:
+            self._shm_threshold = None
+            return
+        value = int(value)
+        if value <= 0:
+            raise ValueError(f'shm_threshold must be > 0, got {value}')
+        self._shm_threshold = value
 
-    # IPC heartbeat
-    ipc_heartbeat_interval: float | None = None
-    ipc_heartbeat_timeout: float | None = None
+    def _shm_overrides(self) -> dict[str, int]:
+        overrides: dict[str, int] = {}
+        if self._shm_threshold is not None:
+            overrides['shm_threshold'] = self._shm_threshold
+        return overrides
 
-    # IPC chunk
-    ipc_max_total_chunks: int | None = None
-    ipc_chunk_gc_interval: float | None = None
-    ipc_chunk_threshold_ratio: float | None = None
-    ipc_chunk_assembler_timeout: float | None = None
-    ipc_max_reassembly_bytes: int | None = None
-    ipc_chunk_size: int | None = None
 
-    # IPC reassembly pool
-    ipc_reassembly_segment_size: int | None = None
-    ipc_reassembly_max_segments: int | None = None
+def _clean_optional_str(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _resolve_shm_threshold() -> int:
+    from c_two._native import resolve_shm_threshold
+
+    shm_overrides = settings._shm_overrides()  # noqa: SLF001
+    return int(resolve_shm_threshold(shm_overrides))
+
+
+def _resolve_relay_address() -> str | None:
+    from c_two._native import resolve_relay_address
+
+    return resolve_relay_address()
 
 
 settings = C2Settings()

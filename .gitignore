@@ -197,3 +197,6 @@ benchmarks/results/*
 .superpowers/
 .worktrees/
 .bin/
+
+# Specific Python versions
+.python-version

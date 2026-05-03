@@ -13,15 +13,15 @@
 //!
 //! All integers are little-endian.
 
+pub mod assembler;
+pub mod buddy;
+pub mod chunk;
+pub mod control;
+pub mod ctrl;
 pub mod flags;
 pub mod frame;
-pub mod buddy;
-pub mod control;
-pub mod chunk;
-pub mod ctrl;
-pub mod msg_type;
 pub mod handshake;
-pub mod assembler;
+pub mod msg_type;
 
 #[cfg(test)]
 mod tests;

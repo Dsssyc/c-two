@@ -72,7 +72,13 @@ pub enum RequestData {
 /// Must be called on error paths where the request won't be consumed by a CRM callback.
 pub fn cleanup_request(request: RequestData) {
     match request {
-        RequestData::Shm { pool, seg_idx, offset, data_size, is_dedicated } => {
+        RequestData::Shm {
+            pool,
+            seg_idx,
+            offset,
+            data_size,
+            is_dedicated,
+        } => {
             let mut p = pool.write();
             let _ = p.free_at(seg_idx as u32, offset, data_size, is_dedicated);
         }
@@ -87,12 +93,18 @@ pub fn cleanup_request(request: RequestData) {
 impl std::fmt::Debug for RequestData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RequestData::Shm { seg_idx, offset, data_size, is_dedicated, .. } =>
-                write!(f, "RequestData::Shm(seg={seg_idx}, off={offset}, size={data_size}, ded={is_dedicated})"),
-            RequestData::Inline(v) =>
-                write!(f, "RequestData::Inline({} bytes)", v.len()),
-            RequestData::Handle { .. } =>
-                write!(f, "RequestData::Handle"),
+            RequestData::Shm {
+                seg_idx,
+                offset,
+                data_size,
+                is_dedicated,
+                ..
+            } => write!(
+                f,
+                "RequestData::Shm(seg={seg_idx}, off={offset}, size={data_size}, ded={is_dedicated})"
+            ),
+            RequestData::Inline(v) => write!(f, "RequestData::Inline({} bytes)", v.len()),
+            RequestData::Handle { .. } => write!(f, "RequestData::Handle"),
         }
     }
 }
@@ -195,8 +207,8 @@ impl Default for Dispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use c2_mem::PoolConfig;
     use crate::scheduler::ConcurrencyMode;
+    use c2_mem::PoolConfig;
     use std::collections::HashMap;
 
     struct MockCallback;
@@ -216,7 +228,10 @@ mod tests {
     fn make_route(name: &str) -> CrmRoute {
         CrmRoute {
             name: name.to_string(),
-            scheduler: Arc::new(Scheduler::new(ConcurrencyMode::ReadParallel, HashMap::new())),
+            scheduler: Arc::new(Scheduler::new(
+                ConcurrencyMode::ReadParallel,
+                HashMap::new(),
+            )),
             callback: Arc::new(MockCallback),
             method_names: vec!["method_a".into(), "method_b".into()],
         }
@@ -233,13 +248,17 @@ mod tests {
 
         // invoke the callback through the route
         let pool = Arc::new(parking_lot::RwLock::new(
-            MemPool::new(PoolConfig::default())
+            MemPool::new(PoolConfig::default()),
         ));
-        let result = route.callback.invoke(
-            "grid", 0,
-            RequestData::Inline(b"test".to_vec()),
-            pool.clone(),
-        ).unwrap();
+        let result = route
+            .callback
+            .invoke(
+                "grid",
+                0,
+                RequestData::Inline(b"test".to_vec()),
+                pool.clone(),
+            )
+            .unwrap();
         assert!(matches!(result, ResponseMeta::Inline(ref v) if v == b"echo"));
     }
 
@@ -335,14 +354,12 @@ mod tests {
         }
 
         let pool = Arc::new(parking_lot::RwLock::new(
-            MemPool::new(PoolConfig::default())
+            MemPool::new(PoolConfig::default()),
         ));
         let cb: Arc<dyn CrmCallback> = Arc::new(FailCallback);
-        let err = cb.invoke(
-            "grid", 99,
-            RequestData::Inline(b"test".to_vec()),
-            pool,
-        ).unwrap_err();
+        let err = cb
+            .invoke("grid", 99, RequestData::Inline(b"test".to_vec()), pool)
+            .unwrap_err();
         assert!(matches!(err, CrmError::InternalError(_)));
     }
 }

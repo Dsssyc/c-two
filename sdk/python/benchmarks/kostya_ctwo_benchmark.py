@@ -224,7 +224,10 @@ if HAS_FASTDB:
 
 def _server_main(variant: str, n: int, ready_path: str) -> None:
     icrm_cls, crm_cls, _ = VARIANTS[variant]
-    cc.set_server(pool_segment_size=2 * 1024 * 1024 * 1024, max_pool_segments=8)
+    cc.set_server(ipc_overrides={
+        'pool_segment_size': 2 * 1024 * 1024 * 1024,
+        'max_pool_segments': 8,
+    })
     cc.register(icrm_cls, crm_cls(n), name='coords')
     addr = cc.server_address() or ''
     with open(ready_path, 'w') as f:
@@ -255,7 +258,10 @@ def run_variant(variant: str, n: int, iters: int, warmup: int) -> dict:
     try:
         address = _wait_ready(ready_path)
 
-        cc.set_client(pool_segment_size=2 * 1024 * 1024 * 1024, max_pool_segments=8)
+        cc.set_client(ipc_overrides={
+            'pool_segment_size': 2 * 1024 * 1024 * 1024,
+            'max_pool_segments': 8,
+        })
         proxy = cc.connect(icrm_cls, name='coords', address=address)
 
         # Warmup

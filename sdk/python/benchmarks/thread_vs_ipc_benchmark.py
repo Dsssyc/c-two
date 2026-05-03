@@ -19,6 +19,7 @@ import statistics
 import time
 
 import c_two as cc
+from c_two.transport.client.util import _socket_path_from_address
 
 
 # ---------------------------------------------------------------------------
@@ -70,12 +71,6 @@ SIZES = [
 ROUNDS = 100
 WARMUP = 5
 
-_IPC_SOCK_DIR = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
-
-
-_IPC_SOCK_DIR = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
-
-
 # ---------------------------------------------------------------------------
 # Thread-local path — cc.connect() without address (zero serde)
 # ---------------------------------------------------------------------------
@@ -122,14 +117,19 @@ def bench_ipc(payload_size: int) -> float:
     _ipc_counter += 1
 
     # 2 GB buddy segments to handle up to 1 GB payloads.
-    cc.set_server(segment_size=2 * 1024 * 1024 * 1024, max_segments=8)
-    cc.set_client(segment_size=2 * 1024 * 1024 * 1024, max_segments=8)
+    cc.set_server(ipc_overrides={
+        'pool_segment_size': 2 * 1024 * 1024 * 1024,
+        'max_pool_segments': 8,
+    })
+    cc.set_client(ipc_overrides={
+        'pool_segment_size': 2 * 1024 * 1024 * 1024,
+        'max_pool_segments': 8,
+    })
     cc.register(Echo, EchoImpl(), name='echo_ipc')
     address = cc.server_address()
 
     # Wait for server socket.
-    region_id = address.replace('ipc://', '')
-    sock_path = os.path.join(_IPC_SOCK_DIR, f'{region_id}.sock')
+    sock_path = _socket_path_from_address(address)
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
         if os.path.exists(sock_path):

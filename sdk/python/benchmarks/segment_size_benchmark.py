@@ -13,9 +13,11 @@ import glob
 import math
 import os
 import statistics
+import sys
 import time
 
 import c_two as cc
+from c_two.transport.client.util import _socket_path_from_address
 from c_two.transport.registry import _ProcessRegistry
 
 # ── Echo CRMs ─────────────────────────────────────────────────────────
@@ -69,7 +71,7 @@ _counter = 0
 def _wait_sock(address: str, timeout: float = 5.0) -> None:
     """Wait for the UDS socket file to appear."""
     import pathlib
-    sock = pathlib.Path(f'/tmp/c_two_ipc/{address.removeprefix("ipc://")}.sock')
+    sock = pathlib.Path(_socket_path_from_address(address))
     t0 = time.monotonic()
     while not sock.exists():
         if time.monotonic() - t0 > timeout:
@@ -92,10 +94,14 @@ def bench_ipc_bytes(payload_size: int, seg_size: int) -> float | None:
     _counter += 1
     _ProcessRegistry.reset()
 
-    cc.set_server(segment_size=seg_size, max_segments=8,
-                              reassembly_segment_size=seg_size, reassembly_max_segments=8)
-    cc.set_client(segment_size=seg_size, max_segments=8,
-                              reassembly_segment_size=seg_size, reassembly_max_segments=8)
+    ipc_overrides = {
+        'pool_segment_size': seg_size,
+        'max_pool_segments': 8,
+        'reassembly_segment_size': seg_size,
+        'reassembly_max_segments': 8,
+    }
+    cc.set_server(ipc_overrides=ipc_overrides)
+    cc.set_client(ipc_overrides=ipc_overrides)
     cc.register(Echo, EchoImpl(), name='echo_b')
     address = cc.server_address()
     _wait_sock(address)
@@ -135,10 +141,14 @@ def bench_ipc_dict(payload_size: int, seg_size: int) -> float | None:
     _counter += 1
     _ProcessRegistry.reset()
 
-    cc.set_server(segment_size=seg_size, max_segments=8,
-                              reassembly_segment_size=seg_size, reassembly_max_segments=8)
-    cc.set_client(segment_size=seg_size, max_segments=8,
-                              reassembly_segment_size=seg_size, reassembly_max_segments=8)
+    ipc_overrides = {
+        'pool_segment_size': seg_size,
+        'max_pool_segments': 8,
+        'reassembly_segment_size': seg_size,
+        'reassembly_max_segments': 8,
+    }
+    cc.set_server(ipc_overrides=ipc_overrides)
+    cc.set_client(ipc_overrides=ipc_overrides)
     cc.register(DictEcho, DictEchoImpl(), name='echo_d')
     address = cc.server_address()
     _wait_sock(address)

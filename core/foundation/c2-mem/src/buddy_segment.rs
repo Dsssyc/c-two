@@ -24,9 +24,7 @@ impl BuddySegment {
         let actual_size = BuddyAllocator::required_shm_size(size, min_block);
         let region = ShmRegion::create(name, actual_size)?;
 
-        let allocator = unsafe {
-            BuddyAllocator::init(region.base_ptr(), actual_size, min_block)
-        };
+        let allocator = unsafe { BuddyAllocator::init(region.base_ptr(), actual_size, min_block) };
 
         Ok(Self { region, allocator })
     }
@@ -35,9 +33,7 @@ impl BuddySegment {
     pub fn open(name: &str, expected_size: usize) -> Result<Self, String> {
         let region = ShmRegion::open(name, expected_size)?;
 
-        let allocator = unsafe {
-            BuddyAllocator::attach(region.base_ptr(), region.size())?
-        };
+        let allocator = unsafe { BuddyAllocator::attach(region.base_ptr(), region.size())? };
 
         Ok(Self { region, allocator })
     }

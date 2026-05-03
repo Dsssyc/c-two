@@ -123,7 +123,8 @@ impl LevelBitmap {
         debug_assert!(block_idx < self.num_blocks);
         let word_idx = block_idx / 64;
         let bit = block_idx % 64;
-        self.word(word_idx).fetch_and(!(1u64 << bit), Ordering::Release);
+        self.word(word_idx)
+            .fetch_and(!(1u64 << bit), Ordering::Release);
     }
 
     /// Number of words in this bitmap.
@@ -174,7 +175,7 @@ pub fn num_levels(segment_data_size: usize, min_block: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::alloc::{alloc_zeroed, dealloc, Layout};
+    use std::alloc::{Layout, alloc_zeroed, dealloc};
 
     fn make_bitmap(num_blocks: usize) -> (LevelBitmap, *mut u8, Layout) {
         let num_words = (num_blocks + 63) / 64;

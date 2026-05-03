@@ -22,6 +22,24 @@ def _resolve_socket_path(region_id: str) -> str:
     return os.path.join(_IPC_SOCK_DIR, f'{region_id}.sock')
 
 
+def _region_from_address(server_address: str) -> str:
+    if not server_address.startswith('ipc://'):
+        raise ValueError(f'invalid IPC address: {server_address!r}')
+    region_id = server_address.removeprefix('ipc://')
+    _validate_region_id(region_id)
+    return region_id
+
+
+def _socket_path_from_address(server_address: str) -> str:
+    return _resolve_socket_path(_region_from_address(server_address))
+
+
+def _validate_region_id(region_id: str) -> None:
+    from c_two._native import validate_ipc_region_id
+
+    validate_ipc_region_id(region_id)
+
+
 def _encode_frame(request_id: int, flags: int, payload: bytes) -> bytes:
     total = 12 + len(payload)
     buf = bytearray(16 + len(payload))
@@ -46,8 +64,10 @@ def _recv_exact(sock: _socket.socket, n: int) -> bytes:
 
 def ping(server_address: str, timeout: float = 0.5) -> bool:
     """Ping a server to check if it is alive."""
-    region_id = server_address.replace('ipc://', '')
-    socket_path = _resolve_socket_path(region_id)
+    try:
+        socket_path = _socket_path_from_address(server_address)
+    except ValueError:
+        return False
     if not os.path.exists(socket_path):
         return False
     sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
@@ -69,8 +89,10 @@ def ping(server_address: str, timeout: float = 0.5) -> bool:
 
 def shutdown(server_address: str, timeout: float = 0.5) -> bool:
     """Send shutdown signal to a server."""
-    region_id = server_address.replace('ipc://', '')
-    socket_path = _resolve_socket_path(region_id)
+    try:
+        socket_path = _socket_path_from_address(server_address)
+    except ValueError:
+        return False
     if not os.path.exists(socket_path):
         return True
     sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)

@@ -1,6 +1,6 @@
 """Integration tests for the HTTP relay chain.
 
-Tests the full pipeline:  RustHttpClient → NativeRelay → RustClient → Server → CRM
+Tests the full pipeline: RustHttpClient -> standalone c3 relay -> RustClient -> Server -> CRM
 
 Also tests ``cc.connect(address='http://...')`` end-to-end.
 """
@@ -8,52 +8,20 @@ from __future__ import annotations
 
 import os
 import threading
-import time
 
 import pytest
 
 import httpx
 
 import c_two as cc
-from c_two._native import NativeRelay, RustHttpClientPool
+from c_two.config.settings import settings
+from c_two._native import RustHttpClientPool
 from c_two.transport.client.proxy import CRMProxy
 from c_two.transport.registry import _ProcessRegistry
 
 from tests.fixtures.hello import HelloImpl
 from tests.fixtures.ihello import Hello
 from tests.fixtures.counter import Counter, CounterImpl
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-_counter = 0
-_lock = threading.Lock()
-
-
-def _next_id() -> int:
-    global _counter
-    with _lock:
-        _counter += 1
-        return _counter
-
-
-def _wait_for_relay(url: str, timeout: float = 5.0) -> None:
-    deadline = time.monotonic() + timeout
-    # trust_env=False disables HTTP_PROXY / HTTPS_PROXY env reading so that
-    # tests which set a black-hole proxy (test_relay_traffic_bypasses_system_proxy)
-    # can still poll the local relay's /health.
-    with httpx.Client(trust_env=False, timeout=0.5) as client:
-        while time.monotonic() < deadline:
-            try:
-                resp = client.get(f'{url}/health')
-                if resp.status_code == 200:
-                    return
-            except Exception:
-                pass
-            time.sleep(0.1)
-    raise TimeoutError(f'Relay at {url} not ready after {timeout}s')
 
 
 def _acquire_http(url: str):
@@ -79,33 +47,30 @@ def _clean_registry():
 
 
 @pytest.fixture
-def relay_stack():
-    """Start Server + NativeRelay and return (relay_url, ipc_address).
+def relay_stack(start_c3_relay):
+    """Start Server + standalone c3 relay and return (relay_url, ipc_address).
 
-    Registers a Hello CRM as 'hello' and optionally a Counter CRM as
-    'counter'.  The relay starts empty; upstreams are added
-    programmatically via ``register_upstream()``.
+    Registers a Hello CRM as 'hello' and a Counter CRM as 'counter'. The relay
+    starts empty; upstreams are added through the HTTP control plane.
     """
-    http_port = 19000 + _next_id()
-
     # Register CRMs via SOTA API.
     cc.register(Hello, HelloImpl(), name='hello')
     cc.register(Counter, CounterImpl(), name='counter')
     ipc_addr = cc.server_address()
+    server_id = cc.server_id()
 
-    # Start relay (empty — no upstream param).
-    relay = NativeRelay(f'0.0.0.0:{http_port}')
-    relay.start()
-    relay_url = f'http://127.0.0.1:{http_port}'
-    _wait_for_relay(relay_url)
+    relay = start_c3_relay()
+    relay_url = relay.url
 
-    # Register upstreams programmatically.
-    relay.register_upstream('hello', ipc_addr)
-    relay.register_upstream('counter', ipc_addr)
+    with httpx.Client(trust_env=False, timeout=5.0) as http:
+        for name in ('hello', 'counter'):
+            resp = http.post(
+                f'{relay_url}/_register',
+                json={'name': name, 'server_id': server_id, 'address': ipc_addr},
+            )
+            assert resp.status_code == 201
 
     yield relay_url, ipc_addr
-
-    relay.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +240,7 @@ class TestCcConnectHttp:
         cc.close(crm)
         assert registry._http_pool.refcount(relay_url) == 0
 
-    def test_connect_http_with_slash_in_name(self):
+    def test_connect_http_with_slash_in_name(self, start_c3_relay):
         """CRM names containing '/' (toodle-style resource paths) work over HTTP relay.
 
         Regression: axum's single-segment ``Path<String>`` extractor would
@@ -283,42 +248,38 @@ class TestCcConnectHttp:
         wrong. Both the Python registry and the Rust HTTP client now
         percent-encode ``/`` as ``%2F``.
         """
-        from c_two._native import NativeRelay
-
         slashed_name = 'toodle/grid/0'
         cc.register(Hello, HelloImpl(), name=slashed_name)
         ipc_addr = cc.server_address()
+        server_id = cc.server_id()
 
-        http_port = 19000 + _next_id()
-        relay = NativeRelay(f'0.0.0.0:{http_port}')
-        relay.start()
-        relay_url = f'http://127.0.0.1:{http_port}'
+        relay = start_c3_relay()
+        relay_url = relay.url
+        with httpx.Client(trust_env=False, timeout=5.0) as http:
+            resp = http.post(
+                f'{relay_url}/_register',
+                json={'name': slashed_name, 'server_id': server_id, 'address': ipc_addr},
+            )
+            assert resp.status_code == 201
+
+        # Forced HTTP mode (address explicitly set).
+        crm = cc.connect(Hello, name=slashed_name, address=relay_url)
         try:
-            _wait_for_relay(relay_url)
-            relay.register_upstream(slashed_name, ipc_addr)
-
-            # Forced HTTP mode (address explicitly set).
-            crm = cc.connect(Hello, name=slashed_name, address=relay_url)
-            try:
-                assert crm.greeting('Slash') == 'Hello, Slash!'
-            finally:
-                cc.close(crm)
+            assert crm.greeting('Slash') == 'Hello, Slash!'
         finally:
-            relay.stop()
+            cc.close(crm)
 
-    def test_relay_traffic_bypasses_system_proxy(self, monkeypatch):
+    def test_relay_traffic_bypasses_system_proxy(self, monkeypatch, start_c3_relay):
         """All relay HTTP traffic must ignore HTTP_PROXY by default.
 
         Regression: when a user sets HTTP_PROXY/HTTPS_PROXY (e.g. a corporate
-        forward proxy or a docker host proxy), Python urllib previously routed
-        relay control traffic through it, and proxies are known to normalize
+        forward proxy or a docker host proxy), relay control traffic must not
+        flow through it by default. Proxies are known to normalize
         percent-encoded ``%2F`` in URL paths to ``/`` — which then breaks
         resource names containing ``/``. This test points HTTP_PROXY at a
         black-hole address and verifies that name resolution + a CRM call
         still succeed (i.e., proxy was bypassed).
         """
-        from c_two._native import NativeRelay
-
         # Black-hole proxy: connecting to TEST-NET-1 (RFC 5737) is guaranteed
         # to time out / fail. If the request actually goes through the proxy,
         # the test will fail loudly.
@@ -328,26 +289,29 @@ class TestCcConnectHttp:
             monkeypatch.delenv(var, raising=False)
 
         name = 'proxy/bypass/test'
-        cc.register(Hello, HelloImpl(), name=name)
-        ipc_addr = cc.server_address()
-
-        http_port = 19000 + _next_id()
-        relay = NativeRelay(f'0.0.0.0:{http_port}')
-        relay.start()
-        relay_url = f'http://127.0.0.1:{http_port}'
+        relay = start_c3_relay()
+        relay_url = relay.url
+        previous_relay = settings.relay_address
+        registrar = _ProcessRegistry()
+        resolver = _ProcessRegistry()
+        crm = None
         try:
-            _wait_for_relay(relay_url)
-            relay.register_upstream(name, ipc_addr)
+            registrar.set_relay(relay_url)
+            # Registration uses the Rust relay control client and must bypass proxies.
+            registrar.register(Hello, HelloImpl(), name=name)
+            resolver.set_relay(relay_url)
 
-            # urllib resolve must succeed (registry's _relay_urlopen bypasses proxy).
-            crm = cc.connect(Hello, name=name, address=relay_url)
-            try:
-                # reqwest call must succeed (Rust HttpClient builder bypasses proxy).
-                assert crm.greeting('NoProxy') == 'Hello, NoProxy!'
-            finally:
-                cc.close(crm)
+            # No-address connect resolves through the Rust relay control client.
+            crm = resolver.connect(Hello, name=name)
+            # reqwest call must succeed (Rust HttpClient builder bypasses proxy).
+            assert crm.greeting('NoProxy') == 'Hello, NoProxy!'
         finally:
-            relay.stop()
+            if crm is not None:
+                resolver.close(crm)
+            resolver.shutdown()
+            settings.relay_address = previous_relay
+            registrar.shutdown()
+            settings.relay_address = previous_relay
 
 
 # ---------------------------------------------------------------------------
@@ -357,179 +321,155 @@ class TestCcConnectHttp:
 class TestRelayControlPlane:
     """Test the relay control-plane endpoints (/_register, /_unregister, /_routes)."""
 
-    def test_register_via_http_control(self):
+    def test_native_control_client_exposes_status_code_for_missing_route(self, start_c3_relay):
+        from c_two._native import RustRelayControlClient
+
+        relay = start_c3_relay()
+        client = RustRelayControlClient(relay.url)
+
+        with pytest.raises(Exception) as exc_info:
+            client.resolve('missing/native')
+
+        assert getattr(exc_info.value, 'status_code', None) == 404
+
+    def test_register_via_http_control(self, start_c3_relay):
         """POST /_register adds an upstream and allows calls."""
-        http_port = 19000 + _next_id()
-
         cc.register(Hello, HelloImpl(), name='hello')
         ipc_addr = cc.server_address()
+        server_id = cc.server_id()
 
-        relay = NativeRelay(f'0.0.0.0:{http_port}')
-        relay.start()
-        relay_url = f'http://127.0.0.1:{http_port}'
-        _wait_for_relay(relay_url)
+        relay = start_c3_relay()
+        relay_url = relay.url
 
+        with httpx.Client(trust_env=False, timeout=5.0) as http:
+            # Register via control endpoint.
+            resp = http.post(
+                f'{relay_url}/_register',
+                json={'name': 'hello', 'server_id': server_id, 'address': ipc_addr},
+            )
+            assert resp.status_code == 201
+            assert resp.json()['registered'] == 'hello'
+
+            # Verify route appears in /_routes.
+            resp = http.get(f'{relay_url}/_routes')
+            assert resp.status_code == 200
+            routes = resp.json()['routes']
+            assert any(r['name'] == 'hello' for r in routes)
+            route = next(r for r in routes if r['name'] == 'hello')
+            assert 'server_id' not in route
+            assert 'ipc_address' not in route
+
+        # Verify data-plane call works.
+        client = _acquire_http(relay_url)
         try:
-            transport = httpx.HTTPTransport()
-            with httpx.Client(transport=transport) as http:
-                # Register via control endpoint.
-                resp = http.post(
-                    f'{relay_url}/_register',
-                    json={'name': 'hello', 'address': ipc_addr},
-                )
-                assert resp.status_code == 201
-                assert resp.json()['registered'] == 'hello'
-
-                # Verify route appears in /_routes.
-                resp = http.get(f'{relay_url}/_routes')
-                assert resp.status_code == 200
-                routes = resp.json()['routes']
-                assert any(r['name'] == 'hello' for r in routes)
-
-            # Verify data-plane call works.
-            client = _acquire_http(relay_url)
-            try:
-                crm = Hello()
-                crm.client = CRMProxy.http(client, 'hello')
-                assert crm.greeting('Control') == 'Hello, Control!'
-            finally:
-                _release_http(relay_url)
+            crm = Hello()
+            crm.client = CRMProxy.http(client, 'hello')
+            assert crm.greeting('Control') == 'Hello, Control!'
         finally:
-            relay.stop()
+            _release_http(relay_url)
 
-    def test_register_duplicate_upsert(self):
+    def test_register_duplicate_upsert(self, start_c3_relay):
         """POST /_register with same name upserts (returns 201)."""
-        http_port = 19000 + _next_id()
-
         cc.register(Hello, HelloImpl(), name='hello')
         ipc_addr = cc.server_address()
+        server_id = cc.server_id()
 
-        relay = NativeRelay(f'0.0.0.0:{http_port}')
-        relay.start()
-        relay_url = f'http://127.0.0.1:{http_port}'
-        _wait_for_relay(relay_url)
+        relay = start_c3_relay()
+        relay_url = relay.url
 
-        try:
-            transport = httpx.HTTPTransport()
-            with httpx.Client(transport=transport) as http:
-                resp = http.post(
-                    f'{relay_url}/_register',
-                    json={'name': 'hello', 'address': ipc_addr},
-                )
-                assert resp.status_code == 201
+        with httpx.Client(trust_env=False, timeout=5.0) as http:
+            resp = http.post(
+                f'{relay_url}/_register',
+                json={'name': 'hello', 'server_id': server_id, 'address': ipc_addr},
+            )
+            assert resp.status_code == 201
 
-                # Same-relay duplicate registration uses upsert semantics.
-                resp = http.post(
-                    f'{relay_url}/_register',
-                    json={'name': 'hello', 'address': ipc_addr},
-                )
-                assert resp.status_code == 201
-        finally:
-            relay.stop()
+            # Same-relay duplicate registration uses upsert semantics.
+            resp = http.post(
+                f'{relay_url}/_register',
+                json={'name': 'hello', 'server_id': server_id, 'address': ipc_addr},
+            )
+            assert resp.status_code == 200
 
-    def test_unregister_removes_route(self):
+    def test_unregister_removes_route(self, start_c3_relay):
         """POST /_unregister removes the route; calls return 404."""
-        http_port = 19000 + _next_id()
-
         cc.register(Hello, HelloImpl(), name='hello')
         ipc_addr = cc.server_address()
+        server_id = cc.server_id()
 
-        relay = NativeRelay(f'0.0.0.0:{http_port}')
-        relay.start()
-        relay_url = f'http://127.0.0.1:{http_port}'
-        _wait_for_relay(relay_url)
+        relay = start_c3_relay()
+        relay_url = relay.url
 
-        try:
-            transport = httpx.HTTPTransport()
-            with httpx.Client(transport=transport) as http:
-                # Register, then unregister.
-                http.post(
-                    f'{relay_url}/_register',
-                    json={'name': 'hello', 'address': ipc_addr},
-                )
-                resp = http.post(
-                    f'{relay_url}/_unregister',
-                    json={'name': 'hello'},
-                )
-                assert resp.status_code == 200
+        with httpx.Client(trust_env=False, timeout=5.0) as http:
+            # Register, then unregister.
+            http.post(
+                f'{relay_url}/_register',
+                json={'name': 'hello', 'server_id': server_id, 'address': ipc_addr},
+            )
+            resp = http.post(
+                f'{relay_url}/_unregister',
+                json={'name': 'hello', 'server_id': server_id},
+            )
+            assert resp.status_code == 200
 
-                # Verify route is gone.
-                resp = http.get(f'{relay_url}/_routes')
-                routes = resp.json()['routes']
-                assert not any(r['name'] == 'hello' for r in routes)
+            # Verify route is gone.
+            resp = http.get(f'{relay_url}/_routes')
+            routes = resp.json()['routes']
+            assert not any(r['name'] == 'hello' for r in routes)
 
-                # Data-plane call should return 404.
-                resp = http.post(
-                    f'{relay_url}/hello/greeting',
-                    content=b'test',
-                )
-                assert resp.status_code == 404
-        finally:
-            relay.stop()
+            # Data-plane call should return 404.
+            resp = http.post(
+                f'{relay_url}/hello/greeting',
+                content=b'test',
+            )
+            assert resp.status_code == 404
 
-    def test_unregister_missing_404(self):
+    def test_unregister_missing_404(self, start_c3_relay):
         """POST /_unregister for unknown name returns 404."""
-        http_port = 19000 + _next_id()
+        relay = start_c3_relay(skip_ipc_validation=True)
+        relay_url = relay.url
 
-        relay = NativeRelay(f'0.0.0.0:{http_port}')
-        relay.start()
-        relay_url = f'http://127.0.0.1:{http_port}'
-        _wait_for_relay(relay_url)
+        with httpx.Client(trust_env=False, timeout=5.0) as http:
+            resp = http.post(
+                f'{relay_url}/_unregister',
+                json={'name': 'nonexistent', 'server_id': 'missing-server'},
+            )
+            assert resp.status_code == 404
 
-        try:
-            transport = httpx.HTTPTransport()
-            with httpx.Client(transport=transport) as http:
-                resp = http.post(
-                    f'{relay_url}/_unregister',
-                    json={'name': 'nonexistent'},
-                )
-                assert resp.status_code == 404
-        finally:
-            relay.stop()
-
-    def test_health_shows_registered_routes(self):
+    def test_health_shows_registered_routes(self, start_c3_relay):
         """GET /health lists all registered route names."""
-        http_port = 19000 + _next_id()
-
         cc.register(Hello, HelloImpl(), name='hello')
         cc.register(Counter, CounterImpl(), name='counter')
         ipc_addr = cc.server_address()
+        server_id = cc.server_id()
 
-        relay = NativeRelay(f'0.0.0.0:{http_port}')
-        relay.start()
-        relay_url = f'http://127.0.0.1:{http_port}'
-        _wait_for_relay(relay_url)
+        relay = start_c3_relay()
+        relay_url = relay.url
 
-        try:
-            relay.register_upstream('hello', ipc_addr)
-            relay.register_upstream('counter', ipc_addr)
-
-            transport = httpx.HTTPTransport()
-            with httpx.Client(transport=transport) as http:
-                resp = http.get(f'{relay_url}/health')
-                health = resp.json()
-                assert health['status'] == 'ok'
-                assert set(health['routes']) == {'hello', 'counter'}
-        finally:
-            relay.stop()
-
-    def test_call_unknown_route_404(self):
-        """POST /{route}/{method} for unregistered route returns 404."""
-        http_port = 19000 + _next_id()
-
-        relay = NativeRelay(f'0.0.0.0:{http_port}')
-        relay.start()
-        relay_url = f'http://127.0.0.1:{http_port}'
-        _wait_for_relay(relay_url)
-
-        try:
-            transport = httpx.HTTPTransport()
-            with httpx.Client(transport=transport) as http:
+        with httpx.Client(trust_env=False, timeout=5.0) as http:
+            for name in ('hello', 'counter'):
                 resp = http.post(
-                    f'{relay_url}/nonexistent/method',
-                    content=b'data',
+                    f'{relay_url}/_register',
+                    json={'name': name, 'server_id': server_id, 'address': ipc_addr},
                 )
-                assert resp.status_code == 404
-                assert 'nonexistent' in resp.json()['error']
-        finally:
-            relay.stop()
+                assert resp.status_code == 201
+
+            resp = http.get(f'{relay_url}/health')
+            health = resp.json()
+            assert health['status'] == 'ok'
+            assert set(health['routes']) == {'hello', 'counter'}
+
+    def test_call_unknown_route_404(self, start_c3_relay):
+        """POST /{route}/{method} for unregistered route returns 404."""
+        relay = start_c3_relay(skip_ipc_validation=True)
+        relay_url = relay.url
+
+        with httpx.Client(trust_env=False, timeout=5.0) as http:
+            resp = http.post(
+                f'{relay_url}/nonexistent/method',
+                content=b'data',
+            )
+            assert resp.status_code == 404
+            data = resp.json()
+            assert data['error'] == 'ResourceNotFound'
+            assert data['route'] == 'nonexistent'

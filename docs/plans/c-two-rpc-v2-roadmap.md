@@ -22,9 +22,9 @@
 | SHM Pool 动态扩容（Segment Chain） | client 自动扩段 + server 懒加载 + 确定性命名 | ✓ (2026-03-31) |
 | SharedClient（N 消费者 → 1 UDS + 1 Pool） | `client/core.py:SharedClient` | ✓ |
 | 统一代理对象（thread / ipc / http 三模式） | `proxy.py:ICRMProxy` | ✓ — 满足 sota.md §4.2 |
-| HTTP relay（Rust 原生） | `c2-relay` Rust crate + `c_two.relay.NativeRelay` | ✓ |
+| HTTP relay（Rust 原生） | `core/transport/c2-http` relay feature + `c3 relay` | ✓ |
 | HTTP client + 跨节点访问 | `client/http.py:HttpClient` | ✓ |
-| Rust SDK（c2-mem, c2-wire, c2-ipc, c2-relay, c2-ffi） | `src/c_two/_native/` workspace (5 crates) | ✓ |
+| Rust 核心（c2-mem, c2-wire, c2-ipc, c2-http, c2-server, c2-config） | `core/` workspace + `cli/` | ✓ |
 | @cc.read / @cc.write 并发控制 | `server/scheduler.py:Scheduler` + `_WriterPriorityReadWriteLock` | ✓ |
 | Per-connection write barrier（同连接因果序保证） | `server/core.py:_handle_client` + barrier 机制 | ✓ (2026-03-28) |
 | dispatch_cache 代际失效 | `server/core.py:_slots_generation` | ✓ (2026-03-28) |
@@ -34,9 +34,9 @@
 | @cc.shutdown 声明式生命周期回调 | `crm/meta.py` + `server/core.py` + `registry.py` | ✓ (2026-03-29) |
 | 心跳检测 + 连接空闲清理 + SHM 孤儿回收 | `server/heartbeat.py` + `server/core.py` + `client/core.py` | ✓ (2026-03-29) |
 | 优雅断连协议（DISCONNECT / DISCONNECT_ACK） | `client/core.py` + `server/core.py` + `c2-ipc/client.rs` | ✓ (2026-03-30) |
-| Relay 空闲连接回收（Python + Rust 双实现） | `relay/core.py` + `c2-relay/state.rs` + `c2-relay/server.rs` | ✓ (2026-03-30) |
-| Relay 死连接主动检测（get() + sweeper） | `relay/core.py:get()` + `c2-relay/state.rs:get()` | ✓ (2026-03-30) |
-| Relay 调用失败即驱逐（Rust router） | `c2-relay/router.rs` 传输错误分支立即驱逐死客户端 | ✓ (2026-03-30) |
+| Relay 空闲连接回收（Rust standalone） | `core/transport/c2-http/src/relay/state.rs` + `server.rs` | ✓ (2026-03-30, 2026-07-21 加固) |
+| Relay 死连接主动检测（get() + sweeper） | `core/transport/c2-http/src/relay/state.rs:get()` | ✓ (2026-03-30) |
+| Relay 调用失败即驱逐（Rust router） | `core/transport/c2-http/src/relay/router.rs` 传输错误分支立即驱逐死客户端 | ✓ (2026-03-30) |
 | DISCONNECT_ACK 显式处理（Rust recv_loop） | `c2-ipc/client.rs:recv_loop` 匹配 ACK 后 clean break | ✓ (2026-03-30) |
 | 死代码清理（SHUTDOWN_SERVER 0x06） | `ipc/msg_type.py` 移除未使用的信号类型 | ✓ (2026-03-30) |
 | 测试环境 .env 隔离 | `transport/config.py:C2_ENV_FILE` + `tests/conftest.py` | ✓ (2026-03-30) |
@@ -47,9 +47,9 @@
 | uv 自动检测 Rust 源码变更并重编译 | `pyproject.toml:cache-keys` 追踪 `_native/**/*.rs` | ✓ (2026-03-31) |
 | 磁盘溢写兜底（MemHandle + Rust ChunkAssembler） | `c2-mem/spill.rs` + `c2-mem/handle.rs` + `c2-wire/assembler.rs` + `c2-ffi/mem_ffi.rs` | ✓ (2026-07-20) |
 | Free-threading 并发安全审计（CRITICAL + HIGH） | `registry.py` + `server/core.py` + `client/core.py` — 竞态修复 | ✓ (2026-07-20) |
-| Python Relay 删除，统一 Rust NativeRelay | 删除 `relay/core.py` (610 行)，`c_two.relay` 直接暴露 Rust | ✓ (2026-07-20) |
+| Python Relay 删除，Relay 独立运行 | 删除 `relay/core.py` (610 行)，SDK 仅通过 HTTP client 访问外部 `c3 relay` | ✓ (2026-07-20, 2026-07-21 收敛) |
 | Legacy event error 类型清理 | `error.py` 重构：移除 Event 相关类型，改名 FrameDecodeError | ✓ (2026-07-20) |
-| Relay 大 payload 支持（HTTP 413 + IPC 帧限制） | `c2-relay/router.rs` DefaultBodyLimit + `frame.py` 2GB 帧上限 | ✓ (2026-07-20) |
+| Relay 大 payload 支持（HTTP 413 + IPC 帧限制） | `core/transport/c2-http/src/relay/router.rs` DefaultBodyLimit + `frame.py` 2GB 帧上限 | ✓ (2026-07-20) |
 | 综合性能基准测试（三模式 + dict/bytes 对比） | `benchmarks/three_mode_benchmark.py` — 64B→1GB 全覆盖 | ✓ (2026-07-20) |
 
 ### 仓库重构 ✓
@@ -63,7 +63,7 @@
 | 配置暴露 | 11 项硬编码常量移入 `IPCConfig`，3 项僵尸常量删除 | 2026-03-29 |
 | Rust 模块重构 | `c2-buddy` → `c2-mem` (alloc/ + segment/ + pool)，Python `c_two.buddy` → `c_two.mem` | 2026-03-31 |
 | SHM 帧模块重命名 | `transport/ipc/buddy.py` → `transport/ipc/shm_frame.py` | 2026-03-31 |
-| Python Relay 删除 | 删除 `relay/core.py` (610 行)，统一使用 Rust `NativeRelay` | 2026-07-20 |
+| Python Relay 删除 | 删除 `relay/core.py` (610 行)，relay 生命周期统一由 `c3 relay` / 编排系统管理 | 2026-07-20 |
 | Error 模块重构 | 移除 `EventSerializeError`/`EventDeserializeError` 等遗留类型 | 2026-07-20 |
 | 僵尸代码清理 | 删除 `server/chunk.py`、`__memoryview_aware__`、`FLAG_DISK_SPILL` | 2026-07-20 |
 
@@ -158,25 +158,25 @@ v0.3.0 发布前对传输层和 Relay 进行的系统性代码审查与加固。
 
 **问题**: Relay 的 IPC 长连接（到上游 CRM）一旦建立就永不释放，CRM 进程重启后旧连接变成僵尸。
 
-**方案**: 周期性 sweeper + 懒重连：
-- **Python Relay**: `UpstreamPool._sweep_idle()` — asyncio task，可配置 `idle_timeout`（`--idle-timeout` CLI 参数）
-- **Rust Relay**: `spawn_idle_sweeper()` — tokio task，相同逻辑
-- Sweeper 同时检查**时间空闲**和**连接死亡**（`_closed` / `!is_connected()`）
+**方案**: Rust standalone relay 周期性 sweeper + 懒重连：
+- `spawn_idle_sweeper()` — tokio task，可配置 `idle_timeout`（`--idle-timeout` CLI 参数）
+- Sweeper 同时检查**时间空闲**和**连接死亡**（`!is_connected()`）
+- 连接条目维护 active counter，请求 guard 在开始/结束时更新，sweeper 只驱逐 `active == 0` 的连接
 - `idle_timeout=0` 时仍以 30s 间隔运行，仅做死连接清理
 - 驱逐后下次 `get()` 懒重连
 
-**改动范围**: `relay/core.py` + `c2-relay/state.rs` + `c2-relay/server.rs` + `cli.py`
+**改动范围**: `core/transport/c2-http/src/relay/state.rs` + `server.rs` + `conn_pool.rs` + `cli/src/relay.rs`
 
 #### 2.4.3 Relay 死连接检测三重保障
 
 **问题**: 上游 CRM 进程意外终止后，Relay 首次请求必然 502（`get()` 返回死客户端）。
 
 **修复**:
-1. **`get()` 即时检测**: Python `get()` 检查 `_closed`、Rust `get()` 检查 `is_connected()` — 死客户端不返回，触发即时重连
+1. **`get()` 即时检测**: Rust `get()` 检查 `is_connected()` — 死客户端不返回，触发即时重连
 2. **调用失败即驱逐**: Rust router 传输错误分支立即从 pool 驱逐死客户端（不等 sweeper）
 3. **周期性 sweeper 兜底**: 上述两条机制之外，sweeper 仍周期扫描作为最终兜底
 
-**改动范围**: `relay/core.py:get()` + `c2-relay/state.rs:get()` + `c2-relay/router.rs`
+**改动范围**: `core/transport/c2-http/src/relay/state.rs:get()` + `core/transport/c2-http/src/relay/router.rs`
 
 #### 2.4.4 信号协议清理
 
@@ -348,7 +348,7 @@ P1 — 性能与可靠性增强 ✅ 全部完成
 ├─ 2.3 CI/CD 发布集成           ✅ 已完成 (2025-07-26, 增补 2026-03-30)
 └─ 2.4 边界鲁棒性增强           ✅ 已完成 (2026-03-30)
     ├─ 优雅断连协议              ✅ DISCONNECT/DISCONNECT_ACK
-    ├─ Relay 空闲连接回收        ✅ sweeper (Python + Rust)
+    ├─ Relay 空闲连接回收        ✅ standalone Rust sweeper + active guard
     ├─ Relay 死连接三重检测      ✅ get() + 调用失败驱逐 + sweeper
     ├─ 信号协议清理              ✅ FF-1 DISCONNECT_ACK / FF-2 SHUTDOWN_SERVER
     ├─ 测试隔离                  ✅ C2_ENV_FILE + 26 新单元测试
@@ -366,7 +366,7 @@ P2 — 功能完善（v0.4.0 里程碑）
 
 架构质量审查 ✅ (2026-07-20)
 ├─ Free-threading 并发安全      ✅ CRITICAL/HIGH/MEDIUM 竞态修复
-├─ Python Relay 删除            ✅ 统一 Rust NativeRelay
+├─ Python Relay 删除            ✅ standalone `c3 relay`，SDK 不管理 relay 生命周期
 ├─ Error 模块重构               ✅ 移除 event 遗留类型
 ├─ Relay 大 payload 支持        ✅ HTTP 413 + IPC 帧限制修复
 ├─ Flaky 测试消除               ✅ 信号处理器竞态 + SHM 握手竞态
@@ -411,7 +411,7 @@ P3 — 长期演进（v1.0 方向）
 
 ## 7. Rust 原生模块架构
 
-当前 `src/c_two/_native/` workspace 包含 5 个 crate：
+当前 Rust 核心与 Python native extension 的主要 crate：
 
 ```
 c2-mem                    共享内存子系统
@@ -428,19 +428,25 @@ c2-wire                   IPC 帧编解码（Handshake v6, 信号帧）
 └─ src/assembler.rs       Rust ChunkAssembler（基于 MemHandle 的分块重组）
 
 c2-ipc                    Rust async IPC client (tokio, UDS + SHM)
-c2-relay                  HTTP relay server (axum → IPC 转发, DefaultBodyLimit 已禁用)
-c2-ffi                    PyO3 统一入口 → Python c_two._native
+c2-http                   HTTP client + relay server feature (axum → IPC 转发)
+c2-server                 Rust IPC server runtime
+c2-config                 Runtime config resolver and defaults
+c2-python-native          PyO3 统一入口 → Python c_two._native
 ```
 
 Python 侧对应关系：
 
 | Rust 层 | Python 模块 | 主要类型 |
 |---------|------------|---------|
-| `c2-mem` → `c2-ffi:mem_ffi.rs` | `c_two.mem` | `MemPool`, `PoolConfig`, `PoolAlloc`, `PoolStats`, `MemHandle`, `ChunkAssembler` |
-| `c2-relay` → `c2-ffi:relay_ffi.rs` | `c_two.relay` | `NativeRelay` |
+| `c2-mem` → `sdk/python/native/src/mem_ffi.rs` | `c_two.mem` | `MemPool`, `PoolConfig`, `PoolAlloc`, `PoolStats`, `MemHandle`, `ChunkAssembler` |
+| `c2-http::client` → `sdk/python/native/src/http_ffi.rs` | `c_two._native` | `RustHttpClient`, `RustHttpClientPool` |
+| `c2-ipc` → `sdk/python/native/src/client_ffi.rs` | `c_two._native` | `RustClient`, `RustClientPool` |
+| `c2-server` → `sdk/python/native/src/server_ffi.rs` | `c_two._native` | `RustServer` |
 | `c2-mem::alloc` | (内部使用) | `BuddyAllocator`, `ShmSpinlock` |
 | `c2-mem::segment` | (内部使用) | `ShmRegion` |
 | `c2-mem::spill` | (内部使用) | `available_physical_memory`, `should_spill`, `create_file_spill` |
-| `c2-wire::assembler` | (通过 c2-ffi 暴露) | `ChunkAssembler` |
+| `c2-wire::assembler` | (通过 `sdk/python/native` 暴露) | `ChunkAssembler` |
+
+Relay server 不通过 Python 模块暴露。源码 checkout 中的测试、examples 与 SDK 开发如果依赖 relay，需要先通过 `python tools/dev/c3_tool.py --build --link` 构建并链接 `c3`，再由测试 fixture、shell 或编排系统启动 `c3 relay`。
 
 **演进方向**: `c2-mem` 的三层架构 + MemHandle + ChunkAssembler 已完整实现。磁盘溢写兜底（§3.0）已完成。下一步可扩展方向：自适应 spill threshold（基于运行时 RSS 趋势）、SHM-backed relay 转发（消除 relay 大 payload 的内存缓冲）。

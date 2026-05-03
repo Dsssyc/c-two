@@ -1,15 +1,12 @@
 //! FileSpill → SHM promotion.
 
-use c2_mem::handle::MemHandle;
 use c2_mem::MemPool;
+use c2_mem::handle::MemHandle;
 
 /// Try to move a FileSpill handle into SHM.
 /// Returns `Ok(shm_handle)` on success, `Err(original_handle)` if SHM is
 /// unavailable or the input is not a FileSpill.
-pub fn promote_to_shm(
-    pool: &mut MemPool,
-    file_handle: MemHandle,
-) -> Result<MemHandle, MemHandle> {
+pub fn promote_to_shm(pool: &mut MemPool, file_handle: MemHandle) -> Result<MemHandle, MemHandle> {
     if !file_handle.is_file_spill() {
         return Err(file_handle);
     }
@@ -57,19 +54,21 @@ mod tests {
         let mut pool = test_pool(cfg.clone());
 
         let size = 800;
-        let (mut mmap, path) =
-            create_file_spill(size, &cfg.spill_dir).expect("create_file_spill");
+        let (mut mmap, path) = create_file_spill(size, &cfg.spill_dir).expect("create_file_spill");
 
         // Write known pattern into the mmap.
         for (i, byte) in mmap[..size].iter_mut().enumerate() {
             *byte = (i % 251) as u8;
         }
 
-        let file_handle = MemHandle::FileSpill { mmap, path, len: size };
+        let file_handle = MemHandle::FileSpill {
+            mmap,
+            path,
+            len: size,
+        };
         assert!(file_handle.is_file_spill());
 
-        let shm_handle = promote_to_shm(&mut pool, file_handle)
-            .expect("promote should succeed");
+        let shm_handle = promote_to_shm(&mut pool, file_handle).expect("promote should succeed");
 
         // Result must NOT be FileSpill.
         assert!(!shm_handle.is_file_spill(), "promoted handle should be SHM");
@@ -101,12 +100,15 @@ mod tests {
 
         // Create a FileSpill handle to attempt promotion.
         let size = 512;
-        let (mut mmap, path) =
-            create_file_spill(size, &cfg.spill_dir).expect("create_file_spill");
+        let (mut mmap, path) = create_file_spill(size, &cfg.spill_dir).expect("create_file_spill");
         for (i, byte) in mmap[..size].iter_mut().enumerate() {
             *byte = (i % 199) as u8;
         }
-        let file_handle = MemHandle::FileSpill { mmap, path, len: size };
+        let file_handle = MemHandle::FileSpill {
+            mmap,
+            path,
+            len: size,
+        };
 
         // Promotion should fail — SHM is full.
         let result = promote_to_shm(&mut pool, file_handle);
@@ -114,7 +116,10 @@ mod tests {
 
         let returned = result.unwrap_err();
         // Returned handle must still be FileSpill with correct length.
-        assert!(returned.is_file_spill(), "returned handle should be FileSpill");
+        assert!(
+            returned.is_file_spill(),
+            "returned handle should be FileSpill"
+        );
         assert_eq!(returned.len(), size);
         // Data must be intact.
         let data = pool.handle_slice(&returned);
