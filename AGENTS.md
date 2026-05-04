@@ -4,6 +4,14 @@ This file contains repository-specific guidance for Codex and other coding
 agents working on C-Two. Follow these instructions together with the user's
 current request.
 
+## 0.x Development Constraint
+
+C-Two is currently in the 0.x line. Do not preserve backwards compatibility for
+incorrect, experimental, or superseded internal APIs unless the user explicitly
+asks for a compatibility window. Prefer clean cuts over compatibility shims:
+remove obsolete code paths, tests, docs, and module surfaces rather than leaving
+dangling fallback behavior or zombie modules that future maintainers must carry.
+
 ## Project Overview
 
 C-Two is a resource-oriented RPC runtime that enables remote invocation of
@@ -76,8 +84,9 @@ fixtures under `sdk/python/tests/fixtures/`.
 ## Architecture
 
 C-Two has a language-neutral Rust core and a Python SDK. The Python SDK owns
-Python domain logic, CRM contracts, resource scheduling, and serialization
-orchestration. Rust owns shared transport, memory, wire codec, HTTP relay, and
+Python domain logic, CRM contracts, Python resource invocation, serialization
+orchestration, and thread-local direct-call guards. Rust owns shared transport,
+memory, wire codec, remote IPC scheduler enforcement, HTTP relay, and
 configuration resolution. PyO3/maturin bridges Rust into Python as
 `c_two._native`.
 
@@ -142,9 +151,10 @@ resolution to Rust.
 Path: `sdk/python/src/c_two/transport/`
 
 The Python transport layer is a thin orchestration shell around a Rust-native
-core. Python handles CRM registration, scheduling, and serialization; Rust
-handles IPC, wire framing, SHM, HTTP relay transport, and relay-aware route
-fallback.
+core. Python handles CRM registration, Python callback dispatch, serialization
+orchestration, and same-process thread-local guards. Rust handles IPC, wire
+framing, SHM, remote IPC scheduler mode enforcement, HTTP relay transport, and
+relay-aware route fallback.
 
 | File | Purpose |
 | --- | --- |
@@ -152,7 +162,7 @@ fallback.
 | `protocol.py` | Re-export facade for Rust handshake codec, route info, and flag constants |
 | `wire.py` | `MethodTable` and thin FFI wrappers for wire control functions |
 | `server/native.py` | `NativeServerBridge` exported as `Server` |
-| `server/scheduler.py` | Read/write-aware resource method scheduler |
+| `server/scheduler.py` | `ConcurrencyConfig` facade and thread-local read/write guard for same-process direct calls |
 | `server/reply.py` | `unpack_icrm_result` and `wrap_error` |
 | `server/hold_registry.py` | Weakref-based tracking of hold-mode SHM buffers |
 | `client/proxy.py` | `CRMProxy` for thread-local, IPC, and HTTP modes |
@@ -161,7 +171,11 @@ fallback.
 Transport modes:
 
 - Thread-local: same-process `cc.connect()` returns a zero-serialization proxy.
+  It passes Python objects directly and may use the Python thread-local guard;
+  do not route this path through Rust bytes dispatch for symmetry.
 - IPC (`ipc://`): UDS control channel plus POSIX SHM data plane through Rust.
+  Remote IPC concurrency semantics belong to Rust `c2-server`, not the Python
+  scheduler.
 - HTTP (`http://`): relay-based cross-machine transport through Rust.
 
 Python resource servers create an auto-generated `ipc://` address. Use
