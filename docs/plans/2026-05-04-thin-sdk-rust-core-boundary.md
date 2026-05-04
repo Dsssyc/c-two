@@ -69,19 +69,14 @@ These are language-specific and should not be forced into the Rust core:
 
 ### P1. Remote IPC scheduler config and execution semantics
 
-**Current Python/Rust ownership**
+**Implemented ownership**
 
-- Python defines `ConcurrencyMode`, `ConcurrencyConfig`, writer-priority
-  read/write locking, pending counters, and optional executor state in
-  `sdk/python/src/c_two/transport/server/scheduler.py`.
-- Python creates a scheduler per CRM slot in
-  `sdk/python/src/c_two/transport/server/native.py`.
-- Rust already owns the remote IPC execution wrapper in
-  `core/transport/c2-server/src/scheduler.rs`.
-- The PyO3 route registration currently hardcodes
-  `ConcurrencyMode::ReadParallel` in
-  `sdk/python/native/src/server_ffi.rs`, so Python config is not fully the
-  remote IPC authority.
+Remote IPC scheduler mode is owned by Rust `c2-server`. Python passes
+`ConcurrencyConfig.mode.value` during route registration; PyO3 parses it into
+`c2_server::scheduler::ConcurrencyMode`; Rust acquires the per-route locks
+around callback invocation. Python keeps `ConcurrencyConfig` as the SDK typed
+facade and keeps `Scheduler.execution_guard()` only for thread-local direct
+calls.
 
 **Why this is core behavior**
 
@@ -131,17 +126,18 @@ share semantics with Rust, expose a tiny native read/write permit or keep a thin
 Python guard. Treat this as a separate SDK design discussion because each
 language SDK may have its own same-process fast path.
 
-**Implementation sketch**
+**Implementation notes**
 
-1. Extend native `RustServer.register_route(...)` to accept concurrency mode
-   and optional limits from Python.
-2. Parse Python mode strings into `c2_server::scheduler::ConcurrencyMode`.
-3. Keep `access_map` as method-index-to-read/write metadata.
-4. Apply the mode when constructing the Rust scheduler.
-5. Remove or reduce Python remote scheduler state once tests prove remote IPC
-   no longer depends on it.
-6. Keep only the Python-side pieces needed for thread-local direct calls, or
-   replace them with a native guard that does not serialize Python objects.
+1. Native `RustServer.register_route(...)` accepts a concurrency mode string
+   from Python.
+2. PyO3 parses Python mode strings into
+   `c2_server::scheduler::ConcurrencyMode`.
+3. `access_map` remains method-index-to-read/write metadata.
+4. Rust applies the mode when constructing the per-route scheduler.
+5. Python scheduler state is retained only for thread-local direct calls and
+   the existing 0.x public facade.
+6. `max_pending` / `max_workers` are not silently accepted for remote IPC
+   unless Rust implements real enforcement for those limits.
 
 **Required tests**
 

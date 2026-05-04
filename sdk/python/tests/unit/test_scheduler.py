@@ -100,6 +100,35 @@ class TestRWLock:
 
 class TestSchedulerExclusive:
 
+    def test_execution_guard_serializes_thread_local_calls(self):
+        """execution_guard is the Python thread-local direct-call guard."""
+        sched = Scheduler(ConcurrencyConfig(mode='exclusive'))
+        log: list[str] = []
+        log_lock = threading.Lock()
+
+        def worker() -> None:
+            with sched.execution_guard(MethodAccess.WRITE):
+                with log_lock:
+                    log.append('enter')
+                time.sleep(0.02)
+                with log_lock:
+                    log.append('exit')
+
+        try:
+            threads = [threading.Thread(target=worker) for _ in range(3)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+            assert not [thread for thread in threads if thread.is_alive()]
+
+            assert len(log) == 6
+            for idx in range(0, len(log), 2):
+                assert log[idx] == 'enter'
+                assert log[idx + 1] == 'exit'
+        finally:
+            sched.shutdown()
+
     def test_basic_execute(self):
         sched = Scheduler(ConcurrencyConfig(mode='exclusive'))
         try:

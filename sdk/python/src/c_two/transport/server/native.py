@@ -189,7 +189,11 @@ class NativeServerBridge:
 
         try:
             self._rust_server.register_route(
-                routing_name, dispatcher, methods, access_map,
+                routing_name,
+                dispatcher,
+                methods,
+                access_map,
+                cc_config.mode.value,
             )
         except Exception:
             with self._slots_lock:

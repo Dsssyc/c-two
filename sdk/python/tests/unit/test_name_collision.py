@@ -136,8 +136,15 @@ class TestServerNameCollision:
         events: list[str] = []
 
         class FakeRustServer:
-            def register_route(self, *_args, **_kwargs):
-                events.append('rust_register')
+            def register_route(
+                self,
+                name,
+                dispatcher,
+                methods,
+                access_map,
+                concurrency_mode,
+            ):  # noqa: ARG002
+                events.append(f'rust_register:{concurrency_mode}')
                 raise RuntimeError('boom')
 
             def unregister_route(self, name: str) -> bool:
@@ -190,7 +197,7 @@ class TestServerNameCollision:
         with pytest.raises(RuntimeError, match='boom'):
             bridge.register_crm(FakeCRM, FakeCRM(), name='grid')
 
-        assert events == ['rust_register', 'scheduler_shutdown']
+        assert events == ['rust_register:read_parallel', 'scheduler_shutdown']
         assert bridge.names == []
 
 

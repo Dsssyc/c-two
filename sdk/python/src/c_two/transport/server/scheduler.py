@@ -1,23 +1,16 @@
-"""Read/write-aware task scheduler for CRM method execution.
+"""Thread-local read/write guards and concurrency config facade.
 
-Three concurrency modes:
+Remote IPC scheduling is enforced by the Rust ``c2-server`` scheduler. This
+module remains in Python for two SDK-local responsibilities:
 
-- **EXCLUSIVE**: all CRM calls serialized via a single lock.
-- **READ_PARALLEL** (default): ``@cc.read`` methods run concurrently; ``@cc.write``
-  methods acquire exclusive access (writer-priority RW lock).
-- **PARALLEL**: no locking — the CRM is assumed fully thread-safe.
+- expose ``ConcurrencyMode`` and ``ConcurrencyConfig`` as typed public SDK
+  inputs to ``cc.register(..., concurrency=...)``;
+- guard same-process thread-local ``CRMProxy.call_direct()`` calls, which pass
+  Python objects directly and intentionally skip serialization.
 
-Usage with asyncio (Server)::
-
-    sched = Scheduler(ConcurrencyConfig(mode='read_parallel'))
-    loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(
-        sched.executor,
-        sched.execute, method, args_bytes, access_mode,
-    )
-
-The scheduler owns the :class:`~concurrent.futures.ThreadPoolExecutor` and
-tracks pending call count for graceful drain on shutdown.
+Do not use this scheduler as the remote IPC execution authority. The legacy
+``execute()``/``begin()`` helpers remain for the 0.x Python API surface and
+thread-local tests, but cross-process calls must be controlled by Rust.
 """
 from __future__ import annotations
 

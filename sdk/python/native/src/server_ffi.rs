@@ -25,6 +25,17 @@ use c2_server::scheduler::{AccessLevel, ConcurrencyMode, Scheduler};
 use crate::mem_ffi::PyMemPool;
 use crate::shm_buffer::PyShmBuffer;
 
+fn parse_concurrency_mode(mode: &str) -> PyResult<ConcurrencyMode> {
+    match mode {
+        "parallel" => Ok(ConcurrencyMode::Parallel),
+        "exclusive" => Ok(ConcurrencyMode::Exclusive),
+        "read_parallel" => Ok(ConcurrencyMode::ReadParallel),
+        other => Err(PyValueError::new_err(format!(
+            "invalid concurrency mode '{other}', expected 'parallel', 'exclusive', or 'read_parallel'"
+        ))),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PyCrmCallback — bridges a Python callable to the Rust CrmCallback trait
 // ---------------------------------------------------------------------------
@@ -99,7 +110,10 @@ impl CrmCallback for PyCrmCallback {
 /// ```python
 /// from c_two._native import RustServer
 /// srv = RustServer("ipc://my_server")
-/// srv.register_route("grid", dispatcher_fn, ["step", "query"], {0: "read", 1: "write"})
+/// srv.register_route(
+///     "grid", dispatcher_fn, ["step", "query"],
+///     {0: "read", 1: "write"}, "read_parallel",
+/// )
 /// srv.start()
 /// # ... serve requests ...
 /// srv.shutdown()
@@ -194,7 +208,7 @@ impl PyServer {
     ///
     /// `method_names` lists the CRM method names indexed by method_idx.
     /// `access_map` maps method_idx → "read" or "write".
-    #[pyo3(signature = (name, dispatcher, method_names, access_map))]
+    #[pyo3(signature = (name, dispatcher, method_names, access_map, concurrency_mode))]
     fn register_route(
         &self,
         py: Python<'_>,
@@ -202,7 +216,10 @@ impl PyServer {
         dispatcher: Py<PyAny>,
         method_names: Vec<String>,
         access_map: &Bound<'_, PyDict>,
+        concurrency_mode: &str,
     ) -> PyResult<()> {
+        let mode = parse_concurrency_mode(concurrency_mode)?;
+
         // Parse access_map: {int: "read"|"write"} → HashMap<u16, AccessLevel>
         let mut map = HashMap::new();
         for (key, value) in access_map.iter() {
@@ -227,7 +244,7 @@ impl PyServer {
             Py::new(py, py_pool)?.into_any()
         };
 
-        let scheduler = Arc::new(Scheduler::new(ConcurrencyMode::ReadParallel, map));
+        let scheduler = Arc::new(Scheduler::new(mode, map));
         let callback = Arc::new(PyCrmCallback {
             py_callable: dispatcher,
             response_pool_obj,

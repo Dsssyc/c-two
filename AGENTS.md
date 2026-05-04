@@ -11,6 +11,9 @@ incorrect, experimental, or superseded internal APIs unless the user explicitly
 asks for a compatibility window. Prefer clean cuts over compatibility shims:
 remove obsolete code paths, tests, docs, and module surfaces rather than leaving
 dangling fallback behavior or zombie modules that future maintainers must carry.
+This applies to agent work as well: when a mechanism moves from an SDK into the
+Rust core, update or remove stale SDK-side guidance in the same change instead
+of documenting both paths as equally supported.
 
 ## Project Overview
 
@@ -83,11 +86,12 @@ fixtures under `sdk/python/tests/fixtures/`.
 
 ## Architecture
 
-C-Two has a language-neutral Rust core and a Python SDK. The Python SDK owns
-Python domain logic, CRM contracts, Python resource invocation, serialization
-orchestration, and thread-local direct-call guards. Rust owns shared transport,
-memory, wire codec, remote IPC scheduler enforcement, HTTP relay, and
-configuration resolution. PyO3/maturin bridges Rust into Python as
+C-Two has a language-neutral Rust core and language SDKs. Python is the current
+SDK surface, not the canonical home for generic runtime mechanisms. The Python
+SDK owns Python domain logic, CRM contracts, Python resource invocation,
+serialization orchestration, and thread-local direct-call guards. Rust owns
+shared transport, memory, wire codec, remote IPC scheduler enforcement, HTTP
+relay, and configuration resolution. PyO3/maturin bridges Rust into Python as
 `c_two._native`.
 
 ### CRM Layer
@@ -146,6 +150,13 @@ Do not reintroduce Python-side default validation for IPC or relay internals.
 SDKs should provide typed override facades and leave environment/default
 resolution to Rust.
 
+Scheduler-related config follows the same boundary. Python may expose
+`ConcurrencyConfig` and SDK-level enums, but remote IPC must pass only typed
+metadata into Rust and let `c2-server` enforce the resulting mode. Do not pass,
+document, or treat remote `max_pending` or worker-limit fields as enforced
+unless Rust actually enforces them; silent no-op config is worse than rejecting
+or postponing the field.
+
 ### Transport Layer
 
 Path: `sdk/python/src/c_two/transport/`
@@ -177,6 +188,12 @@ Transport modes:
   Remote IPC concurrency semantics belong to Rust `c2-server`, not the Python
   scheduler.
 - HTTP (`http://`): relay-based cross-machine transport through Rust.
+
+Direct IPC is a complete standalone mode. `cc.connect(..., address='ipc://...')`
+must bypass relay discovery and remain usable when no relay is configured or a
+relay environment variable points at an unavailable server. Relay is only a
+discovery/forwarding projection above IPC; do not make relay the owner of IPC
+registration, scheduling, or connection establishment.
 
 Python resource servers create an auto-generated `ipc://` address. Use
 `cc.server_address()` after registration only when a same-host process needs to
@@ -390,6 +407,12 @@ zero-copy and single-allocation patterns. Python `wire.py` retains `MethodTable`
 `payload_total_size`, and thin FFI wrappers. The thread-local transport skips
 serialization entirely. SHM segment names are deterministic for lazy peer-side
 opening. The buddy allocator's `alloc()` and `free_at()` are thread-safe.
+When changing remote dispatch or scheduler code, keep the SHM request path as
+`RequestData::Shm` / `RequestData::Handle` to `PyShmBuffer` to Python
+`memoryview`; do not materialize SHM or handle payloads into Python `bytes`
+before invoking resource code. Thread-local same-process calls must continue to
+pass Python objects directly instead of being routed through Rust serialized
+dispatch for symmetry.
 
 ## Environment Variables
 
@@ -446,6 +469,15 @@ cautious with C extensions, shared mutable state, and GIL assumptions.
   resolver, route fallback, or protocol mechanisms into Python SDK code.
 - Use Rust core crates for cross-language behavior so later SDKs do not have to
   reimplement mechanisms independently.
+- Do not treat the Python SDK as the reference implementation for generic
+  runtime behavior. If behavior is language-neutral, prefer a Rust-core owner
+  with thin SDK facades.
+- Preserve direct IPC as relay-independent. If touching registration, client
+  routing, or runtime session code, include checks for explicit `ipc://`
+  connections with relay unset or unavailable.
+- Preserve zero-copy boundaries. If touching wire, SHM, scheduler, or native
+  callback code, include checks that large SHM-backed payloads are not converted
+  to Python `bytes` on the remote IPC path.
 - For bug fixes and behavior changes, add or update focused tests first when
   feasible, then implement the minimal code needed to pass.
 - Do not revert unrelated user changes in a dirty worktree.
