@@ -89,10 +89,10 @@ fixtures under `sdk/python/tests/fixtures/`.
 C-Two has a language-neutral Rust core and language SDKs. Python is the current
 SDK surface, not the canonical home for generic runtime mechanisms. The Python
 SDK owns Python domain logic, CRM contracts, Python resource invocation,
-serialization orchestration, and thread-local direct-call guards. Rust owns
-shared transport, memory, wire codec, remote IPC scheduler enforcement, HTTP
-relay, and configuration resolution. PyO3/maturin bridges Rust into Python as
-`c_two._native`.
+serialization orchestration, and same-process direct-call glue. Rust owns
+shared transport, memory, wire codec, route concurrency enforcement and state,
+HTTP relay, and configuration resolution. PyO3/maturin bridges Rust into Python
+as `c_two._native`.
 
 ### CRM Layer
 
@@ -151,11 +151,12 @@ SDKs should provide typed override facades and leave environment/default
 resolution to Rust.
 
 Scheduler-related config follows the same boundary. Python may expose
-`ConcurrencyConfig` and SDK-level enums, but remote IPC must pass only typed
-metadata into Rust and let `c2-server` enforce the resulting mode. Do not pass,
-document, or treat remote `max_pending` or worker-limit fields as enforced
-unless Rust actually enforces them; silent no-op config is worse than rejecting
-or postponing the field.
+`ConcurrencyConfig` and SDK-level enums, but Rust now owns the resolved route
+concurrency handle, including mode, `max_pending`, `max_workers`, and close
+state. Python must pass the full typed config into Rust, then treat the native
+handle as the source of truth for both same-process direct calls and remote
+dispatch. Do not keep a second Python-owned scheduler state or hidden default
+policy alive after registration.
 
 ### Transport Layer
 
@@ -173,7 +174,7 @@ relay-aware route fallback.
 | `protocol.py` | Re-export facade for Rust handshake codec, route info, and flag constants |
 | `wire.py` | `MethodTable` and thin FFI wrappers for wire control functions |
 | `server/native.py` | `NativeServerBridge` exported as `Server` |
-| `server/scheduler.py` | `ConcurrencyConfig` facade and thread-local read/write guard for same-process direct calls |
+| `server/scheduler.py` | `ConcurrencyConfig` facade plus thin native route-concurrency adapter for same-process direct calls |
 | `server/reply.py` | `unpack_icrm_result` and `wrap_error` |
 | `server/hold_registry.py` | Weakref-based tracking of hold-mode SHM buffers |
 | `client/proxy.py` | `CRMProxy` for thread-local, IPC, and HTTP modes |
@@ -185,8 +186,8 @@ Transport modes:
   It passes Python objects directly and may use the Python thread-local guard;
   do not route this path through Rust bytes dispatch for symmetry.
 - IPC (`ipc://`): UDS control channel plus POSIX SHM data plane through Rust.
-  Remote IPC concurrency semantics belong to Rust `c2-server`, not the Python
-  scheduler.
+  Remote IPC concurrency semantics and route capacity limits belong to Rust
+  `c2-server`; Python only projects the native handle for same-process calls.
 - HTTP (`http://`): relay-based cross-machine transport through Rust.
 
 Direct IPC is a complete standalone mode. `cc.connect(..., address='ipc://...')`

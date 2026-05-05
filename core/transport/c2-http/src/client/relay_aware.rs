@@ -27,7 +27,7 @@ impl Default for RelayAwareClientConfig {
 }
 
 pub struct RelayAwareHttpClient {
-    control: RelayControlClient,
+    control: Arc<RelayControlClient>,
     pool: &'static HttpClientPool,
     route_name: String,
     use_proxy: bool,
@@ -42,14 +42,26 @@ impl RelayAwareHttpClient {
         use_proxy: bool,
         config: RelayAwareClientConfig,
     ) -> Result<Self, HttpError> {
-        Ok(Self {
-            control: RelayControlClient::new(relay_url, use_proxy)?,
+        let control = Arc::new(RelayControlClient::new(relay_url, use_proxy)?);
+        Ok(Self::new_with_control(
+            control, route_name, use_proxy, config,
+        ))
+    }
+
+    pub fn new_with_control(
+        control: Arc<RelayControlClient>,
+        route_name: &str,
+        use_proxy: bool,
+        config: RelayAwareClientConfig,
+    ) -> Self {
+        Self {
+            control,
             pool: HttpClientPool::instance(),
             route_name: route_name.to_string(),
             use_proxy,
             config,
             current: Mutex::new(None),
-        })
+        }
     }
 
     pub fn call(&self, method_name: &str, data: &[u8]) -> Result<Vec<u8>, HttpError> {

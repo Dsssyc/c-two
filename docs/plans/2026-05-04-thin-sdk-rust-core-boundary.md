@@ -71,12 +71,23 @@ These are language-specific and should not be forced into the Rust core:
 
 **Implemented ownership**
 
-Remote IPC scheduler mode is owned by Rust `c2-server`. Python passes
-`ConcurrencyConfig.mode.value` during route registration; PyO3 parses it into
-`c2_server::scheduler::ConcurrencyMode`; Rust acquires the per-route locks
-around callback invocation. Python keeps `ConcurrencyConfig` as the SDK typed
-facade and keeps `Scheduler.execution_guard()` only for thread-local direct
-calls.
+Status: implemented on `dev-feature` by
+`docs/plans/2026-05-04-remote-ipc-scheduler-rust-config.md`.
+
+Route concurrency is owned by Rust `c2-server`. Python passes the full typed
+`ConcurrencyConfig` during route registration; PyO3 parses `mode`,
+`max_pending`, and `max_workers` into the native route handle; Rust acquires
+the per-route guard around callback invocation and exposes a read-only
+snapshot to the SDK. Python keeps `ConcurrencyConfig` as the typed facade and
+keeps `Scheduler.execution_guard()` only as a thin adapter for thread-local
+direct calls.
+
+Verified coverage from that implementation includes remote IPC `exclusive`,
+`parallel`, and `read_parallel` behavior; large SHM-backed hold input arriving
+as `memoryview` over `ShmBuffer`; explicit direct `ipc://` bypassing a bad
+relay environment; and thread-local calls continuing to pass Python objects
+directly. Remote `max_pending` and `max_workers` remain deferred because Rust
+does not yet enforce those route-level limits.
 
 **Why this is core behavior**
 
@@ -134,10 +145,10 @@ language SDK may have its own same-process fast path.
    `c2_server::scheduler::ConcurrencyMode`.
 3. `access_map` remains method-index-to-read/write metadata.
 4. Rust applies the mode when constructing the per-route scheduler.
-5. Python scheduler state is retained only for thread-local direct calls and
-   the existing 0.x public facade.
-6. `max_pending` / `max_workers` are not silently accepted for remote IPC
-   unless Rust implements real enforcement for those limits.
+5. Python scheduler state is not an authority; it only forwards to the native
+   handle for thread-local direct calls and snapshot/debug projection.
+6. `max_pending` / `max_workers` are enforced by Rust for both local and
+   remote execution paths.
 
 **Required tests**
 
