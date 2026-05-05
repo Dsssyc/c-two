@@ -1,7 +1,7 @@
 # Route Concurrency Rust Authority Design
 
-**Date:** 2026-05-04  
-**Status:** Draft for review  
+**Date:** 2026-05-04
+**Status:** Draft for review
 **Scope:** Make route concurrency configuration and execution state Rust-owned so the same `ConcurrencyConfig` limits apply to same-process thread-local calls, direct IPC, and relay-backed HTTP without a Python-side duplicate scheduler.
 
 > **0.x constraint:** C-Two is pre-1.0. Do not preserve compatibility shims for stale scheduler ownership or dual-state execution paths. Prefer a clean cut that removes zombie code and keeps one authoritative concurrency model.

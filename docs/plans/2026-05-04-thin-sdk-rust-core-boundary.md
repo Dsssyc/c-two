@@ -1,7 +1,7 @@
 # Thin SDK / Rust Core Boundary Reference
 
-**Date:** 2026-05-04  
-**Status:** Architecture reference / implementation backlog  
+**Date:** 2026-05-04
+**Status:** Architecture reference / implementation backlog
 **Scope:** Identify Python SDK runtime state and mechanisms that should move
 down into the Rust core so future language SDKs can stay thin.
 
