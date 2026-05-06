@@ -530,7 +530,13 @@ shared mutable state, and GIL assumptions.
   callback code, include checks that large SHM-backed payloads are not converted
   to Python `bytes` on the remote IPC path.
 - For bug fixes and behavior changes, add or update focused tests first when
-  feasible, then implement the minimal code needed to pass.
+  feasible, then implement the correct production-grade code change needed to
+  satisfy the verified behavior; do not use phase boundaries to justify
+  temporary shims or lower-quality shortcuts.
+- When work is split into phases, treat the split as sequencing only. Write the
+  phase boundaries, exit criteria, and follow-up items into the plan document
+  before implementation, keep that plan updated as the authoritative record,
+  and finish each phase with docs that make the remaining work explicit.
 - Do not revert unrelated user changes in a dirty worktree.
 - Avoid destructive git commands unless the user explicitly asks for them.
 - For reviews, lead with concrete findings ordered by severity and include file
