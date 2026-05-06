@@ -51,6 +51,7 @@ jobs:
               - '.github/scripts/**'
               - '.github/dependabot.yml'
               - 'tools/dev/**'
+              - 'tests/repo/**'
 
   core:
     needs: changes

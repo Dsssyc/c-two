@@ -22,6 +22,19 @@ def _workflow_text() -> str:
     )
 
 
+def _filter_lines(ci_text: str, filter_name: str) -> list[str]:
+    lines = ci_text.splitlines()
+    header = f"            {filter_name}:"
+    start = lines.index(header) + 1
+    result: list[str] = []
+    for line in lines[start:]:
+        if line.startswith("            ") and not line.startswith("              - "):
+            break
+        if line.startswith("              - "):
+            result.append(line.removeprefix("              - ").strip("'"))
+    return result
+
+
 def test_cli_release_builds_canonical_platform_artifacts():
     text = _workflow_text()
 
@@ -82,6 +95,7 @@ def test_ci_routes_tests_by_changed_domain():
     assert "cli/**" in ci_text
     assert "tools/dev/**" in ci_text
     assert ".github/dependabot.yml" in ci_text
+    assert "tests/repo/**" in _filter_lines(ci_text, "workflow_policy")
     assert ".github/workflows/cli-release.yml" in ci_text
     assert "github.event_name == 'merge_group'" in ci_text
     assert "needs.changes.outputs.sdk == 'true'" in ci_text

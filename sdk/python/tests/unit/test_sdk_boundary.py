@@ -89,3 +89,9 @@ def _literal_slice(node: ast.Subscript) -> object | None:
     if isinstance(node.slice, ast.Constant):
         return node.slice.value
     return None
+
+
+def test_import_does_not_expose_logo_banner():
+    import c_two
+
+    assert not hasattr(c_two, "LOGO" + "_UNICODE")
