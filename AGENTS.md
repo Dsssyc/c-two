@@ -446,6 +446,14 @@ the error wire payload, and do not use or add legacy-named error codec APIs.
 Error classes are named by location, for example `ResourceDeserializeInput`,
 `ClientSerializeInput`, `ResourceExecuteFunction`, and `ClientCallResource`.
 Enum values live under `ERROR_AT_RESOURCE_*` and `ERROR_AT_CLIENT_*`.
+Transfer hook errors are split by hook type: `deserialize()` failures remain
+`ERROR_AT_RESOURCE_INPUT_DESERIALIZING` or
+`ERROR_AT_CLIENT_OUTPUT_DESERIALIZING`, while `from_buffer()` /
+`fromBuffer()` failures use `ERROR_AT_RESOURCE_INPUT_FROM_BUFFER` or
+`ERROR_AT_CLIENT_OUTPUT_FROM_BUFFER`. Do not label zero-deserialization buffer
+view construction as deserialization. On any `from_buffer()` failure before a
+resource/user receives a retained value, release the native memoryview and
+buffer owner immediately so Rust lease stats do not retain stale holds.
 
 ### Naming
 

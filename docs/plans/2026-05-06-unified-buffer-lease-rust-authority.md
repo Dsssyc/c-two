@@ -66,9 +66,9 @@ It also treats inline buffers as non-leases even though inline `ResponseBufferIn
 ```text
 Rust IPC client receives inline response
   -> PyResponseBuffer { storage=inline, owner=Vec<u8> }
-  -> Python cc.hold() path calls response.track_retained(route, method, "client_response")
   -> memoryview(response)
   -> output.from_buffer(memoryview)
+  -> Python cc.hold() path calls response.track_retained(route, method, "client_response")
   -> HeldResult holds value + memoryview + ResponseBuffer owner
   -> HeldResult.release()
        -> memoryview.release()
@@ -82,9 +82,9 @@ Rust IPC client receives inline response
 ```text
 Rust IPC client receives SHM or reassembled handle response
   -> PyResponseBuffer { storage=shm|handle|file_spill }
-  -> Python cc.hold() path calls response.track_retained(route, method, "client_response")
   -> memoryview(response)
   -> output.from_buffer(memoryview)
+  -> Python cc.hold() path calls response.track_retained(route, method, "client_response")
   -> HeldResult holds value + memoryview + ResponseBuffer owner
   -> HeldResult.release()
        -> memoryview.release()
@@ -114,6 +114,14 @@ Rust creates PyResponseBuffer or PyShmBuffer
   -> memoryview.release()
   -> buffer.release()
 ```
+
+Client output `from_buffer()` failures release `memoryview(response)` and the
+`ResponseBuffer` before raising `ClientOutputFromBuffer`; resource input
+`from_buffer()` failures release `memoryview(request_buf)` and `request_buf`
+before returning `ResourceInputFromBuffer` over the normal C2 error wire. If a
+resource successfully receives and retains a hold-mode input view before later
+raising, the retained lease remains tracked until the resource drops the view;
+this avoids invalidating buffer-backed objects that resource code already owns.
 
 The core lease model includes `LeaseRetention::Transient`, but Python does not add retained-style global accounting to every default view call. This keeps current hot-path performance while leaving a Rust-native transient model available for focused diagnostics and cross-SDK ABI parity.
 

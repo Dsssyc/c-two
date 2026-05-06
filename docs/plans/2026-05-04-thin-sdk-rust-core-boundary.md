@@ -311,6 +311,11 @@ mapping for `CCError.deserialize()`.
 - Unknown numeric codes map to `ERROR_UNKNOWN` with canonical Rust context.
 - Malformed wire payloads keep Python public behavior.
 - Boundary tests prevent Python from reimplementing the `code:message` parser.
+- Transfer hook errors distinguish bytes deserialization from buffer-backed
+  `from_buffer()` construction on both resource input and client output. Rust
+  `c2-error` owns `ResourceInputFromBuffer = 4` and
+  `ClientOutputFromBuffer = 8`; SDKs project those codes and choose the
+  precise hook-specific presentation error without re-owning the wire codec.
 - `c2-server` emits canonical `c2-error` wire bytes for route-capacity,
   route-closed, and server-side internal execution errors instead of raw
   UTF-8 status strings, so issue1/3 route outcomes remain compatible with
@@ -349,6 +354,10 @@ accurate.
 - `hold_stats()` works without a Python server object and reports storage and
   direction breakdowns.
 - Direct IPC retained buffers remain relay-independent.
+- Client output `from_buffer()` and resource input `from_buffer()` failure
+  paths release their memoryview/native buffer owner before propagating a
+  `CCError`, so traceback-local response/request objects do not pin stale
+  retained lease stats.
 - Default view mode still releases immediately and does not materialize payloads
   or add retained accounting overhead.
 
