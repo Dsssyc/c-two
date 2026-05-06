@@ -8,20 +8,20 @@
 
 ## Problem
 
-Today the Python SDK still owns part of route concurrency behavior:
+The Python SDK now owns only the typed registration facade and the same-process adapter surface. Route concurrency authority lives in Rust:
 
 - `ConcurrencyConfig` is created and validated in Python.
-- `Scheduler(cc_config)` in Python still owns thread-local execution guards and capacity bookkeeping.
-- `NativeServerBridge.register_crm()` forwards only `cc_config.mode.value` into Rust.
-- Rust `c2-server` enforces only the mode (`parallel` / `exclusive` / `read_parallel`) for remote route dispatch.
+- `NativeServerBridge.register_crm()` passes `mode`, `max_pending`, and `max_workers` into Rust.
+- Rust `c2-server` constructs the shared route handle and enforces mode plus capacity for both remote dispatch and same-process direct calls.
+- Python `Scheduler` is a thin adapter over the native handle, not an owning scheduler.
 
-That means the same registration input can produce different effective behavior depending on transport:
+That means the same registration input now behaves consistently across transport modes:
 
-- same-process thread-local calls use Python scheduler state;
-- remote IPC and relay-backed HTTP use Rust route dispatch state;
-- `max_pending` and `max_workers` can be accepted in Python but not enforced by Rust route execution.
+- same-process thread-local calls and remote IPC share the same native route handle;
+- `max_pending` and `max_workers` are enforced by Rust for both paths;
+- relay remains forwarding / discovery only.
 
-This is the exact class of “accepted but not authoritative” state drift that makes later SDKs harder to implement.
+This is the state we want future SDKs to inherit.
 
 ## Goals
 
@@ -86,22 +86,21 @@ The native bridge creates the Rust concurrency object once and clones the same `
 
 This is the key boundary change: one route, one concurrency object, shared across transport modes.
 
-The PyO3 `register_route()` boundary must pass the complete concurrency policy:
+The PyO3 `register_route()` boundary passes the complete concurrency policy:
 
 - `mode`
 - `max_pending`
 - `max_workers`
 
-It is not sufficient to pass only `mode` and return a native handle. If either
-limit is accepted by Python but omitted from the FFI call, Rust is not the
-authority and registration must fail instead of silently dropping the field.
+`SchedulerLimits::try_from_usize()` validates the limits before the route is
+registered. Python does not retain a second authoritative copy of these values.
 
-The Python bridge must not resolve hidden defaults before Rust sees the config. In particular, `NativeServerBridge.__init__(max_workers=4)` must stop injecting `ConcurrencyConfig(max_workers=max_workers)` as a Python-side default. The default policy is either:
+The Python bridge no longer resolves a hidden `max_workers=4` default before Rust sees the config. The default policy is either:
 
 - explicit `ConcurrencyConfig(...)` provided by the caller; or
 - Rust default resolution when no config is provided.
 
-If Python exposes a default snapshot, it must be projected back from the native route handle after registration.
+If Python exposes a default snapshot, it is projected back from the native route handle after registration.
 
 ### 4) Execution uses the same object in both paths
 
@@ -112,7 +111,7 @@ If Python exposes a default snapshot, it must be projected back from the native 
 That keeps same-process direct calls zero-copy while ensuring they consume the same route-level permits as remote calls.
 
 
-For the unconstrained hot path, `CRMProxy.call_direct()` may bypass the native guard only when the native handle reports that the route is truly unconstrained: `mode=parallel`, `max_pending=None`, and `max_workers=None`. `read_parallel` is not unconstrained, because it still enforces read/write semantics. This preserves the no-op fast path for plain local calls without letting capacity or read/write limits drift from Rust.
+For the unconstrained hot path, `CRMProxy.call_direct()` bypasses the native guard only when the native handle reports that the route is truly unconstrained: `mode=parallel`, `max_pending=None`, and `max_workers=None`. `read_parallel` is not unconstrained, because it still enforces read/write semantics. This preserves the no-op fast path for plain local calls without letting capacity or read/write limits drift from Rust.
 
 **Remote IPC / relay-backed HTTP**
 

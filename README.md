@@ -591,6 +591,11 @@ uv sync                            # install dependencies + compile Rust extensi
 uv sync --group examples           # install examples dependencies (pandas, pyarrow)
 python tools/dev/c3_tool.py --build --link  # build and link native c3 for source checkouts
 uv run pytest                      # run the test suite
+
+# Python 3.10 compatibility check. C-Two keeps 3.10 support for downstream
+# stacks such as Taichi that are still pinned to that runtime.
+uv python install 3.10
+uv run pytest sdk/python/tests/unit/test_python_examples_syntax.py::test_python_examples_compile_on_minimum_supported_python -q --timeout=30 -rs
 ```
 
 > Requires [uv](https://github.com/astral-sh/uv) and a Rust toolchain.
