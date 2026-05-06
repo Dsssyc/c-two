@@ -681,18 +681,16 @@ def serve(blocking: bool = True) -> None:
 
 
 def hold_stats() -> dict:
-    """Return hold-mode SHM tracking statistics.
+    """Return retained runtime buffer tracking statistics.
 
     Returns dict with:
-    - active_holds: number of currently held SHM buffers
-    - total_held_bytes: total bytes pinned in SHM
+    - active_holds: number of currently retained runtime buffers
+    - total_held_bytes: total retained runtime buffer bytes
     - oldest_hold_seconds: age of oldest active hold
+    - by_storage: retained counts by inline, SHM, handle, and file-spill storage
     """
-    inst = _ProcessRegistry._instance
-    server = inst._server if inst else None
-    if server is None:
-        return {'active_holds': 0, 'total_held_bytes': 0, 'oldest_hold_seconds': 0}
-    return server.hold_stats()
+    inst = _ProcessRegistry.get()
+    return dict(inst._runtime_session.hold_stats())  # noqa: SLF001
 
 
 # Auto-cleanup on process exit.

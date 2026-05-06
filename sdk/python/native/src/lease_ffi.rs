@@ -21,6 +21,10 @@ pub struct PyBufferLease {
 }
 
 impl PyBufferLeaseTracker {
+    pub(crate) fn from_arc(inner: Arc<BufferLeaseTracker>) -> Self {
+        Self { inner }
+    }
+
     pub(crate) fn track_retained_guard(
         &self,
         route_name: &str,

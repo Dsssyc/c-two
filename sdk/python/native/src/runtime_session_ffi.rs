@@ -7,7 +7,9 @@ use parking_lot::Mutex;
 use pyo3::exceptions::{PyKeyError, PyLookupError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
+use std::sync::Arc;
 
+use c2_mem::BufferLeaseTracker;
 use c2_runtime::{
     RegisterOutcome, RelayCleanupError, RuntimeRouteSpec, RuntimeSession, RuntimeSessionOptions,
     ShutdownOutcome, UnregisterOutcome,
@@ -24,11 +26,13 @@ use crate::http_ffi::{
     http_client_refcount_from_global_pool, release_http_client_from_global_pool,
     shutdown_http_clients_from_global_pool,
 };
+use crate::lease_ffi::PyBufferLeaseTracker;
 use crate::server_ffi::{PyServer, parse_concurrency_mode};
 
 #[pyclass(name = "RuntimeSession", frozen)]
 pub struct PyRuntimeSession {
     inner: RuntimeSession,
+    lease_tracker: Arc<BufferLeaseTracker>,
     server_bridge: Mutex<Option<Py<PyAny>>>,
     pool: PyRustClientPool,
 }
@@ -61,9 +65,27 @@ impl PyRuntimeSession {
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(Self {
             inner,
+            lease_tracker: Arc::new(BufferLeaseTracker::default()),
             server_bridge: Mutex::new(None),
             pool: PyRustClientPool::global(),
         })
+    }
+
+    fn lease_tracker(&self) -> PyBufferLeaseTracker {
+        PyBufferLeaseTracker::from_arc(Arc::clone(&self.lease_tracker))
+    }
+
+    fn hold_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        PyBufferLeaseTracker::from_arc(Arc::clone(&self.lease_tracker)).stats_dict(py)
+    }
+
+    fn sweep_hold_leases<'py>(
+        &self,
+        py: Python<'py>,
+        threshold_seconds: f64,
+    ) -> PyResult<Bound<'py, PyList>> {
+        PyBufferLeaseTracker::from_arc(Arc::clone(&self.lease_tracker))
+            .sweep_retained_list(py, threshold_seconds)
     }
 
     fn ensure_server<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
