@@ -224,6 +224,53 @@ def test_resource_input_from_buffer_failure_uses_specific_error_and_releases_req
         cc.close(client)
 
 
+@cc.transferable
+class BadOutputFromBuffer:
+    data: memoryview | bytes
+
+    def serialize(value: "BadOutputFromBuffer") -> bytes:
+        return bytes(value.data)
+
+    def deserialize(data: memoryview) -> "BadOutputFromBuffer":
+        return BadOutputFromBuffer(bytes(data))
+
+    def from_buffer(data: memoryview) -> "BadOutputFromBuffer":
+        raise RuntimeError("bad client output from_buffer")
+
+
+@cc.crm(namespace="cc.test.bad_output_from_buffer", version="0.1.0")
+class BadOutputCRM:
+    @cc.transfer(output=BadOutputFromBuffer)
+    def payload(self, size: int) -> BadOutputFromBuffer:
+        ...
+
+
+class BadOutputResource:
+    def payload(self, size: int) -> BadOutputFromBuffer:
+        return BadOutputFromBuffer(b"x" * size)
+
+
+@pytest.mark.parametrize("size", [16, 8192])
+def test_client_output_from_buffer_failure_releases_response_for_inline_and_shm(monkeypatch, size):
+    settings.shm_threshold = 1024
+    monkeypatch.delenv("C2_RELAY_ADDRESS", raising=False)
+    route_name = f"bad_output_from_buffer_{size}"
+    cc.register(BadOutputCRM, BadOutputResource(), name=route_name)
+    cc.serve(blocking=False)
+    address = cc.server_address()
+    assert address is not None
+    client = cc.connect(BadOutputCRM, name=route_name, address=address)
+    try:
+        with pytest.raises(cc.error.ClientOutputFromBuffer) as exc_info:
+            cc.hold(client.payload)(size)
+        assert "bad client output from_buffer" in str(exc_info.value)
+        stats = cc.hold_stats()
+        assert stats["by_direction"]["client_response"]["active_holds"] == 0
+        assert stats["active_holds"] == 0
+    finally:
+        cc.close(client)
+
+
 @cc.crm(namespace="cc.test.grid_like_buffer_lease", version="0.1.0")
 class GridLikeCRM:
     @cc.transfer(output=BytesView)
