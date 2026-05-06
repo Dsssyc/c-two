@@ -1,6 +1,6 @@
 # Canonical Error Rust Authority Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]` / `- [x]`) syntax for tracking.
 
 **Goal:** Make Rust `c2-error` the canonical owner of C-Two error code registry and error wire bytes while keeping Python exception classes as a thin SDK presentation layer.
 
@@ -9,6 +9,35 @@
 **Tech Stack:** Rust `core/foundation/c2-error`, PyO3 bindings in `sdk/python/native/src/error_ffi.rs`, Python SDK facade in `sdk/python/src/c_two/error.py`, pytest unit/integration tests, Cargo tests.
 
 ---
+
+## Implementation Status
+
+Status: implemented on `dev-feature` by these commits:
+
+- `d40cc3b refactor(error): expose canonical wire codec through native`
+- `0dcb11d refactor(python): delegate error wire codec to native`
+- `7705b5b test: guard native error wire authority`
+- `2f17998 docs: mark error wire codec rust-owned`
+- `4462135 docs: update error wire authority guidance`
+
+Task 1 and Task 2 were committed together because removing the Rust
+`to_legacy_bytes` / `from_legacy_bytes` methods intentionally breaks the native
+crate until the PyO3 bindings are renamed in the same functional slice. This
+keeps the branch buildable at commit boundaries while preserving the 0.x
+clean-cut rule: no compatibility aliases or legacy-named exported codec APIs
+remain.
+
+Final verification evidence captured during implementation:
+
+- `cargo test --manifest-path core/Cargo.toml -p c2-error`: 9 passed.
+- `cargo check --manifest-path sdk/python/native/Cargo.toml -q`: passed.
+- Focused Python error/native/boundary tests: 83 passed.
+- `sdk/python/tests/integration/test_error_propagation.py`: 32 passed.
+- `cargo test --manifest-path core/Cargo.toml --workspace`: passed.
+- `C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30 -rs`:
+  648 passed, 2 skipped for optional example dependencies.
+- Stale-symbol search for legacy codec names in active code and tests: no
+  matches.
 
 ## 0.x Clean-Cut Constraint
 
@@ -48,7 +77,7 @@ C-Two is in the 0.x line. Do not preserve stale `legacy` API names as compatibil
 **Files:**
 - Commit existing modifications before editing error authority files.
 
-- [ ] **Step 1: Inspect the current worktree**
+- [x] **Step 1: Inspect the current worktree**
 
 Run:
 
@@ -66,7 +95,7 @@ Expected if Issue3 fixes are still uncommitted:
  M tests/repo/test_cli_release_workflow.py
 ```
 
-- [ ] **Step 2: Commit the completed Issue3 fix before starting Issue4**
+- [x] **Step 2: Commit the completed Issue3 fix before starting Issue4**
 
 Run:
 
@@ -81,7 +110,7 @@ git commit -m "test: finalize repo policy test migration"
 
 Expected: a commit is created containing only Issue3 migration cleanup.
 
-- [ ] **Step 3: Confirm a clean worktree for Issue4**
+- [x] **Step 3: Confirm a clean worktree for Issue4**
 
 Run:
 
@@ -105,7 +134,7 @@ or the equivalent clean branch status for the active local branch.
 - Modify: `core/foundation/c2-error/src/lib.rs`
 - Test: `core/foundation/c2-error/src/lib.rs`
 
-- [ ] **Step 1: Write the failing Rust API-name test by updating existing tests**
+- [x] **Step 1: Write the failing Rust API-name test by updating existing tests**
 
 In `core/foundation/c2-error/src/lib.rs`, replace the test module with this version. The important red condition is that tests call `to_wire_bytes()` and `from_wire_bytes()`, which do not exist before implementation.
 
@@ -214,7 +243,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the Rust error crate tests and verify the expected failure**
+- [x] **Step 2: Run the Rust error crate tests and verify the expected failure**
 
 Run:
 
@@ -224,7 +253,7 @@ cargo test --manifest-path core/Cargo.toml -p c2-error
 
 Expected: FAIL because `C2Error::to_wire_bytes` and `C2Error::from_wire_bytes` are not defined.
 
-- [ ] **Step 3: Implement the wire-named Rust API and remove legacy-named methods**
+- [x] **Step 3: Implement the wire-named Rust API and remove legacy-named methods**
 
 In `core/foundation/c2-error/src/lib.rs`, replace `C2ErrorDecodeError` display text and the `C2Error` encode/decode methods with this implementation:
 
@@ -284,7 +313,7 @@ impl C2Error {
 }
 ```
 
-- [ ] **Step 4: Update all Rust references to the old method names**
+- [x] **Step 4: Update all Rust references to the old method names**
 
 Run:
 
@@ -294,7 +323,7 @@ rg -n "to_legacy_bytes|from_legacy_bytes" core sdk/python/native
 
 Replace each remaining Rust call with `to_wire_bytes` or `from_wire_bytes`. No compatibility wrappers should remain.
 
-- [ ] **Step 5: Run Rust error tests and verify green**
+- [x] **Step 5: Run Rust error tests and verify green**
 
 Run:
 
@@ -304,7 +333,7 @@ cargo test --manifest-path core/Cargo.toml -p c2-error
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit Task 1**
+- [x] **Step 6: Commit Task 1**
 
 Run:
 
@@ -321,7 +350,7 @@ git commit -m "refactor(error): rename canonical codec to wire"
 - Modify: `sdk/python/native/src/error_ffi.rs`
 - Test: `sdk/python/tests/unit/test_native_error_registry.py`
 
-- [ ] **Step 1: Write failing Python tests for the new native API names and behavior**
+- [x] **Step 1: Write failing Python tests for the new native API names and behavior**
 
 Replace `sdk/python/tests/unit/test_native_error_registry.py` with:
 
@@ -373,7 +402,7 @@ def test_native_error_ffi_does_not_export_legacy_codec_names():
     assert not hasattr(_native, "decode_error_legacy")
 ```
 
-- [ ] **Step 2: Run the native error registry tests and verify the expected failure**
+- [x] **Step 2: Run the native error registry tests and verify the expected failure**
 
 Run:
 
@@ -383,7 +412,7 @@ C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_native_error_registry
 
 Expected: FAIL because `_native.encode_error_wire` and `_native.decode_error_wire_parts` are not exported yet.
 
-- [ ] **Step 3: Replace `sdk/python/native/src/error_ffi.rs` with wire-named low-copy bindings**
+- [x] **Step 3: Replace `sdk/python/native/src/error_ffi.rs` with wire-named low-copy bindings**
 
 Use this implementation:
 
@@ -444,7 +473,7 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 **Implementation note:** `PyBuffer<u8>` avoids a Python-side pre-copy from `memoryview`. PyO3 still copies into a temporary Rust `Vec<u8>` for decode because `PyBuffer` does not expose a single safe borrowed contiguous slice for every exporter. This is acceptable for small error payloads and avoids the larger Python `tobytes()` copy. Encode writes directly into the final Python bytes allocation.
 
-- [ ] **Step 4: Run Cargo check for the native extension**
+- [x] **Step 4: Run Cargo check for the native extension**
 
 Run:
 
@@ -454,7 +483,7 @@ cargo check --manifest-path sdk/python/native/Cargo.toml -q
 
 Expected: PASS.
 
-- [ ] **Step 5: Rebuild the Python native extension and run native error tests**
+- [x] **Step 5: Rebuild the Python native extension and run native error tests**
 
 Run:
 
@@ -465,7 +494,7 @@ C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_native_error_registry
 
 Expected: PASS.
 
-- [ ] **Step 6: Assert old native names are gone by source search**
+- [x] **Step 6: Assert old native names are gone by source search**
 
 Run:
 
@@ -475,7 +504,7 @@ rg -n "encode_error_legacy|decode_error_legacy|legacy_error" sdk/python/native s
 
 Expected: no matches.
 
-- [ ] **Step 7: Commit Task 2**
+- [x] **Step 7: Commit Task 2**
 
 Run:
 
@@ -492,7 +521,7 @@ git commit -m "refactor(error): expose canonical wire codec through native"
 - Modify: `sdk/python/src/c_two/error.py`
 - Modify: `sdk/python/tests/unit/test_error.py`
 
-- [ ] **Step 1: Write failing tests for native-generated enum and delegated codec calls**
+- [x] **Step 1: Write failing tests for native-generated enum and delegated codec calls**
 
 In `sdk/python/tests/unit/test_error.py`, replace `TestNativeErrorRegistryParity` with this expanded class:
 
@@ -556,7 +585,7 @@ class TestNativeErrorRegistryParity:
         assert isinstance(calls[0], NoToBytes)
 ```
 
-- [ ] **Step 2: Run the focused Python error tests and verify expected failure**
+- [x] **Step 2: Run the focused Python error tests and verify expected failure**
 
 Run:
 
@@ -566,7 +595,7 @@ C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_error.py::TestNativeE
 
 Expected: FAIL because `error._native.encode_error_wire`, `error._native.decode_error_wire_parts`, and registry-generated enum behavior are not wired into `error.py` yet.
 
-- [ ] **Step 3: Replace the top of `sdk/python/src/c_two/error.py` with native-generated enum setup**
+- [x] **Step 3: Replace the top of `sdk/python/src/c_two/error.py` with native-generated enum setup**
 
 At the top of `sdk/python/src/c_two/error.py`, replace the hand-written enum with:
 
@@ -611,7 +640,7 @@ def _load_error_code_members() -> dict[str, int]:
 ERROR_Code = unique(IntEnum("ERROR_Code", _load_error_code_members()))
 ```
 
-- [ ] **Step 4: Replace `CCError.serialize()` and `CCError.deserialize()` with native delegation**
+- [x] **Step 4: Replace `CCError.serialize()` and `CCError.deserialize()` with native delegation**
 
 In `sdk/python/src/c_two/error.py`, replace both static methods with:
 
@@ -658,7 +687,7 @@ In `sdk/python/src/c_two/error.py`, replace both static methods with:
 
 Do not add any UTF-8 decode, split, or integer parsing logic in Python.
 
-- [ ] **Step 5: Run focused Python error tests and verify green**
+- [x] **Step 5: Run focused Python error tests and verify green**
 
 Run:
 
@@ -668,7 +697,7 @@ C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_error.py -q --timeout
 
 Expected: PASS.
 
-- [ ] **Step 6: Run mesh error tests to verify subclass presentation remains intact**
+- [x] **Step 6: Run mesh error tests to verify subclass presentation remains intact**
 
 Run:
 
@@ -678,7 +707,7 @@ C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_mesh_errors.py -q --t
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit Task 3**
+- [x] **Step 7: Commit Task 3**
 
 Run:
 
@@ -694,7 +723,7 @@ git commit -m "refactor(python): delegate error wire codec to native"
 **Files:**
 - Modify: `sdk/python/tests/unit/test_sdk_boundary.py`
 
-- [ ] **Step 1: Add the failing boundary test**
+- [x] **Step 1: Add the failing boundary test**
 
 Append this test to `sdk/python/tests/unit/test_sdk_boundary.py`:
 
@@ -728,7 +757,7 @@ def test_error_facade_does_not_reimplement_wire_codec():
     assert "_native.decode_error_wire_parts" in source
 ```
 
-- [ ] **Step 2: Run the boundary test and verify it passes after Tasks 1-3**
+- [x] **Step 2: Run the boundary test and verify it passes after Tasks 1-3**
 
 Run:
 
@@ -738,7 +767,7 @@ C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_sdk_boundary.py::test
 
 Expected: PASS.
 
-- [ ] **Step 3: Commit Task 4**
+- [x] **Step 3: Commit Task 4**
 
 Run:
 
@@ -754,7 +783,7 @@ git commit -m "test: guard native error wire authority"
 **Files:**
 - Modify: `docs/plans/2026-05-04-thin-sdk-rust-core-boundary.md`
 
-- [ ] **Step 1: Replace the Canonical Error section with implemented ownership wording**
+- [x] **Step 1: Replace the Canonical Error section with implemented ownership wording**
 
 In `docs/plans/2026-05-04-thin-sdk-rust-core-boundary.md`, replace the section starting at `### P1. Canonical error registry and legacy bytes` through its required tests with:
 
@@ -797,7 +826,7 @@ mapping for `CCError.deserialize()`.
 - Boundary tests prevent Python from reimplementing the `code:message` parser.
 ```
 
-- [ ] **Step 2: Search for stale legacy naming in active error docs and tests**
+- [x] **Step 2: Search for stale legacy naming in active error docs and tests**
 
 Run:
 
@@ -807,7 +836,7 @@ rg -n "legacy bytes|legacy_error|encode_error_legacy|decode_error_legacy|to_lega
 
 Expected: no matches. Mentions in older historical plan files outside this active section are not part of this task.
 
-- [ ] **Step 3: Commit Task 5**
+- [x] **Step 3: Commit Task 5**
 
 Run:
 
@@ -823,7 +852,7 @@ git commit -m "docs: mark error wire codec rust-owned"
 **Files:**
 - Verify all changed files.
 
-- [ ] **Step 1: Verify Rust error crate**
+- [x] **Step 1: Verify Rust error crate**
 
 Run:
 
@@ -833,7 +862,7 @@ cargo test --manifest-path core/Cargo.toml -p c2-error
 
 Expected: PASS.
 
-- [ ] **Step 2: Verify Python error unit and boundary tests**
+- [x] **Step 2: Verify Python error unit and boundary tests**
 
 Run:
 
@@ -848,7 +877,7 @@ C2_RELAY_ADDRESS= uv run pytest \
 
 Expected: PASS.
 
-- [ ] **Step 3: Verify error propagation integration**
+- [x] **Step 3: Verify error propagation integration**
 
 Run:
 
@@ -858,7 +887,7 @@ C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/integration/test_error_propagat
 
 Expected: PASS.
 
-- [ ] **Step 4: Verify native extension build**
+- [x] **Step 4: Verify native extension build**
 
 Run:
 
@@ -868,7 +897,7 @@ cargo check --manifest-path sdk/python/native/Cargo.toml -q
 
 Expected: PASS.
 
-- [ ] **Step 5: Verify full Rust workspace**
+- [x] **Step 5: Verify full Rust workspace**
 
 Run:
 
@@ -878,7 +907,7 @@ cargo test --manifest-path core/Cargo.toml --workspace
 
 Expected: PASS.
 
-- [ ] **Step 6: Verify full Python SDK test suite**
+- [x] **Step 6: Verify full Python SDK test suite**
 
 Run:
 
@@ -888,7 +917,7 @@ C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30 -rs
 
 Expected: PASS, allowing only documented skips for optional example dependencies or unavailable local relay binary.
 
-- [ ] **Step 7: Verify whitespace and stale symbol cleanup**
+- [x] **Step 7: Verify whitespace and stale symbol cleanup**
 
 Run:
 
@@ -899,7 +928,7 @@ rg -n "to_legacy_bytes|from_legacy_bytes|encode_error_legacy|decode_error_legacy
 
 Expected: `git diff --check` exits 0 and `rg` prints no matches.
 
-- [ ] **Step 8: Commit final verification notes only if a docs file was updated during verification**
+- [x] **Step 8: Commit final verification notes only if a docs file was updated during verification**
 
 If Task 6 finds a documentation correction, commit it with:
 
