@@ -373,10 +373,13 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
         if output is not None:
             if _c2_buffer == 'hold' and hasattr(output, 'from_buffer') and callable(output.from_buffer):
                 output_fn = output.from_buffer
+                output_hook = 'from_buffer'
             else:
                 output_fn = output.deserialize
+                output_hook = 'deserialize'
         else:
             output_fn = None
+            output_hook = None
 
         try:
             if len(args) < 1:
@@ -408,19 +411,30 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
                 return None
 
             if hasattr(response, 'release'):
-                if _c2_buffer == 'hold' and hasattr(response, 'track_retained'):
-                    tracker = getattr(client, 'lease_tracker', None)
-                    if tracker is not None:
-                        route_name = getattr(client, 'route_name', '')
-                        response.track_retained(
-                            tracker,
-                            route_name,
-                            method_name,
-                            'client_response',
-                        )
                 mv = memoryview(response)
                 if _c2_buffer == 'hold':
-                    result = output_fn(mv)
+                    try:
+                        result = output_fn(mv)
+                        if output_hook == 'from_buffer' and hasattr(response, 'track_retained'):
+                            tracker = getattr(client, 'lease_tracker', None)
+                            if tracker is not None:
+                                route_name = getattr(client, 'route_name', '')
+                                response.track_retained(
+                                    tracker,
+                                    route_name,
+                                    method_name,
+                                    'client_response',
+                                )
+                    except Exception as exc:
+                        mv.release()
+                        try:
+                            response.release()
+                        except Exception:
+                            pass
+                        if output_hook == 'from_buffer':
+                            raise error.ClientOutputFromBuffer(str(exc)) from exc
+                        raise
+
                     def release_cb():
                         mv.release()
                         try:
@@ -451,6 +465,8 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
                 raise error.ClientSerializeInput(str(e)) from e
             elif stage == 'call_crm':
                 raise error.ClientCallResource(str(e)) from e
+            elif output_hook == 'from_buffer':
+                raise error.ClientOutputFromBuffer(str(e)) from e
             else:
                 raise error.ClientDeserializeOutput(str(e)) from e
 
