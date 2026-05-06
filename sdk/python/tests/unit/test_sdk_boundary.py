@@ -138,11 +138,11 @@ def test_python_does_not_own_buffer_lease_accounting():
     root = Path(__file__).resolve().parents[2] / "src" / "c_two"
     offenders = []
     forbidden = [
-        "class HoldRegistry",
-        "weakref.ref(request_buf",
-        "_hold_registry",
-        "_entries",
-        "total_held_bytes +=",
+        "class " + "Hold" + "Registry",
+        "weakref." + "ref(request_buf",
+        "_hold" + "_registry",
+        "_entr" + "ies",
+        "total_held_bytes " + "+=",
     ]
     for path in root.rglob("*.py"):
         text = path.read_text(encoding="utf-8")

@@ -75,6 +75,7 @@ def test_client_hold_inline_response_counts_and_releases_without_copy():
 
 def test_client_hold_shm_response_counts_and_releases_without_relay(monkeypatch):
     settings.shm_threshold = 1024
+    monkeypatch.delenv("C2_RELAY_ADDRESS", raising=False)
     cc.register(PayloadCRM, PayloadResource(), name="payload")
     cc.serve(blocking=False)
     monkeypatch.setenv("C2_RELAY_ADDRESS", "http://127.0.0.1:9")
