@@ -1,21 +1,41 @@
 from __future__ import annotations
 from enum import IntEnum, unique
 
-@unique
-class ERROR_Code(IntEnum):
-    ERROR_UNKNOWN                           = 0
-    ERROR_AT_RESOURCE_INPUT_DESERIALIZING   = 1
-    ERROR_AT_RESOURCE_OUTPUT_SERIALIZING    = 2
-    ERROR_AT_RESOURCE_FUNCTION_EXECUTING    = 3
-    ERROR_AT_CLIENT_INPUT_SERIALIZING       = 5
-    ERROR_AT_CLIENT_OUTPUT_DESERIALIZING    = 6
-    ERROR_AT_CLIENT_CALLING_RESOURCE        = 7
-    ERROR_RESOURCE_NOT_FOUND                = 701
-    ERROR_RESOURCE_UNAVAILABLE              = 702
-    ERROR_RESOURCE_ALREADY_REGISTERED       = 703
-    ERROR_STALE_RESOURCE                    = 704
-    ERROR_REGISTRY_UNAVAILABLE              = 705
-    ERROR_WRITE_CONFLICT                    = 706
+from c_two import _native
+
+_NATIVE_TO_PY_ERROR_NAMES = {
+    "Unknown": "ERROR_UNKNOWN",
+    "ResourceInputDeserializing": "ERROR_AT_RESOURCE_INPUT_DESERIALIZING",
+    "ResourceOutputSerializing": "ERROR_AT_RESOURCE_OUTPUT_SERIALIZING",
+    "ResourceFunctionExecuting": "ERROR_AT_RESOURCE_FUNCTION_EXECUTING",
+    "ClientInputSerializing": "ERROR_AT_CLIENT_INPUT_SERIALIZING",
+    "ClientOutputDeserializing": "ERROR_AT_CLIENT_OUTPUT_DESERIALIZING",
+    "ClientCallingResource": "ERROR_AT_CLIENT_CALLING_RESOURCE",
+    "ResourceNotFound": "ERROR_RESOURCE_NOT_FOUND",
+    "ResourceUnavailable": "ERROR_RESOURCE_UNAVAILABLE",
+    "ResourceAlreadyRegistered": "ERROR_RESOURCE_ALREADY_REGISTERED",
+    "StaleResource": "ERROR_STALE_RESOURCE",
+    "RegistryUnavailable": "ERROR_REGISTRY_UNAVAILABLE",
+    "WriteConflict": "ERROR_WRITE_CONFLICT",
+}
+
+
+def _load_error_code_members() -> dict[str, int]:
+    registry = _native.error_registry()
+    missing = sorted(set(_NATIVE_TO_PY_ERROR_NAMES) - set(registry))
+    extra = sorted(set(registry) - set(_NATIVE_TO_PY_ERROR_NAMES))
+    if missing or extra:
+        raise RuntimeError(
+            "Rust error registry does not match Python facade mapping "
+            f"(missing={missing}, extra={extra})"
+        )
+    return {
+        py_name: int(registry[native_name])
+        for native_name, py_name in _NATIVE_TO_PY_ERROR_NAMES.items()
+    }
+
+
+ERROR_Code = unique(IntEnum("ERROR_Code", _load_error_code_members()))
 
 class CCBaseError(Exception):
     """Base class for all C-Two-related errors."""
@@ -45,60 +65,35 @@ class CCError(CCBaseError):
     @staticmethod
     def serialize(err: 'CCError' | None) -> bytes:
         """
-        Serialize the error to bytes.
-        
-        Returns:
-            bytes: Serialized error data.
+        Serialize the error to canonical C-Two error wire bytes.
         """
         if err is None:
             return b''
 
-        return f'{err.code.value}:{err.message}'.encode('utf-8')
-    
-    @staticmethod
-    def deserialize(data: memoryview) -> 'CCError' | None:
-        """
-        Deserialize bytes to an error object.
-        
-        Args:
-            data (memoryview): Serialized error data.
+        message = err.message or 'Error occurred when using C-Two.'
+        return _native.encode_error_wire(int(err.code), message)
 
-        Returns:
-            CCError: Deserialized error object.
+    @staticmethod
+    def deserialize(data) -> 'CCError' | None:
         """
-        if not data:
+        Deserialize canonical C-Two error wire bytes to a Python error object.
+        """
+        try:
+            decoded = _native.decode_error_wire_parts(data)
+        except ValueError as exc:
+            return CCError(
+                code=ERROR_Code.ERROR_UNKNOWN,
+                message=f'Malformed error payload: {exc}',
+            )
+
+        if decoded is None:
             return None
 
-        raw_bytes = data.tobytes()
-        try:
-            raw = raw_bytes.decode('utf-8')
-        except UnicodeDecodeError:
-            return CCError(
-                code=ERROR_Code.ERROR_UNKNOWN,
-                message=f'Malformed error payload: invalid UTF-8 ({raw_bytes!r})',
-            )
-
-        parts = raw.split(':', 1)
-        if len(parts) != 2:
-            return CCError(
-                code=ERROR_Code.ERROR_UNKNOWN,
-                message=f'Malformed error payload: missing ":" separator ({raw!r})',
-            )
-
-        code_raw, message = parts
-        try:
-            code_value = int(code_raw)
-        except ValueError:
-            return CCError(
-                code=ERROR_Code.ERROR_UNKNOWN,
-                message=f'Malformed error payload: invalid code {code_raw!r}: {message}',
-            )
-        
+        code_value, message = decoded
         try:
             code = ERROR_Code(code_value)
         except ValueError:
             code = ERROR_Code.ERROR_UNKNOWN
-            message = f'Unknown error code {code_value}: {message or ""}'
         subclass = _CODE_TO_CLASS.get(code, CCError)
         obj = Exception.__new__(subclass)
         obj.code = code

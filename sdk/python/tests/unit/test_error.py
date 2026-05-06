@@ -237,22 +237,55 @@ class TestNativeErrorRegistryParity:
         from c_two import _native
 
         native = _native.error_registry()
-        python_codes = {code.name.removeprefix("ERROR_"): code.value for code in ERROR_Code}
-        expected_python_names = {
-            "UNKNOWN": "Unknown",
-            "AT_RESOURCE_INPUT_DESERIALIZING": "ResourceInputDeserializing",
-            "AT_RESOURCE_OUTPUT_SERIALIZING": "ResourceOutputSerializing",
-            "AT_RESOURCE_FUNCTION_EXECUTING": "ResourceFunctionExecuting",
-            "AT_CLIENT_INPUT_SERIALIZING": "ClientInputSerializing",
-            "AT_CLIENT_OUTPUT_DESERIALIZING": "ClientOutputDeserializing",
-            "AT_CLIENT_CALLING_RESOURCE": "ClientCallingResource",
-            "RESOURCE_NOT_FOUND": "ResourceNotFound",
-            "RESOURCE_UNAVAILABLE": "ResourceUnavailable",
-            "RESOURCE_ALREADY_REGISTERED": "ResourceAlreadyRegistered",
-            "STALE_RESOURCE": "StaleResource",
-            "REGISTRY_UNAVAILABLE": "RegistryUnavailable",
-            "WRITE_CONFLICT": "WriteConflict",
+        expected = {
+            "ERROR_UNKNOWN": ("Unknown", 0),
+            "ERROR_AT_RESOURCE_INPUT_DESERIALIZING": ("ResourceInputDeserializing", 1),
+            "ERROR_AT_RESOURCE_OUTPUT_SERIALIZING": ("ResourceOutputSerializing", 2),
+            "ERROR_AT_RESOURCE_FUNCTION_EXECUTING": ("ResourceFunctionExecuting", 3),
+            "ERROR_AT_CLIENT_INPUT_SERIALIZING": ("ClientInputSerializing", 5),
+            "ERROR_AT_CLIENT_OUTPUT_DESERIALIZING": ("ClientOutputDeserializing", 6),
+            "ERROR_AT_CLIENT_CALLING_RESOURCE": ("ClientCallingResource", 7),
+            "ERROR_RESOURCE_NOT_FOUND": ("ResourceNotFound", 701),
+            "ERROR_RESOURCE_UNAVAILABLE": ("ResourceUnavailable", 702),
+            "ERROR_RESOURCE_ALREADY_REGISTERED": ("ResourceAlreadyRegistered", 703),
+            "ERROR_STALE_RESOURCE": ("StaleResource", 704),
+            "ERROR_REGISTRY_UNAVAILABLE": ("RegistryUnavailable", 705),
+            "ERROR_WRITE_CONFLICT": ("WriteConflict", 706),
         }
-        assert set(expected_python_names.values()) == set(native)
-        for python_name, native_name in expected_python_names.items():
-            assert python_codes[python_name] == native[native_name]
+
+        assert set(ERROR_Code.__members__) == set(expected)
+        for py_name, (native_name, value) in expected.items():
+            assert native[native_name] == value
+            assert ERROR_Code[py_name].value == value
+
+    def test_serialize_uses_native_wire_encoder(self, monkeypatch):
+        calls = []
+
+        def fake_encode(code, message):
+            calls.append((code, message))
+            return b"3:from-native"
+
+        monkeypatch.setattr(error._native, "encode_error_wire", fake_encode)
+
+        err = CCError(ERROR_Code.ERROR_AT_RESOURCE_FUNCTION_EXECUTING, "boom")
+        assert CCError.serialize(err) == b"3:from-native"
+        assert calls == [(3, "boom")]
+
+    def test_deserialize_uses_native_wire_decoder_without_python_tobytes(self, monkeypatch):
+        class NoToBytes:
+            def tobytes(self):
+                raise AssertionError("deserialize must not call tobytes")
+
+        calls = []
+
+        def fake_decode(data):
+            calls.append(data)
+            return (703, "grid exists")
+
+        monkeypatch.setattr(error._native, "decode_error_wire_parts", fake_decode)
+
+        result = CCError.deserialize(NoToBytes())
+        assert isinstance(result, ResourceAlreadyRegistered)
+        assert result.message == "grid exists"
+        assert len(calls) == 1
+        assert isinstance(calls[0], NoToBytes)
