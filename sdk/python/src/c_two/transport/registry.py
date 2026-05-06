@@ -307,6 +307,7 @@ class _ProcessRegistry:
                 if address is None and server is not None
                 else None
             )
+            lease_tracker = self._runtime_session.lease_tracker()
 
         if address is None and local is not None:
             # Thread preference — same process, no serialization.
@@ -314,6 +315,7 @@ class _ProcessRegistry:
             proxy = CRMProxy.thread_local(
                 crm_instance,
                 scheduler=scheduler,
+                lease_tracker=lease_tracker,
             )
         elif address is not None and address.startswith(('http://', 'https://')):
             # HTTP mode — cross-node via relay server.
@@ -324,6 +326,7 @@ class _ProcessRegistry:
                 on_terminate=lambda addr=address: (
                     self._runtime_session.release_http_client(addr)
                 ),
+                lease_tracker=lease_tracker,
             )
         elif address is not None:
             # Remote IPC via pooled RustClient.
@@ -332,6 +335,7 @@ class _ProcessRegistry:
                 client,
                 name,
                 on_terminate=lambda addr=address: self._runtime_session.release_ipc_client(addr),
+                lease_tracker=lease_tracker,
             )
         else:
             self._sync_relay_override()
@@ -353,6 +357,7 @@ class _ProcessRegistry:
                 client,
                 name,
                 on_terminate=lambda: client.close(),
+                lease_tracker=lease_tracker,
             )
 
         crm = crm_class()

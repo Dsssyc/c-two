@@ -408,6 +408,16 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
                 return None
 
             if hasattr(response, 'release'):
+                if _c2_buffer == 'hold' and hasattr(response, 'track_retained'):
+                    tracker = getattr(client, 'lease_tracker', None)
+                    if tracker is not None:
+                        route_name = getattr(client, 'route_name', '')
+                        response.track_retained(
+                            tracker,
+                            route_name,
+                            method_name,
+                            'client_response',
+                        )
                 mv = memoryview(response)
                 if _c2_buffer == 'hold':
                     result = output_fn(mv)

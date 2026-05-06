@@ -258,6 +258,9 @@ def test_relay_resolved_connect_delegates_route_validation_to_runtime_session(mo
             calls.append((self.relay_address_override, route_name))
             return FakeRelayAwareClient()
 
+        def lease_tracker(self):
+            return None
+
     class FakeRelayAwareClient:
         def close(self):
             pass
@@ -297,6 +300,9 @@ def test_relay_resolved_connect_maps_native_404_to_resource_not_found(monkeypatc
             err = RuntimeError('HTTP 404')
             err.status_code = 404
             raise err
+
+        def lease_tracker(self):
+            return None
 
     registry._runtime_session = FakeRuntimeSession()  # noqa: SLF001
 
