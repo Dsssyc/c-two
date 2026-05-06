@@ -7,9 +7,11 @@ pub enum ErrorCode {
     ResourceInputDeserializing = 1,
     ResourceOutputSerializing = 2,
     ResourceFunctionExecuting = 3,
+    ResourceInputFromBuffer = 4,
     ClientInputSerializing = 5,
     ClientOutputDeserializing = 6,
     ClientCallingResource = 7,
+    ClientOutputFromBuffer = 8,
     ResourceNotFound = 701,
     ResourceUnavailable = 702,
     ResourceAlreadyRegistered = 703,
@@ -42,6 +44,10 @@ const ERROR_CODE_REGISTRY: &[ErrorCodeEntry] = &[
         name: "ResourceFunctionExecuting",
     },
     ErrorCodeEntry {
+        code: ErrorCode::ResourceInputFromBuffer,
+        name: "ResourceInputFromBuffer",
+    },
+    ErrorCodeEntry {
         code: ErrorCode::ClientInputSerializing,
         name: "ClientInputSerializing",
     },
@@ -52,6 +58,10 @@ const ERROR_CODE_REGISTRY: &[ErrorCodeEntry] = &[
     ErrorCodeEntry {
         code: ErrorCode::ClientCallingResource,
         name: "ClientCallingResource",
+    },
+    ErrorCodeEntry {
+        code: ErrorCode::ClientOutputFromBuffer,
+        name: "ClientOutputFromBuffer",
     },
     ErrorCodeEntry {
         code: ErrorCode::ResourceNotFound,
@@ -108,9 +118,11 @@ impl TryFrom<u16> for ErrorCode {
             1 => Ok(ErrorCode::ResourceInputDeserializing),
             2 => Ok(ErrorCode::ResourceOutputSerializing),
             3 => Ok(ErrorCode::ResourceFunctionExecuting),
+            4 => Ok(ErrorCode::ResourceInputFromBuffer),
             5 => Ok(ErrorCode::ClientInputSerializing),
             6 => Ok(ErrorCode::ClientOutputDeserializing),
             7 => Ok(ErrorCode::ClientCallingResource),
+            8 => Ok(ErrorCode::ClientOutputFromBuffer),
             701 => Ok(ErrorCode::ResourceNotFound),
             702 => Ok(ErrorCode::ResourceUnavailable),
             703 => Ok(ErrorCode::ResourceAlreadyRegistered),
@@ -207,9 +219,11 @@ mod tests {
         assert_eq!(u16::from(ErrorCode::ResourceInputDeserializing), 1);
         assert_eq!(u16::from(ErrorCode::ResourceOutputSerializing), 2);
         assert_eq!(u16::from(ErrorCode::ResourceFunctionExecuting), 3);
+        assert_eq!(u16::from(ErrorCode::ResourceInputFromBuffer), 4);
         assert_eq!(u16::from(ErrorCode::ClientInputSerializing), 5);
         assert_eq!(u16::from(ErrorCode::ClientOutputDeserializing), 6);
         assert_eq!(u16::from(ErrorCode::ClientCallingResource), 7);
+        assert_eq!(u16::from(ErrorCode::ClientOutputFromBuffer), 8);
         assert_eq!(u16::from(ErrorCode::ResourceNotFound), 701);
         assert_eq!(u16::from(ErrorCode::ResourceUnavailable), 702);
         assert_eq!(u16::from(ErrorCode::ResourceAlreadyRegistered), 703);
@@ -238,9 +252,11 @@ mod tests {
                 ("ResourceInputDeserializing", 1),
                 ("ResourceOutputSerializing", 2),
                 ("ResourceFunctionExecuting", 3),
+                ("ResourceInputFromBuffer", 4),
                 ("ClientInputSerializing", 5),
                 ("ClientOutputDeserializing", 6),
                 ("ClientCallingResource", 7),
+                ("ClientOutputFromBuffer", 8),
                 ("ResourceNotFound", 701),
                 ("ResourceUnavailable", 702),
                 ("ResourceAlreadyRegistered", 703),
@@ -250,6 +266,18 @@ mod tests {
             ],
         );
         assert_eq!(ErrorCode::WriteConflict.name(), "WriteConflict");
+    }
+
+    #[test]
+    fn from_buffer_error_codes_round_trip_from_wire_values() {
+        assert_eq!(
+            ErrorCode::try_from(4),
+            Ok(ErrorCode::ResourceInputFromBuffer),
+        );
+        assert_eq!(
+            ErrorCode::try_from(8),
+            Ok(ErrorCode::ClientOutputFromBuffer),
+        );
     }
 
     #[test]
