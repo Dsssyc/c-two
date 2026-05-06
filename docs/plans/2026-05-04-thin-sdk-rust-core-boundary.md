@@ -327,6 +327,10 @@ mapping for `CCError.deserialize()`.
 
 Status: implemented on `dev-feature` by
 `docs/plans/2026-05-06-unified-buffer-lease-rust-authority.md`.
+Post-review repair also landed for deserialize-only client output hold: any
+successful `cc.hold()` response that keeps a native response owner alive is
+counted as a retained client-response lease until `HeldResult.release()`, even
+when the output type falls back to `deserialize()` rather than `from_buffer()`.
 
 Rust `core/foundation/c2-mem` owns SDK-visible buffer lease accounting for
 runtime-owned buffers exposed to language SDKs. Inline, SHM, handle, and
@@ -358,8 +362,23 @@ accurate.
   paths release their memoryview/native buffer owner before propagating a
   `CCError`, so traceback-local response/request objects do not pin stale
   retained lease stats.
+- Deserialize-only outputs wrapped with `cc.hold()` are counted as retained
+  client-response leases because `HeldResult` still keeps the native response
+  owner and memoryview alive until explicit release.
 - Default view mode still releases immediately and does not materialize payloads
   or add retained accounting overhead.
+
+**Repair direction for future issue5 hardening**
+
+The current implementation covers the issue5 ownership boundary. Further work
+should be treated as hardening rather than a second architecture: keep `c2-mem`
+as the source of truth, keep `ResponseBuffer.release()` / `ShmBuffer.release()`
+as memory-release authority, and improve only the SDK/native seam. The next
+repair plan should focus on (1) locking down successful-hold tracking semantics
+for both `from_buffer()` and deserialize-only outputs, (2) making native retained
+tracking calls idempotent and non-leaking under exceptional paths, and (3)
+extracting cross-SDK conformance tests that Go, Rust, Fortran, and Python can
+share without forcing payload copies or SHM promotion for inline results.
 
 ### P2. Server route slot lifecycle and readiness
 

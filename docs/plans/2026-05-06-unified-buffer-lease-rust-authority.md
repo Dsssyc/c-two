@@ -14,6 +14,28 @@
 
 C-Two is in the 0.x line. Remove Python-owned hold accounting rather than keeping compatibility shims. Do not keep `HoldRegistry`, Python `_entries`, weakref lease cleanup, or Python sweep authority after native retained-buffer accounting is wired. Public names such as `cc.hold()` and `cc.hold_stats()` may remain as SDK facades, but their state source must be native.
 
+
+## Post-Implementation Review Status
+
+Issue5 is implemented on `dev-feature`. A post-review repair fixed the only
+observed semantic drift: deserialize-only client outputs wrapped with
+`cc.hold()` now count as retained client-response leases. This is required
+because the Python `HeldResult` still holds both the native response owner and a
+`memoryview` until `HeldResult.release()`, even when the output object itself was
+constructed by `deserialize()` rather than `from_buffer()`.
+
+The current repair baseline is therefore:
+
+- Track every successful client `cc.hold()` response that keeps a native owner
+  alive, independent of output construction hook.
+- Track only after output construction succeeds; failed `from_buffer()` paths
+  release the memoryview and response owner immediately and must not leave stale
+  retained stats.
+- Preserve storage transparency: inline, SHM, handle, and file-spill retained
+  responses use the same stats semantics without forcing SHM promotion.
+- Treat remaining issue5 work as hardening of the SDK/native seam, not a new
+  Python-owned lifecycle mechanism.
+
 ## Corrected Scope For Issue 5
 
 The original issue name says “Hold-mode lease tracking”, but the correct abstraction is broader:
@@ -67,7 +89,8 @@ It also treats inline buffers as non-leases even though inline `ResponseBufferIn
 Rust IPC client receives inline response
   -> PyResponseBuffer { storage=inline, owner=Vec<u8> }
   -> memoryview(response)
-  -> output.from_buffer(memoryview)
+  -> output.from_buffer(memoryview) or output.deserialize(memoryview)
+  -> output construction succeeds
   -> Python cc.hold() path calls response.track_retained(route, method, "client_response")
   -> HeldResult holds value + memoryview + ResponseBuffer owner
   -> HeldResult.release()
@@ -83,7 +106,8 @@ Rust IPC client receives inline response
 Rust IPC client receives SHM or reassembled handle response
   -> PyResponseBuffer { storage=shm|handle|file_spill }
   -> memoryview(response)
-  -> output.from_buffer(memoryview)
+  -> output.from_buffer(memoryview) or output.deserialize(memoryview)
+  -> output construction succeeds
   -> Python cc.hold() path calls response.track_retained(route, method, "client_response")
   -> HeldResult holds value + memoryview + ResponseBuffer owner
   -> HeldResult.release()
@@ -136,7 +160,7 @@ The core lease model includes `LeaseRetention::Transient`, but Python does not a
 - Modify `sdk/python/native/src/runtime_session_ffi.rs`: make `RuntimeSession` own one `Arc<BufferLeaseTracker>`, expose `lease_tracker()`, `hold_stats()`, and `sweep_hold_leases(threshold_seconds)`.
 - Modify `sdk/python/src/c_two/transport/registry.py`: route public `hold_stats()` to native `RuntimeSession.hold_stats()` even when no server is running.
 - Modify `sdk/python/src/c_two/transport/client/proxy.py`: store the native lease tracker and expose route/mode metadata used by transfer wrappers.
-- Modify `sdk/python/src/c_two/crm/transferable.py`: in client-side hold path, track retained response leases before creating the memoryview; keep owner and memoryview alive inside `HeldResult` release closure.
+- Modify `sdk/python/src/c_two/crm/transferable.py`: in client-side hold path, create a memoryview, construct the output through `from_buffer()` or `deserialize()`, then track retained response leases only after construction succeeds and before returning `HeldResult`; keep owner and memoryview alive inside the release closure.
 - Modify `sdk/python/src/c_two/transport/server/native.py`: accept/pass a native lease tracker, track retained resource-input leases in the hold branch, log warnings from native stale snapshots, and remove Python `HoldRegistry` usage.
 - Delete `sdk/python/src/c_two/transport/server/hold_registry.py`: remove Python-owned lease accounting.
 - Replace `sdk/python/tests/unit/test_hold_registry.py`: move coverage to native/core lease tests and Python retained-buffer integration tests.
@@ -1497,34 +1521,41 @@ Use the same keyword for thread-local and HTTP proxy creation. HTTP retained byt
 
 - [ ] **Step 5: Track retained client responses in `transferable.py`**
 
-Modify `sdk/python/src/c_two/crm/transferable.py` in `com_to_crm()` inside the `if hasattr(response, 'release'):` branch before `mv = memoryview(response)`:
+Modify `sdk/python/src/c_two/crm/transferable.py` in `com_to_crm()` inside the `if hasattr(response, 'release'):` hold branch so retained tracking happens only after output construction succeeds and before returning `HeldResult`:
 
 ```python
-if _c2_buffer == 'hold' and hasattr(response, 'track_retained'):
-    tracker = getattr(client, 'lease_tracker', None)
-    if tracker is not None:
-        route_name = getattr(client, 'route_name', '')
-        response.track_retained(
-            tracker,
-            route_name,
-            method_name,
-            'client_response',
-        )
-```
-
-Keep the existing release closure shape that captures both `mv` and `response`:
-
-```python
-def release_cb():
-    mv.release()
+mv = memoryview(response)
+if _c2_buffer == 'hold':
     try:
-        response.release()
+        result = output_fn(mv)
+        if hasattr(response, 'track_retained'):
+            tracker = getattr(client, 'lease_tracker', None)
+            if tracker is not None:
+                route_name = getattr(client, 'route_name', '')
+                response.track_retained(
+                    tracker,
+                    route_name,
+                    method_name,
+                    'client_response',
+                )
     except Exception:
-        pass
-return HeldResult(result, release_cb)
+        mv.release()
+        try:
+            response.release()
+        except Exception:
+            pass
+        raise
+
+    def release_cb():
+        mv.release()
+        try:
+            response.release()
+        except Exception:
+            pass
+    return HeldResult(result, release_cb)
 ```
 
-This closure is required for inline retained zero-copy because `response` owns the native `Vec<u8>` backing the memoryview.
+This ordering is deliberate: failed `from_buffer()` paths must not leave stale retained stats, while deserialize-only successful hold outputs still count because `HeldResult` retains the native owner. The closure is required for inline retained zero-copy because `response` owns the native `Vec<u8>` backing the memoryview.
 
 - [ ] **Step 6: Run client retained lease tests**
 
@@ -2080,7 +2111,7 @@ rg -n "track_retained|_c2_buffer == 'hold'|memoryview\(|tobytes\(|bytes\(respons
   sdk/python/native/src/shm_buffer.rs -S
 ```
 
-Expected: retained tracking appears before memoryview creation; no new `tobytes()` or `bytes(response)` conversion is used to support lease accounting. Existing `bytes(...)` in tests or explicit value assertions are not part of the runtime retained path.
+Expected: retained tracking appears after successful hold output construction and before returning `HeldResult`; no new `tobytes()` or `bytes(response)` conversion is used to support lease accounting. Existing `bytes(...)` in tests, user-defined deserialize hooks, or explicit value assertions are not part of the runtime retained-accounting path.
 
 - [ ] **Step 8: Audit direct IPC relay independence**
 
