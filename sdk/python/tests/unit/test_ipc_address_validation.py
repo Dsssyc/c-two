@@ -28,16 +28,36 @@ def test_client_util_accepts_plain_ipc_region():
     )
 
 
-def test_client_util_uses_native_validation(monkeypatch):
+def test_client_util_uses_native_socket_path(monkeypatch):
     calls = []
 
-    def fake_validate(region_id: str) -> None:
-        calls.append(region_id)
-        raise ValueError('native validation sentinel')
+    def fake_socket_path(address: str) -> str:
+        calls.append(address)
+        return '/tmp/native.sock'
 
-    monkeypatch.setattr(util, '_validate_region_id', fake_validate)
+    import c_two._native as native
 
-    with pytest.raises(ValueError, match='native validation sentinel'):
-        util._socket_path_from_address('ipc://unit-server')
+    monkeypatch.setattr(native, 'ipc_socket_path', fake_socket_path)
 
-    assert calls == ['unit-server']
+    assert util._socket_path_from_address('ipc://unit-server') == '/tmp/native.sock'
+    assert calls == ['ipc://unit-server']
+
+
+def test_ping_invalid_address_returns_false():
+    assert util.ping('tcp://not-ipc') is False
+
+
+def test_shutdown_invalid_address_returns_false():
+    assert util.shutdown('tcp://not-ipc') is False
+
+
+@pytest.mark.parametrize('timeout', [-1.0, float('nan'), float('inf')])
+def test_ping_rejects_invalid_timeout(timeout):
+    with pytest.raises(ValueError, match='timeout'):
+        util.ping('ipc://unit-server', timeout=timeout)
+
+
+@pytest.mark.parametrize('timeout', [-1.0, float('nan'), float('inf')])
+def test_shutdown_rejects_invalid_timeout(timeout):
+    with pytest.raises(ValueError, match='timeout'):
+        util.shutdown('ipc://unit-server', timeout=timeout)

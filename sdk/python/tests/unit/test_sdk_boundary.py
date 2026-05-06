@@ -21,6 +21,7 @@ def test_registry_does_not_own_relay_control_plane_mechanisms():
     forbidden_classes: list[str] = []
     forbidden_names: list[str] = []
     forbidden_route_fields: list[str] = []
+    forbidden_pool_names: list[str] = []
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -36,6 +37,12 @@ def test_registry_does_not_own_relay_control_plane_mechanisms():
         elif isinstance(node, ast.FunctionDef):
             if node.name == "_is_local_relay_url":
                 forbidden_names.append(node.name)
+        elif isinstance(node, ast.Name):
+            if node.id in {"RustHttpClientPool", "_http_pool"}:
+                forbidden_pool_names.append(node.id)
+        elif isinstance(node, ast.Attribute):
+            if node.attr == "_http_pool":
+                forbidden_pool_names.append(node.attr)
         elif isinstance(node, ast.Call):
             func = node.func
             if isinstance(func, ast.Attribute):
@@ -63,6 +70,7 @@ def test_registry_does_not_own_relay_control_plane_mechanisms():
     assert forbidden_names == []
     assert forbidden_calls == []
     assert forbidden_route_fields == []
+    assert forbidden_pool_names == []
 
 
 def _attribute_name(node: ast.Attribute) -> str:

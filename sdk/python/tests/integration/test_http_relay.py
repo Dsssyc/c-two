@@ -15,6 +15,7 @@ import httpx
 
 import c_two as cc
 from c_two.config.settings import settings
+from c_two.error import ResourceNotFound
 from c_two._native import RustHttpClientPool
 from c_two.transport.client.proxy import CRMProxy
 from c_two.transport.registry import _ProcessRegistry
@@ -235,10 +236,10 @@ class TestCcConnectHttp:
         registry = _ProcessRegistry.get()
 
         crm = cc.connect(Hello, name='hello', address=relay_url)
-        assert registry._http_pool.refcount(relay_url) == 1
+        assert registry._runtime_session.http_client_refcount(relay_url) == 1
 
         cc.close(crm)
-        assert registry._http_pool.refcount(relay_url) == 0
+        assert registry._runtime_session.http_client_refcount(relay_url) == 0
 
     def test_connect_http_with_slash_in_name(self, start_c3_relay):
         """CRM names containing '/' (toodle-style resource paths) work over HTTP relay.
@@ -268,6 +269,68 @@ class TestCcConnectHttp:
             assert crm.greeting('Slash') == 'Hello, Slash!'
         finally:
             cc.close(crm)
+
+    def test_no_address_connect_uses_env_relay_projection(self, start_c3_relay, monkeypatch):
+        name = 'runtime/session/env-relay-connect'
+        relay = start_c3_relay()
+        relay_url = relay.url
+        previous_relay = settings.relay_address
+        registrar = _ProcessRegistry()
+        resolver = _ProcessRegistry()
+        crm = None
+        try:
+            monkeypatch.setenv('C2_RELAY_ADDRESS', relay_url)
+            settings.relay_address = None
+            registrar.register(Hello, HelloImpl(), name=name)
+            assert registrar.get_server_address() is not None
+
+            crm = resolver.connect(Hello, name=name)
+            assert crm.client._mode == 'http'
+            assert crm.greeting('EnvRelay') == 'Hello, EnvRelay!'
+        finally:
+            if crm is not None:
+                resolver.close(crm)
+            resolver.shutdown()
+            settings.relay_address = previous_relay
+            registrar.shutdown()
+            settings.relay_address = previous_relay
+
+    def test_no_address_connect_uses_runtime_session_relay_projection(self, start_c3_relay):
+        name = 'runtime/session/relay-connect'
+        relay = start_c3_relay()
+        relay_url = relay.url
+        previous_relay = settings.relay_address
+        registrar = _ProcessRegistry()
+        resolver = _ProcessRegistry()
+        crm = None
+        try:
+            registrar.set_relay(relay_url)
+            registrar.register(Hello, HelloImpl(), name=name)
+            assert registrar.get_server_address() is not None
+
+            resolver.set_relay(relay_url)
+            crm = resolver.connect(Hello, name=name)
+            assert crm.client._mode == 'http'
+            assert crm.greeting('RuntimeRelay') == 'Hello, RuntimeRelay!'
+        finally:
+            if crm is not None:
+                resolver.close(crm)
+            resolver.shutdown()
+            settings.relay_address = previous_relay
+            registrar.shutdown()
+            settings.relay_address = previous_relay
+
+    def test_no_address_relay_connect_maps_missing_route_to_resource_not_found(self, start_c3_relay):
+        relay = start_c3_relay()
+        previous_relay = settings.relay_address
+        registry = _ProcessRegistry()
+        try:
+            registry.set_relay(relay.url)
+            with pytest.raises(ResourceNotFound, match="Resource 'missing-route' not found"):
+                registry.connect(Hello, name='missing-route')
+        finally:
+            registry.shutdown()
+            settings.relay_address = previous_relay
 
     def test_relay_traffic_bypasses_system_proxy(self, monkeypatch, start_c3_relay):
         """All relay HTTP traffic must ignore HTTP_PROXY by default.

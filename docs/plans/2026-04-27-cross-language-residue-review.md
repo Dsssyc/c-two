@@ -170,7 +170,7 @@ the product identity from the current Python SDK status.
 **Discussion questions:**
 
 - Should the root README describe C-Two as a language-neutral resource RPC
-  runtime with Python as the first SDK?
+  runtime?
 - Should Python-specific examples remain dominant until another SDK exists?
 - Should roadmap wording continue to track the Rust resolver as the
   configuration owner once migration work lands?
@@ -376,7 +376,7 @@ product identity from current Python SDK status.
 #### Discussion questions
 
 - Should the root README describe C-Two as a language-neutral resource RPC
-  runtime with Python as the first SDK?
+  runtime?
 - Should Python-specific examples remain dominant until another SDK exists?
 - Should roadmap wording continue to track the Rust resolver as the
   configuration owner once migration work lands?

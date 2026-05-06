@@ -23,6 +23,12 @@ uv sync --reinstall-package c-two
 # Run the full test suite (C2_RELAY_ADDRESS= avoids env interference)
 C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30
 
+# Ensure the Python 3.10 compatibility syntax check executes instead of
+# skipping. Keep 3.10 coverage because some downstream users, including
+# Taichi-based stacks, are still pinned to Python 3.10.
+uv python install 3.10
+C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_python_examples_syntax.py::test_python_examples_compile_on_minimum_supported_python -q --timeout=30 -rs
+
 # Run a single test file
 uv run pytest sdk/python/tests/unit/test_wire.py -q
 
@@ -57,7 +63,23 @@ c3 --version
 c3 relay --upstream grid=server-grid@ipc://my_server --bind 0.0.0.0:8080
 ```
 
-Tests use **pytest** with a 30-second per-test timeout. Tests live under `sdk/python/tests/unit/` and `sdk/python/tests/integration/`, with shared fixtures in `sdk/python/tests/fixtures/` (see `Hello` CRM contract and `HelloImpl` resource).
+Tests use **pytest** with a 30-second per-test timeout. Tests live under `sdk/python/tests/unit/` and `sdk/python/tests/integration/`, with shared fixtures in `sdk/python/tests/fixtures/` (see `Hello` CRM contract and `HelloImpl` resource). The minimum-supported-Python syntax test discovers `python3.10` or `uv python find 3.10`; run `uv python install 3.10` before the suite if you need to guarantee it does not skip. For a broader 3.10 smoke test without replacing the default `.venv`, use `UV_PROJECT_ENVIRONMENT=.venv-py310 C2_RELAY_ADDRESS= uv run --python 3.10 pytest sdk/python/tests/unit/test_python_examples_syntax.py -q --timeout=30 -rs`.
+
+## 0.x And Phase Discipline
+
+C-Two is in the 0.x line. Do not preserve backwards compatibility for
+incorrect, experimental, or superseded internal APIs unless a compatibility
+window is explicitly requested. Prefer clean cuts over compatibility shims:
+remove obsolete code, tests, docs, and module surfaces when Rust takes over a
+runtime concern.
+
+Runtime-session work is phased only for reviewability. Every phase must be
+industrial production work with the same invariants as the final target: the
+Rust owner must enforce the moved concern, Python must not keep a second source
+of truth, direct IPC must remain relay-independent, thread-local calls must
+stay zero-serialization, SHM dispatch must stay zero-copy, and deferred work
+must be recorded in
+`docs/plans/2026-05-05-runtime-session-rust-authority.md` before proceeding.
 
 ## Architecture
 
@@ -107,17 +129,36 @@ The transport layer is a thin Python orchestration shell around a Rust-native co
 | `server/reply.py` | `unpack_icrm_result` + `wrap_error` — resource reply handling |
 | `server/hold_registry.py` | `HoldRegistry` — weakref-based tracking of hold-mode SHM buffers |
 | `client/proxy.py` | `CRMProxy` — unified proxy supporting both thread-local and IPC modes |
-| `client/util.py` | Standalone `ping()` and `shutdown()` — lightweight server probes via raw UDS |
+| `client/util.py` | Thin native-backed `ping()` and `shutdown()` probes for direct IPC |
 
 **Transport modes:**
 - **Thread-local** (same process): `cc.connect()` returns a zero-serialization proxy that calls resource methods directly.
 - **IPC** (`ipc://`): UDS control channel + POSIX SHM data plane via Rust (`c2-ipc`, `c2-server`).
 - **HTTP** (`http://`): HTTP relay for cross-machine transport via Rust (`c2-http`).
 
-**Server address:** Python resource servers create an auto-generated `ipc://` address.
-Use `cc.server_address()` after registration to inspect it.
+**Server address:** Rust `RuntimeSession` owns server identity and creates the
+canonical auto-generated `ipc://` address. Use `cc.server_address()` after
+registration to inspect the native session projection.
 
 **Relay priority:** `cc.set_relay()` > `C2_RELAY_ADDRESS` env var > none (standalone mode).
+
+Direct `ipc://` is a complete standalone mode. Explicit `cc.connect(...,
+address="ipc://...")` must bypass relay discovery and continue to work with no
+relay configured or with a bad relay environment value. Relay is a
+discovery/forwarding projection above IPC; it must not own IPC registration,
+server lifecycle, route handles, direct IPC clients, or scheduling.
+
+The active runtime-session migration has already moved process identity,
+canonical server address, server IPC override projection, direct IPC client
+acquire/release, client config freeze, route registration transactions,
+unregister/shutdown transaction outcomes, relay address projection, and
+relay-backed name resolution into Rust `RuntimeSession`. Explicit HTTP address
+acquire/release/shutdown also goes through `RuntimeSession` rather than a
+Python-owned `_http_pool`. Python still owns Python CRM local bindings and
+invokes `@on_shutdown` callbacks from native structured outcomes. Do not
+reintroduce Python relay-control cache fields, direct
+`RustRelayAwareHttpClient` construction, direct `RustHttpClientPool.instance()`,
+or `_http_pool` in `registry.py`.
 
 ### 5. Rust Native Layer (`core/`, `sdk/python/native/`)
 
@@ -274,7 +315,7 @@ stats = cc.hold_stats()
 ```
 
 ### Error Handling
-Errors are modeled as `CCError` subclasses with numeric `ERROR_Code` values. Errors serialize to/from bytes for wire transfer. Error classes are named by location: `ResourceDeserializeInput`, `ClientSerializeInput`, `ResourceExecuteFunction`, `ClientCallResource`, etc. Enum values live under `ERROR_AT_RESOURCE_*` and `ERROR_AT_CLIENT_*`.
+Errors are modeled as `CCError` subclasses with numeric `ERROR_Code` values. Rust `core/foundation/c2-error` owns the canonical error registry and `code:message` wire codec. Python generates `ERROR_Code` from `_native.error_registry()` and delegates `CCError.serialize()` / `CCError.deserialize()` to `_native.encode_error_wire()` and `_native.decode_error_wire_parts()`. Do not reintroduce Python-side parsing of the error wire payload, and do not use or add legacy-named error codec APIs. Error classes are named by location: `ResourceDeserializeInput`, `ClientSerializeInput`, `ResourceExecuteFunction`, `ClientCallResource`, etc. Enum values live under `ERROR_AT_RESOURCE_*` and `ERROR_AT_CLIENT_*`.
 
 ### Naming
 - CRM contract classes: plain names, **no `I` prefix** (e.g., `Grid`, not `IGrid`)
@@ -321,4 +362,4 @@ See `.env.example` for the full reference.
 
 ## Python Version
 
-Requires Python ≥ 3.10. Uses modern type hints (`list[int]`, `str | None`, `tuple[...]`). Free-threading (3.14t) is a target platform — be cautious with C extensions and GIL assumptions.
+Requires Python ≥ 3.10. Keep Python 3.10 compatibility intentional: downstream Taichi-based workloads can still be pinned to 3.10 even when normal development prefers Python 3.12 and free-threading validation targets 3.14t. Uses modern type hints (`list[int]`, `str | None`, `tuple[...]`). Free-threading (3.14t) is a target platform — be cautious with C extensions and GIL assumptions.

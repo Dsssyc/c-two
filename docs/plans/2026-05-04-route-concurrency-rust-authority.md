@@ -2,6 +2,10 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Status:** Implemented on `dev-feature`. Rust `c2-server` owns the shared
+route-concurrency handle, including mode, `max_pending`, `max_workers`, close
+state, and projection into Python for same-process direct calls.
+
 **Goal:** Move route concurrency state, limits, lifecycle, and fast-path projection into Rust so the same `ConcurrencyConfig` governs thread-local, direct IPC, and relay-backed HTTP without a Python-owned duplicate scheduler or hidden default fallback.
 
 **Architecture:** Rust owns one shared per-route concurrency handle that resolves mode and limits once, exposes a read-only snapshot, and enforces admission/execution control for both Rust-dispatched remote calls and Python thread-local direct calls. Python keeps `ConcurrencyConfig` as input plus a thin adapter for same-process calls, but it no longer owns pending counters, a worker executor, or the default policy. The direct-call hot path stays zero-copy and continues to invoke the Python resource object; only the permit / mode decision moves into Rust, and only when the route is actually constrained.
@@ -24,14 +28,14 @@ C-Two is in the 0.x line. Do not preserve compatibility shims for stale schedule
 
 ## Current Problem
 
-Today the route concurrency boundary is split across languages:
+The route concurrency boundary is now implemented as a Rust-owned shared handle, and this plan records the target state and verification matrix for that implementation:
 
-- Python creates and owns `ConcurrencyConfig` plus a full `Scheduler` implementation with pending counters, an executor, and `begin()` / `execute()` / `shutdown()` state.
-- `NativeServerBridge.__init__()` currently injects a Python-side default `ConcurrencyConfig(max_workers=max_workers)` when the caller omits a config.
-- `NativeServerBridge.register_crm()` forwards only part of the concurrency state into Rust.
-- The Python same-process path still relies on Python scheduler state, while Rust remote dispatch enforces only a subset of route behavior.
+- Python keeps `ConcurrencyConfig` as the typed registration input and a thin `Scheduler` adapter for same-process direct calls.
+- `NativeServerBridge.__init__()` no longer injects a Python-side `max_workers=4` default.
+- `NativeServerBridge.register_crm()` passes the full concurrency policy into Rust.
+- Rust `c2-server` owns the shared route handle and enforces the same limits for local and remote calls.
 
-That split means the same registration input can still diverge by transport or by language-default behavior.
+The key maintenance risk is preventing future SDK or doc changes from reintroducing split scheduler authority, silent no-op limits, relay-coupled IPC, or a bytes-copy detour on the SHM request path.
 
 ## File Responsibility Map
 

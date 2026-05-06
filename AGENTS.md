@@ -46,6 +46,12 @@ uv sync --reinstall-package c-two
 # Run the full Python test suite. Empty C2_RELAY_ADDRESS avoids env interference.
 C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30
 
+# Ensure the Python 3.10 compatibility syntax check executes instead of
+# skipping. Keep 3.10 coverage because downstream Taichi-based stacks can still
+# be pinned to Python 3.10.
+uv python install 3.10
+C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_python_examples_syntax.py::test_python_examples_compile_on_minimum_supported_python -q --timeout=30 -rs
+
 # Run one test file
 uv run pytest sdk/python/tests/unit/test_wire.py -q
 
@@ -82,7 +88,15 @@ c3 relay --upstream grid=server-grid@ipc://my_server --bind 0.0.0.0:8080
 
 Tests use `pytest` with a 30-second per-test timeout. Tests live under
 `sdk/python/tests/unit/` and `sdk/python/tests/integration/`, with shared
-fixtures under `sdk/python/tests/fixtures/`.
+fixtures under `sdk/python/tests/fixtures/`. The minimum-supported-Python
+syntax test discovers `python3.10` or `uv python find 3.10`; run
+`uv python install 3.10` before the suite if you need to guarantee it does not
+skip. For broader 3.10 smoke coverage without replacing the default `.venv`,
+use a separate environment:
+
+```bash
+UV_PROJECT_ENVIRONMENT=.venv-py310 C2_RELAY_ADDRESS= uv run --python 3.10 pytest sdk/python/tests/unit/test_python_examples_syntax.py -q --timeout=30 -rs
+```
 
 ## Architecture
 
@@ -158,14 +172,29 @@ handle as the source of truth for both same-process direct calls and remote
 dispatch. Do not keep a second Python-owned scheduler state or hidden default
 policy alive after registration.
 
+Runtime-session config follows the same ownership rule. Rust
+`c2-runtime::RuntimeSession` owns process server identity, canonical
+`ipc://` address derivation, server IPC override storage/projection, direct IPC
+client acquire/release, client IPC config projection/freeze, route registration
+transactions, unregister/shutdown transaction outcomes, relay projection,
+relay-backed name resolution, and explicit HTTP client pool projection. Python
+may expose typed override facades and forward them into the native session, but
+must not keep separate `_server_ipc_overrides`, `_client_config`,
+`_client_ipc_overrides`, `_pool_config_applied`, server-id, server-address,
+direct `RustClientPool` or `RustHttpClientPool` authority, `_http_pool`,
+`_rollback_registration`, relay control-client caches, or independent route
+unregister/shutdown ordering authority in `registry.py`. Python still owns
+Python CRM local bindings and invokes `@on_shutdown` callbacks exactly once
+from native structured outcomes.
+
 ### Transport Layer
 
 Path: `sdk/python/src/c_two/transport/`
 
 The Python transport layer is a thin orchestration shell around a Rust-native
 core. Python handles CRM registration, Python callback dispatch, serialization
-orchestration, and same-process thread-local guards. Rust handles IPC, wire
-framing, SHM, remote IPC scheduler mode enforcement, HTTP relay transport, and
+orchestration, and same-process direct-call glue. Rust handles IPC, wire
+framing, SHM, route concurrency enforcement, runtime session state, HTTP relay transport, and
 relay-aware route fallback.
 
 | File | Purpose |
@@ -178,13 +207,24 @@ relay-aware route fallback.
 | `server/reply.py` | `unpack_icrm_result` and `wrap_error` |
 | `server/hold_registry.py` | Weakref-based tracking of hold-mode SHM buffers |
 | `client/proxy.py` | `CRMProxy` for thread-local, IPC, and HTTP modes |
-| `client/util.py` | Standalone `ping()` and `shutdown()` probes over raw UDS |
+| `client/util.py` | Thin native-backed `ping()` and `shutdown()` probes for direct IPC |
+
+`registry.py` asks native `RuntimeSession.ensure_server_bridge()` for the
+server bridge, `RuntimeSession.acquire_ipc_client()` for direct IPC clients,
+`RuntimeSession.acquire_http_client()` for explicit HTTP clients, and
+`RuntimeSession.connect_via_relay()` for relay name resolution. It consumes
+native unregister/shutdown outcomes before mutating Python local bindings. Do
+not reintroduce `_relay_control_client`, `_relay_control_address`,
+`_relay_control_client_for()`, `_http_pool`, direct
+`RustHttpClientPool.instance()`, or direct construction of
+`RustRelayAwareHttpClient` in `registry.py`.
 
 Transport modes:
 
 - Thread-local: same-process `cc.connect()` returns a zero-serialization proxy.
-  It passes Python objects directly and may use the Python thread-local guard;
-  do not route this path through Rust bytes dispatch for symmetry.
+  It passes Python objects directly and may use the native route-concurrency
+  handle through a thin Python adapter; do not route this path through Rust
+  bytes dispatch for symmetry.
 - IPC (`ipc://`): UDS control channel plus POSIX SHM data plane through Rust.
   Remote IPC concurrency semantics and route capacity limits belong to Rust
   `c2-server`; Python only projects the native handle for same-process calls.
@@ -220,11 +260,13 @@ extension crate under `sdk/python/native/`.
 | Layer | Crate | Purpose |
 | --- | --- | --- |
 | foundation | `c2-config` | Unified IPC and relay configuration structs/resolvers |
+| foundation | `c2-error` | Canonical error registry and `code:message` wire codec |
 | foundation | `c2-mem` | Buddy allocator, SHM regions, unified memory pool |
 | protocol | `c2-wire` | Wire protocol codec, frames, chunk assembler, chunk registry |
 | transport | `c2-ipc` | Async IPC client, UDS, SHM, chunked transfer |
 | transport | `c2-server` | Tokio UDS server with per-connection state and peer SHM lazy-open |
 | transport | `c2-http` | HTTP client, relay-aware client, and HTTP relay server behind `relay` feature |
+| runtime | `c2-runtime` | Process runtime session, route transactions, client pools, relay projection |
 | sdk/python/native | `c2-python-native` | PyO3 bindings for `c_two._native` |
 
 Memory subsystem:
@@ -463,9 +505,12 @@ segment count.
 
 ## Python Version
 
-Requires Python 3.10 or newer. Use modern type hints such as `list[int]`,
-`str | None`, and `tuple[...]`. Free-threading Python is a target platform; be
-cautious with C extensions, shared mutable state, and GIL assumptions.
+Requires Python 3.10 or newer. Keep Python 3.10 compatibility intentional:
+downstream Taichi-based workloads can still be pinned to 3.10 even when normal
+development prefers Python 3.12 and free-threading validation targets 3.14t.
+Use modern type hints such as `list[int]`, `str | None`, and `tuple[...]`.
+Free-threading Python is a target platform; be cautious with C extensions,
+shared mutable state, and GIL assumptions.
 
 ## Agent Working Rules
 

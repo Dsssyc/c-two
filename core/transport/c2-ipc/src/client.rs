@@ -260,30 +260,14 @@ static REASSEMBLY_POOL_GEN: AtomicU64 = AtomicU64::new(0);
 /// Monotonic counter so each IpcClient gets a unique conn_id.
 static CLIENT_CONN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-const IPC_SOCK_DIR: &str = "/tmp/c_two_ipc";
-
 fn socket_path_from_address(address: &str) -> (PathBuf, Option<String>) {
-    match region_from_address(address).and_then(validate_region_id) {
-        Ok(region) => (
-            PathBuf::from(IPC_SOCK_DIR).join(format!("{region}.sock")),
-            None,
-        ),
+    match crate::control::socket_path_from_ipc_address(address) {
+        Ok(path) => (path, None),
         Err(error) => (
-            PathBuf::from(IPC_SOCK_DIR).join("invalid.sock"),
-            Some(error),
+            PathBuf::from("/tmp/c_two_ipc").join("invalid.sock"),
+            Some(error.to_string()),
         ),
     }
-}
-
-fn region_from_address(address: &str) -> Result<&str, String> {
-    address
-        .strip_prefix("ipc://")
-        .ok_or_else(|| format!("invalid IPC address: {address}"))
-}
-
-fn validate_region_id(region: &str) -> Result<&str, String> {
-    c2_config::validate_ipc_region_id(region)?;
-    Ok(region)
 }
 
 impl IpcClient {

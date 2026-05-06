@@ -656,14 +656,16 @@ class TestComToCrmBufferModes:
 
     def _make_mock_response(self, data: bytes):
         """Create a mock PyShmBuffer-like response."""
-        class MockResponse:
+        class MockResponse(bytes):
+            def __new__(cls, data):
+                return super().__new__(cls, data)
+
             def __init__(self, data):
-                self._data = data
                 self.released = False
+
             def release(self):
                 self.released = True
-            def __buffer__(self, flags):
-                return memoryview(self._data)
+
         return MockResponse(data)
 
     def _make_icrm(self, response_data):

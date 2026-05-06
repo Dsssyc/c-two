@@ -14,6 +14,31 @@ python tools/dev/c3_tool.py --build --link
 # Full test suite (855 tests, ~80s on Apple Silicon)
 uv run pytest sdk/python/tests -q
 
+# Focused runtime-session / relay / direct IPC regressions
+C2_RELAY_ADDRESS= uv run pytest \
+  sdk/python/tests/unit/test_runtime_session.py \
+  sdk/python/tests/unit/test_name_collision.py \
+  sdk/python/tests/unit/test_serve.py \
+  sdk/python/tests/unit/test_relay_graceful_shutdown.py \
+  sdk/python/tests/integration/test_registry.py \
+  sdk/python/tests/integration/test_http_relay.py \
+  sdk/python/tests/integration/test_p0_fixes.py \
+  sdk/python/tests/integration/test_direct_ipc_control.py \
+  sdk/python/tests/integration/test_zero_copy_ipc.py \
+  sdk/python/tests/integration/test_remote_scheduler_config.py \
+  -q --timeout=30 -rs
+
+# Make the Python 3.10 minimum-compatibility syntax check execute instead of
+# skipping. This matters for downstream stacks such as Taichi that remain
+# pinned to Python 3.10.
+uv python install 3.10
+uv python find 3.10
+uv run pytest sdk/python/tests/unit/test_python_examples_syntax.py::test_python_examples_compile_on_minimum_supported_python -q --timeout=30 -rs
+
+# Optional broader Python 3.10 smoke test. Use a separate uv environment so
+# `uv run --python 3.10` does not replace the default development `.venv`.
+UV_PROJECT_ENVIRONMENT=.venv-py310 uv run --python 3.10 pytest sdk/python/tests/unit/test_python_examples_syntax.py -q --timeout=30 -rs
+
 # Single test file
 uv run pytest sdk/python/tests/unit/test_wire.py -q
 
@@ -24,7 +49,10 @@ uv run pytest sdk/python/tests/unit/test_transferable.py::TestTransferableDecora
 uv run pytest sdk/python/tests -v --timeout=30
 ```
 
-All tests use a **30-second per-test timeout**. Verified on Python 3.14t (free-threaded).
+All tests use a **30-second per-test timeout**. Verified on Python 3.14t
+(free-threaded). Python 3.10 remains a supported compatibility floor; do not
+treat a skipped `test_python_examples_compile_on_minimum_supported_python` as
+equivalent to a passing 3.10 check.
 
 ---
 
@@ -71,7 +99,7 @@ All tests use a **30-second per-test timeout**. Verified on Python 3.14t (free-t
 | File | Description |
 |------|-------------|
 | `test_http_client.py` | HTTP client transport — request/response, error handling |
-| `test_relay_graceful_shutdown.py` | Relay graceful shutdown — drain, timeout |
+| `test_relay_graceful_shutdown.py` | RuntimeSession unregister/shutdown relay cleanup outcomes, exactly-once `@on_shutdown` callbacks |
 
 ## Integration Tests (`sdk/python/tests/integration/`)
 
@@ -88,7 +116,7 @@ All tests use a **30-second per-test timeout**. Verified on Python 3.14t (free-t
 | `test_error_propagation.py` | CRM-side exceptions propagate to client as typed `CCError` |
 | `test_p0_fixes.py` | P0 regression tests — scheduler, proxy, lifecycle fixes |
 | `test_serve.py` | `cc.serve()` integration — multi-protocol serving |
-| `test_http_relay.py` | Standalone `c3 relay` end-to-end — POST routing, error forwarding |
+| `test_http_relay.py` | Standalone `c3 relay` end-to-end — POST routing, error forwarding, RuntimeSession relay-backed no-address connect |
 
 Relay mesh integration tests also exercise standalone `c3 relay` coverage for
 multi-relay route propagation and discovery.

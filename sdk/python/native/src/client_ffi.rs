@@ -309,6 +309,12 @@ pub struct PyRustClient {
     inner: Arc<SyncClient>,
 }
 
+impl PyRustClient {
+    pub(crate) fn from_arc(inner: Arc<SyncClient>) -> Self {
+        Self { inner }
+    }
+}
+
 #[pymethods]
 impl PyRustClient {
     /// Create and connect to the given IPC address.
@@ -497,7 +503,15 @@ impl PyRustClient {
 /// ```
 #[pyclass(name = "RustClientPool", frozen)]
 pub struct PyRustClientPool {
-    inner: &'static ClientPool,
+    pub(crate) inner: &'static ClientPool,
+}
+
+impl PyRustClientPool {
+    pub(crate) fn global() -> Self {
+        Self {
+            inner: ClientPool::instance(),
+        }
+    }
 }
 
 #[pymethods]
@@ -505,9 +519,7 @@ impl PyRustClientPool {
     /// Get the process-level singleton pool.
     #[staticmethod]
     fn instance() -> Self {
-        Self {
-            inner: ClientPool::instance(),
-        }
+        Self::global()
     }
 
     /// Acquire (or create) a client for the given address.

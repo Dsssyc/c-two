@@ -39,6 +39,12 @@ Final verification evidence captured during implementation:
 - Stale-symbol search for legacy codec names in active code and tests: no
   matches.
 
+Integration note after merging issue2/issue3: Rust `c2-server` also emits
+canonical `c2-error` wire bytes for route-capacity, route-closed, SHM input,
+and internal route execution errors. This prevents the Python issue4 decoder
+from treating Rust-owned scheduler/runtime errors as malformed raw UTF-8
+payloads.
+
 ## 0.x Clean-Cut Constraint
 
 C-Two is in the 0.x line. Do not preserve stale `legacy` API names as compatibility aliases. This implementation must remove or replace `to_legacy_bytes`, `from_legacy_bytes`, `_native.encode_error_legacy`, and `_native.decode_error_legacy` rather than carrying both naming schemes. The current `code:message` bytes format remains supported as the canonical wire format and should be named `wire`, not `legacy`.

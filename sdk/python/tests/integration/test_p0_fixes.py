@@ -79,11 +79,10 @@ class TestThreadLocalConcurrency:
         cc.register(Counter, crm, name='ctr')
         crm = cc.connect(Counter, name='ctr')
 
-        # The proxy should have scheduler set
+        # The proxy should have the native-backed scheduler adapter set.
         assert crm.client._scheduler is not None
-        assert crm.client._access_map is not None
-        assert 'get_value' in crm.client._access_map
-        assert 'increment' in crm.client._access_map
+        assert crm.client._scheduler.method_idx('get_value') == 0
+        assert crm.client._scheduler.method_idx('increment') == 1
 
         cc.close(crm)
 

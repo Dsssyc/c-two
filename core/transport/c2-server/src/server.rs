@@ -29,6 +29,7 @@ use tracing::{debug, info, warn};
 /// suffix the max SHM name is 27 chars (within macOS 31-char limit).
 static RESPONSE_POOL_GEN: AtomicU64 = AtomicU64::new(0);
 
+use c2_error::{C2Error, ErrorCode};
 use c2_mem::MemPool;
 use c2_mem::config::PoolConfig;
 use c2_wire::buddy::{
@@ -53,8 +54,13 @@ use crate::dispatcher::{
     CrmError, CrmRoute, Dispatcher, RequestData, ResponseMeta, cleanup_request,
 };
 use crate::heartbeat::run_heartbeat;
+use crate::scheduler::{Scheduler, SchedulerAcquireError};
 
 const IPC_SOCK_DIR: &str = "/tmp/c_two_ipc";
+
+fn error_wire(code: ErrorCode, message: impl Into<String>) -> Vec<u8> {
+    C2Error::new(code, message).to_wire_bytes()
+}
 
 // ---------------------------------------------------------------------------
 // Error
@@ -176,6 +182,12 @@ impl Server {
     pub async fn register_route(&self, route: CrmRoute) -> Result<(), ServerError> {
         validate_route_for_wire(&route)?;
         let mut dispatcher = self.dispatcher.write().await;
+        if dispatcher.resolve(&route.name).is_some() {
+            return Err(ServerError::Protocol(format!(
+                "route already registered: {}",
+                route.name
+            )));
+        }
         if dispatcher.len() >= MAX_ROUTES && dispatcher.resolve(&route.name).is_none() {
             return Err(ServerError::Protocol(format!(
                 "route count exceeds wire limit: {} > {}",
@@ -188,8 +200,19 @@ impl Server {
     }
 
     /// Remove a CRM route. Returns `true` if it existed.
+    ///
+    /// The route handle is marked closed under the same dispatcher write lock
+    /// that removes the route, so local handle clones and remote route lookup
+    /// cannot observe an open-but-unregistered window.
     pub async fn unregister_route(&self, name: &str) -> bool {
-        self.dispatcher.write().await.unregister(name)
+        let mut dispatcher = self.dispatcher.write().await;
+        let removed = dispatcher.unregister(name);
+        if let Some(route) = removed.as_ref() {
+            route.scheduler.close();
+            true
+        } else {
+            false
+        }
     }
 
     /// Filesystem path of the bound UDS socket.
@@ -200,6 +223,11 @@ impl Server {
     /// Get a shared reference to the response pool (for zero-copy dispatch).
     pub fn response_pool_arc(&self) -> Arc<parking_lot::RwLock<MemPool>> {
         Arc::clone(&self.response_pool)
+    }
+
+    /// Return true if a route is currently registered.
+    pub async fn contains_route(&self, name: &str) -> bool {
+        self.dispatcher.read().await.resolve(name).is_some()
     }
 
     /// Get the chunk registry (for FFI or external use).
@@ -520,6 +548,85 @@ async fn handle_signal(
     action
 }
 
+#[derive(Debug)]
+enum RouteExecutionError {
+    Acquire(SchedulerAcquireError),
+    Crm(CrmError),
+}
+
+async fn execute_route_request<F>(
+    scheduler: Scheduler,
+    method_idx: u16,
+    request: RequestData,
+    f: F,
+) -> Result<ResponseMeta, RouteExecutionError>
+where
+    F: FnOnce(RequestData) -> Result<ResponseMeta, CrmError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let guard = match scheduler.blocking_acquire(method_idx) {
+            Ok(guard) => guard,
+            Err(err) => {
+                cleanup_request(request);
+                return Err(RouteExecutionError::Acquire(err));
+            }
+        };
+        let _guard = guard;
+        f(request).map_err(RouteExecutionError::Crm)
+    })
+    .await
+    .expect("route execution task panicked")
+}
+
+async fn send_route_execution_result(
+    server: &Server,
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    request_id: u64,
+    result: Result<ResponseMeta, RouteExecutionError>,
+) {
+    match result {
+        Ok(meta) => {
+            send_response_meta(
+                &server.response_pool,
+                writer,
+                request_id,
+                meta,
+                server.config.shm_threshold,
+                server.config.chunk_size as usize,
+            )
+            .await
+        }
+        Err(RouteExecutionError::Crm(CrmError::UserError(b))) => {
+            write_reply(writer, request_id, &ReplyControl::Error(b)).await;
+        }
+        Err(RouteExecutionError::Crm(CrmError::InternalError(s))) => {
+            write_reply(
+                writer,
+                request_id,
+                &ReplyControl::Error(error_wire(ErrorCode::ResourceFunctionExecuting, s)),
+            )
+            .await;
+        }
+        Err(RouteExecutionError::Acquire(SchedulerAcquireError::Closed)) => {
+            write_reply(
+                writer,
+                request_id,
+                &ReplyControl::Error(error_wire(ErrorCode::ResourceUnavailable, "route closed")),
+            )
+            .await;
+        }
+        Err(RouteExecutionError::Acquire(SchedulerAcquireError::Capacity { field, limit })) => {
+            let msg = format!("route concurrency capacity exceeded: {field}={limit}");
+            write_reply(
+                writer,
+                request_id,
+                &ReplyControl::Error(error_wire(ErrorCode::ResourceUnavailable, msg)),
+            )
+            .await;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CRM call dispatch (inline, non-buddy, non-chunked)
 // ---------------------------------------------------------------------------
@@ -563,32 +670,14 @@ async fn dispatch_call(
     let args = payload[consumed..].to_vec();
     let resp_pool = Arc::clone(&server.response_pool);
 
-    let result = route
-        .scheduler
-        .execute(idx, move || {
-            callback.invoke(&name, idx, RequestData::Inline(args), resp_pool)
-        })
-        .await;
+    let scheduler = route.scheduler.as_ref().clone();
+    let request = RequestData::Inline(args);
+    let result = execute_route_request(scheduler, idx, request, move |request| {
+        callback.invoke(&name, idx, request, resp_pool)
+    })
+    .await;
 
-    match result {
-        Ok(meta) => {
-            send_response_meta(
-                &server.response_pool,
-                writer,
-                request_id,
-                meta,
-                server.config.shm_threshold,
-                server.config.chunk_size as usize,
-            )
-            .await
-        }
-        Err(CrmError::UserError(b)) => {
-            write_reply(writer, request_id, &ReplyControl::Error(b)).await;
-        }
-        Err(CrmError::InternalError(s)) => {
-            write_reply(writer, request_id, &ReplyControl::Error(s.into_bytes())).await;
-        }
-    }
+    send_route_execution_result(server, writer, request_id, result).await;
 
     conn.flight_dec();
 }
@@ -636,7 +725,12 @@ async fn dispatch_buddy_call(
         Err(e) => {
             warn!(conn_id = conn.conn_id(), %e, "ensure_and_get_peer_pool failed");
             let msg = format!("buddy SHM segment open: {e}");
-            write_reply(writer, request_id, &ReplyControl::Error(msg.into_bytes())).await;
+            write_reply(
+                writer,
+                request_id,
+                &ReplyControl::Error(error_wire(ErrorCode::ResourceInputDeserializing, msg)),
+            )
+            .await;
             conn.flight_dec();
             return;
         }
@@ -671,7 +765,12 @@ async fn dispatch_buddy_call(
             Err(e) => {
                 warn!(conn_id = conn.conn_id(), %e, "buddy SHM read failed (fallback)");
                 let msg = format!("buddy SHM read: {e}");
-                write_reply(writer, request_id, &ReplyControl::Error(msg.into_bytes())).await;
+                write_reply(
+                    writer,
+                    request_id,
+                    &ReplyControl::Error(error_wire(ErrorCode::ResourceInputDeserializing, msg)),
+                )
+                .await;
                 conn.flight_dec();
                 return;
             }
@@ -712,30 +811,13 @@ async fn dispatch_buddy_call(
     let idx = ctrl.method_idx;
     let resp_pool = Arc::clone(&server.response_pool);
 
-    let result = route
-        .scheduler
-        .execute(idx, move || callback.invoke(&name, idx, request, resp_pool))
-        .await;
+    let scheduler = route.scheduler.as_ref().clone();
+    let result = execute_route_request(scheduler, idx, request, move |request| {
+        callback.invoke(&name, idx, request, resp_pool)
+    })
+    .await;
 
-    match result {
-        Ok(meta) => {
-            send_response_meta(
-                &server.response_pool,
-                writer,
-                request_id,
-                meta,
-                server.config.shm_threshold,
-                server.config.chunk_size as usize,
-            )
-            .await
-        }
-        Err(CrmError::UserError(b)) => {
-            write_reply(writer, request_id, &ReplyControl::Error(b)).await;
-        }
-        Err(CrmError::InternalError(s)) => {
-            write_reply(writer, request_id, &ReplyControl::Error(s.into_bytes())).await;
-        }
-    }
+    send_route_execution_result(server, writer, request_id, result).await;
 
     conn.flight_dec();
 }
@@ -903,30 +985,13 @@ async fn dispatch_chunked_call(
         let idx = method_idx;
         let resp_pool = Arc::clone(&server.response_pool);
 
-        let result = route
-            .scheduler
-            .execute(idx, move || callback.invoke(&name, idx, request, resp_pool))
-            .await;
+        let scheduler = route.scheduler.as_ref().clone();
+        let result = execute_route_request(scheduler, idx, request, move |request| {
+            callback.invoke(&name, idx, request, resp_pool)
+        })
+        .await;
 
-        match result {
-            Ok(meta) => {
-                send_response_meta(
-                    &server.response_pool,
-                    writer,
-                    request_id,
-                    meta,
-                    server.config.shm_threshold,
-                    server.config.chunk_size as usize,
-                )
-                .await
-            }
-            Err(CrmError::UserError(b)) => {
-                write_reply(writer, request_id, &ReplyControl::Error(b)).await;
-            }
-            Err(CrmError::InternalError(s)) => {
-                write_reply(writer, request_id, &ReplyControl::Error(s.into_bytes())).await;
-            }
-        }
+        send_route_execution_result(server, writer, request_id, result).await;
     }
 }
 
@@ -1267,11 +1332,83 @@ mod tests {
     async fn register_unregister_route() {
         let s = Arc::new(Server::new("ipc://reg_test", ServerIpcConfig::default()).unwrap());
 
-        s.register_route(make_route("grid")).await.unwrap();
+        let route = make_route("grid");
+        let scheduler = route.scheduler.as_ref().clone();
+        s.register_route(route).await.unwrap();
         assert!(s.dispatcher.read().await.resolve("grid").is_some());
+        assert!(s.contains_route("grid").await);
 
         assert!(s.unregister_route("grid").await);
         assert!(s.dispatcher.read().await.resolve("grid").is_none());
+        assert!(!s.contains_route("grid").await);
+        assert!(scheduler.snapshot().closed);
+        assert_eq!(
+            scheduler.try_acquire(0).unwrap_err(),
+            crate::scheduler::SchedulerAcquireError::Closed,
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_route_registration_is_rejected() {
+        let s = Arc::new(Server::new("ipc://dup_route_test", ServerIpcConfig::default()).unwrap());
+
+        s.register_route(make_route("grid")).await.unwrap();
+        let err = s.register_route(make_route("grid")).await.unwrap_err();
+
+        assert!(err.to_string().contains("already registered"));
+    }
+
+    #[tokio::test]
+    async fn rejected_acquire_cleans_materialized_request() {
+        use crate::scheduler::{SchedulerAcquireError, SchedulerLimits};
+        use c2_mem::PoolConfig;
+        use std::num::NonZeroUsize;
+
+        let pool = Arc::new(parking_lot::RwLock::new(MemPool::new_with_prefix(
+            PoolConfig {
+                segment_size: 4096,
+                min_block_size: 128,
+                max_segments: 1,
+                max_dedicated_segments: 0,
+                dedicated_crash_timeout_secs: 0.0,
+                ..PoolConfig::default()
+            },
+            format!("/cc2s{:04x}{:04x}", std::process::id() as u16, 0xaceu16,),
+        )));
+        pool.write().ensure_ready().unwrap();
+        let alloc = pool.write().alloc(128).unwrap();
+        let request = RequestData::Shm {
+            pool: Arc::clone(&pool),
+            seg_idx: alloc.seg_idx as u16,
+            offset: alloc.offset,
+            data_size: 128,
+            is_dedicated: alloc.is_dedicated,
+        };
+        let scheduler = Scheduler::with_limits(
+            ConcurrencyMode::Parallel,
+            HashMap::new(),
+            SchedulerLimits {
+                max_pending: Some(NonZeroUsize::new(1).unwrap()),
+                max_workers: Some(NonZeroUsize::new(1).unwrap()),
+            },
+        );
+        let _first = scheduler.try_acquire(0).unwrap();
+
+        let err = execute_route_request(scheduler.clone(), 0, request, |_request| {
+            panic!("callback must not run when acquire fails")
+        })
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RouteExecutionError::Acquire(SchedulerAcquireError::Capacity {
+                field: "max_pending",
+                limit: 1,
+            })
+        ));
+        let reused = pool.write().alloc(128).unwrap();
+        assert_eq!(reused.offset, alloc.offset);
     }
 
     #[tokio::test]

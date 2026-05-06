@@ -2,6 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Status:** Implemented on `dev-feature`. Rust `c2-runtime::RuntimeSession`
+owns process identity, route transactions, direct IPC and HTTP client pool
+projection, relay projection, and unregister/shutdown outcomes. Python remains
+the CRM/resource binding facade.
+
 **Goal:** Move process runtime/session state from the Python SDK into a Rust-owned `RuntimeSession` while keeping Python as the CRM/resource binding layer and preserving relay-independent direct IPC.
 
 **Architecture:** Add a language-neutral Rust runtime crate that owns the standalone IPC session, process server identity/address, server lifecycle, client pools, route transaction state, and optional relay projection. Python keeps CRM metadata discovery, Python callback dispatch, thread-local direct-call binding, proxy construction, and Python shutdown callbacks. The migration is intentionally phased, but phases are only reviewable engineering slices: every phase has full production-grade invariants and verification, and no phase is allowed to leave a documented no-op, compatibility shim, or split-brain runtime authority.
@@ -70,8 +75,8 @@ artifact; if a review discovers a gap, update this file before continuing.
 
 ## Current Problem
 
-`sdk/python/src/c_two/transport/registry.py` still acts as the process runtime
-authority. It owns:
+At the start of this plan, `sdk/python/src/c_two/transport/registry.py` still
+acted as the process runtime authority. It owned:
 
 - HTTP pool handles;
 - relay control client cache;
@@ -146,7 +151,7 @@ documented deletion of the stale Python authority.
 - Create `sdk/python/native/src/runtime_session_ffi.rs`: PyO3 `RuntimeSession` wrapper, route-registration bridge, client acquire/release wrappers, relay projection wrappers, and outcome conversion.
 - Modify `sdk/python/native/src/server_ffi.rs`: expose any reusable server-route construction pieces needed by runtime session without duplicating callback or SHM conversion logic.
 - Modify `sdk/python/native/src/client_ffi.rs`: share or wrap native client/response types so `RuntimeSession.acquire_ipc_client()` returns the same Python-visible call surface as `RustClientPool.acquire()`.
-- Modify `sdk/python/native/src/http_ffi.rs`: share or wrap relay-aware HTTP clients so `RuntimeSession.connect_via_relay()` returns the same Python-visible call surface as `RustRelayAwareHttpClient`.
+- Modify `sdk/python/native/src/http_ffi.rs`: share or wrap HTTP and relay-aware HTTP clients so `RuntimeSession.acquire_http_client()` and `RuntimeSession.connect_via_relay()` return the same Python-visible call surfaces as `RustHttpClient` and `RustRelayAwareHttpClient`.
 - Modify `sdk/python/native/src/lib.rs`: register `runtime_session_ffi`.
 - Modify `sdk/python/src/c_two/transport/registry.py`: reduce `_ProcessRegistry` to a facade over native `RuntimeSession` plus Python local binding table.
 - Modify `sdk/python/src/c_two/transport/server/native.py`: keep CRM slot and dispatcher construction, but receive native route handles/session route outcomes from `RuntimeSession`.
@@ -207,9 +212,9 @@ with:
 | 1. Identity/session skeleton | Implemented in current worktree | `RuntimeSession` owns server id, canonical `ipc://` address, server IPC override storage/projection, and native server bridge acquisition | Route registration transactions, unregister/shutdown transactions, direct IPC client pool/config, and relay projection were not closed by Phase 1; client pool/config moved in Phase 2 |
 | 2. Direct IPC client pool/config | Implemented in current worktree | `RuntimeSession` owns client IPC overrides, resolved client config snapshot, config freeze, `shm_threshold` propagation, direct IPC acquire/release, and client shutdown drain | Unregister/shutdown remains Phase 4; HTTP/relay projection remains Phase 5 |
 | 3. Route registration transactions | Implemented in current worktree | `RuntimeSession.register_route(...)` owns local route registration, relay rollback on failure, and route success/failure outcomes | Relay connect/resolve/cache remains Phase 5; final stale Python deletion remains Phase 6 |
-| 4. Unregister/shutdown transactions | Implemented in current worktree | `RuntimeSession.unregister_route(...)` and `RuntimeSession.shutdown(...)` own local route removal, structured relay cleanup outcomes, idempotence, native server shutdown signaling, and direct IPC client drain through the PyO3 session wrapper | Relay connect/resolve/cache and remaining HTTP pool projection remain Phase 5/6; final stale Python deletion remains Phase 6 |
-| 5. Relay projection connect/resolve | Implemented in current worktree | `RuntimeSession` owns relay address override/effective resolution, relay register/unregister projection, and relay-backed `connect_via_relay()`; Python local binding lookup still wins before relay | Remaining explicit HTTP address pooling is still held by the Python facade through native `RustHttpClientPool`; Phase 6 must either move it into `RuntimeSession` or document that explicit-HTTP pool boundary as intentional |
-| 6. Final deletion/docs cleanup | Planned | Durable docs and agent guidance must reflect the final Rust runtime boundary; obsolete Python private state and docs must be removed | No runtime-session follow-up may remain unassigned |
+| 4. Unregister/shutdown transactions | Implemented in current worktree | `RuntimeSession.unregister_route(...)` and `RuntimeSession.shutdown(...)` own local route removal, structured relay cleanup outcomes, idempotence, native server shutdown signaling, and direct IPC client drain through the PyO3 session wrapper | Relay connect/resolve/cache and explicit HTTP client projection remain Phase 5; final stale Python deletion remains Phase 6 |
+| 5. Relay projection and explicit HTTP client projection | Implemented in current worktree | `RuntimeSession` owns relay address override/effective resolution, relay register/unregister projection, relay-backed `connect_via_relay()`, and explicit HTTP address acquire/release/refcount/shutdown projection; Python local binding lookup still wins before relay | Final stale Python deletion and docs guidance remain Phase 6 |
+| 6. Final deletion/docs cleanup | Implemented in current worktree | Durable docs and agent guidance reflect the final Rust runtime boundary; obsolete Python private state and docs were removed or rewritten | No runtime-session follow-up remains unassigned |
 
 ### Phase 1: RuntimeSession Skeleton And Identity Authority
 
@@ -492,8 +497,9 @@ callbacks only from native `local_removed` / `removed_routes` outcomes.
 `_ProcessRegistry.unregister()` raises explicit relay cleanup failures only
 after local cleanup, and `_ProcessRegistry.shutdown()` logs relay cleanup
 failures without raising. Relay connect/resolve cache work remains Phase 5.
-HTTP pool projection is still owned by the Python facade in this phase and is
-explicitly carried into Phase 5/6 rather than documented as complete.
+Explicit HTTP client projection remains Phase 5 and is not documented as
+complete until `registry.py` no longer owns `_http_pool` or
+`RustHttpClientPool.instance()`.
 
 **Rust API additions:**
 
@@ -557,9 +563,9 @@ outcome.
 - Rust removes all supplied local routes, attempts best-effort relay unregister
   for each configured projection, signals native server shutdown, drains direct
   IPC clients through the PyO3 session wrapper, and returns all relay cleanup
-  errors in the outcome. HTTP pool drain remains a Phase 5/6 projection item in
-  this worktree; Python still calls the native HTTP pool wrapper during
-  shutdown until that projection moves.
+  errors in the outcome. HTTP pool drain remains a Phase 5 projection item until
+  the PyO3 `RuntimeSession` wrapper drains the native HTTP pool and reports
+  `http_clients_drained=true`.
 - Python removes any matching local bindings and invokes each `@on_shutdown`
   callback exactly once.
 - Python logs relay cleanup failures during shutdown and does not raise.
@@ -623,20 +629,22 @@ C2_RELAY_ADDRESS= uv run pytest \
 - Any public behavior changes are documented in `AGENTS.md`,
   `.github/copilot-instructions.md`, and SDK test docs before proceeding.
 
-### Phase 5: RelayProjection Connect/Resolve Authority
+### Phase 5: RelayProjection And Explicit HTTP Client Authority
 
-**Objective:** Move relay-aware name resolution and relay-control cache into
-`RuntimeSession` without coupling relay to direct IPC.
+**Objective:** Move relay-aware name resolution, relay-control cache, and
+explicit HTTP client pool projection into `RuntimeSession` without coupling
+relay to direct IPC.
 
 **Implementation status:** implemented in the current worktree. Relay remains an
 optional projection above the standalone IPC session. `RuntimeSession` now stores
 the explicit relay address override, resolves the effective relay address from
 that override or `C2_RELAY_ADDRESS`, owns the reusable relay control-client
 projection/cache, performs relay registration/unregistration through `c2-http`,
-and exposes `connect_via_relay()` for name-only relay connections. Python still
-checks the same-process local binding first and still uses explicit `ipc://`
-connections directly; relay does not own server identity, server lifecycle,
-direct IPC clients, route handles, or scheduling.
+exposes `connect_via_relay()` for name-only relay connections, and exposes
+explicit HTTP address acquire/release/refcount/shutdown methods over the native
+`c2-http` pool. Python still checks the same-process local binding first and
+still uses explicit `ipc://` connections directly; relay does not own server
+identity, server lifecycle, direct IPC clients, route handles, or scheduling.
 
 **Rust/PyO3 API additions:**
 
@@ -653,12 +661,21 @@ impl RuntimeSession {
     ) -> Result<Arc<RelayAwareHttpClient>, RuntimeSessionError>;
     pub fn clear_relay_projection_cache(&self);
 }
+
+// PyO3 RuntimeSession projection over the native c2-http pool.
+impl PyRuntimeSession {
+    pub fn acquire_http_client(&self, address: &str) -> Result<PyRustHttpClient, PyErr>;
+    pub fn release_http_client(&self, address: &str);
+    pub fn http_client_refcount(&self, address: &str) -> usize;
+    pub fn shutdown_http_clients(&self);
+}
 ```
 
 PyO3 exposes `RuntimeSession.set_relay_address(...)`,
-`relay_address_override`, `effective_relay_address`, and
-`connect_via_relay(name) -> RustRelayAwareHttpClient` so `registry.py` does not
-construct or cache relay-aware/control clients itself.
+`relay_address_override`, `effective_relay_address`,
+`connect_via_relay(name) -> RustRelayAwareHttpClient`, and explicit HTTP
+client pool projection methods so `registry.py` does not construct or cache
+relay-aware/control clients or own `RustHttpClientPool.instance()` itself.
 
 **Relay rules:**
 
@@ -676,8 +693,10 @@ construct or cache relay-aware/control clients itself.
 - Registration starts the local IPC server before relay projection when an
   effective relay address exists, even when Python passes `relay_address=None`;
   this preserves relay upstream validation without making relay the IPC owner.
-- Explicit HTTP addresses still use the Python facade's native HTTP pool
-  projection directly; explicit IPC addresses still bypass relay entirely.
+- Explicit HTTP addresses call `RuntimeSession.acquire_http_client(...)` and
+  release through `RuntimeSession.release_http_client(...)`; Python does not
+  store `_http_pool` or instantiate `RustHttpClientPool`.
+- Explicit IPC addresses still bypass relay entirely.
 
 **Implemented verification for this phase:**
 
@@ -695,7 +714,11 @@ construct or cache relay-aware/control clients itself.
   - `registry.py` no longer has Python relay-control cache fields or direct
     `RustRelayAwareHttpClient` construction;
   - explicit `ipc://` still works with relay unset or bad relay/proxy env;
-  - relay registration starts the IPC server before relay upstream validation.
+  - relay registration starts the IPC server before relay upstream validation;
+  - explicit HTTP `cc.connect(..., address=relay_url)` increments and releases
+    the HTTP pool reference through `RuntimeSession.http_client_refcount(...)`;
+  - `registry.py` no longer imports `RustHttpClientPool`, stores `_http_pool`,
+    or calls `RustHttpClientPool.instance()` directly.
 
 **Verification commands recorded for Phase 5:**
 
@@ -712,8 +735,31 @@ C2_RELAY_ADDRESS= uv run pytest \
 C2_RELAY_ADDRESS= uv run pytest \
   sdk/python/tests/integration/test_http_relay.py::TestCcConnectHttp::test_no_address_connect_uses_runtime_session_relay_projection \
   sdk/python/tests/integration/test_http_relay.py::TestCcConnectHttp::test_no_address_relay_connect_maps_missing_route_to_resource_not_found \
+  sdk/python/tests/integration/test_http_relay.py::TestCcConnectHttp::test_connect_http_close_releases_pool \
+  sdk/python/tests/unit/test_sdk_boundary.py::test_registry_does_not_own_relay_control_plane_mechanisms \
   -q --timeout=30 -rs -vv
+git diff --check
 ```
+
+Latest focused rerun after moving explicit HTTP pooling through
+`RuntimeSession`:
+
+```bash
+cargo check --manifest-path sdk/python/native/Cargo.toml -q
+cargo test --manifest-path core/Cargo.toml -p c2-runtime -q
+C2_RELAY_ADDRESS= uv run pytest \
+  sdk/python/tests/unit/test_runtime_session.py \
+  sdk/python/tests/unit/test_sdk_boundary.py \
+  sdk/python/tests/unit/test_ipc_config.py \
+  sdk/python/tests/integration/test_http_relay.py::TestCcConnectHttp::test_connect_http_close_releases_pool \
+  sdk/python/tests/integration/test_http_relay.py::TestCcConnectHttp::test_no_address_connect_uses_runtime_session_relay_projection \
+  sdk/python/tests/integration/test_http_relay.py::TestCcConnectHttp::test_no_address_relay_connect_maps_missing_route_to_resource_not_found \
+  -q --timeout=30 -rs
+git diff --check
+```
+
+Observed result: `c2-runtime` 12 passed, focused pytest 56 passed, and
+`git diff --check` passed.
 
 **Phase exit criteria:**
 
@@ -721,8 +767,10 @@ C2_RELAY_ADDRESS= uv run pytest \
 - Direct IPC still works without relay as a dependency.
 - Python no longer owns relay control-client cache state.
 - Name-only relay connect uses native `RuntimeSession.connect_via_relay()`.
-- The plan and boundary docs point to Phase 6 for the remaining explicit HTTP
-  address pool projection and final stale-authority cleanup.
+- Explicit HTTP address connect/release/shutdown goes through native
+  `RuntimeSession` methods, not Python-owned `_http_pool` state.
+- The plan and boundary docs point to Phase 6 only for final stale-authority
+  deletion and guidance updates.
 
 ### Phase 6: Delete Python Runtime Authority And Update Documentation
 
@@ -730,9 +778,9 @@ C2_RELAY_ADDRESS= uv run pytest \
 docs so future SDK work copies the Rust session boundary, not the old Python
 registry internals.
 
-**Implementation status:** planned. This is not a cosmetic cleanup phase; it is
-the phase that prevents zombie private APIs and stale agent guidance from
-becoming the next SDK's reference implementation.
+**Implementation status:** implemented in the current worktree. This is not a
+cosmetic cleanup phase; it is the phase that prevents zombie private APIs and
+stale agent guidance from becoming the next SDK's reference implementation.
 
 **Required deletions from Python registry after all native phases land:**
 
@@ -749,9 +797,7 @@ becoming the next SDK's reference implementation.
 - `_address_for_server_id()`
 - `_rollback_registration()`
 - direct ownership of `RustClientPool.instance()`
-- direct ownership of `RustHttpClientPool.instance()` unless explicit HTTP
-  address pooling remains intentionally outside session; if so, document that
-  as a Rust HTTP pool projection owned through native session handles.
+- direct ownership of `RustHttpClientPool.instance()`
 
 **Required documentation updates:**
 
@@ -772,8 +818,67 @@ becoming the next SDK's reference implementation.
 - AGENTS and SDK guidance no longer describe deleted Python-owned behavior as
   supported.
 - `rg` checks for deleted private state names, direct `RustRelayAwareHttpClient`
-  construction in `registry.py`, and stale ownership claims are recorded in this
-  section before the phase closes.
+  or `RustHttpClientPool` construction in `registry.py`, and stale ownership
+  claims are recorded in this section before the phase closes.
+
+**Verification recorded for Phase 6:**
+
+```bash
+python - <<'PY'
+from pathlib import Path
+
+registry = Path('sdk/python/src/c_two/transport/registry.py').read_text()
+for needle in [
+    'self._server_id',
+    'self._server_address',
+    'self._server_id_override',
+    'self._client_config',
+    'self._client_ipc_overrides',
+    'self._pool_config_applied',
+    'self._relay_control_client',
+    'self._relay_control_address',
+    'def _relay_control_client_for',
+    'def _auto_server_id',
+    'def _address_for_server_id',
+    'def _rollback_registration',
+    'RustClientPool.instance()',
+    'RustHttpClientPool.instance()',
+    'self._http_pool',
+    'RustRelayAwareHttpClient(',
+]:
+    assert needle not in registry, needle
+
+docs = '\\n'.join(
+    Path(path).read_text()
+    for path in [
+        'AGENTS.md',
+        '.github/copilot-instructions.md',
+        'docs/plans/2026-05-04-thin-sdk-rust-core-boundary.md',
+        'sdk/python/tests/README.md',
+    ]
+)
+for stale in [
+    'remaining explicit HTTP address pool projection',
+    'explicit HTTP address pool projection remains',
+    'Phase 6 moves or',
+    'intentionally held by the Python facade',
+]:
+    assert stale not in docs, stale
+PY
+
+C2_RELAY_ADDRESS= uv run pytest \
+  sdk/python/tests/unit/test_runtime_session.py::test_set_relay_blank_clears_native_override \
+  sdk/python/tests/unit/test_runtime_session.py::test_runtime_session_shutdown_drains_explicit_http_pool \
+  sdk/python/tests/unit/test_sdk_boundary.py::test_registry_does_not_own_relay_control_plane_mechanisms \
+  -q --timeout=30 -rs
+```
+
+Observed result: the source assertion returned no stale registry/runtime
+authority matches in production code or stale docs, and the focused pytest
+checks passed. The blank-relay regression test was added after review found
+that `cc.set_relay("   ")` cleared `settings` but left an empty native relay
+override; the Python facade now projects the cleaned settings value into
+`RuntimeSession`.
 
 ## PyO3 Boundary Design
 
@@ -807,6 +912,8 @@ route_handle = session.register_route(
 outcome = session.unregister_route(name)
 client = session.acquire_ipc_client("ipc://server")
 session.release_ipc_client("ipc://server")
+http_client = session.acquire_http_client("http://relay:8080")
+session.release_http_client("http://relay:8080")
 http_client = session.connect_via_relay(name)
 session.shutdown()
 ```
@@ -830,7 +937,7 @@ register()
 connect(address=None)
   -> if address is None and Python binding exists: thread-local proxy
   -> elif address starts with ipc://: native session.acquire_ipc_client(address)
-  -> elif address starts with http:// or https://: native session/acquired HTTP client
+  -> elif address starts with http:// or https://: native session.acquire_http_client(address)
   -> else: native session.connect_via_relay(name)
 
 unregister()

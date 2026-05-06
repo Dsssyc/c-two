@@ -20,12 +20,13 @@ use c2_config::{BaseIpcConfig, ServerIpcConfig};
 use c2_mem::MemPool;
 use c2_server::Server;
 use c2_server::dispatcher::{CrmCallback, CrmError, CrmRoute, RequestData, ResponseMeta};
-use c2_server::scheduler::{AccessLevel, ConcurrencyMode, Scheduler};
+use c2_server::scheduler::{AccessLevel, ConcurrencyMode, Scheduler, SchedulerLimits};
 
 use crate::mem_ffi::PyMemPool;
+use crate::route_concurrency_ffi::PyRouteConcurrency;
 use crate::shm_buffer::PyShmBuffer;
 
-fn parse_concurrency_mode(mode: &str) -> PyResult<ConcurrencyMode> {
+pub(crate) fn parse_concurrency_mode(mode: &str) -> PyResult<ConcurrencyMode> {
     match mode {
         "parallel" => Ok(ConcurrencyMode::Parallel),
         "exclusive" => Ok(ConcurrencyMode::Exclusive),
@@ -40,7 +41,7 @@ fn parse_concurrency_mode(mode: &str) -> PyResult<ConcurrencyMode> {
 // PyCrmCallback — bridges a Python callable to the Rust CrmCallback trait
 // ---------------------------------------------------------------------------
 
-struct PyCrmCallback {
+pub(crate) struct PyCrmCallback {
     py_callable: Py<PyAny>,
     response_pool_obj: Py<PyAny>,
 }
@@ -120,8 +121,122 @@ impl CrmCallback for PyCrmCallback {
 /// ```
 #[pyclass(name = "RustServer", frozen)]
 pub struct PyServer {
-    inner: Arc<Server>,
+    pub(crate) inner: Arc<Server>,
     rt: Mutex<Option<tokio::runtime::Runtime>>,
+}
+
+pub(crate) struct BuiltRoute {
+    pub route: CrmRoute,
+    pub route_handle: PyRouteConcurrency,
+}
+
+impl PyServer {
+    pub(crate) fn build_route(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        dispatcher: Py<PyAny>,
+        method_names: Vec<String>,
+        access_map: &Bound<'_, PyDict>,
+        concurrency_mode: &str,
+        max_pending: Option<usize>,
+        max_workers: Option<usize>,
+    ) -> PyResult<BuiltRoute> {
+        let mode = parse_concurrency_mode(concurrency_mode)?;
+        let limits = SchedulerLimits::try_from_usize(max_pending, max_workers)
+            .map_err(PyValueError::new_err)?;
+
+        // Parse access_map: {int: "read"|"write"} → HashMap<u16, AccessLevel>
+        let mut map = HashMap::new();
+        for (key, value) in access_map.iter() {
+            let idx: u16 = key.extract()?;
+            let level_str: String = value.extract()?;
+            let level = match level_str.as_str() {
+                "read" => AccessLevel::Read,
+                "write" => AccessLevel::Write,
+                other => {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "invalid access level '{other}', expected 'read' or 'write'"
+                    )));
+                }
+            };
+            map.insert(idx, level);
+        }
+
+        // Create PyMemPool wrapping the server's response pool
+        let response_pool_obj: Py<PyAny> = {
+            let pool_arc = self.inner.response_pool_arc();
+            let py_pool = PyMemPool::from_arc(pool_arc);
+            Py::new(py, py_pool)?.into_any()
+        };
+
+        let scheduler = Scheduler::with_limits(mode, map, limits);
+        let route_handle = PyRouteConcurrency::new(scheduler.clone());
+        let callback = Arc::new(PyCrmCallback {
+            py_callable: dispatcher,
+            response_pool_obj,
+        });
+
+        let route = CrmRoute {
+            name: name.to_string(),
+            scheduler: Arc::new(scheduler),
+            callback,
+            method_names,
+        };
+
+        Ok(BuiltRoute {
+            route,
+            route_handle,
+        })
+    }
+
+    pub(crate) fn register_built_route(&self, py: Python<'_>, route: CrmRoute) -> PyResult<()> {
+        let server = Arc::clone(&self.inner);
+
+        // Register requires async; use a short-lived runtime if the main
+        // one hasn't started, or block_on the existing runtime's handle.
+        py.detach(move || -> PyResult<()> {
+            let rt_guard = self.rt.lock();
+            if let Some(rt) = rt_guard.as_ref() {
+                rt.block_on(server.register_route(route))
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            } else {
+                // Server not started yet — create a temporary runtime for registration.
+                let tmp_rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| {
+                        PyRuntimeError::new_err(format!("failed to create runtime: {e}"))
+                    })?;
+                tmp_rt
+                    .block_on(server.register_route(route))
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn unregister_route_blocking(&self, py: Python<'_>, name: &str) -> PyResult<bool> {
+        let server = Arc::clone(&self.inner);
+        let name = name.to_string();
+
+        py.detach(move || {
+            let rt_guard = self.rt.lock();
+            if let Some(rt) = rt_guard.as_ref() {
+                Ok(rt.block_on(server.unregister_route(&name)))
+            } else {
+                let tmp_rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
+                Ok(tmp_rt.block_on(server.unregister_route(&name)))
+            }
+        })
+    }
+
+    pub(crate) fn runtime_is_running(&self) -> bool {
+        self.rt.lock().is_some()
+    }
 }
 
 #[pymethods]
@@ -208,7 +323,7 @@ impl PyServer {
     ///
     /// `method_names` lists the CRM method names indexed by method_idx.
     /// `access_map` maps method_idx → "read" or "write".
-    #[pyo3(signature = (name, dispatcher, method_names, access_map, concurrency_mode))]
+    #[pyo3(signature = (name, dispatcher, method_names, access_map, concurrency_mode, max_pending=None, max_workers=None))]
     fn register_route(
         &self,
         py: Python<'_>,
@@ -217,69 +332,22 @@ impl PyServer {
         method_names: Vec<String>,
         access_map: &Bound<'_, PyDict>,
         concurrency_mode: &str,
-    ) -> PyResult<()> {
-        let mode = parse_concurrency_mode(concurrency_mode)?;
-
-        // Parse access_map: {int: "read"|"write"} → HashMap<u16, AccessLevel>
-        let mut map = HashMap::new();
-        for (key, value) in access_map.iter() {
-            let idx: u16 = key.extract()?;
-            let level_str: String = value.extract()?;
-            let level = match level_str.as_str() {
-                "read" => AccessLevel::Read,
-                "write" => AccessLevel::Write,
-                other => {
-                    return Err(PyRuntimeError::new_err(format!(
-                        "invalid access level '{other}', expected 'read' or 'write'"
-                    )));
-                }
-            };
-            map.insert(idx, level);
-        }
-
-        // Create PyMemPool wrapping the server's response pool
-        let response_pool_obj: Py<PyAny> = {
-            let pool_arc = self.inner.response_pool_arc();
-            let py_pool = PyMemPool::from_arc(pool_arc);
-            Py::new(py, py_pool)?.into_any()
-        };
-
-        let scheduler = Arc::new(Scheduler::new(mode, map));
-        let callback = Arc::new(PyCrmCallback {
-            py_callable: dispatcher,
-            response_pool_obj,
-        });
-
-        let route = CrmRoute {
-            name: name.to_string(),
-            scheduler,
-            callback,
+        max_pending: Option<usize>,
+        max_workers: Option<usize>,
+    ) -> PyResult<PyRouteConcurrency> {
+        let built = self.build_route(
+            py,
+            name,
+            dispatcher,
             method_names,
-        };
-
-        let server = Arc::clone(&self.inner);
-
-        // Register requires async; use a short-lived runtime if the main
-        // one hasn't started, or block_on the existing runtime's handle.
-        py.detach(move || -> PyResult<()> {
-            let rt_guard = self.rt.lock();
-            if let Some(rt) = rt_guard.as_ref() {
-                rt.block_on(server.register_route(route))
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            } else {
-                // Server not started yet — create a temporary runtime for registration.
-                let tmp_rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| {
-                        PyRuntimeError::new_err(format!("failed to create runtime: {e}"))
-                    })?;
-                tmp_rt
-                    .block_on(server.register_route(route))
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            }
-            Ok(())
-        })
+            access_map,
+            concurrency_mode,
+            max_pending,
+            max_workers,
+        )?;
+        let route_handle = built.route_handle.clone();
+        self.register_built_route(py, built.route)?;
+        Ok(route_handle)
     }
 
     /// Start the server on a background thread with a tokio runtime.
@@ -341,27 +409,13 @@ impl PyServer {
 
     /// Remove a CRM route. Returns `True` if it existed.
     fn unregister_route(&self, py: Python<'_>, name: &str) -> PyResult<bool> {
-        let server = Arc::clone(&self.inner);
-        let name = name.to_string();
-
-        py.detach(move || {
-            let rt_guard = self.rt.lock();
-            if let Some(rt) = rt_guard.as_ref() {
-                Ok(rt.block_on(server.unregister_route(&name)))
-            } else {
-                let tmp_rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
-                Ok(tmp_rt.block_on(server.unregister_route(&name)))
-            }
-        })
+        self.unregister_route_blocking(py, name)
     }
 
     /// Whether the server is currently running.
     #[getter]
     fn is_running(&self) -> bool {
-        self.rt.lock().is_some()
+        self.runtime_is_running()
     }
 
     /// The filesystem path of the UDS socket.

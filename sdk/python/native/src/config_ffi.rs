@@ -36,7 +36,7 @@ fn resolve_server_ipc_config(
     global_overrides: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
     let mut runtime = RuntimeConfigOverrides::default();
-    let server_overrides = server_overrides(overrides)?;
+    let server_overrides = parse_server_ipc_overrides(overrides)?;
     apply_shm_overrides(&mut runtime, global_overrides)?;
     let resolved = ConfigResolver::resolve_server_ipc(
         server_overrides,
@@ -87,7 +87,9 @@ fn apply_shm_overrides(
     Ok(())
 }
 
-fn server_overrides(dict: Option<&Bound<'_, PyDict>>) -> PyResult<ServerIpcConfigOverrides> {
+pub(crate) fn parse_server_ipc_overrides(
+    dict: Option<&Bound<'_, PyDict>>,
+) -> PyResult<ServerIpcConfigOverrides> {
     let Some(dict) = dict else {
         return Ok(ServerIpcConfigOverrides::default());
     };
@@ -113,6 +115,178 @@ fn server_overrides(dict: Option<&Bound<'_, PyDict>>) -> PyResult<ServerIpcConfi
         heartbeat_timeout_secs: get_opt(dict, "heartbeat_timeout")?,
         ..Default::default()
     })
+}
+
+pub(crate) fn parse_client_ipc_overrides(
+    dict: Option<&Bound<'_, PyDict>>,
+) -> PyResult<ClientIpcConfigOverrides> {
+    client_overrides(dict)
+}
+
+pub(crate) fn server_ipc_overrides_to_dict<'py>(
+    py: Python<'py>,
+    overrides: &ServerIpcConfigOverrides,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    if let Some(value) = overrides.base.pool_enabled {
+        dict.set_item("pool_enabled", value)?;
+    }
+    if let Some(value) = overrides.base.pool_segment_size {
+        dict.set_item("pool_segment_size", value)?;
+    }
+    if let Some(value) = overrides.base.max_pool_segments {
+        dict.set_item("max_pool_segments", value)?;
+    }
+    if let Some(value) = overrides.base.reassembly_segment_size {
+        dict.set_item("reassembly_segment_size", value)?;
+    }
+    if let Some(value) = overrides.base.reassembly_max_segments {
+        dict.set_item("reassembly_max_segments", value)?;
+    }
+    if let Some(value) = overrides.base.max_total_chunks {
+        dict.set_item("max_total_chunks", value)?;
+    }
+    if let Some(value) = overrides.base.chunk_gc_interval_secs {
+        dict.set_item("chunk_gc_interval", value)?;
+    }
+    if let Some(value) = overrides.base.chunk_threshold_ratio {
+        dict.set_item("chunk_threshold_ratio", value)?;
+    }
+    if let Some(value) = overrides.base.chunk_assembler_timeout_secs {
+        dict.set_item("chunk_assembler_timeout", value)?;
+    }
+    if let Some(value) = overrides.base.max_reassembly_bytes {
+        dict.set_item("max_reassembly_bytes", value)?;
+    }
+    if let Some(value) = overrides.base.chunk_size {
+        dict.set_item("chunk_size", value)?;
+    }
+    if let Some(value) = overrides.pool_enabled {
+        dict.set_item("pool_enabled", value)?;
+    }
+    if let Some(value) = overrides.pool_segment_size {
+        dict.set_item("pool_segment_size", value)?;
+    }
+    if let Some(value) = overrides.max_pool_segments {
+        dict.set_item("max_pool_segments", value)?;
+    }
+    if let Some(value) = overrides.reassembly_segment_size {
+        dict.set_item("reassembly_segment_size", value)?;
+    }
+    if let Some(value) = overrides.reassembly_max_segments {
+        dict.set_item("reassembly_max_segments", value)?;
+    }
+    if let Some(value) = overrides.max_total_chunks {
+        dict.set_item("max_total_chunks", value)?;
+    }
+    if let Some(value) = overrides.chunk_gc_interval_secs {
+        dict.set_item("chunk_gc_interval", value)?;
+    }
+    if let Some(value) = overrides.chunk_threshold_ratio {
+        dict.set_item("chunk_threshold_ratio", value)?;
+    }
+    if let Some(value) = overrides.chunk_assembler_timeout_secs {
+        dict.set_item("chunk_assembler_timeout", value)?;
+    }
+    if let Some(value) = overrides.max_reassembly_bytes {
+        dict.set_item("max_reassembly_bytes", value)?;
+    }
+    if let Some(value) = overrides.chunk_size {
+        dict.set_item("chunk_size", value)?;
+    }
+    if let Some(value) = overrides.max_frame_size {
+        dict.set_item("max_frame_size", value)?;
+    }
+    if let Some(value) = overrides.max_payload_size {
+        dict.set_item("max_payload_size", value)?;
+    }
+    if let Some(value) = overrides.max_pending_requests {
+        dict.set_item("max_pending_requests", value)?;
+    }
+    if let Some(value) = overrides.pool_decay_seconds {
+        dict.set_item("pool_decay_seconds", value)?;
+    }
+    if let Some(value) = overrides.heartbeat_interval_secs {
+        dict.set_item("heartbeat_interval", value)?;
+    }
+    if let Some(value) = overrides.heartbeat_timeout_secs {
+        dict.set_item("heartbeat_timeout", value)?;
+    }
+    Ok(dict)
+}
+
+pub(crate) fn client_ipc_overrides_to_dict<'py>(
+    py: Python<'py>,
+    overrides: &ClientIpcConfigOverrides,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    if let Some(value) = overrides.base.pool_enabled {
+        dict.set_item("pool_enabled", value)?;
+    }
+    if let Some(value) = overrides.base.pool_segment_size {
+        dict.set_item("pool_segment_size", value)?;
+    }
+    if let Some(value) = overrides.base.max_pool_segments {
+        dict.set_item("max_pool_segments", value)?;
+    }
+    if let Some(value) = overrides.base.reassembly_segment_size {
+        dict.set_item("reassembly_segment_size", value)?;
+    }
+    if let Some(value) = overrides.base.reassembly_max_segments {
+        dict.set_item("reassembly_max_segments", value)?;
+    }
+    if let Some(value) = overrides.base.max_total_chunks {
+        dict.set_item("max_total_chunks", value)?;
+    }
+    if let Some(value) = overrides.base.chunk_gc_interval_secs {
+        dict.set_item("chunk_gc_interval", value)?;
+    }
+    if let Some(value) = overrides.base.chunk_threshold_ratio {
+        dict.set_item("chunk_threshold_ratio", value)?;
+    }
+    if let Some(value) = overrides.base.chunk_assembler_timeout_secs {
+        dict.set_item("chunk_assembler_timeout", value)?;
+    }
+    if let Some(value) = overrides.base.max_reassembly_bytes {
+        dict.set_item("max_reassembly_bytes", value)?;
+    }
+    if let Some(value) = overrides.base.chunk_size {
+        dict.set_item("chunk_size", value)?;
+    }
+    if let Some(value) = overrides.pool_enabled {
+        dict.set_item("pool_enabled", value)?;
+    }
+    if let Some(value) = overrides.pool_segment_size {
+        dict.set_item("pool_segment_size", value)?;
+    }
+    if let Some(value) = overrides.max_pool_segments {
+        dict.set_item("max_pool_segments", value)?;
+    }
+    if let Some(value) = overrides.reassembly_segment_size {
+        dict.set_item("reassembly_segment_size", value)?;
+    }
+    if let Some(value) = overrides.reassembly_max_segments {
+        dict.set_item("reassembly_max_segments", value)?;
+    }
+    if let Some(value) = overrides.max_total_chunks {
+        dict.set_item("max_total_chunks", value)?;
+    }
+    if let Some(value) = overrides.chunk_gc_interval_secs {
+        dict.set_item("chunk_gc_interval", value)?;
+    }
+    if let Some(value) = overrides.chunk_threshold_ratio {
+        dict.set_item("chunk_threshold_ratio", value)?;
+    }
+    if let Some(value) = overrides.chunk_assembler_timeout_secs {
+        dict.set_item("chunk_assembler_timeout", value)?;
+    }
+    if let Some(value) = overrides.max_reassembly_bytes {
+        dict.set_item("max_reassembly_bytes", value)?;
+    }
+    if let Some(value) = overrides.chunk_size {
+        dict.set_item("chunk_size", value)?;
+    }
+    Ok(dict)
 }
 
 fn client_overrides(dict: Option<&Bound<'_, PyDict>>) -> PyResult<ClientIpcConfigOverrides> {
@@ -216,7 +390,10 @@ fn server_ipc_to_dict<'py>(py: Python<'py>, cfg: &ServerIpcConfig) -> PyResult<B
     Ok(dict)
 }
 
-fn client_ipc_to_dict<'py>(py: Python<'py>, cfg: &ClientIpcConfig) -> PyResult<Bound<'py, PyDict>> {
+pub(crate) fn client_ipc_to_dict<'py>(
+    py: Python<'py>,
+    cfg: &ClientIpcConfig,
+) -> PyResult<Bound<'py, PyDict>> {
     let dict = base_ipc_to_dict(py, &cfg.base)?;
     dict.set_item("shm_threshold", cfg.shm_threshold)?;
     Ok(dict)

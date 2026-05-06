@@ -18,8 +18,8 @@ fn error_registry(py: Python<'_>) -> PyResult<Py<PyAny>> {
 fn decode_error_wire_parts(py: Python<'_>, data: PyBuffer<u8>) -> PyResult<Option<Py<PyAny>>> {
     let mut bytes = vec![0_u8; data.len_bytes()];
     data.copy_to_slice(py, &mut bytes)?;
-    let Some(err) = C2Error::from_wire_bytes(&bytes)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?
+    let Some(err) =
+        C2Error::from_wire_bytes(&bytes).map_err(|e| PyValueError::new_err(e.to_string()))?
     else {
         return Ok(None);
     };

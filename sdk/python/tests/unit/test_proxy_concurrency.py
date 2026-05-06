@@ -1,223 +1,95 @@
-"""Unit tests for thread-local proxy concurrency control (P0 §1.1)."""
+"""Unit tests for thread-local proxy native concurrency adapter."""
 from __future__ import annotations
 
-import threading
-import time
+from contextlib import nullcontext
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
-from c_two.crm.meta import MethodAccess
 from c_two.transport.client.proxy import CRMProxy
-from c_two.transport.server.scheduler import Scheduler, ConcurrencyConfig, ConcurrencyMode
+from c_two.transport.server.scheduler import ConcurrencyMode
 
 
-# ---------------------------------------------------------------------------
-# Slow CRM for concurrency testing
-# ---------------------------------------------------------------------------
+class Resource:
+    def op(self):
+        return 'ok'
 
-class _SlowCRM:
-    """CRM with methods that sleep to expose concurrency issues."""
 
+class RecordingResource:
     def __init__(self):
-        self.call_log: list[tuple[str, float, float]] = []
-        self._lock = threading.Lock()
+        self.calls = []
 
-    def read_op(self) -> str:
-        start = time.monotonic()
-        time.sleep(0.05)
-        end = time.monotonic()
-        with self._lock:
-            self.call_log.append(('read', start, end))
-        return 'read_result'
-
-    def write_op(self, data: str = '') -> str:
-        start = time.monotonic()
-        time.sleep(0.05)
-        end = time.monotonic()
-        with self._lock:
-            self.call_log.append(('write', start, end))
-        return 'write_result'
+    def op(self):
+        self.calls.append('op')
+        return 'ok'
 
 
-_READ_WRITE_MAP = {
-    'read_op': MethodAccess.READ,
-    'write_op': MethodAccess.WRITE,
-}
+class FakeScheduler:
+    def __init__(self, *, snapshot, method_index):
+        self._snapshot = snapshot
+        self._method_index = method_index
+        self.guard_calls = []
+
+    @property
+    def is_unconstrained(self):
+        return self._snapshot.is_unconstrained
+
+    def method_idx(self, method_name):
+        return self._method_index[method_name]
+
+    def execution_guard(self, method_idx):
+        self.guard_calls.append(method_idx)
+        return nullcontext()
 
 
-def _overlaps(a_start, a_end, b_start, b_end) -> bool:
-    """Return True if time intervals [a_start, a_end] and [b_start, b_end] overlap."""
-    return a_start < b_end and b_start < a_end
+def test_unconstrained_call_direct_skips_guard():
+    scheduler = FakeScheduler(
+        snapshot=SimpleNamespace(
+            mode=ConcurrencyMode.PARALLEL,
+            max_pending=None,
+            max_workers=None,
+            closed=False,
+            is_unconstrained=True,
+        ),
+        method_index={'op': 0},
+    )
+    proxy = CRMProxy.thread_local(Resource(), scheduler=scheduler)
+    assert proxy.call_direct('op', ()) == 'ok'
+    assert scheduler.guard_calls == []
 
 
-# ---------------------------------------------------------------------------
-# Backward compatibility: no scheduler
-# ---------------------------------------------------------------------------
-
-class TestThreadLocalNoScheduler:
-
-    def test_call_direct_no_scheduler(self):
-        """Without scheduler, call_direct works as before (no locking)."""
-        crm = _SlowCRM()
-        proxy = CRMProxy.thread_local(crm)
-        assert proxy.call_direct('read_op', ()) == 'read_result'
-        assert proxy.call_direct('write_op', ('hello',)) == 'write_result'
-
-    def test_supports_direct_call(self):
-        proxy = CRMProxy.thread_local(_SlowCRM())
-        assert proxy.supports_direct_call is True
+def test_constrained_call_direct_enters_native_guard_by_method_index():
+    scheduler = FakeScheduler(
+        snapshot=SimpleNamespace(
+            mode=ConcurrencyMode.EXCLUSIVE,
+            max_pending=None,
+            max_workers=None,
+            closed=False,
+            is_unconstrained=False,
+        ),
+        method_index={'op': 7},
+    )
+    proxy = CRMProxy.thread_local(Resource(), scheduler=scheduler)
+    assert proxy.call_direct('op', ()) == 'ok'
+    assert scheduler.guard_calls == [7]
 
 
-# ---------------------------------------------------------------------------
-# EXCLUSIVE mode: all calls serialized
-# ---------------------------------------------------------------------------
+def test_closed_call_direct_fails_before_entering_resource():
+    resource = RecordingResource()
+    scheduler = FakeScheduler(
+        snapshot=SimpleNamespace(
+            mode=ConcurrencyMode.PARALLEL,
+            max_pending=None,
+            max_workers=None,
+            closed=True,
+            is_unconstrained=False,
+        ),
+        method_index={'op': 0},
+    )
+    scheduler.execution_guard = Mock(side_effect=RuntimeError('route closed'))
+    proxy = CRMProxy.thread_local(resource, scheduler=scheduler)
 
-class TestExclusiveMode:
-
-    def test_writes_serialized(self):
-        """Two concurrent writes should not overlap in EXCLUSIVE mode."""
-        crm = _SlowCRM()
-        sched = Scheduler(ConcurrencyConfig(mode=ConcurrencyMode.EXCLUSIVE))
-        proxy = CRMProxy.thread_local(
-            crm, scheduler=sched, access_map=_READ_WRITE_MAP,
-        )
-
-        results = [None, None]
-        def do_write(idx):
-            results[idx] = proxy.call_direct('write_op', (f'w{idx}',))
-
-        t1 = threading.Thread(target=do_write, args=(0,))
-        t2 = threading.Thread(target=do_write, args=(1,))
-        t1.start(); t2.start()
-        t1.join(); t2.join()
-
-        assert results == ['write_result', 'write_result']
-        assert len(crm.call_log) == 2
-        # Calls should NOT overlap
-        (_, s1, e1), (_, s2, e2) = crm.call_log
-        assert not _overlaps(s1, e1, s2, e2), 'EXCLUSIVE writes must not overlap'
-
-    def test_read_write_serialized(self):
-        """Read and write should not overlap in EXCLUSIVE mode."""
-        crm = _SlowCRM()
-        sched = Scheduler(ConcurrencyConfig(mode=ConcurrencyMode.EXCLUSIVE))
-        proxy = CRMProxy.thread_local(
-            crm, scheduler=sched, access_map=_READ_WRITE_MAP,
-        )
-
-        def do_read():
-            proxy.call_direct('read_op', ())
-
-        def do_write():
-            proxy.call_direct('write_op', ('',))
-
-        t1 = threading.Thread(target=do_read)
-        t2 = threading.Thread(target=do_write)
-        t1.start(); t2.start()
-        t1.join(); t2.join()
-
-        assert len(crm.call_log) == 2
-        (_, s1, e1), (_, s2, e2) = crm.call_log
-        assert not _overlaps(s1, e1, s2, e2), 'EXCLUSIVE read+write must not overlap'
-
-
-# ---------------------------------------------------------------------------
-# READ_PARALLEL mode: reads concurrent, writes exclusive
-# ---------------------------------------------------------------------------
-
-class TestReadParallelMode:
-
-    def test_reads_concurrent(self):
-        """Two reads should overlap in READ_PARALLEL mode."""
-        crm = _SlowCRM()
-        sched = Scheduler(ConcurrencyConfig(mode=ConcurrencyMode.READ_PARALLEL))
-        proxy = CRMProxy.thread_local(
-            crm, scheduler=sched, access_map=_READ_WRITE_MAP,
-        )
-
-        def do_read():
-            proxy.call_direct('read_op', ())
-
-        t1 = threading.Thread(target=do_read)
-        t2 = threading.Thread(target=do_read)
-        t1.start(); t2.start()
-        t1.join(); t2.join()
-
-        assert len(crm.call_log) == 2
-        (_, s1, e1), (_, s2, e2) = crm.call_log
-        assert _overlaps(s1, e1, s2, e2), 'READ_PARALLEL reads should overlap'
-
-    def test_write_exclusive(self):
-        """Write blocks reads in READ_PARALLEL mode."""
-        crm = _SlowCRM()
-        sched = Scheduler(ConcurrencyConfig(mode=ConcurrencyMode.READ_PARALLEL))
-        proxy = CRMProxy.thread_local(
-            crm, scheduler=sched, access_map=_READ_WRITE_MAP,
-        )
-
-        def do_write():
-            proxy.call_direct('write_op', ('',))
-
-        t1 = threading.Thread(target=do_write)
-        t2 = threading.Thread(target=do_write)
-        t1.start(); t2.start()
-        t1.join(); t2.join()
-
-        assert len(crm.call_log) == 2
-        (_, s1, e1), (_, s2, e2) = crm.call_log
-        assert not _overlaps(s1, e1, s2, e2), 'READ_PARALLEL writes must not overlap'
-
-
-# ---------------------------------------------------------------------------
-# PARALLEL mode: no locking
-# ---------------------------------------------------------------------------
-
-class TestParallelMode:
-
-    def test_all_concurrent(self):
-        """All calls should overlap in PARALLEL mode."""
-        crm = _SlowCRM()
-        sched = Scheduler(ConcurrencyConfig(mode=ConcurrencyMode.PARALLEL))
-        proxy = CRMProxy.thread_local(
-            crm, scheduler=sched, access_map=_READ_WRITE_MAP,
-        )
-
-        def do_write():
-            proxy.call_direct('write_op', ('',))
-
-        t1 = threading.Thread(target=do_write)
-        t2 = threading.Thread(target=do_write)
-        t1.start(); t2.start()
-        t1.join(); t2.join()
-
-        assert len(crm.call_log) == 2
-        (_, s1, e1), (_, s2, e2) = crm.call_log
-        assert _overlaps(s1, e1, s2, e2), 'PARALLEL writes should overlap'
-
-
-# ---------------------------------------------------------------------------
-# Default access (no access_map entry → WRITE)
-# ---------------------------------------------------------------------------
-
-class TestDefaultAccess:
-
-    def test_unknown_method_defaults_to_write(self):
-        """Methods not in access_map default to WRITE (EXCLUSIVE locks)."""
-        crm = _SlowCRM()
-        sched = Scheduler(ConcurrencyConfig(mode=ConcurrencyMode.EXCLUSIVE))
-        # Empty access_map — all methods default to WRITE
-        proxy = CRMProxy.thread_local(crm, scheduler=sched, access_map={})
-
-        results = []
-        def do_write(idx):
-            results.append(proxy.call_direct('write_op', (f'w{idx}',)))
-
-        t1 = threading.Thread(target=do_write, args=(0,))
-        t2 = threading.Thread(target=do_write, args=(1,))
-        t1.start(); t2.start()
-        t1.join(); t2.join()
-
-        # Both should succeed and be serialized
-        assert len(results) == 2
-        (_, s1, e1), (_, s2, e2) = crm.call_log
-        assert not _overlaps(s1, e1, s2, e2)
+    with pytest.raises(RuntimeError, match='route closed'):
+        proxy.call_direct('op', ())
+    assert resource.calls == []

@@ -44,6 +44,8 @@ C-Two already has the main language-neutral layers in Rust:
 - `core/transport/c2-server`: direct IPC UDS server, dispatcher, scheduler.
 - `core/transport/c2-http`: relay HTTP client, relay-aware route fallback,
   relay server behind the `relay` feature.
+- `core/runtime/c2-runtime`: process runtime session, route transactions,
+  client pools, relay projection, and lifecycle outcomes.
 
 The Python SDK is already thinner than earlier versions, but it still owns
 several generic runtime mechanisms that future SDKs would otherwise have to
@@ -77,8 +79,8 @@ reduced in code, not merely planned in a separate implementation document.
 | Issue | Candidate | Current status | Evidence |
 | --- | --- | --- | --- |
 | 1 | Remote IPC scheduler config and execution semantics | Implemented | See `docs/plans/2026-05-04-remote-ipc-scheduler-rust-config.md`; this section below records Rust `c2-server` ownership and verified IPC/thread-local coverage. |
-| 2 | Direct IPC probe/control helpers | Planned, not implemented in this branch | `docs/plans/2026-05-04-direct-ipc-control-helpers-rust.md` is the implementation plan; `sdk/python/src/c_two/transport/client/util.py` still owns raw UDS socket probing and copied signal/frame constants. |
-| 3 | Process runtime/session state | Planned, not implemented in this branch | `docs/plans/2026-05-05-runtime-session-rust-authority.md` is the implementation plan; `sdk/python/src/c_two/transport/registry.py` still owns process server/session state and there is no `core/runtime/c2-runtime` crate in this branch. |
+| 2 | Direct IPC probe/control helpers | Implemented | See `docs/plans/2026-05-04-direct-ipc-control-helpers-rust.md`; `c2-ipc` owns socket-path derivation plus ping/shutdown control helpers, and Python `client/util.py` is a thin native facade. |
+| 3 | Process runtime/session state | Implemented | See `docs/plans/2026-05-05-runtime-session-rust-authority.md`; `core/runtime/c2-runtime` owns identity, route transactions, client pools, relay projection, and shutdown/unregister outcomes. |
 | 4 | Canonical error registry and wire bytes | Implemented | See `docs/plans/2026-05-06-canonical-error-rust-authority.md`; Rust `c2-error` owns registry/wire bytes and Python delegates through native codec bindings. |
 
 ### P1. Remote IPC scheduler config and execution semantics
@@ -100,8 +102,8 @@ Verified coverage from that implementation includes remote IPC `exclusive`,
 `parallel`, and `read_parallel` behavior; large SHM-backed hold input arriving
 as `memoryview` over `ShmBuffer`; explicit direct `ipc://` bypassing a bad
 relay environment; and thread-local calls continuing to pass Python objects
-directly. Remote `max_pending` and `max_workers` remain deferred because Rust
-does not yet enforce those route-level limits.
+directly. Route-level `max_pending` and `max_workers` are now enforced by the
+same Rust handle for remote IPC and same-process thread-local calls.
 
 **Why this is core behavior**
 
@@ -146,10 +148,11 @@ path.
 
 Thread-local dispatch is different from remote IPC. It passes Python objects
 directly and intentionally skips serialization. Do not route thread-local calls
-through Rust bytes dispatch for symmetry. If thread-local concurrency needs to
-share semantics with Rust, expose a tiny native read/write permit or keep a thin
-Python guard. Treat this as a separate SDK design discussion because each
-language SDK may have its own same-process fast path.
+through Rust bytes dispatch for symmetry. The implemented shape projects a
+small native route-concurrency handle into Python so same-process calls share
+mode and capacity state with remote calls without serializing Python objects.
+Each future SDK can use its own same-process fast path, but the shared
+concurrency state must remain Rust-owned.
 
 **Implementation notes**
 
@@ -173,21 +176,26 @@ language SDK may have its own same-process fast path.
 - Large SHM-backed requests still arrive in Python as `ShmBuffer`/
   `memoryview`, not `bytes`.
 - Thread-local calls still skip serialization and still pass Python objects.
+- Mixed thread-local/direct-IPC calls share `max_workers` and `max_pending`
+  capacity limits through the same native route handle.
 
 ### P1. Direct IPC probe/control helpers
 
-**Implementation status**
+**Implemented ownership**
 
-Status: planned, not implemented in the current `dev-feature` branch. The
-implementation plan is `docs/plans/2026-05-04-direct-ipc-control-helpers-rust.md`.
-Keep this section as a pending downshift until Python no longer owns raw UDS
-socket probing, copied signal/frame constants, or socket-path derivation.
+Status: implemented on `dev-feature` by
+`docs/plans/2026-05-04-direct-ipc-control-helpers-rust.md`.
 
-**Current Python ownership**
+Rust `core/transport/c2-ipc` now owns socket-path derivation and direct IPC
+control helpers for `ping()` and `shutdown()`. The PyO3 native layer exposes
+`ipc_socket_path()`, `ipc_ping()`, and `ipc_shutdown()`. Python
+`sdk/python/src/c_two/transport/client/util.py` delegates to those functions
+and no longer owns raw UDS socket probing, copied frame structs, signal
+constants, or socket-path derivation.
 
-`sdk/python/src/c_two/transport/client/util.py` manually builds UDS control
-frames for `ping()` and `shutdown()` using copied frame constants and raw socket
-handling.
+Malformed IPC addresses are rejected by Rust validation. Missing sockets return
+the same boolean probe behavior through the native helper without making relay
+part of the direct IPC control path.
 
 **Why this is core behavior**
 
@@ -195,20 +203,12 @@ Signal frames, UDS path derivation, and IPC liveness probes are wire/IPC
 control-plane behavior. They are language-neutral and already partially defined
 in Rust through `c2-wire` constants and `c2-server` signal handling.
 
-**Implementation sketch**
-
-1. Add `c2-ipc` helpers such as `ping(address, timeout)` and
-   `shutdown(address, timeout)`.
-2. Use Rust `c2-wire` frame/signal constants as the only source of truth.
-3. Expose thin PyO3 wrappers from `sdk/python/native`.
-4. Replace Python raw socket code with native calls.
-
 **IPC/no-relay impact**
 
 This strengthens direct IPC independence. These helpers must live under
 `c2-ipc`/native bindings, not `c2-http` or relay code.
 
-**Required tests**
+**Verified coverage**
 
 - `ping("ipc://...")` returns true against a direct IPC server with no relay.
 - `shutdown("ipc://...")` stops a direct IPC server with no relay.
@@ -216,24 +216,32 @@ This strengthens direct IPC independence. These helpers must live under
 
 ### P1. Process runtime/session state
 
-**Implementation status**
+**Implemented ownership**
 
-Status: planned, not implemented in the current `dev-feature` branch. The
-implementation plan is `docs/plans/2026-05-05-runtime-session-rust-authority.md`.
-Keep this section as a pending downshift until a Rust runtime/session owner is
-present in code and Python no longer owns an independent process runtime state.
+Status: implemented on `dev-feature` by
+`docs/plans/2026-05-05-runtime-session-rust-authority.md`.
 
-**Current Python ownership**
+Rust `core/runtime/c2-runtime` now owns process-level runtime/session state.
+The Python registry is a facade around native `RuntimeSession` plus
+language-specific CRM binding and proxy construction.
 
-`sdk/python/src/c_two/transport/registry.py` owns process-level state:
+Rust-owned pieces include:
 
-- local server object, server id, server address;
-- server/client IPC overrides;
-- pool default config application;
-- relay control client cache;
-- lazy server creation;
-- registration rollback;
-- shutdown ordering.
+- local server identity and canonical `ipc://` address;
+- server/client IPC override storage and resolved client config projection;
+- client config freeze after first connection acquisition;
+- direct IPC client acquire/release/refcount/shutdown through the native
+  session pool;
+- explicit HTTP client acquire/release/refcount/shutdown through the native
+  session projection;
+- lazy server bridge creation through `ensure_server_bridge()`;
+- route registration transactions through `register_route()`;
+- local unregister and shutdown transaction outcomes;
+- relay address projection, relay-backed name resolution, and relay cleanup
+  error reporting.
+
+Python still owns Python CRM local bindings, thread-local proxy construction,
+and invoking `@on_shutdown` callbacks from native structured outcomes.
 
 **Why this is core behavior**
 
@@ -256,25 +264,16 @@ Rust RuntimeSession
 Relay projection must not own the base session. The base IPC session exists and
 works when relay is absent.
 
-**Implementation sketch**
-
-1. Add a native runtime/session object that can create or hold a direct IPC
-   server independent of relay.
-2. Let Python provide only language-specific route callback metadata and CRM
-   class information.
-3. Move server id/address generation into Rust config/identity utilities.
-4. Move pool default config application into Rust session setup.
-5. Keep Python registry as a facade around the native session and Python proxy
-   construction.
-6. Remove old Python fallback paths once native session behavior is complete.
-
-**Required tests**
+**Verified coverage**
 
 - No relay: `register -> server_address -> connect(address)` works across
   processes.
 - Bad relay env: explicit direct IPC address still works.
 - Relay register failure does not leave split-brain local/Rust route state.
 - Explicit unregister preserves local correctness even if relay cleanup fails.
+- Name-only relay connections go through native `RuntimeSession.connect_via_relay()`.
+- Shutdown drains native IPC/HTTP clients and consumes native relay cleanup
+  outcomes before clearing Python local bindings.
 
 ### P1. Canonical error registry and wire bytes
 
@@ -312,6 +311,10 @@ mapping for `CCError.deserialize()`.
 - Unknown numeric codes map to `ERROR_UNKNOWN` with canonical Rust context.
 - Malformed wire payloads keep Python public behavior.
 - Boundary tests prevent Python from reimplementing the `code:message` parser.
+- `c2-server` emits canonical `c2-error` wire bytes for route-capacity,
+  route-closed, and server-side internal execution errors instead of raw
+  UTF-8 status strings, so issue1/3 route outcomes remain compatible with
+  the issue4 decoder.
 
 ### P2. Hold-mode lease tracking
 
@@ -436,9 +439,9 @@ runtime/session, IPC control helpers, and error/config canonicalization.
 
 1. Remote IPC scheduler config, with explicit zero-copy guardrails.
 2. Direct IPC probe/control helpers in `c2-ipc`.
-3. Canonical Python error facade over `c2-error`.
-4. Native runtime/session design for standalone IPC plus optional relay
+3. Native runtime/session design for standalone IPC plus optional relay
    projection.
+4. Canonical Python error facade over `c2-error`.
 5. Hold lease tracking and server readiness cleanup.
 6. Config validation deduplication.
 7. Native method table cleanup only if still useful.

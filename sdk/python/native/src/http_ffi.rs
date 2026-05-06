@@ -52,6 +52,37 @@ pub struct PyRustRelayAwareHttpClient {
     inner: Arc<RelayAwareHttpClient>,
 }
 
+impl PyRustHttpClient {
+    pub(crate) fn from_arc(inner: Arc<HttpClient>) -> Self {
+        Self { inner }
+    }
+}
+
+impl PyRustRelayAwareHttpClient {
+    pub(crate) fn from_arc(inner: Arc<RelayAwareHttpClient>) -> Self {
+        Self { inner }
+    }
+}
+
+pub(crate) fn acquire_http_client_from_global_pool(
+    base_url: &str,
+    use_proxy: bool,
+) -> Result<Arc<HttpClient>, HttpError> {
+    HttpClientPool::instance().acquire_with_proxy_policy(base_url, use_proxy)
+}
+
+pub(crate) fn release_http_client_from_global_pool(base_url: &str) {
+    HttpClientPool::instance().release(base_url);
+}
+
+pub(crate) fn http_client_refcount_from_global_pool(base_url: &str) -> usize {
+    HttpClientPool::instance().refcount(base_url)
+}
+
+pub(crate) fn shutdown_http_clients_from_global_pool() {
+    HttpClientPool::instance().shutdown_all();
+}
+
 #[pymethods]
 impl PyRustHttpClient {
     /// Call a CRM method via HTTP relay.

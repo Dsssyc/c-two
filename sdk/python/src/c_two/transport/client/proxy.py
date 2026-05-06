@@ -38,8 +38,6 @@ from __future__ import annotations
 import threading
 from typing import Any, Callable, TYPE_CHECKING
 
-from ...crm.meta import MethodAccess
-
 if TYPE_CHECKING:
     from ..server.scheduler import Scheduler
 
@@ -60,7 +58,7 @@ class CRMProxy:
     __slots__ = (
         '_mode', '_crm', '_client', '_name',
         '_closed', '_close_lock', '_on_terminate',
-        '_scheduler', '_access_map',
+        '_scheduler',
     )
 
     # ------------------------------------------------------------------
@@ -73,7 +71,6 @@ class CRMProxy:
         crm_instance: object,
         *,
         scheduler: Scheduler | None = None,
-        access_map: dict[str, MethodAccess] | None = None,
         on_terminate: Callable[[], None] | None = None,
     ) -> CRMProxy:
         """Create a thread-local proxy (same process, no serialization).
@@ -87,9 +84,6 @@ class CRMProxy:
             Optional :class:`Scheduler` for read/write concurrency control.
             When provided, ``call_direct`` wraps method execution in
             the scheduler's execution guard.
-        access_map:
-            Mapping from method name → :class:`MethodAccess`.  Required
-            when *scheduler* is provided.
         """
         proxy = object.__new__(cls)
         proxy._mode = 'thread'
@@ -100,7 +94,6 @@ class CRMProxy:
         proxy._closed = False
         proxy._on_terminate = on_terminate
         proxy._scheduler = scheduler
-        proxy._access_map = access_map
         return proxy
 
     @classmethod
@@ -126,7 +119,6 @@ class CRMProxy:
         proxy._closed = False
         proxy._on_terminate = on_terminate
         proxy._scheduler = None
-        proxy._access_map = None
         # Auto-discover route name when not provided.
         if not name and hasattr(client, 'route_names'):
             names = client.route_names()
@@ -156,7 +148,6 @@ class CRMProxy:
         proxy._closed = False
         proxy._on_terminate = on_terminate
         proxy._scheduler = None
-        proxy._access_map = None
         return proxy
 
     # ------------------------------------------------------------------
@@ -222,10 +213,10 @@ class CRMProxy:
             raise AttributeError(
                 f'{type(self._crm).__name__} has no method {method_name!r}',
             )
-        if self._scheduler is None:
+        if self._scheduler is None or self._scheduler.is_unconstrained:
             return method(*args)
-        access = self._access_map.get(method_name, MethodAccess.WRITE) if self._access_map else MethodAccess.WRITE
-        with self._scheduler.execution_guard(access):
+        method_idx = self._scheduler.method_idx(method_name)
+        with self._scheduler.execution_guard(method_idx):
             return method(*args)
 
     def relay(self, event_bytes: bytes) -> bytes:

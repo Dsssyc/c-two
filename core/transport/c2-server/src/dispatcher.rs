@@ -162,9 +162,9 @@ impl Dispatcher {
         self.routes.insert(name, Arc::new(route));
     }
 
-    /// Remove a CRM route. Returns true if it existed.
-    pub fn unregister(&mut self, name: &str) -> bool {
-        let removed = self.routes.remove(name).is_some();
+    /// Remove a CRM route. Returns the removed route if it existed.
+    pub fn unregister(&mut self, name: &str) -> Option<Arc<CrmRoute>> {
+        let removed = self.routes.remove(name);
         if self.default_route.as_deref() == Some(name) {
             self.default_route = self.routes.keys().next().cloned();
         }
@@ -277,7 +277,7 @@ mod tests {
         let mut d = Dispatcher::new();
         d.register(make_route("grid"));
 
-        assert!(d.unregister("grid"));
+        assert!(d.unregister("grid").is_some());
         assert!(d.resolve("grid").is_none());
         assert!(d.is_empty());
     }
@@ -291,7 +291,8 @@ mod tests {
         // default is "alpha" (first registered)
         assert_eq!(d.resolve("").unwrap().name, "alpha");
 
-        d.unregister("alpha");
+        let removed = d.unregister("alpha");
+        assert!(removed.is_some());
 
         // default should now be "beta"
         let route = d.resolve("").expect("should have a new default");
@@ -301,7 +302,7 @@ mod tests {
     #[test]
     fn unregister_nonexistent_returns_false() {
         let mut d = Dispatcher::new();
-        assert!(!d.unregister("nope"));
+        assert!(d.unregister("nope").is_none());
     }
 
     #[test]

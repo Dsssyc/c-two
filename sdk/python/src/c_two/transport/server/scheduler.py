@@ -1,33 +1,14 @@
-"""Thread-local read/write guards and concurrency config facade.
-
-Remote IPC scheduling is enforced by the Rust ``c2-server`` scheduler. This
-module remains in Python for two SDK-local responsibilities:
-
-- expose ``ConcurrencyMode`` and ``ConcurrencyConfig`` as typed public SDK
-  inputs to ``cc.register(..., concurrency=...)``;
-- guard same-process thread-local ``CRMProxy.call_direct()`` calls, which pass
-  Python objects directly and intentionally skip serialization.
-
-Do not use this scheduler as the remote IPC execution authority. The legacy
-``execute()``/``begin()`` helpers remain for the 0.x Python API surface and
-thread-local tests, but cross-process calls must be controlled by Rust.
-"""
+"""Concurrency configuration and thin native route-concurrency adapter."""
 from __future__ import annotations
 
 import enum
-import threading
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
-# Re-export access decorators so consumers only import from transport.
+# Re-export access helpers for existing import sites. Scheduling authority lives
+# in Rust; these are metadata helpers used while building the method index map.
 from ...crm.meta import MethodAccess, get_method_access  # noqa: F401
 
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
 
 @enum.unique
 class ConcurrencyMode(enum.Enum):
@@ -50,206 +31,33 @@ class ConcurrencyConfig:
             raise ValueError('max_pending must be at least 1 when provided.')
 
 
-# ---------------------------------------------------------------------------
-# Writer-priority read/write lock
-# ---------------------------------------------------------------------------
-
-class _WriterPriorityReadWriteLock:
-    """Readers run concurrently; writers get exclusive access with priority.
-
-    When a writer is waiting, new readers block until the writer completes.
-    """
-
-    def __init__(self) -> None:
-        self._condition = threading.Condition()
-        self._active_readers = 0
-        self._writer_active = False
-        self._waiting_writers = 0
-
-    @contextmanager
-    def read_lock(self):
-        with self._condition:
-            while self._writer_active or self._waiting_writers > 0:
-                self._condition.wait()
-            self._active_readers += 1
-        try:
-            yield
-        finally:
-            with self._condition:
-                self._active_readers -= 1
-                if self._active_readers == 0:
-                    self._condition.notify_all()
-
-    @contextmanager
-    def write_lock(self):
-        with self._condition:
-            self._waiting_writers += 1
-            try:
-                while self._writer_active or self._active_readers > 0:
-                    self._condition.wait()
-                self._writer_active = True
-            finally:
-                self._waiting_writers -= 1
-        try:
-            yield
-        finally:
-            with self._condition:
-                self._writer_active = False
-                self._condition.notify_all()
-
-
-# ---------------------------------------------------------------------------
-# Scheduler
-# ---------------------------------------------------------------------------
-
 class Scheduler:
-    """Thread-pool scheduler with read/write concurrency control.
+    """Thin adapter over Rust-owned route concurrency state.
 
-    Parameters
-    ----------
-    config:
-        Concurrency mode and worker limits.
+    Python no longer owns locks, pending counters, executors, or drain state.
+    This class exists so thread-local direct calls can enter the same native
+    guard used by IPC dispatch while preserving the public SDK config types.
     """
 
-    def __init__(self, config: ConcurrencyConfig | None = None) -> None:
-        self._config = config or ConcurrencyConfig()
-        self._exclusive_lock = threading.Lock()
-        self._rw_lock = _WriterPriorityReadWriteLock()
+    def __init__(self, native: Any, method_index: dict[str, int]) -> None:
+        self._native = native
+        self._method_index = dict(method_index)
 
-        # Pending-call tracking for graceful drain.
-        self._state_lock = threading.Lock()
-        self._shutdown_flag = False
-        self._pending_count = 0
-        self._drain_event = threading.Event()
-        self._drain_event.set()
-        # Pre-compute hot-path flags.
-        self._has_capacity_limit = config is not None and config.max_pending is not None
-        self._is_exclusive = self._config.mode is ConcurrencyMode.EXCLUSIVE
-        self._is_parallel = self._config.mode is ConcurrencyMode.PARALLEL
-
-        effective_workers = self._config.max_workers
-        if effective_workers is None and self._config.mode is ConcurrencyMode.EXCLUSIVE:
-            effective_workers = 1
-
-        # Executor kept for backward compatibility (v1 dispatch path)
-        # but _FastDispatcher is the primary dispatch mechanism.
-        self._executor: ThreadPoolExecutor | None = None
-        self._executor_workers = effective_workers
+    def method_idx(self, method_name: str) -> int:
+        return self._method_index[method_name]
 
     @property
-    def executor(self) -> ThreadPoolExecutor:
-        """The underlying executor — lazy creation for backward compatibility."""
-        if self._executor is None:
-            self._executor = ThreadPoolExecutor(
-                max_workers=self._executor_workers,
-                thread_name_prefix='c2_worker',
-            )
-        return self._executor
+    def is_unconstrained(self) -> bool:
+        return bool(self._native.is_unconstrained)
 
-    @property
-    def pending_count(self) -> int:
-        with self._state_lock:
-            return self._pending_count
+    def snapshot(self) -> Any:
+        return self._native.snapshot()
 
-    # ------------------------------------------------------------------
-    # Synchronous execution (called from within run_in_executor)
-    # ------------------------------------------------------------------
+    def execution_guard(self, method_idx: int):
+        return self._native.execution_guard(method_idx)
 
-    def execute(
-        self,
-        method: Callable[..., Any],
-        args_bytes: bytes | memoryview,
-        access_mode: MethodAccess = MethodAccess.WRITE,
-    ) -> Any:
-        """Execute *method(args_bytes)* with the appropriate concurrency guard."""
-        try:
-            if self._is_parallel:
-                return method(args_bytes)
-            if self._is_exclusive:
-                with self._exclusive_lock:
-                    return method(args_bytes)
-            # READ_PARALLEL
-            if access_mode is MethodAccess.READ:
-                with self._rw_lock.read_lock():
-                    return method(args_bytes)
-            with self._rw_lock.write_lock():
-                return method(args_bytes)
-        finally:
-            with self._state_lock:
-                self._pending_count -= 1
-                if self._shutdown_flag and self._pending_count == 0:
-                    self._drain_event.set()
-
-    def execute_fast(
-        self,
-        method: Callable[..., Any],
-        args_bytes: bytes | memoryview,
-        access_mode: MethodAccess = MethodAccess.WRITE,
-    ) -> Any:
-        """Like execute() but without pending-count tracking.
-
-        Used by _FastDispatcher where task lifecycle is managed by asyncio.
-        Caller must ensure shutdown() waits for tasks via other means.
-        """
-        if self._is_parallel:
-            return method(args_bytes)
-        if self._is_exclusive:
-            with self._exclusive_lock:
-                return method(args_bytes)
-        if access_mode is MethodAccess.READ:
-            with self._rw_lock.read_lock():
-                return method(args_bytes)
-        with self._rw_lock.write_lock():
-            return method(args_bytes)
-
-    def begin(self) -> None:
-        """Increment pending counter before dispatching to the executor."""
-        if self._shutdown_flag:
-            raise RuntimeError('Scheduler is shut down')
-        if self._has_capacity_limit:
-            with self._state_lock:
-                if (self._pending_count >= self._config.max_pending):
-                    raise RuntimeError(
-                        f'Scheduler at capacity ({self._config.max_pending} pending)',
-                    )
-                self._pending_count += 1
-        else:
-            with self._state_lock:
-                self._pending_count += 1
-
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
+    def close(self) -> None:
+        self._native.close()
 
     def shutdown(self) -> None:
-        """Wait for pending calls to drain, then shut down the executor."""
-        with self._state_lock:
-            if self._shutdown_flag:
-                return
-            self._shutdown_flag = True
-        self._drain_event.wait()
-        if self._executor is not None:
-            self._executor.shutdown(wait=True)
-
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
-
-    @contextmanager
-    def execution_guard(self, access_mode: MethodAccess):
-        if self._config.mode is ConcurrencyMode.EXCLUSIVE:
-            with self._exclusive_lock:
-                yield
-            return
-
-        if self._config.mode is ConcurrencyMode.READ_PARALLEL:
-            if access_mode is MethodAccess.READ:
-                with self._rw_lock.read_lock():
-                    yield
-            else:
-                with self._rw_lock.write_lock():
-                    yield
-            return
-
-        # PARALLEL — no locking.
-        yield
+        self.close()

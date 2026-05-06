@@ -296,35 +296,3 @@ class TestMethodTableSafety:
         assert t.names() == []
         assert not t.has_name('x')
         assert not t.has_index(0)
-
-
-class TestSchedulerSafety:
-    """Validate scheduler edge cases."""
-
-    def test_begin_after_shutdown_raises(self):
-        from c_two.transport.server.scheduler import ConcurrencyConfig, Scheduler
-        sched = Scheduler(ConcurrencyConfig())
-        sched.shutdown()
-        with pytest.raises(RuntimeError, match='shut down'):
-            sched.begin()
-
-    def test_begin_at_capacity_raises(self):
-        from c_two.transport.server.scheduler import ConcurrencyConfig, Scheduler
-        sched = Scheduler(ConcurrencyConfig(max_pending=1))
-        sched.begin()  # fills to capacity
-        with pytest.raises(RuntimeError, match='capacity'):
-            sched.begin()
-        # Clean up: decrement so shutdown doesn't wait forever
-        with sched._state_lock:
-            sched._pending_count = 0
-            sched._drain_event.set()
-        sched.shutdown()
-
-    def test_execute_decrements_pending(self):
-        from c_two.transport.server.scheduler import ConcurrencyConfig, Scheduler
-        sched = Scheduler(ConcurrencyConfig(max_pending=2))
-        sched.begin()
-        assert sched._pending_count == 1
-        sched.execute(lambda b: b, b'test')
-        assert sched._pending_count == 0
-        sched.shutdown()

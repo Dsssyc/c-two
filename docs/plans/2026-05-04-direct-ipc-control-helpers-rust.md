@@ -2,6 +2,10 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Status:** Implemented on `dev-feature`. Rust `c2-ipc` owns the direct IPC
+socket-path, ping, and shutdown control helpers; Python `client/util.py` is now
+a thin native-call facade.
+
 **Goal:** Move direct IPC `ping()` and `shutdown()` control-plane helpers from Python raw-socket/frame construction into Rust `c2-ipc`, with Python left as a thin native-call facade.
 
 **Architecture:** Rust `c2-ipc` becomes the language-neutral owner for IPC address validation, UDS socket-path derivation, signal frame encoding, timeout handling, and response validation. The Python SDK keeps the public `c_two.transport.client.util.ping()` and `shutdown()` functions for API continuity, but those functions call PyO3 wrappers instead of constructing frames or opening sockets themselves. Relay remains out of this path: all helpers operate on explicit `ipc://` addresses and never consult relay configuration.
@@ -24,7 +28,8 @@ C-Two is in the 0.x line. Do not keep Python raw-socket fallback behavior after 
 
 ## Current Problem
 
-`sdk/python/src/c_two/transport/client/util.py` currently does all of the following in Python:
+At the start of this plan,
+`sdk/python/src/c_two/transport/client/util.py` did all of the following in Python:
 
 - derives `/tmp/c_two_ipc/{region}.sock` from `ipc://{region}`;
 - validates IPC region IDs by calling native validation but still owns path construction;

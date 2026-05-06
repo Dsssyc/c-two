@@ -13,6 +13,7 @@
 //! ```
 
 pub mod client;
+pub mod control;
 pub mod pool;
 pub mod response;
 pub mod shm;
@@ -22,6 +23,7 @@ pub mod sync_client;
 mod tests;
 
 pub use client::{ClientIpcConfig, IpcClient, IpcError, MethodTable, ServerPoolState};
+pub use control::{ping, shutdown, socket_path_from_ipc_address};
 pub use pool::ClientPool;
 pub use response::ResponseData;
 pub use shm::{MappedSegment, SegmentCache, ShmError};

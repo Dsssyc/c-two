@@ -121,6 +121,37 @@ class RemoteSchedulerProbeImpl:
         return Count(self.max_seen)
 
 
+@cc.crm(namespace='test.remote.scheduler.shared', version='0.1.0')
+class SharedLimitProbe:
+    @cc.write
+    @cc.transfer(input=Delay, output=Window)
+    def hold(self, delay: Delay) -> Window: ...
+
+    @cc.write
+    @cc.transfer(output=Count)
+    def probe(self) -> Count: ...
+
+
+class SharedLimitProbeImpl:
+    def __init__(self):
+        self.hold_entered = threading.Event()
+        self.release = threading.Event()
+        self.probe_calls = 0
+        self.lock = threading.Lock()
+
+    def hold(self, delay: Delay) -> Window:
+        start = time.monotonic()
+        self.hold_entered.set()
+        self.release.wait(timeout=2)
+        time.sleep(delay.value)
+        return Window(start, time.monotonic())
+
+    def probe(self) -> Count:
+        with self.lock:
+            self.probe_calls += 1
+            return Count(self.probe_calls)
+
+
 def test_remote_ipc_exclusive_serializes_reads():
     cc.register(
         RemoteSchedulerProbe,
@@ -366,3 +397,97 @@ def test_remote_ipc_scheduler_direct_address_ignores_bad_relay(monkeypatch):
         assert client.max_active().value == 1
     finally:
         cc.close(client)
+
+
+def test_remote_ipc_scheduler_max_workers_shares_with_local_thread_calls():
+    cc.register(
+        SharedLimitProbe,
+        SharedLimitProbeImpl(),
+        name='mixed_limit_workers',
+        concurrency=ConcurrencyConfig(
+            mode=ConcurrencyMode.PARALLEL,
+            max_workers=1,
+        ),
+    )
+    cc.serve(blocking=False)
+    direct_address = cc.server_address()
+    assert direct_address is not None
+
+    resource = _ProcessRegistry.get()._server._slots['mixed_limit_workers'].crm_instance.resource  # noqa: SLF001
+    local = cc.connect(SharedLimitProbe, name='mixed_limit_workers')
+    remote = cc.connect(
+        SharedLimitProbe,
+        name='mixed_limit_workers',
+        address=direct_address,
+    )
+    try:
+        errors: list[BaseException] = []
+        local_result: list[Window] = []
+
+        def local_worker():
+            try:
+                local_result.append(local.hold(Delay(0.01)))
+            except BaseException as exc:
+                errors.append(exc)
+
+        t1 = threading.Thread(target=local_worker)
+        t1.start()
+        assert resource.hold_entered.wait(timeout=1)
+
+        with pytest.raises(Exception, match='max_workers=1'):
+            remote.probe()
+
+        assert resource.probe_calls == 0
+        assert not errors
+        resource.release.set()
+        _join_all([t1])
+        assert local_result and local_result[0].end >= local_result[0].start
+    finally:
+        cc.close(local)
+        cc.close(remote)
+
+
+def test_remote_ipc_scheduler_max_pending_shares_with_local_thread_calls():
+    cc.register(
+        SharedLimitProbe,
+        SharedLimitProbeImpl(),
+        name='mixed_limit_pending',
+        concurrency=ConcurrencyConfig(
+            mode=ConcurrencyMode.PARALLEL,
+            max_pending=1,
+        ),
+    )
+    cc.serve(blocking=False)
+    direct_address = cc.server_address()
+    assert direct_address is not None
+
+    resource = _ProcessRegistry.get()._server._slots['mixed_limit_pending'].crm_instance.resource  # noqa: SLF001
+    local = cc.connect(SharedLimitProbe, name='mixed_limit_pending')
+    remote = cc.connect(
+        SharedLimitProbe,
+        name='mixed_limit_pending',
+        address=direct_address,
+    )
+    try:
+        errors: list[BaseException] = []
+
+        def local_worker():
+            try:
+                local.hold(Delay(0.01))
+            except BaseException as exc:
+                errors.append(exc)
+
+        t1 = threading.Thread(target=local_worker)
+        t1.start()
+        assert resource.hold_entered.wait(timeout=1)
+
+        with pytest.raises(Exception, match='max_pending=1'):
+            remote.probe()
+
+        assert resource.probe_calls == 0
+        assert not errors
+        resource.release.set()
+        _join_all([t1])
+    finally:
+        cc.close(local)
+        cc.close(remote)
