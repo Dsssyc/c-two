@@ -95,3 +95,32 @@ def test_import_does_not_expose_logo_banner():
     import c_two
 
     assert not hasattr(c_two, "LOGO" + "_UNICODE")
+
+
+def test_error_facade_does_not_reimplement_wire_codec():
+    source_path = Path(__file__).resolve().parents[2] / "src" / "c_two" / "error.py"
+    source = source_path.read_text(encoding="utf-8")
+
+    legacy = "legacy"
+    forbidden = [
+        ".tobytes()",
+        ".decode('utf-8')",
+        '.decode("utf-8")',
+        ".split(':', 1)",
+        '.split(":", 1)',
+        "int(code_raw)",
+        "Unknown error code {code_value}",
+        "invalid UTF-8",
+        "missing ':' separator",
+        "invalid code",
+        f"encode_error_{legacy}",
+        f"decode_error_{legacy}",
+        f"to_{legacy}_bytes",
+        f"from_{legacy}_bytes",
+    ]
+
+    offenders = [needle for needle in forbidden if needle in source]
+    assert offenders == []
+    assert "_native.error_registry" in source
+    assert "_native.encode_error_wire" in source
+    assert "_native.decode_error_wire_parts" in source
