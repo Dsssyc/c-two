@@ -67,6 +67,20 @@ These are language-specific and should not be forced into the Rust core:
 
 ## Downshift Candidates
 
+### P1 Issue Status Ledger
+
+This ledger tracks the first four P1 downshift issues in this document against
+the current `dev-feature` branch. Do not mark an issue as implemented here
+unless the corresponding Python-owned authority has actually been removed or
+reduced in code, not merely planned in a separate implementation document.
+
+| Issue | Candidate | Current status | Evidence |
+| --- | --- | --- | --- |
+| 1 | Remote IPC scheduler config and execution semantics | Implemented | See `docs/plans/2026-05-04-remote-ipc-scheduler-rust-config.md`; this section below records Rust `c2-server` ownership and verified IPC/thread-local coverage. |
+| 2 | Direct IPC probe/control helpers | Planned, not implemented in this branch | `docs/plans/2026-05-04-direct-ipc-control-helpers-rust.md` is the implementation plan; `sdk/python/src/c_two/transport/client/util.py` still owns raw UDS socket probing and copied signal/frame constants. |
+| 3 | Process runtime/session state | Planned, not implemented in this branch | `docs/plans/2026-05-05-runtime-session-rust-authority.md` is the implementation plan; `sdk/python/src/c_two/transport/registry.py` still owns process server/session state and there is no `core/runtime/c2-runtime` crate in this branch. |
+| 4 | Canonical error registry and wire bytes | Implemented | See `docs/plans/2026-05-06-canonical-error-rust-authority.md`; Rust `c2-error` owns registry/wire bytes and Python delegates through native codec bindings. |
+
 ### P1. Remote IPC scheduler config and execution semantics
 
 **Implemented ownership**
@@ -162,6 +176,13 @@ language SDK may have its own same-process fast path.
 
 ### P1. Direct IPC probe/control helpers
 
+**Implementation status**
+
+Status: planned, not implemented in the current `dev-feature` branch. The
+implementation plan is `docs/plans/2026-05-04-direct-ipc-control-helpers-rust.md`.
+Keep this section as a pending downshift until Python no longer owns raw UDS
+socket probing, copied signal/frame constants, or socket-path derivation.
+
 **Current Python ownership**
 
 `sdk/python/src/c_two/transport/client/util.py` manually builds UDS control
@@ -194,6 +215,13 @@ This strengthens direct IPC independence. These helpers must live under
 - Invalid IPC addresses are rejected through Rust validation.
 
 ### P1. Process runtime/session state
+
+**Implementation status**
+
+Status: planned, not implemented in the current `dev-feature` branch. The
+implementation plan is `docs/plans/2026-05-05-runtime-session-rust-authority.md`.
+Keep this section as a pending downshift until a Rust runtime/session owner is
+present in code and Python no longer owns an independent process runtime state.
 
 **Current Python ownership**
 
