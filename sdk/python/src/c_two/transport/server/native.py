@@ -485,7 +485,24 @@ class NativeServerBridge:
                         'resource_input',
                     )
                 mv = memoryview(request_buf)
-                result = method(mv)
+                released = False
+
+                def release_fn():
+                    nonlocal released
+                    if not released:
+                        released = True
+                        mv.release()
+                        try:
+                            request_buf.release()
+                        except Exception:
+                            pass
+
+                try:
+                    result = method(mv, _release_fn=release_fn)
+                except Exception:
+                    if not released:
+                        release_fn()
+                    raise
 
                 nonlocal hold_dispatch_count
                 hold_dispatch_count += 1

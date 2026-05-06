@@ -637,6 +637,29 @@ class TestCrmToComBufferModes:
         result = wrapped(crm, pickle.dumps(42), _release_fn=lambda: released.append(True))
         assert released, '_release_fn must be called even on error'
 
+    def test_resource_input_deserialize_failure_remains_resource_deserialize_input(self):
+        from c_two import error
+
+        @cc.transferable
+        class BadDeserializeIn:
+            def serialize(val: int) -> bytes:
+                return pickle.dumps(val)
+
+            def deserialize(data) -> int:
+                raise RuntimeError('bad resource input deserialize')
+
+        wrapped = self._setup(BadDeserializeIn, buffer='view')
+        crm = self._make_icrm()
+        err_bytes, result_bytes = wrapped(
+            crm,
+            pickle.dumps(42),
+            _release_fn=lambda: None,
+        )
+        restored = error.CCError.deserialize(err_bytes)
+        assert isinstance(restored, error.ResourceDeserializeInput)
+        assert 'bad resource input deserialize' in str(restored)
+        assert result_bytes == b''
+
     def test_transfer_wrapper_has_buffer_mode_attrs(self):
         """transfer_wrapper should expose _input_buffer_mode."""
         @cc.transferable

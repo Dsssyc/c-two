@@ -471,14 +471,17 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
                 raise error.ClientDeserializeOutput(str(e)) from e
 
     def crm_to_com(*args, _release_fn=None):
-        # Select input deserializer based on buffer mode
+        # Select input construction hook based on buffer mode.
         if input is not None:
             if buffer == 'hold' and hasattr(input, 'from_buffer') and callable(input.from_buffer):
                 input_fn = input.from_buffer
+                input_hook = 'from_buffer'
             else:
                 input_fn = input.deserialize
+                input_hook = 'deserialize'
         else:
             input_fn = None
+            input_hook = None
         output_transferable = output.serialize if output else None
         input_buffer_mode = buffer
 
@@ -521,13 +524,21 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
 
         except Exception as e:
             result = None
-            if _release_fn is not None:
+            should_release_input = (
+                _release_fn is not None
+                and (input_buffer_mode == 'view' or stage == 'deserialize_input')
+            )
+            if should_release_input:
                 try:
                     _release_fn()
+                    _release_fn = None
                 except Exception:
                     pass
             if stage == 'deserialize_input':
-                err = error.ResourceDeserializeInput(str(e))
+                if input_hook == 'from_buffer':
+                    err = error.ResourceInputFromBuffer(str(e))
+                else:
+                    err = error.ResourceDeserializeInput(str(e))
             elif stage == 'execute_function':
                 err = error.ResourceExecuteFunction(str(e))
             else:

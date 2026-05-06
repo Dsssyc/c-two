@@ -151,6 +151,79 @@ def test_resource_input_hold_counts_inline_or_shm_until_request_buffer_release()
     assert cc.hold_stats()["by_direction"]["resource_input"]["active_holds"] == 0
 
 
+class FailingRetainInputResource:
+    def __init__(self) -> None:
+        self.retained = []
+
+    def echo(self, data: BytesView) -> BytesView:
+        self.retained.append(data.data)
+        raise RuntimeError("boom after retaining input")
+
+
+def test_resource_input_hold_execute_failure_preserves_retained_view_until_resource_releases():
+    settings.shm_threshold = 1024
+    resource = FailingRetainInputResource()
+    cc.register(InputHoldCRM, resource, name="failing_input_hold")
+    cc.serve(blocking=False)
+    address = cc.server_address()
+    assert address is not None
+    client = cc.connect(InputHoldCRM, name="failing_input_hold", address=address)
+    try:
+        with pytest.raises(cc.error.ResourceExecuteFunction) as exc_info:
+            client.echo(BytesView(b"x" * 8192))
+        assert "boom after retaining input" in str(exc_info.value)
+        assert cc.hold_stats()["by_direction"]["resource_input"]["active_holds"] >= 1
+        assert bytes(resource.retained[0][:4]) == b"xxxx"
+        resource.retained.clear()
+        gc.collect()
+        assert cc.hold_stats()["by_direction"]["resource_input"]["active_holds"] == 0
+    finally:
+        cc.close(client)
+
+
+@cc.transferable
+class BadInputFromBuffer:
+    data: memoryview | bytes
+
+    def serialize(value: "BadInputFromBuffer") -> bytes:
+        return bytes(value.data)
+
+    def deserialize(data: memoryview) -> "BadInputFromBuffer":
+        return BadInputFromBuffer(bytes(data))
+
+    def from_buffer(data: memoryview) -> "BadInputFromBuffer":
+        raise RuntimeError("bad resource input from_buffer")
+
+
+@cc.crm(namespace="cc.test.bad_input_from_buffer", version="0.1.0")
+class BadInputCRM:
+    @cc.transfer(input=BadInputFromBuffer, output=BytesView, buffer="hold")
+    def echo(self, data: BadInputFromBuffer) -> BytesView:
+        ...
+
+
+class BadInputResource:
+    def echo(self, data: BadInputFromBuffer) -> BytesView:
+        return BytesView(b"unreachable")
+
+
+def test_resource_input_from_buffer_failure_uses_specific_error_and_releases_request(monkeypatch):
+    settings.shm_threshold = 1024
+    monkeypatch.delenv("C2_RELAY_ADDRESS", raising=False)
+    cc.register(BadInputCRM, BadInputResource(), name="bad_input_from_buffer")
+    cc.serve(blocking=False)
+    address = cc.server_address()
+    assert address is not None
+    client = cc.connect(BadInputCRM, name="bad_input_from_buffer", address=address)
+    try:
+        with pytest.raises(cc.error.ResourceInputFromBuffer) as exc_info:
+            client.echo(BadInputFromBuffer(b"x" * 8192))
+        assert "bad resource input from_buffer" in str(exc_info.value)
+        assert cc.hold_stats()["by_direction"]["resource_input"]["active_holds"] == 0
+    finally:
+        cc.close(client)
+
+
 @cc.crm(namespace="cc.test.grid_like_buffer_lease", version="0.1.0")
 class GridLikeCRM:
     @cc.transfer(output=BytesView)
