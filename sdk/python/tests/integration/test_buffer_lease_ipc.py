@@ -46,6 +46,29 @@ class PayloadResource:
         return BytesView(b"x" * size)
 
 
+@cc.transferable
+class BytesDeserializeOnly:
+    data: bytes
+
+    def serialize(value: "BytesDeserializeOnly") -> bytes:
+        return value.data
+
+    def deserialize(data: memoryview) -> "BytesDeserializeOnly":
+        return BytesDeserializeOnly(bytes(data))
+
+
+@cc.crm(namespace="cc.test.buffer_lease_deserialize_only", version="0.1.0")
+class DeserializeOnlyPayloadCRM:
+    @cc.transfer(output=BytesDeserializeOnly)
+    def payload(self, size: int) -> BytesDeserializeOnly:
+        ...
+
+
+class DeserializeOnlyPayloadResource:
+    def payload(self, size: int) -> BytesDeserializeOnly:
+        return BytesDeserializeOnly(b"x" * size)
+
+
 def _connect_payload():
     address = cc.server_address()
     assert address is not None
@@ -93,6 +116,31 @@ def test_client_hold_shm_response_counts_and_releases_without_relay(monkeypatch)
             )
             assert isinstance(held.value.data, memoryview)
             assert bytes(held.value.data[:4]) == b"xxxx"
+        finally:
+            held.release()
+        assert cc.hold_stats()["active_holds"] == 0
+    finally:
+        cc.close(client)
+
+
+@pytest.mark.parametrize("size", [16, 8192])
+def test_client_hold_deserialize_only_response_counts_until_release(monkeypatch, size):
+    settings.shm_threshold = 1024
+    monkeypatch.delenv("C2_RELAY_ADDRESS", raising=False)
+    route_name = f"deserialize_only_payload_{size}"
+    cc.register(DeserializeOnlyPayloadCRM, DeserializeOnlyPayloadResource(), name=route_name)
+    cc.serve(blocking=False)
+    address = cc.server_address()
+    assert address is not None
+    client = cc.connect(DeserializeOnlyPayloadCRM, name=route_name, address=address)
+    try:
+        held = cc.hold(client.payload)(size)
+        try:
+            assert held.value.data == b"x" * size
+            stats = cc.hold_stats()
+            assert stats["active_holds"] == 1
+            assert stats["by_direction"]["client_response"]["active_holds"] == 1
+            assert stats["total_held_bytes"] == size
         finally:
             held.release()
         assert cc.hold_stats()["active_holds"] == 0

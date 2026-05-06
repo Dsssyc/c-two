@@ -800,6 +800,50 @@ class TestComToCrmBufferModes:
         result.release()
         assert mock_resp.released
 
+    def test_hold_output_deserialize_success_tracks_retained_response_until_release(self):
+        from c_two import _native
+        from c_two.crm.transferable import _build_transfer_wrapper, HeldResult
+
+        tracker = _native.BufferLeaseTracker()
+
+        @cc.transferable
+        class DeserializeOnlyOut:
+            def serialize(val: int) -> bytes:
+                return pickle.dumps(val)
+
+            def deserialize(data) -> int:
+                return pickle.loads(bytes(data))
+
+        response = self._make_retained_response(pickle.dumps(42), tracker)
+
+        class MockClient:
+            supports_direct_call = False
+            lease_tracker = tracker
+            route_name = 'mock_route'
+
+            def call(self, method, data):
+                return response
+
+        class MockCRM:
+            direction = '->'
+            client = MockClient()
+
+        def fn(self) -> int: ...
+
+        wrapped = _build_transfer_wrapper(fn, input=None, output=DeserializeOnlyOut)
+        result = wrapped(MockCRM(), _c2_buffer='hold')
+
+        assert isinstance(result, HeldResult)
+        assert result.value == 42
+        assert not response.released
+        assert tracker.stats()['active_holds'] == 1
+        assert tracker.stats()['by_direction']['client_response']['active_holds'] == 1
+
+        result.release()
+
+        assert response.released
+        assert tracker.stats()['active_holds'] == 0
+
     def test_hold_output_from_buffer_failure_raises_specific_error_and_releases_response(self):
         from c_two import _native
         from c_two import error

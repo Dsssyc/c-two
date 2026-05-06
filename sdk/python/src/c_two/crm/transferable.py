@@ -415,7 +415,7 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
                 if _c2_buffer == 'hold':
                     try:
                         result = output_fn(mv)
-                        if output_hook == 'from_buffer' and hasattr(response, 'track_retained'):
+                        if hasattr(response, 'track_retained'):
                             tracker = getattr(client, 'lease_tracker', None)
                             if tracker is not None:
                                 route_name = getattr(client, 'route_name', '')
