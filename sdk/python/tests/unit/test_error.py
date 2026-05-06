@@ -2,8 +2,10 @@ import pytest
 import c_two.error as error
 from c_two.error import (
     ERROR_Code, CCBaseError, CCError,
-    ResourceDeserializeInput, ResourceSerializeOutput, ResourceExecuteFunction,
-    ClientSerializeInput, ClientDeserializeOutput, ClientCallResource,
+    ResourceDeserializeInput, ResourceInputFromBuffer,
+    ResourceSerializeOutput, ResourceExecuteFunction,
+    ClientSerializeInput, ClientDeserializeOutput, ClientOutputFromBuffer,
+    ClientCallResource,
     ResourceAlreadyRegistered, StaleResource, WriteConflict,
 )
 
@@ -14,15 +16,17 @@ class TestERRORCode:
         assert ERROR_Code.ERROR_AT_RESOURCE_INPUT_DESERIALIZING == 1
         assert ERROR_Code.ERROR_AT_RESOURCE_OUTPUT_SERIALIZING == 2
         assert ERROR_Code.ERROR_AT_RESOURCE_FUNCTION_EXECUTING == 3
+        assert ERROR_Code.ERROR_AT_RESOURCE_INPUT_FROM_BUFFER == 4
         assert ERROR_Code.ERROR_AT_CLIENT_INPUT_SERIALIZING == 5
         assert ERROR_Code.ERROR_AT_CLIENT_OUTPUT_DESERIALIZING == 6
         assert ERROR_Code.ERROR_AT_CLIENT_CALLING_RESOURCE == 7
+        assert ERROR_Code.ERROR_AT_CLIENT_OUTPUT_FROM_BUFFER == 8
         assert ERROR_Code.ERROR_RESOURCE_ALREADY_REGISTERED == 703
         assert ERROR_Code.ERROR_STALE_RESOURCE == 704
         assert ERROR_Code.ERROR_WRITE_CONFLICT == 706
 
-    def test_has_exactly_13_members(self):
-        assert len(ERROR_Code) == 13
+    def test_has_exactly_15_members(self):
+        assert len(ERROR_Code) == 15
 
     def test_values_are_unique(self):
         values = [e.value for e in ERROR_Code]
@@ -128,10 +132,12 @@ class TestCCErrorSerialization:
 
 SUBCLASS_PARAMS = [
     (ResourceDeserializeInput,   ERROR_Code.ERROR_AT_RESOURCE_INPUT_DESERIALIZING,    'deserializing input at resource'),
+    (ResourceInputFromBuffer,    ERROR_Code.ERROR_AT_RESOURCE_INPUT_FROM_BUFFER,      'constructing resource input from buffer'),
     (ResourceSerializeOutput,    ERROR_Code.ERROR_AT_RESOURCE_OUTPUT_SERIALIZING,     'serializing output at resource'),
     (ResourceExecuteFunction,    ERROR_Code.ERROR_AT_RESOURCE_FUNCTION_EXECUTING,     'executing function at resource'),
     (ClientSerializeInput,   ERROR_Code.ERROR_AT_CLIENT_INPUT_SERIALIZING,    'serializing input at client'),
     (ClientDeserializeOutput,ERROR_Code.ERROR_AT_CLIENT_OUTPUT_DESERIALIZING, 'deserializing output at client'),
+    (ClientOutputFromBuffer,  ERROR_Code.ERROR_AT_CLIENT_OUTPUT_FROM_BUFFER,  'constructing client output from buffer'),
     (ClientCallResource,       ERROR_Code.ERROR_AT_CLIENT_CALLING_RESOURCE,          'calling resource from client'),
 ]
 
@@ -166,10 +172,12 @@ class TestErrorSubclasses:
 
 ALL_SUBCLASSES = [
     error.ResourceDeserializeInput,
+    error.ResourceInputFromBuffer,
     error.ResourceSerializeOutput,
     error.ResourceExecuteFunction,
     error.ClientSerializeInput,
     error.ClientDeserializeOutput,
+    error.ClientOutputFromBuffer,
     error.ClientCallResource,
 ]
 
@@ -199,6 +207,21 @@ class TestSubclassDeserialization:
         assert isinstance(result, ResourceAlreadyRegistered)
         assert result.code == ERROR_Code.ERROR_RESOURCE_ALREADY_REGISTERED
         assert result.message == "Route name already registered: 'grid'"
+
+    def test_from_buffer_errors_round_trip_to_specific_subclasses(self):
+        resource_err = ResourceInputFromBuffer("bad input view")
+        restored_resource = CCError.deserialize(CCError.serialize(resource_err))
+        assert isinstance(restored_resource, ResourceInputFromBuffer)
+        assert restored_resource.code == ERROR_Code.ERROR_AT_RESOURCE_INPUT_FROM_BUFFER
+        assert "constructing resource input from buffer" in restored_resource.message
+        assert "bad input view" in restored_resource.message
+
+        client_err = ClientOutputFromBuffer("bad output view")
+        restored_client = CCError.deserialize(CCError.serialize(client_err))
+        assert isinstance(restored_client, ClientOutputFromBuffer)
+        assert restored_client.code == ERROR_Code.ERROR_AT_CLIENT_OUTPUT_FROM_BUFFER
+        assert "constructing client output from buffer" in restored_client.message
+        assert "bad output view" in restored_client.message
 
     def test_future_mesh_errors_round_trip(self):
         stale = StaleResource("grid stale")
@@ -242,9 +265,11 @@ class TestNativeErrorRegistryParity:
             "ERROR_AT_RESOURCE_INPUT_DESERIALIZING": ("ResourceInputDeserializing", 1),
             "ERROR_AT_RESOURCE_OUTPUT_SERIALIZING": ("ResourceOutputSerializing", 2),
             "ERROR_AT_RESOURCE_FUNCTION_EXECUTING": ("ResourceFunctionExecuting", 3),
+            "ERROR_AT_RESOURCE_INPUT_FROM_BUFFER": ("ResourceInputFromBuffer", 4),
             "ERROR_AT_CLIENT_INPUT_SERIALIZING": ("ClientInputSerializing", 5),
             "ERROR_AT_CLIENT_OUTPUT_DESERIALIZING": ("ClientOutputDeserializing", 6),
             "ERROR_AT_CLIENT_CALLING_RESOURCE": ("ClientCallingResource", 7),
+            "ERROR_AT_CLIENT_OUTPUT_FROM_BUFFER": ("ClientOutputFromBuffer", 8),
             "ERROR_RESOURCE_NOT_FOUND": ("ResourceNotFound", 701),
             "ERROR_RESOURCE_UNAVAILABLE": ("ResourceUnavailable", 702),
             "ERROR_RESOURCE_ALREADY_REGISTERED": ("ResourceAlreadyRegistered", 703),

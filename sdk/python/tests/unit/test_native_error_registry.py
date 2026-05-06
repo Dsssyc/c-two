@@ -5,6 +5,8 @@ def test_native_error_registry_exposes_canonical_codes():
     registry = _native.error_registry()
     assert registry["Unknown"] == 0
     assert registry["ResourceNotFound"] == 701
+    assert registry["ResourceInputFromBuffer"] == 4
+    assert registry["ClientOutputFromBuffer"] == 8
     assert registry["ResourceUnavailable"] == 702
     assert registry["ResourceAlreadyRegistered"] == 703
     assert registry["StaleResource"] == 704

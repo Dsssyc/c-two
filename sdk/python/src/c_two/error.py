@@ -8,9 +8,11 @@ _NATIVE_TO_PY_ERROR_NAMES = {
     "ResourceInputDeserializing": "ERROR_AT_RESOURCE_INPUT_DESERIALIZING",
     "ResourceOutputSerializing": "ERROR_AT_RESOURCE_OUTPUT_SERIALIZING",
     "ResourceFunctionExecuting": "ERROR_AT_RESOURCE_FUNCTION_EXECUTING",
+    "ResourceInputFromBuffer": "ERROR_AT_RESOURCE_INPUT_FROM_BUFFER",
     "ClientInputSerializing": "ERROR_AT_CLIENT_INPUT_SERIALIZING",
     "ClientOutputDeserializing": "ERROR_AT_CLIENT_OUTPUT_DESERIALIZING",
     "ClientCallingResource": "ERROR_AT_CLIENT_CALLING_RESOURCE",
+    "ClientOutputFromBuffer": "ERROR_AT_CLIENT_OUTPUT_FROM_BUFFER",
     "ResourceNotFound": "ERROR_RESOURCE_NOT_FOUND",
     "ResourceUnavailable": "ERROR_RESOURCE_UNAVAILABLE",
     "ResourceAlreadyRegistered": "ERROR_RESOURCE_ALREADY_REGISTERED",
@@ -105,6 +107,11 @@ class ResourceDeserializeInput(CCError):
         message = 'Error occurred when deserializing input at resource' + (f':\n{message}' if message else '')
         super().__init__(code=ERROR_Code.ERROR_AT_RESOURCE_INPUT_DESERIALIZING, message=message)
 
+class ResourceInputFromBuffer(CCError):
+    def __init__(self, message: str | None = None):
+        message = 'Error occurred when constructing resource input from buffer' + (f':\n{message}' if message else '')
+        super().__init__(code=ERROR_Code.ERROR_AT_RESOURCE_INPUT_FROM_BUFFER, message=message)
+
 class ResourceSerializeOutput(CCError):
     def __init__(self, message: str | None = None):
         message = 'Error occurred when serializing output at resource' + (f':\n{message}' if message else '')
@@ -124,6 +131,11 @@ class ClientDeserializeOutput(CCError):
     def __init__(self, message: str | None = None):
         message = 'Error occurred when deserializing output at client' + (f':\n{message}' if message else '')
         super().__init__(code=ERROR_Code.ERROR_AT_CLIENT_OUTPUT_DESERIALIZING, message=message)
+
+class ClientOutputFromBuffer(CCError):
+    def __init__(self, message: str | None = None):
+        message = 'Error occurred when constructing client output from buffer' + (f':\n{message}' if message else '')
+        super().__init__(code=ERROR_Code.ERROR_AT_CLIENT_OUTPUT_FROM_BUFFER, message=message)
 
 class ClientCallResource(CCError):
     def __init__(self, message: str | None = None):
@@ -180,10 +192,12 @@ class WriteConflict(CCError):
 
 _CODE_TO_CLASS: dict[int, type] = {
     ERROR_Code.ERROR_AT_RESOURCE_INPUT_DESERIALIZING: ResourceDeserializeInput,
+    ERROR_Code.ERROR_AT_RESOURCE_INPUT_FROM_BUFFER:    ResourceInputFromBuffer,
     ERROR_Code.ERROR_AT_RESOURCE_OUTPUT_SERIALIZING:  ResourceSerializeOutput,
     ERROR_Code.ERROR_AT_RESOURCE_FUNCTION_EXECUTING:  ResourceExecuteFunction,
     ERROR_Code.ERROR_AT_CLIENT_INPUT_SERIALIZING:     ClientSerializeInput,
     ERROR_Code.ERROR_AT_CLIENT_OUTPUT_DESERIALIZING:  ClientDeserializeOutput,
+    ERROR_Code.ERROR_AT_CLIENT_OUTPUT_FROM_BUFFER:    ClientOutputFromBuffer,
     ERROR_Code.ERROR_AT_CLIENT_CALLING_RESOURCE:      ClientCallResource,
     ERROR_Code.ERROR_RESOURCE_NOT_FOUND:               ResourceNotFound,
     ERROR_Code.ERROR_RESOURCE_UNAVAILABLE:             ResourceUnavailable,
