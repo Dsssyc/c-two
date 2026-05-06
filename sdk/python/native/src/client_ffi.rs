@@ -16,9 +16,10 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
+use crate::lease_ffi::PyBufferLeaseTracker;
 use c2_config::{BaseIpcConfig, ClientIpcConfig};
 use c2_ipc::{ClientPool, IpcError, ResponseData, ServerPoolState, SyncClient};
-use c2_mem::MemPool;
+use c2_mem::{BufferLeaseGuard, MemPool};
 
 // ---------------------------------------------------------------------------
 // CrmCallError — custom exception carrying serialised error bytes
@@ -56,6 +57,7 @@ enum ResponseBufferInner {
 #[pyclass(name = "ResponseBuffer", frozen)]
 pub struct PyResponseBuffer {
     inner: Mutex<Option<ResponseBufferInner>>,
+    lease: Mutex<Option<BufferLeaseGuard>>,
     data_len: usize,
     exports: AtomicU32,
 }
@@ -88,8 +90,23 @@ impl PyResponseBuffer {
         };
         Self {
             inner: Mutex::new(Some(inner)),
+            lease: Mutex::new(None),
             data_len,
             exports: AtomicU32::new(0),
+        }
+    }
+
+    fn storage_label_for_inner(inner: &ResponseBufferInner) -> &'static str {
+        match inner {
+            ResponseBufferInner::Inline(_) => "inline",
+            ResponseBufferInner::Shm { .. } => "shm",
+            ResponseBufferInner::Handle { handle, .. } => {
+                if handle.is_file_spill() {
+                    "file_spill"
+                } else {
+                    "handle"
+                }
+            }
         }
     }
 }
@@ -158,7 +175,11 @@ impl PyResponseBuffer {
                 "cannot release: buffer is currently exported as memoryview",
             ));
         }
-        match guard.take() {
+        let inner = guard.take();
+        self.lease.lock().take();
+        drop(guard);
+
+        match inner {
             Some(ResponseBufferInner::Shm {
                 pool,
                 seg_idx,
@@ -183,6 +204,32 @@ impl PyResponseBuffer {
             Some(ResponseBufferInner::Inline(_)) => Ok(()),
             None => Ok(()), // already released, idempotent
         }
+    }
+
+    #[pyo3(signature = (tracker, route_name, method_name, direction="client_response"))]
+    fn track_retained(
+        &self,
+        tracker: &PyBufferLeaseTracker,
+        route_name: &str,
+        method_name: &str,
+        direction: &str,
+    ) -> PyResult<()> {
+        let guard = self.inner.lock();
+        let Some(inner) = guard.as_ref() else {
+            return Ok(());
+        };
+        let storage = Self::storage_label_for_inner(inner);
+        let lease_guard = tracker.track_retained_guard(
+            route_name,
+            method_name,
+            direction,
+            storage,
+            self.data_len,
+        )?;
+        let mut current = self.lease.lock();
+        current.take();
+        *current = Some(lease_guard);
+        Ok(())
     }
 
     /// Buffer protocol — enables memoryview(response).
@@ -267,7 +314,11 @@ impl Drop for PyResponseBuffer {
     fn drop(&mut self) {
         // Auto-release SHM/Handle if Python forgot to call release()
         let mut guard = self.inner.lock();
-        match guard.take() {
+        let inner = guard.take();
+        self.lease.lock().take();
+        drop(guard);
+
+        match inner {
             Some(ResponseBufferInner::Shm {
                 pool,
                 seg_idx,

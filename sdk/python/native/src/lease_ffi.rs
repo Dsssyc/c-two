@@ -21,6 +21,24 @@ pub struct PyBufferLease {
 }
 
 impl PyBufferLeaseTracker {
+    pub(crate) fn track_retained_guard(
+        &self,
+        route_name: &str,
+        method_name: &str,
+        direction: &str,
+        storage: &str,
+        bytes: usize,
+    ) -> PyResult<BufferLeaseGuard> {
+        Ok(self.inner.track(BufferLeaseMeta {
+            route_name: route_name.to_string(),
+            method_name: method_name.to_string(),
+            direction: parse_direction(direction)?,
+            retention: LeaseRetention::Retained,
+            storage: parse_storage(storage)?,
+            bytes,
+        }))
+    }
+
     pub(crate) fn stats_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let stats = self.inner.stats();
         let dict = PyDict::new(py);
@@ -126,14 +144,8 @@ impl PyBufferLeaseTracker {
         storage: &str,
         bytes: usize,
     ) -> PyResult<PyBufferLease> {
-        let guard = self.inner.track(BufferLeaseMeta {
-            route_name: route_name.to_string(),
-            method_name: method_name.to_string(),
-            direction: parse_direction(direction)?,
-            retention: LeaseRetention::Retained,
-            storage: parse_storage(storage)?,
-            bytes,
-        });
+        let guard =
+            self.track_retained_guard(route_name, method_name, direction, storage, bytes)?;
         Ok(PyBufferLease {
             guard: parking_lot::Mutex::new(Some(guard)),
         })
