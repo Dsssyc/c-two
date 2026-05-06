@@ -660,6 +660,34 @@ class TestCrmToComBufferModes:
         assert 'bad resource input deserialize' in str(restored)
         assert result_bytes == b''
 
+    def test_resource_output_serialize_failure_is_resource_serialize_output(self):
+        from c_two import error
+        from c_two.crm.transferable import _build_transfer_wrapper
+
+        def echo(self, x: int) -> int: ...
+
+        input_trans = create_default_transferable(echo, is_input=True)
+
+        @cc.transferable
+        class BadOutput:
+            def serialize(value: int) -> bytes:
+                raise RuntimeError('bad resource output serialize')
+
+            def deserialize(data) -> int:
+                return 0
+
+        wrapped = _build_transfer_wrapper(echo, input=input_trans, output=BadOutput)
+        crm = self._make_icrm()
+        err_bytes, result_bytes = wrapped(
+            crm,
+            pickle.dumps(42),
+            _release_fn=lambda: None,
+        )
+        restored = error.CCError.deserialize(err_bytes)
+        assert isinstance(restored, error.ResourceSerializeOutput)
+        assert 'bad resource output serialize' in str(restored)
+        assert result_bytes == b''
+
     def test_transfer_wrapper_has_buffer_mode_attrs(self):
         """transfer_wrapper should expose _input_buffer_mode."""
         @cc.transferable

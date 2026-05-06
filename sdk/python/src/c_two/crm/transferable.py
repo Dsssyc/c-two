@@ -544,13 +544,18 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
             else:
                 err = error.ResourceSerializeOutput(str(e))
 
-        serialized_error = error.CCError.serialize(err)
         serialized_result = b''
-        if output_transferable is not None and result is not None:
-            serialized_result = (
-                output_transferable(*result) if isinstance(result, tuple)
-                else output_transferable(result)
-            )
+        if err is None and output_transferable is not None and result is not None:
+            try:
+                serialized_result = (
+                    output_transferable(*result) if isinstance(result, tuple)
+                    else output_transferable(result)
+                )
+            except Exception as e:
+                err = error.ResourceSerializeOutput(str(e))
+                serialized_result = b''
+
+        serialized_error = error.CCError.serialize(err)
         return (serialized_error, serialized_result)
 
     @wraps(func)
