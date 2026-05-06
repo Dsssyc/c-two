@@ -15,6 +15,8 @@ mod http_ffi;
 #[cfg(feature = "python")]
 mod ipc_control_ffi;
 #[cfg(feature = "python")]
+mod lease_ffi;
+#[cfg(feature = "python")]
 mod mem_ffi;
 #[cfg(feature = "python")]
 mod route_concurrency_ffi;
@@ -42,6 +44,7 @@ fn c2_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     client_ffi::register_module(m)?;
     ipc_control_ffi::register_module(m)?;
     http_ffi::register_module(m)?;
+    lease_ffi::register_module(m)?;
     mem_ffi::register_module(m)?;
     route_concurrency_ffi::register_module(m)?;
     runtime_session_ffi::register_module(m)?;
