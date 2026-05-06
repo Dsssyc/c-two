@@ -138,12 +138,12 @@ pub enum C2ErrorDecodeError {
 impl fmt::Display for C2ErrorDecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            C2ErrorDecodeError::InvalidUtf8 => f.write_str("invalid legacy C2 error UTF-8"),
+            C2ErrorDecodeError::InvalidUtf8 => f.write_str("invalid C2 error wire UTF-8"),
             C2ErrorDecodeError::MissingSeparator => {
-                f.write_str("invalid legacy C2 error: missing ':' separator")
+                f.write_str("invalid C2 error wire payload: missing ':' separator")
             }
             C2ErrorDecodeError::InvalidCode(code) => {
-                write!(f, "invalid legacy C2 error code: {code}")
+                write!(f, "invalid C2 error wire code: {code}")
             }
         }
     }
@@ -163,11 +163,11 @@ impl C2Error {
         Self::new(ErrorCode::Unknown, message)
     }
 
-    pub fn to_legacy_bytes(&self) -> Vec<u8> {
+    pub fn to_wire_bytes(&self) -> Vec<u8> {
         format!("{}:{}", u16::from(self.code), self.message).into_bytes()
     }
 
-    pub fn from_legacy_bytes(data: &[u8]) -> Result<Option<Self>, C2ErrorDecodeError> {
+    pub fn from_wire_bytes(data: &[u8]) -> Result<Option<Self>, C2ErrorDecodeError> {
         if data.is_empty() {
             return Ok(None);
         }
@@ -202,7 +202,7 @@ mod tests {
     use super::{C2Error, ErrorCode};
 
     #[test]
-    fn canonical_error_codes_match_python_compatibility_values() {
+    fn canonical_error_codes_match_wire_values() {
         assert_eq!(u16::from(ErrorCode::Unknown), 0);
         assert_eq!(u16::from(ErrorCode::ResourceInputDeserializing), 1);
         assert_eq!(u16::from(ErrorCode::ResourceOutputSerializing), 2);
@@ -253,19 +253,19 @@ mod tests {
     }
 
     #[test]
-    fn legacy_encode_matches_existing_python_format() {
+    fn wire_encode_matches_canonical_error_wire_format() {
         let err = C2Error::new(ErrorCode::ResourceAlreadyRegistered, "grid exists");
-        assert_eq!(err.to_legacy_bytes(), b"703:grid exists");
+        assert_eq!(err.to_wire_bytes(), b"703:grid exists");
     }
 
     #[test]
-    fn legacy_decode_empty_bytes_means_no_error() {
-        assert_eq!(C2Error::from_legacy_bytes(b"").unwrap(), None);
+    fn wire_decode_empty_bytes_means_no_error() {
+        assert_eq!(C2Error::from_wire_bytes(b"").unwrap(), None);
     }
 
     #[test]
-    fn legacy_decode_known_code_returns_canonical_error() {
-        let err = C2Error::from_legacy_bytes(b"701:missing grid")
+    fn wire_decode_known_code_returns_canonical_error() {
+        let err = C2Error::from_wire_bytes(b"701:missing grid")
             .unwrap()
             .unwrap();
         assert_eq!(err.code, ErrorCode::ResourceNotFound);
@@ -273,8 +273,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_decode_preserves_colons_in_message() {
-        let err = C2Error::from_legacy_bytes(b"0:host:port:extra")
+    fn wire_decode_preserves_colons_in_message() {
+        let err = C2Error::from_wire_bytes(b"0:host:port:extra")
             .unwrap()
             .unwrap();
         assert_eq!(err.code, ErrorCode::Unknown);
@@ -282,8 +282,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_decode_unknown_code_degrades_to_unknown_with_context() {
-        let err = C2Error::from_legacy_bytes(b"9999:low-level relay failure")
+    fn wire_decode_unknown_code_degrades_to_unknown_with_context() {
+        let err = C2Error::from_wire_bytes(b"9999:low-level relay failure")
             .unwrap()
             .unwrap();
         assert_eq!(err.code, ErrorCode::Unknown);
@@ -294,8 +294,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_decode_malformed_code_fails() {
-        let err = C2Error::from_legacy_bytes(b"abc:not a number").unwrap_err();
-        assert_eq!(err.to_string(), "invalid legacy C2 error code: abc");
+    fn wire_decode_malformed_code_fails() {
+        let err = C2Error::from_wire_bytes(b"abc:not a number").unwrap_err();
+        assert_eq!(err.to_string(), "invalid C2 error wire code: abc");
     }
 }
