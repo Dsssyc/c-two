@@ -387,10 +387,15 @@ same CRM contract with different instances, can coexist under distinct names.
 ### Error Handling
 
 Errors are modeled as `CCError` subclasses with numeric `ERROR_Code` values.
-Errors serialize to and from bytes for wire transfer. Error classes are named
-by location, for example `ResourceDeserializeInput`, `ClientSerializeInput`,
-`ResourceExecuteFunction`, and `ClientCallResource`. Enum values live under
-`ERROR_AT_RESOURCE_*` and `ERROR_AT_CLIENT_*`.
+Rust `core/foundation/c2-error` owns the canonical error registry and
+`code:message` wire codec. Python generates `ERROR_Code` from
+`_native.error_registry()` and delegates `CCError.serialize()` /
+`CCError.deserialize()` to `_native.encode_error_wire()` and
+`_native.decode_error_wire_parts()`. Do not reintroduce Python-side parsing of
+the error wire payload, and do not use or add legacy-named error codec APIs.
+Error classes are named by location, for example `ResourceDeserializeInput`,
+`ClientSerializeInput`, `ResourceExecuteFunction`, and `ClientCallResource`.
+Enum values live under `ERROR_AT_RESOURCE_*` and `ERROR_AT_CLIENT_*`.
 
 ### Naming
 
