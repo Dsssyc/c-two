@@ -132,3 +132,21 @@ def test_error_facade_does_not_reimplement_wire_codec():
     assert "_native.error_registry" in source
     assert "_native.encode_error_wire" in source
     assert "_native.decode_error_wire_parts" in source
+
+
+def test_python_does_not_own_buffer_lease_accounting():
+    root = Path(__file__).resolve().parents[2] / "src" / "c_two"
+    offenders = []
+    forbidden = [
+        "class HoldRegistry",
+        "weakref.ref(request_buf",
+        "_hold_registry",
+        "_entries",
+        "total_held_bytes +=",
+    ]
+    for path in root.rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        for needle in forbidden:
+            if needle in text:
+                offenders.append(f"{path.relative_to(root)}:{needle}")
+    assert offenders == []

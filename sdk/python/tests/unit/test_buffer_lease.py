@@ -8,6 +8,7 @@ def test_runtime_session_hold_stats_are_native_and_available_without_server():
     assert stats["total_held_bytes"] == 0
     assert stats["oldest_hold_seconds"] == 0
     assert set(stats["by_storage"]) == {"inline", "shm", "handle", "file_spill"}
+    assert set(stats["by_direction"]) == {"client_response", "resource_input"}
 
 
 def test_runtime_session_lease_tracker_is_shared_by_stats():

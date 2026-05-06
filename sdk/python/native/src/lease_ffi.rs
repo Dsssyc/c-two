@@ -63,6 +63,20 @@ impl PyBufferLeaseTracker {
             by_storage.set_item(storage.as_str(), storage_stats_dict(py, &value)?)?;
         }
         dict.set_item("by_storage", by_storage)?;
+
+        let by_direction = PyDict::new(py);
+        for direction in [
+            LeaseDirection::ClientResponse,
+            LeaseDirection::ResourceInput,
+        ] {
+            let value = stats
+                .by_direction
+                .get(&direction)
+                .cloned()
+                .unwrap_or_default();
+            by_direction.set_item(direction.as_str(), direction_stats_dict(py, &value)?)?;
+        }
+        dict.set_item("by_direction", by_direction)?;
         Ok(dict)
     }
 
@@ -120,6 +134,18 @@ fn parse_direction(direction: &str) -> PyResult<LeaseDirection> {
 fn storage_stats_dict<'py>(
     py: Python<'py>,
     stats: &c2_mem::StorageLeaseStats,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("active_leases", stats.active_leases)?;
+    dict.set_item("active_holds", stats.active_holds)?;
+    dict.set_item("total_leased_bytes", stats.total_leased_bytes)?;
+    dict.set_item("total_held_bytes", stats.total_held_bytes)?;
+    Ok(dict)
+}
+
+fn direction_stats_dict<'py>(
+    py: Python<'py>,
+    stats: &c2_mem::DirectionLeaseStats,
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item("active_leases", stats.active_leases)?;

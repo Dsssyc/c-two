@@ -212,6 +212,7 @@ impl PyRuntimeSession {
                 server_ipc_overrides_to_dict(py, &overrides)?,
             )?;
         }
+        kwargs.set_item("lease_tracker", self.lease_tracker())?;
         let server = class.call((), Some(&kwargs))?;
         let server_obj = server.unbind();
         *self.server_bridge.lock() = Some(server_obj.clone_ref(py));

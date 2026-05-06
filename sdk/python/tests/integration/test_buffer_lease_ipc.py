@@ -112,3 +112,39 @@ def test_client_hold_drop_releases_retained_response():
         assert cc.hold_stats()["active_holds"] == 0
     finally:
         cc.close(client)
+
+
+@cc.crm(namespace="cc.test.buffer_lease_input", version="0.1.0")
+class InputHoldCRM:
+    @cc.transfer(input=BytesView, output=BytesView, buffer="hold")
+    def echo(self, data: BytesView) -> BytesView:
+        ...
+
+
+class InputHoldResource:
+    def __init__(self) -> None:
+        self.retained = []
+
+    def echo(self, data: BytesView) -> BytesView:
+        self.retained.append(data.data)
+        return BytesView(data.data[:4])
+
+
+def test_resource_input_hold_counts_inline_or_shm_until_request_buffer_release():
+    settings.shm_threshold = 1024
+    resource = InputHoldResource()
+    cc.register(InputHoldCRM, resource, name="input_hold")
+    cc.serve(blocking=False)
+    address = cc.server_address()
+    assert address is not None
+    client = cc.connect(InputHoldCRM, name="input_hold", address=address)
+    try:
+        result = client.echo(BytesView(b"x" * 8192))
+        assert bytes(result.data) == b"xxxx"
+        stats = cc.hold_stats()
+        assert stats["by_direction"]["resource_input"]["active_holds"] >= 1
+        resource.retained.clear()
+        gc.collect()
+    finally:
+        cc.close(client)
+    assert cc.hold_stats()["by_direction"]["resource_input"]["active_holds"] == 0

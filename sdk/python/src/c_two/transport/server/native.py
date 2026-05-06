@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import math
 import os
 import threading
 import time
@@ -23,7 +24,6 @@ from c_two.config.ipc import ServerIPCOverrides, _resolve_server_ipc_config
 from ..wire import MethodTable
 from .scheduler import ConcurrencyConfig, Scheduler
 from .reply import unpack_resource_result
-from .hold_registry import HoldRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +96,7 @@ class NativeServerBridge:
         ipc_overrides: ServerIPCOverrides | None = None,
         name: str | None = None,
         hold_warn_seconds: float = 60.0,
+        lease_tracker: object | None = None,
     ) -> None:
         self._config = _resolve_server_ipc_config(ipc_overrides)
         self._address = bind_address
@@ -107,7 +108,18 @@ class NativeServerBridge:
         self._default_name: str | None = None
         self._started = False
 
-        self._hold_registry = HoldRegistry(warn_threshold=hold_warn_seconds)
+        if lease_tracker is None:
+            from c_two._native import BufferLeaseTracker
+            lease_tracker = BufferLeaseTracker()
+        self._lease_tracker = lease_tracker
+        self._hold_warn_seconds = float(hold_warn_seconds)
+        if (
+            not math.isfinite(self._hold_warn_seconds)
+            or self._hold_warn_seconds < 0.0
+        ):
+            raise ValueError(
+                'hold_warn_seconds must be a non-negative finite number',
+            )
         self._hold_sweep_interval = 10
 
         from c_two._native import RustServer
@@ -401,8 +413,8 @@ class NativeServerBridge:
             )
 
     def hold_stats(self) -> dict:
-        """Return hold-mode SHM tracking statistics."""
-        return self._hold_registry.stats()
+        """Return retained runtime buffer tracking statistics."""
+        return dict(self._lease_tracker.stats())
 
     # ------------------------------------------------------------------
     # Dispatch callable factory
@@ -425,7 +437,8 @@ class NativeServerBridge:
         dispatch_table = slot._dispatch_table
         shm_threshold = self._shm_threshold
 
-        hold_registry = self._hold_registry
+        lease_tracker = self._lease_tracker
+        hold_warn_seconds = self._hold_warn_seconds
         hold_sweep_interval = self._hold_sweep_interval
         hold_dispatch_count = 0
 
@@ -464,24 +477,35 @@ class NativeServerBridge:
                     if not released:
                         release_fn()
             else:  # hold
+                if lease_tracker is not None and hasattr(request_buf, 'track_retained'):
+                    request_buf.track_retained(
+                        lease_tracker,
+                        route_name,
+                        method_name,
+                        'resource_input',
+                    )
                 mv = memoryview(request_buf)
-                try:
-                    result = method(mv)
-                finally:
-                    if not getattr(request_buf, 'is_inline', False):
-                        hold_registry.track(request_buf, method_name, route_name)
+                result = method(mv)
 
                 nonlocal hold_dispatch_count
                 hold_dispatch_count += 1
-                if hold_dispatch_count % hold_sweep_interval == 0:
-                    for stale in hold_registry.sweep():
-                        age = time.monotonic() - stale.created_at
+                should_sweep_holds = (
+                    lease_tracker is not None
+                    and hold_dispatch_count % hold_sweep_interval == 0
+                )
+                if should_sweep_holds:
+                    for stale in lease_tracker.sweep_retained(hold_warn_seconds):
+                        if stale.get('direction') != 'resource_input':
+                            continue
                         logger.warning(
-                            "Hold-mode SHM buffer pinned for %.1fs — "
-                            "route=%s method=%s size=%d bytes. "
-                            "CRM may be storing buffer-backed views.",
-                            age, stale.route_name, stale.method_name,
-                            stale.data_len,
+                            "Retained resource input buffer pinned for %.1fs — "
+                            "route=%s method=%s storage=%s size=%d bytes. "
+                            "Resource may be storing buffer-backed views.",
+                            stale['age_seconds'],
+                            stale['route_name'],
+                            stale['method_name'],
+                            stale['storage'],
+                            stale['bytes'],
                         )
 
             # 3. Unpack result

@@ -332,8 +332,6 @@ class TestServerNameCollision:
         bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
         bridge._default_name = None  # noqa: SLF001
         bridge._started = False  # noqa: SLF001
-        bridge._hold_registry = object()  # noqa: SLF001
-        bridge._hold_sweep_interval = 10  # noqa: SLF001
         bridge._shm_threshold = 1024  # noqa: SLF001
         bridge._default_concurrency = ConcurrencyConfig(max_workers=1)  # noqa: SLF001
         bridge._rust_server = FakeRustServer()  # noqa: SLF001

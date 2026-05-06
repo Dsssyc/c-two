@@ -37,7 +37,7 @@ impl LeaseRetention {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LeaseDirection {
     ClientResponse,
     ResourceInput,
@@ -76,6 +76,14 @@ pub struct StorageLeaseStats {
     pub total_held_bytes: usize,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DirectionLeaseStats {
+    pub active_leases: usize,
+    pub active_holds: usize,
+    pub total_leased_bytes: usize,
+    pub total_held_bytes: usize,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct BufferLeaseStats {
     pub active_leases: usize,
@@ -84,6 +92,7 @@ pub struct BufferLeaseStats {
     pub total_held_bytes: usize,
     pub oldest_hold_seconds: f64,
     pub by_storage: BTreeMap<BufferStorage, StorageLeaseStats>,
+    pub by_direction: BTreeMap<LeaseDirection, DirectionLeaseStats>,
 }
 
 #[derive(Debug, Clone)]
@@ -170,12 +179,21 @@ impl BufferLeaseTracker {
             storage.total_leased_bytes =
                 storage.total_leased_bytes.saturating_add(entry.meta.bytes);
 
+            let direction = stats.by_direction.entry(entry.meta.direction).or_default();
+            direction.active_leases = direction.active_leases.saturating_add(1);
+            direction.total_leased_bytes = direction
+                .total_leased_bytes
+                .saturating_add(entry.meta.bytes);
+
             if entry.meta.retention == LeaseRetention::Retained {
                 stats.active_holds = stats.active_holds.saturating_add(1);
                 stats.total_held_bytes = stats.total_held_bytes.saturating_add(entry.meta.bytes);
                 storage.active_holds = storage.active_holds.saturating_add(1);
                 storage.total_held_bytes =
                     storage.total_held_bytes.saturating_add(entry.meta.bytes);
+                direction.active_holds = direction.active_holds.saturating_add(1);
+                direction.total_held_bytes =
+                    direction.total_held_bytes.saturating_add(entry.meta.bytes);
 
                 let age = now.duration_since(entry.created_at).as_secs_f64();
                 if age > stats.oldest_hold_seconds {
@@ -326,5 +344,44 @@ mod tests {
         assert_eq!(stats.total_leased_bytes, 4096);
         drop(guard);
         assert_eq!(tracker.stats().active_leases, 0);
+    }
+
+    #[test]
+    fn retained_leases_are_counted_by_direction() {
+        let tracker = BufferLeaseTracker::new(false);
+        let _client = tracker.track(BufferLeaseMeta {
+            route_name: "grid".to_string(),
+            method_name: "read".to_string(),
+            direction: LeaseDirection::ClientResponse,
+            retention: LeaseRetention::Retained,
+            storage: BufferStorage::Inline,
+            bytes: 32,
+        });
+        let _resource = tracker.track(BufferLeaseMeta {
+            route_name: "grid".to_string(),
+            method_name: "write".to_string(),
+            direction: LeaseDirection::ResourceInput,
+            retention: LeaseRetention::Retained,
+            storage: BufferStorage::Shm,
+            bytes: 64,
+        });
+
+        let stats = tracker.stats();
+        assert_eq!(
+            stats
+                .by_direction
+                .get(&LeaseDirection::ClientResponse)
+                .unwrap()
+                .active_holds,
+            1
+        );
+        assert_eq!(
+            stats
+                .by_direction
+                .get(&LeaseDirection::ResourceInput)
+                .unwrap()
+                .total_held_bytes,
+            64
+        );
     }
 }

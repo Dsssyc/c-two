@@ -23,7 +23,7 @@ pub use dedicated::DedicatedSegment;
 pub use handle::MemHandle;
 pub use lease::{
     BufferLeaseGuard, BufferLeaseMeta, BufferLeaseSnapshot, BufferLeaseStats, BufferLeaseTracker,
-    BufferStorage, LeaseDirection, LeaseRetention, StorageLeaseStats,
+    BufferStorage, DirectionLeaseStats, LeaseDirection, LeaseRetention, StorageLeaseStats,
 };
 pub use pool::{FreeResult, MemPool};
 pub use segment::ShmRegion;
