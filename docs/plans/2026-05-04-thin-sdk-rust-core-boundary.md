@@ -316,32 +316,41 @@ mapping for `CCError.deserialize()`.
   UTF-8 status strings, so issue1/3 route outcomes remain compatible with
   the issue4 decoder.
 
-### P2. Hold-mode lease tracking
+### P2. SDK-visible buffer lease lifecycle
 
-**Current Python ownership**
+**Implemented ownership**
 
-`sdk/python/src/c_two/transport/server/hold_registry.py` tracks hold-mode SHM
-buffers with weakrefs, ages, warning thresholds, and stats.
+Status: implemented on `dev-feature` by
+`docs/plans/2026-05-06-unified-buffer-lease-rust-authority.md`.
 
-**Why this is partly core behavior**
+Rust `core/foundation/c2-mem` owns SDK-visible buffer lease accounting for
+runtime-owned buffers exposed to language SDKs. Inline, SHM, handle, and
+file-spill buffers are storage tiers; transient view mode and retained hold
+mode are retention policies. Python keeps `cc.hold()`, `HeldResult`,
+`from_buffer()` orchestration, and warning presentation, but retained entry
+state, byte totals, ages, storage/direction aggregation, and stale snapshots
+come from native accounting.
 
-The generic part is lease accounting: which SHM handles are retained, how long
-they have been retained, and how much memory is pinned. Python weakrefs are only
-one binding-specific notification mechanism.
+Client-side `cc.hold()` is the primary retained lease path. Resource-side
+`@cc.transfer(..., buffer="hold")` input retention uses the same native tracker
+as a diagnostic path. Inline retained buffers are counted because they can back
+zero-copy `memoryview` outputs through native-owned `Vec<u8>`; they are reported
+separately from SHM-backed retained buffers so memory pressure diagnostics stay
+accurate.
 
-**Implementation sketch**
+**Verified coverage**
 
-1. Add a Rust/native hold lease tracker keyed by SHM handle identity.
-2. Keep Python weakref callbacks only as binding hooks that release or mark
-   leases.
-3. Expose `hold_stats()` from native accounting.
-4. Remove duplicate Python-only sweep state after native tracking is complete.
-
-**Required tests**
-
-- Hold-mode SHM memory is counted while a Python view is retained.
-- Stats decrease after release/GC.
-- Warnings include route, method, bytes, and age.
+- Inline client-response `cc.hold()` counts as a retained lease and releases on
+  `HeldResult.release()` / context manager / GC fallback.
+- SHM or handle client-response `cc.hold()` uses the same API and releases
+  through the existing `ResponseBuffer.release()` memory path.
+- Resource-side input hold uses the same native retained tracker without
+  Python weakref accounting.
+- `hold_stats()` works without a Python server object and reports storage and
+  direction breakdowns.
+- Direct IPC retained buffers remain relay-independent.
+- Default view mode still releases immediately and does not materialize payloads
+  or add retained accounting overhead.
 
 ### P2. Server route slot lifecycle and readiness
 

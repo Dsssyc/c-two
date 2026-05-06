@@ -205,7 +205,6 @@ relay-aware route fallback.
 | `server/native.py` | `NativeServerBridge` exported as `Server` |
 | `server/scheduler.py` | `ConcurrencyConfig` facade plus thin native route-concurrency adapter for same-process direct calls |
 | `server/reply.py` | `unpack_icrm_result` and `wrap_error` |
-| `server/hold_registry.py` | Weakref-based tracking of hold-mode SHM buffers |
 | `client/proxy.py` | `CRMProxy` for thread-local, IPC, and HTTP modes |
 | `client/util.py` | Thin native-backed `ping()` and `shutdown()` probes for direct IPC |
 
@@ -273,6 +272,10 @@ Memory subsystem:
 
 - Allocation tiers: buddy SHM, dedicated SHM, file spill.
 - `MemHandle` abstracts buddy, dedicated, and file-spill handles.
+- `c2-mem` owns SDK-visible buffer lease accounting. Lease tracking records
+  metadata and retention state only; it must not read payload bytes, allocate a
+  second buffer, or replace `MemPool::free_at()` / `release_handle()` as the
+  memory release authority.
 - SHM segment names are deterministic:
   `{prefix}_b{idx:04x}` for buddy and `{prefix}_d{idx:04x}` for dedicated.
 - Server lazy-opens peer segments from prefix and index. There is no explicit
@@ -367,6 +370,11 @@ class MyResource:
 `cc.hold()` wraps a CRM proxy bound method for client-side SHM retention. It
 returns `HeldResult` with `.value` and `.release()`. Safety layers are explicit
 release, context manager, and `__del__` fallback.
+
+Retained buffer accounting is Rust-owned. `cc.hold()` and `HeldResult` are
+Python SDK facades over native SDK-visible buffer leases. Inline, SHM, handle,
+and file-spill buffers can all be retained leases; do not special-case hold as
+SHM-only and do not reintroduce Python weakref registries for held buffers.
 
 ```python
 with cc.hold(proxy.method)(args) as held:
