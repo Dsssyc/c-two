@@ -37,7 +37,7 @@ Required invariants:
 C-Two already has the main language-neutral layers in Rust:
 
 - `core/foundation/c2-config`: environment/default/config resolution.
-- `core/foundation/c2-error`: canonical error code registry and legacy bytes.
+- `core/foundation/c2-error`: canonical error code registry and wire bytes.
 - `core/foundation/c2-mem`: SHM pool, buddy/dedicated/file-spill handles.
 - `core/protocol/c2-wire`: wire frame, handshake, control, signal, chunk codec.
 - `core/transport/c2-ipc`: direct IPC client, client pool, SHM/chunk transfer.
@@ -248,33 +248,42 @@ works when relay is absent.
 - Relay register failure does not leave split-brain local/Rust route state.
 - Explicit unregister preserves local correctness even if relay cleanup fails.
 
-### P1. Canonical error registry and legacy bytes
+### P1. Canonical error registry and wire bytes
 
-**Current Python ownership**
+**Implemented ownership**
 
-`sdk/python/src/c_two/error.py` duplicates the numeric error enum and implements
-legacy `code:message` serialization/deserialization in Python.
+Status: implemented on `dev-feature` by
+`docs/plans/2026-05-06-canonical-error-rust-authority.md`.
 
-**Existing Rust support**
+Rust `core/foundation/c2-error` owns the canonical error code registry and the
+canonical `code:message` error wire bytes. The format is named `wire`, not
+`legacy`, because it is still the active C-Two error payload format. Python
+keeps only SDK presentation: `ERROR_Code` as a public enum facade generated
+from `_native.error_registry()`, Python exception subclasses, and subclass
+mapping for `CCError.deserialize()`.
 
-`core/foundation/c2-error` already defines canonical error codes, names,
-registry, and legacy encode/decode. `sdk/python/native/src/error_ffi.rs` already
-exposes `error_registry()`, `decode_error_legacy()`, and
-`encode_error_legacy()`.
+**Copy constraints**
 
-**Implementation sketch**
+- Python `CCError.deserialize(...)` passes the input buffer directly to native
+  decode and does not call `memoryview.tobytes()` or `bytes(data)` first.
+- Native decode returns only `(code, message)` for the SDK hot path. It does
+  not allocate a dict or return the error name for normal Python exception
+  construction.
+- Native encode writes `code:message` directly into the Python bytes allocation
+  and avoids an intermediate Rust `Vec<u8>` where practical.
+- Python malformed-payload presentation remains SDK-owned: native parser errors
+  become `CCError(ERROR_UNKNOWN, "Malformed error payload: ...")` instead of
+  leaking native `ValueError` through user-facing call paths.
 
-1. Generate or load Python `ERROR_Code` values from native `error_registry()`.
-2. Make `CCError.serialize()` call native `encode_error_legacy()`.
-3. Make `CCError.deserialize()` call native `decode_error_legacy()` and map
-   the result to Python exception subclasses.
-4. Remove duplicated parser edge-case logic from Python after parity tests pass.
+**Verified coverage**
 
-**Required tests**
-
-- All Python error code values match Rust registry.
-- Legacy bytes remain byte-for-byte compatible.
-- Unknown numeric codes map to `ERROR_UNKNOWN` with the same message semantics.
+- All Python `ERROR_Code` values match the Rust registry.
+- `CCError.serialize()` uses native `encode_error_wire()`.
+- `CCError.deserialize()` uses native `decode_error_wire_parts()` without a
+  Python pre-copy.
+- Unknown numeric codes map to `ERROR_UNKNOWN` with canonical Rust context.
+- Malformed wire payloads keep Python public behavior.
+- Boundary tests prevent Python from reimplementing the `code:message` parser.
 
 ### P2. Hold-mode lease tracking
 
