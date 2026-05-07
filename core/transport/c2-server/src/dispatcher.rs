@@ -28,7 +28,9 @@ impl std::error::Error for CrmError {}
 /// Metadata describing how the CRM callback produced its response.
 ///
 /// Returned by `CrmCallback::invoke()`. The server reads these coordinates
-/// to build the reply frame — no payload data crosses the FFI boundary.
+/// or owned bytes to build the reply frame. For language bindings, large
+/// buffer-like outputs should be prepared through Rust response helpers before
+/// falling back to owned inline bytes.
 #[derive(Debug)]
 pub enum ResponseMeta {
     /// CRM wrote result into response SHM (via pool.alloc + pool.write).
@@ -38,7 +40,10 @@ pub enum ResponseMeta {
         data_size: u32,
         is_dedicated: bool,
     },
-    /// Small result returned as inline bytes (< shm_threshold).
+    /// Owned response bytes awaiting native transport selection.
+    ///
+    /// `send_response_meta()` may still choose buddy SHM or chunked transport
+    /// for this data based on the server IPC config.
     Inline(Vec<u8>),
     /// Method returned None / empty.
     Empty,

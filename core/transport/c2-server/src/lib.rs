@@ -2,6 +2,7 @@ pub mod config;
 pub mod connection;
 pub mod dispatcher;
 pub mod heartbeat;
+pub mod response;
 pub mod scheduler;
 pub mod server;
 
