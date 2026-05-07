@@ -105,7 +105,6 @@ def test_low_level_server_uses_env_for_global_transport_policy(monkeypatch):
 
     server = Server(bind_address='ipc://unit_env_threshold')
     try:
-        assert server._shm_threshold == 8192  # noqa: SLF001
         assert server._config['shm_threshold'] == 8192  # noqa: SLF001
     finally:
         server.shutdown()
@@ -118,7 +117,6 @@ def test_transport_policy_override_beats_env(monkeypatch):
 
     server = Server(bind_address='ipc://unit_policy_override')
     try:
-        assert server._shm_threshold == 16384  # noqa: SLF001
         assert server._config['shm_threshold'] == 16384  # noqa: SLF001
     finally:
         server.shutdown()

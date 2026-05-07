@@ -84,7 +84,7 @@ code, not merely planned in a separate implementation document.
 | 4 | Canonical error registry and wire bytes | Implemented | See `docs/plans/2026-05-06-canonical-error-rust-authority.md`; Rust `c2-error` owns registry/wire bytes and Python delegates through native codec bindings. |
 | 5 | SDK-visible buffer lease lifecycle | Implemented | See `docs/plans/2026-05-06-unified-buffer-lease-rust-authority.md`; `c2-mem` owns retained buffer lease accounting and Python exposes only hold/result facades. |
 | 6 | Server route slot lifecycle and readiness | Implemented | See `docs/plans/2026-05-07-server-readiness-rust-authority.md`; `c2-server` owns readiness, lifecycle transitions, socket unlink authority, and shutdown barriers. |
-| 7 | Response allocation decision | Planned next | See `docs/plans/2026-05-07-response-allocation-rust-authority.md`; implementation must remove Python response-pool allocation and move low-copy buffer preparation into Rust native/core. |
+| 7 | Response allocation decision | Implemented | See `docs/plans/2026-05-07-response-allocation-rust-authority.md`; Python response-pool allocation was removed and low-copy response buffer preparation now lives in Rust native/core. |
 | 8 | IPC config validation duplication | Backlog | Python still duplicates IPC override key validation that should be delegated to native config resolution. |
 | 9 | Native method table facade | Backlog / low priority | Method discovery remains language-specific enough that this should only proceed if it removes real duplicated wire authority. |
 
@@ -448,31 +448,37 @@ transient `Stopping` after `RustServer.shutdown()` returns.
 
 ### P2. Response allocation decision
 
-**Current Python ownership**
+**Implemented ownership**
 
-Python dispatcher checks `len(res_part) > shm_threshold`, allocates response
-pool memory through the native pool object, writes bytes, and returns SHM
-coordinates.
+Status: implemented on `dev-feature` by
+`docs/plans/2026-05-07-response-allocation-rust-authority.md`.
 
-**Why this may move lower**
+Python dispatcher now returns only `None` or serialized bytes-like data after
+CRM method execution. It no longer receives a native response pool object,
+compares `len(res_part)` against `shm_threshold`, writes response SHM, returns
+SHM coordinate tuples, or converts `memoryview` outputs with `bytes(...)` for
+transport.
 
-The response transport choice is generic: inline vs buddy SHM vs chunked reply.
-Rust already performs this decision for `ResponseMeta::Inline` in
-`c2-server`. Python should ideally return result bytes or memoryview and let
-native server choose the reply path.
+Rust `c2-server::response::try_prepare_shm_response()` owns threshold-based
+large response SHM preparation and post-allocation cleanup. PyO3
+`parse_response_meta()` accepts `bytes` and generic `PyBuffer<u8>` exporters,
+attempts direct Python-buffer-to-response-SHM writes for large outputs, and
+only materializes owned inline bytes for small outputs or SHM allocation
+fallback. Existing `send_response_meta()` remains the final inline / buddy SHM
+/ chunked transport selector for owned bytes.
 
-**Copy constraint**
+**Verified coverage**
 
-Moving this lower must not introduce extra copies for large transferable output.
-If Python serialization already produced bytes, Rust can choose SHM reply from
-those bytes. If Python can expose a memoryview, native should consume that view
-directly where safe instead of forcing `bytes(memoryview)`.
-
-**Required tests**
-
-- Large Python result uses SHM reply.
-- `memoryview` result does not get forced through an avoidable Python bytes
-  copy when a safe direct native write path exists.
+- Rust helper tests cover below-threshold no-allocation behavior, large
+  direct SHM writes, allocation-failure fallback, and cleanup after copy
+  failure.
+- Direct IPC integration tests cover large `bytes` responses, large
+  `memoryview` responses, and small inline responses through `cc.hold()`
+  retained storage accounting.
+- Boundary tests prevent Python response-pool allocation and PyO3 SHM
+  coordinate tuple parsing from being reintroduced.
+- Direct IPC response allocation remains relay-independent, including with a
+  bad relay environment variable.
 
 ### P2. IPC config validation duplication
 

@@ -194,8 +194,9 @@ Path: `sdk/python/src/c_two/transport/`
 The Python transport layer is a thin orchestration shell around a Rust-native
 core. Python handles CRM registration, Python callback dispatch, serialization
 orchestration, and same-process direct-call glue. Rust handles IPC, wire
-framing, SHM, route concurrency enforcement, runtime session state, HTTP relay transport, and
-relay-aware route fallback.
+framing, SHM, response allocation/transport selection, route concurrency
+enforcement, runtime session state, HTTP relay transport, and relay-aware route
+fallback.
 
 | File | Purpose |
 | --- | --- |
@@ -499,9 +500,14 @@ opening. The buddy allocator's `alloc()` and `free_at()` are thread-safe.
 When changing remote dispatch or scheduler code, keep the SHM request path as
 `RequestData::Shm` / `RequestData::Handle` to `PyShmBuffer` to Python
 `memoryview`; do not materialize SHM or handle payloads into Python `bytes`
-before invoking resource code. Thread-local same-process calls must continue to
-pass Python objects directly instead of being routed through Rust serialized
-dispatch for symmetry.
+before invoking resource code. Response allocation follows the same boundary:
+Python server dispatch may return serialized `bytes` or buffer-protocol data,
+but must not receive native response pools, compare result length against
+`shm_threshold`, return SHM coordinate tuples, or call `bytes(memoryview)` for
+transport. Native PyO3/c2-server response preparation must attempt large-buffer
+SHM writes before materializing owned inline bytes. Thread-local same-process
+calls must continue to pass Python objects directly instead of being routed
+through Rust serialized dispatch for symmetry.
 
 ## Environment Variables
 

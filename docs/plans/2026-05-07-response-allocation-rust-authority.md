@@ -1,6 +1,6 @@
 # Response Allocation Rust Authority Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Move Python IPC response allocation decisions out of the Python SDK and into Rust-native response preparation without adding payload copies for large transferable outputs.
 
@@ -8,7 +8,15 @@
 
 **Tech Stack:** Rust `core/transport/c2-server`, PyO3 bindings in `sdk/python/native/src/server_ffi.rs`, Python SDK dispatch glue in `sdk/python/src/c_two/transport/server/native.py`, pytest unit/integration tests, Cargo tests.
 
-**Implementation status:** Design only; not implemented.
+**Implementation status:** Implemented on `dev-feature`.
+
+**Final implementation note:** The implemented design keeps the wire format
+unchanged. `c2-server::response::try_prepare_shm_response()` returns existing
+`ResponseMeta::ShmAlloc` metadata for successful large SHM preparation and
+`Ok(None)` for allocation fallback so existing `send_response_meta()` can still
+choose chunked/inline transport from owned bytes. PyO3 removed the internal
+tuple compatibility path entirely and now treats dispatcher outputs as `None`,
+`bytes`, or `PyBuffer<u8>`.
 
 ---
 
@@ -86,7 +94,7 @@ This has four boundary problems:
 - Read: `sdk/python/tests/integration/test_buffer_lease_ipc.py`
 - Read: `sdk/python/tests/integration/test_ipc_buddy_reply.py`
 
-- [ ] **Step 1: Confirm the worktree baseline**
+- [x] **Step 1: Confirm the worktree baseline**
 
 Run:
 
@@ -96,7 +104,7 @@ git status --short --branch
 
 Expected: branch is `dev-feature`. If previous issue6 changes are still uncommitted, commit or intentionally keep them grouped before editing issue7 code.
 
-- [ ] **Step 2: Record current Python response-allocation ownership**
+- [x] **Step 2: Record current Python response-allocation ownership**
 
 Run:
 
@@ -108,7 +116,7 @@ rg -n "response_pool|shm_threshold|len\(res_part\)|write_from_buffer|bytes\(res_
 
 Expected before implementation: matches show Python dispatcher threshold/allocation logic and PyO3 tuple parsing. Expected after implementation: these matches disappear from the Python dispatcher and `parse_response_meta()` path except for unrelated config construction or comments that do not preserve the old protocol.
 
-- [ ] **Step 3: Run baseline focused tests**
+- [x] **Step 3: Run baseline focused tests**
 
 Run:
 
@@ -133,7 +141,7 @@ Expected: baseline passes before changing behavior. If failures appear, debug th
 - Modify: `core/transport/c2-server/src/lib.rs`
 - Test: inline unit tests in `core/transport/c2-server/src/response.rs`
 
-- [ ] **Step 1: Write failing Rust tests for native response preparation**
+- [x] **Step 1: Write failing Rust tests for native response preparation**
 
 Add tests that assert these exact behaviors:
 
@@ -150,7 +158,7 @@ cargo test --manifest-path core/Cargo.toml -p c2-server response:: -q
 
 Expected: tests fail because the helper does not exist yet.
 
-- [ ] **Step 2: Implement `try_prepare_shm_response`**
+- [x] **Step 2: Implement `try_prepare_shm_response`**
 
 Implement a helper with this responsibility and shape:
 
@@ -175,7 +183,7 @@ Required behavior:
 - Return `ResponseMeta::ShmAlloc` with `seg_idx`, `offset`, `data_size`, and `is_dedicated` copied from the allocation and requested payload length.
 - Reject lengths that cannot be represented by the current buddy response wire `u32 data_size`; do not silently truncate.
 
-- [ ] **Step 3: Export the helper module**
+- [x] **Step 3: Export the helper module**
 
 If a new `response.rs` module is used, add it to `core/transport/c2-server/src/lib.rs`:
 
@@ -185,7 +193,7 @@ pub mod response;
 
 Do not expose Python-specific types from this module. The helper must be reusable by future Rust, Go, and Fortran SDK bindings as a length + write-callback abstraction.
 
-- [ ] **Step 4: Run Rust helper tests**
+- [x] **Step 4: Run Rust helper tests**
 
 Run:
 
@@ -196,7 +204,7 @@ cargo test --manifest-path core/Cargo.toml -p c2-server -q
 
 Expected: all `c2-server` tests pass.
 
-- [ ] **Step 5: Strict review Task 1**
+- [x] **Step 5: Strict review Task 1**
 
 Review the diff and verify:
 
@@ -214,7 +222,7 @@ Review the diff and verify:
 - Modify: `core/transport/c2-server/src/server.rs` if a threshold accessor is needed
 - Test: `cargo check --manifest-path sdk/python/native/Cargo.toml -q`
 
-- [ ] **Step 1: Add native response threshold projection**
+- [x] **Step 1: Add native response threshold projection**
 
 Expose a small method on `c2_server::Server` if needed:
 
@@ -226,7 +234,7 @@ pub fn response_shm_threshold(&self) -> u64 {
 
 Use this in `PyServer::build_route()` to store the threshold on `PyCrmCallback`. Do not pass the threshold to Python.
 
-- [ ] **Step 2: Remove cached Python `MemPool` response object**
+- [x] **Step 2: Remove cached Python `MemPool` response object**
 
 Remove `response_pool_obj: Py<PyAny>` from `PyCrmCallback`, remove `PyMemPool::from_arc(...)` construction in `PyServer::build_route()`, and remove the now-unused `use crate::mem_ffi::PyMemPool;` import if no other code needs it. Keep the `response_pool` parameter passed by the language-neutral `CrmCallback::invoke()` trait and forward that pool into `parse_response_meta(...)`.
 
@@ -244,7 +252,7 @@ match self.py_callable.call1(py, args) {
 }
 ```
 
-- [ ] **Step 3: Replace tuple parser with buffer parser**
+- [x] **Step 3: Replace tuple parser with buffer parser**
 
 Change `parse_response_meta(...)` so it accepts:
 
@@ -254,7 +262,7 @@ Change `parse_response_meta(...)` so it accepts:
 
 Remove `PyTuple` parsing entirely. A tuple return should now produce an internal error that says the dispatcher must return `None` or a bytes-like buffer, not SHM coordinates.
 
-- [ ] **Step 4: Preserve low-copy behavior for large Python bytes and memoryview**
+- [x] **Step 4: Preserve low-copy behavior for large Python bytes and memoryview**
 
 For large `PyBytes`, call `try_prepare_shm_response(...)` with a writer closure that copies from `bytes.as_bytes()` directly into the SHM destination slice.
 
@@ -262,7 +270,7 @@ For large generic `PyBuffer<u8>`, call `try_prepare_shm_response(...)` with a wr
 
 Only materialize a Rust `Vec<u8>` when the helper returns `Ok(None)` or the payload is at/below threshold.
 
-- [ ] **Step 5: Compile native bindings**
+- [x] **Step 5: Compile native bindings**
 
 Run:
 
@@ -274,7 +282,7 @@ cargo check --manifest-path sdk/python/native/Cargo.toml -q
 
 Expected: compile succeeds without unused imports. If PyO3 `PyBuffer` acquisition requires a different 0.28 API shape, adjust the binding code without moving parsing back into Python.
 
-- [ ] **Step 6: Strict review Task 2**
+- [x] **Step 6: Strict review Task 2**
 
 Review the diff and verify:
 
@@ -292,7 +300,7 @@ Review the diff and verify:
 - Modify: `sdk/python/src/c_two/transport/server/reply.py` if type hints need broadening
 - Test: `sdk/python/tests/unit/test_sdk_boundary.py`
 
-- [ ] **Step 1: Update dispatcher signature and comments**
+- [x] **Step 1: Update dispatcher signature and comments**
 
 Change `_make_dispatcher()` documentation and nested `dispatch()` signature from:
 
@@ -308,7 +316,7 @@ def dispatch(_route_name: str, method_idx: int, request_buf: object) -> object:
 
 The docstring should state that the dispatcher returns `None` or serialized output bytes-like data, and native Rust chooses the transport allocation.
 
-- [ ] **Step 2: Remove Python response threshold/allocation logic**
+- [x] **Step 2: Remove Python response threshold/allocation logic**
 
 Delete the branch that reads `shm_threshold`, calls `response_pool.alloc(...)`, calls `response_pool.write_from_buffer(...)`, and returns `(seg_idx, offset, data_size, is_dedicated)`.
 
@@ -324,11 +332,11 @@ return res_part
 
 Do not add `bytes(res_part)` in Python. Buffer validation belongs to PyO3.
 
-- [ ] **Step 3: Remove unused `_shm_threshold` server-bridge state**
+- [x] **Step 3: Remove unused `_shm_threshold` server-bridge state**
 
 If `_shm_threshold` is no longer used outside response allocation, remove the attribute assignment from `NativeServerBridge.__init__()`. Keep passing the resolved threshold into `RustServer(...)`; Rust still needs it.
 
-- [ ] **Step 4: Run Python boundary tests**
+- [x] **Step 4: Run Python boundary tests**
 
 Run:
 
@@ -338,7 +346,7 @@ C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_sdk_boundary.py -q --
 
 Expected: existing boundary tests pass before adding issue7-specific guards.
 
-- [ ] **Step 5: Strict review Task 3**
+- [x] **Step 5: Strict review Task 3**
 
 Review the diff and verify:
 
@@ -356,7 +364,7 @@ Review the diff and verify:
 - Add: `sdk/python/tests/integration/test_response_allocation_ipc.py`
 - Possibly modify: `sdk/python/tests/integration/test_ipc_buddy_reply.py` only if overlapping assertions should move to the new file
 
-- [ ] **Step 1: Add source guard for Python response allocation authority**
+- [x] **Step 1: Add source guard for Python response allocation authority**
 
 Add a test to `test_sdk_boundary.py` that inspects `NativeServerBridge` source and fails if the dispatcher contains:
 
@@ -371,23 +379,23 @@ is_dedicated
 
 Scope the search to `NativeServerBridge._make_dispatcher` so unrelated config or docs do not cause false positives.
 
-- [ ] **Step 2: Add source guard for PyO3 tuple compatibility**
+- [x] **Step 2: Add source guard for PyO3 tuple compatibility**
 
 Add a test that reads `sdk/python/native/src/server_ffi.rs` and fails if `parse_response_meta` still accepts tuple SHM coordinates. The guard should reject source patterns such as `PyTuple`, `ShmAlloc` construction from tuple fields, and the error text `seg_idx, offset, data_size` inside the parser.
 
-- [ ] **Step 3: Add large bytes response integration test**
+- [x] **Step 3: Add large bytes response integration test**
 
 Create `sdk/python/tests/integration/test_response_allocation_ipc.py` with a direct IPC CRM that returns a large `bytes` payload above `settings.shm_threshold`. Use `cc.hold(proxy.method)(...)` and assert `cc.hold_stats()` reports one retained `shm`, `handle`, or `file_spill` client-response lease rather than inline storage.
 
-- [ ] **Step 4: Add large memoryview response integration test**
+- [x] **Step 4: Add large memoryview response integration test**
 
 In the same file, define a custom transferable whose `serialize()` returns `memoryview(value.data)` for output. Return a large payload above threshold and assert the held result round-trips through `from_buffer()` without Python-side materialization and with retained storage reported as `shm`, `handle`, or `file_spill`.
 
-- [ ] **Step 5: Preserve small inline behavior**
+- [x] **Step 5: Preserve small inline behavior**
 
 Add a small payload case below threshold and assert hold stats report `inline` storage. This prevents the fix from forcing SHM promotion for every response just to simplify allocation ownership.
 
-- [ ] **Step 6: Run focused tests**
+- [x] **Step 6: Run focused tests**
 
 Run:
 
@@ -403,7 +411,7 @@ C2_RELAY_ADDRESS= uv run pytest \
 
 Expected: all focused tests pass, with no relay dependency.
 
-- [ ] **Step 7: Strict review Task 4**
+- [x] **Step 7: Strict review Task 4**
 
 Review test coverage and verify:
 
@@ -421,19 +429,19 @@ Review test coverage and verify:
 - Modify: `docs/plans/2026-05-07-response-allocation-rust-authority.md`
 - Modify: `AGENTS.md`
 
-- [ ] **Step 1: Update implementation status after code lands**
+- [x] **Step 1: Update implementation status after code lands**
 
 Only after Tasks 1-4 pass, update this plan's status to `Implemented on dev-feature` and add final implementation notes for any review-driven repairs.
 
-- [ ] **Step 2: Update the thin-SDK boundary document**
+- [x] **Step 2: Update the thin-SDK boundary document**
 
 In `docs/plans/2026-05-04-thin-sdk-rust-core-boundary.md`, mark issue7 implemented and link to this plan. Do not mark issue8 or issue9 implemented.
 
-- [ ] **Step 3: Update AGENTS.md guidance**
+- [x] **Step 3: Update AGENTS.md guidance**
 
 Add concise guidance that Rust owns response allocation and transport selection. The Python server dispatcher may return serialized buffers, but must not receive native response pools, compare response length against `shm_threshold`, return SHM coordinate tuples, or materialize `memoryview` outputs for transport.
 
-- [ ] **Step 4: Run full verification**
+- [x] **Step 4: Run full verification**
 
 Run:
 
@@ -447,16 +455,17 @@ C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30 -rs
 git diff --check
 rg -n "response_pool|write_from_buffer|bytes\(res_part\)|PyTuple|seg_idx, offset, data_size|is_dedicated\) tuple" \
   sdk/python/src/c_two/transport/server/native.py \
-  sdk/python/native/src/server_ffi.rs \
   sdk/python/tests/unit/test_sdk_boundary.py
+rg -n "PyTuple|expected 4-element tuple|dispatcher must return None, bytes, or|SHM-allocated response" \
+  sdk/python/native/src/server_ffi.rs
 ```
 
 Expected:
 
 - Formatting/check/test commands pass.
-- The final `rg` only shows boundary-test forbidden strings or unrelated comments that do not preserve the old protocol. If active code still has Python response-pool allocation or PyO3 tuple parsing, the implementation is not complete.
+- The final `rg` only shows boundary-test forbidden strings or unrelated comments that do not preserve the old protocol. Active PyO3 code may still use the Rust `response_pool` argument supplied by `CrmCallback::invoke()`; active Python dispatcher code must not receive it, and active PyO3 parser code must not accept tuple SHM coordinates. If active Python response-pool allocation or PyO3 tuple parsing remains, the implementation is not complete.
 
-- [ ] **Step 5: Final strict review before commit/merge**
+- [x] **Step 5: Final strict review before commit/merge**
 
 Review the final diff and verify:
 
