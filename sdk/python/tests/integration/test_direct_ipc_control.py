@@ -82,3 +82,67 @@ def test_shutdown_stops_direct_ipc_without_relay(monkeypatch):
 def test_control_helpers_reject_invalid_addresses():
     assert ping('tcp://not-ipc', timeout=0.01) is False
     assert shutdown('tcp://not-ipc', timeout=0.01) is False
+
+
+def test_server_start_returns_only_after_direct_ipc_ready(monkeypatch):
+    monkeypatch.delenv('C2_RELAY_ADDRESS', raising=False)
+    address = f'ipc://{_unique_region("ready")}'
+    server = Server(
+        bind_address=address,
+        crm_class=Hello,
+        crm_instance=HelloImpl(),
+        name='hello',
+    )
+    try:
+        server.start(timeout=5.0)
+        assert ping(address, timeout=0.5) is True
+    finally:
+        server.shutdown()
+
+
+def test_server_start_readiness_ignores_bad_relay_env(monkeypatch):
+    monkeypatch.setenv('C2_RELAY_ADDRESS', 'http://127.0.0.1:9')
+    address = f'ipc://{_unique_region("ready_bad_relay")}'
+    server = Server(
+        bind_address=address,
+        crm_class=Hello,
+        crm_instance=HelloImpl(),
+        name='hello',
+    )
+    try:
+        server.start(timeout=5.0)
+        assert ping(address, timeout=0.5) is True
+    finally:
+        server.shutdown()
+
+
+def test_starting_second_server_does_not_unlink_active_socket(monkeypatch):
+    monkeypatch.delenv('C2_RELAY_ADDRESS', raising=False)
+    address = f'ipc://{_unique_region("active")}'
+    first = Server(
+        bind_address=address,
+        crm_class=Hello,
+        crm_instance=HelloImpl(),
+        name='hello',
+    )
+    second = Server(
+        bind_address=address,
+        crm_class=Hello,
+        crm_instance=HelloImpl(),
+        name='hello2',
+    )
+    try:
+        first.start(timeout=5.0)
+        assert ping(address, timeout=0.5) is True
+        with pytest.raises(
+            RuntimeError,
+            match='active listener|address already in use|failed to start',
+        ):
+            second.start(timeout=1.0)
+        assert ping(address, timeout=0.5) is True
+    finally:
+        try:
+            second.shutdown()
+        except Exception:
+            pass
+        first.shutdown()

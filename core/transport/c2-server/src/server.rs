@@ -13,7 +13,7 @@ use std::io::ErrorKind;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -134,6 +134,7 @@ pub struct Server {
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
     lifecycle_tx: watch::Sender<ServerLifecycleState>,
+    socket_bound: AtomicBool,
     conn_counter: AtomicU64,
     /// Sharded chunk reassembly lifecycle manager.
     chunk_registry: Arc<c2_wire::chunk::ChunkRegistry>,
@@ -199,6 +200,7 @@ impl Server {
             shutdown_tx,
             shutdown_rx,
             lifecycle_tx,
+            socket_bound: AtomicBool::new(false),
             conn_counter: AtomicU64::new(0),
             chunk_registry,
             response_pool: Arc::new(parking_lot::RwLock::new(response_pool)),
@@ -245,6 +247,12 @@ impl Server {
     /// Filesystem path of the bound UDS socket.
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+
+    fn remove_owned_socket_file(&self) {
+        if self.socket_bound.swap(false, Ordering::AcqRel) {
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
     }
 
     fn set_lifecycle_state(&self, state: ServerLifecycleState) {
@@ -321,6 +329,7 @@ impl Server {
             std::fs::create_dir_all(IPC_SOCK_DIR)?;
             remove_stale_socket_file(&self.socket_path)?;
             let listener = UnixListener::bind(&self.socket_path)?;
+            self.socket_bound.store(true, Ordering::Release);
             Ok::<UnixListener, ServerError>(listener)
         }
         .await;
@@ -385,7 +394,7 @@ impl Server {
             }
         }
 
-        let _ = std::fs::remove_file(&self.socket_path);
+        self.remove_owned_socket_file();
         self.set_lifecycle_state(ServerLifecycleState::Stopped);
         Ok(())
     }
@@ -396,7 +405,7 @@ impl Server {
             self.set_lifecycle_state(ServerLifecycleState::Stopping);
         }
         let _ = self.shutdown_tx.send(true);
-        let _ = std::fs::remove_file(&self.socket_path);
+        self.remove_owned_socket_file();
     }
 }
 
@@ -1514,6 +1523,42 @@ mod tests {
                 panic!("second server hung instead of rejecting the active socket");
             }
         }
+
+        assert!(first.is_ready());
+        assert!(StdUnixStream::connect(first.socket_path()).is_ok());
+        first.shutdown();
+        first_runner.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_after_failed_bind_does_not_unlink_active_socket() {
+        let address = unique_readiness_address("failed_bind_shutdown");
+        let first = Arc::new(Server::new(&address, ServerIpcConfig::default()).unwrap());
+        let first_runner = {
+            let first = Arc::clone(&first);
+            tokio::spawn(async move { first.run().await })
+        };
+        first
+            .wait_until_ready(Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(StdUnixStream::connect(first.socket_path()).is_ok());
+
+        let second = Arc::new(Server::new(&address, ServerIpcConfig::default()).unwrap());
+        let second_result = tokio::time::timeout(Duration::from_millis(200), {
+            let second = Arc::clone(&second);
+            async move { second.run().await }
+        })
+        .await;
+        let err = second_result
+            .expect("second server hung instead of rejecting the active socket")
+            .expect_err("second bind must fail");
+        assert!(
+            err.to_string().contains("active listener")
+                || err.to_string().contains("address already in use"),
+            "unexpected error: {err}",
+        );
+        second.shutdown();
 
         assert!(first.is_ready());
         assert!(StdUnixStream::connect(first.socket_path()).is_ok());
