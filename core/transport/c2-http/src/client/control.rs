@@ -30,6 +30,7 @@ fn canonical_base_url(base_url: &str) -> String {
 struct RegisterRequest<'a> {
     name: &'a str,
     server_id: &'a str,
+    server_instance_id: &'a str,
     address: &'a str,
     crm_ns: &'a str,
     crm_ver: &'a str,
@@ -46,6 +47,8 @@ pub struct RelayRouteInfo {
     pub name: String,
     pub relay_url: String,
     pub ipc_address: Option<String>,
+    pub server_id: Option<String>,
+    pub server_instance_id: Option<String>,
     pub crm_ns: String,
     pub crm_ver: String,
 }
@@ -108,6 +111,7 @@ impl RelayControlClient {
         &self,
         name: &str,
         server_id: &str,
+        server_instance_id: &str,
         address: &str,
         crm_ns: &str,
         crm_ver: &str,
@@ -115,6 +119,7 @@ impl RelayControlClient {
         let request = RegisterRequest {
             name,
             server_id,
+            server_instance_id,
             address,
             crm_ns,
             crm_ver,
@@ -279,6 +284,8 @@ mod tests {
                     name: "grid".into(),
                     relay_url: "http://relay-a.test".into(),
                     ipc_address: None,
+                    server_id: None,
+                    server_instance_id: None,
                     crm_ns: "".into(),
                     crm_ver: "".into(),
                 }],

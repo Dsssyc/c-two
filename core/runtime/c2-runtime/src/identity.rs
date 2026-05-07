@@ -14,3 +14,7 @@ pub fn auto_server_id() -> String {
     let uuid = uuid::Uuid::new_v4().simple().to_string();
     format!("cc{:x}{uuid}", std::process::id())
 }
+
+pub fn auto_server_instance_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}

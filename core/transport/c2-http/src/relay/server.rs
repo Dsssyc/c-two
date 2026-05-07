@@ -386,7 +386,8 @@ impl RelayServer {
                             continue;
                         }
                         Err(ControlError::InvalidName { reason })
-                        | Err(ControlError::InvalidServerId { reason }) => {
+                        | Err(ControlError::InvalidServerId { reason })
+                        | Err(ControlError::InvalidServerInstanceId { reason }) => {
                             let _ = reply.send(Err(RelayControlError::Other(reason.to_string())));
                             continue;
                         }
@@ -404,10 +405,23 @@ impl RelayServer {
                         };
                         match connect_result {
                             Ok(()) => {
+                                let server_identity_matches = state.config().skip_ipc_validation
+                                    || (client.server_id() == Some(server_id.as_str()));
+                                if !server_identity_matches {
+                                    let _ = reply.send(Err(RelayControlError::Other(format!(
+                                        "IPC server identity mismatch for upstream '{name}'"
+                                    ))));
+                                    continue;
+                                }
+                                let server_instance_id = client
+                                    .server_instance_id()
+                                    .map(ToOwned::to_owned)
+                                    .unwrap_or_else(|| format!("{server_id}-instance"));
                                 let client = Arc::new(client);
                                 match state.commit_register_upstream(
                                     name.clone(),
                                     server_id,
+                                    server_instance_id,
                                     address,
                                     String::new(),
                                     String::new(),

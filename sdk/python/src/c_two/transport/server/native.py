@@ -93,6 +93,8 @@ class NativeServerBridge:
         *,
         ipc_overrides: ServerIPCOverrides | None = None,
         name: str | None = None,
+        server_id: str | None = None,
+        server_instance_id: str | None = None,
         hold_warn_seconds: float = 60.0,
         lease_tracker: object | None = None,
     ) -> None:
@@ -140,6 +142,8 @@ class NativeServerBridge:
             chunk_assembler_timeout=self._config['chunk_assembler_timeout'],
             max_reassembly_bytes=self._config['max_reassembly_bytes'],
             chunk_size=self._config['chunk_size'],
+            server_id=server_id,
+            server_instance_id=server_instance_id,
         )
 
         # Register initial CRM if provided (compat with old Server constructor).

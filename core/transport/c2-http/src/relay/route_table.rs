@@ -418,6 +418,7 @@ impl RouteTable {
             // invariant local so malformed or old inputs cannot poison peers.
             entry.ipc_address = None;
             entry.server_id = None;
+            entry.server_instance_id = None;
             let key = (entry.name.clone(), entry.relay_id.clone());
             replacement_routes.insert(key, entry);
         }
@@ -597,6 +598,7 @@ mod tests {
             relay_id: relay_id.into(),
             relay_url: format!("http://{relay_id}:8080"),
             server_id: Some(format!("server-{name}-{relay_id}")),
+            server_instance_id: Some(format!("inst-{name}-{relay_id}")),
             ipc_address: Some(format!("ipc://{name}_{relay_id}")),
             crm_ns: "test.ns".into(),
             crm_ver: "0.1.0".into(),
@@ -611,6 +613,7 @@ mod tests {
             relay_id: relay_id.into(),
             relay_url: format!("http://{relay_id}:8080"),
             server_id: None,
+            server_instance_id: None,
             ipc_address: None,
             crm_ns: "test.ns".into(),
             crm_ver: "0.1.0".into(),
@@ -644,6 +647,14 @@ mod tests {
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].name, "grid");
         assert!(resolved[0].ipc_address.is_some());
+        assert_eq!(
+            resolved[0].server_id.as_deref(),
+            Some("server-grid-relay-a")
+        );
+        assert_eq!(
+            resolved[0].server_instance_id.as_deref(),
+            Some("inst-grid-relay-a")
+        );
     }
 
     #[test]
@@ -655,7 +666,9 @@ mod tests {
         let resolved = rt.resolve("grid");
         assert_eq!(resolved.len(), 2);
         assert!(resolved[0].ipc_address.is_some()); // LOCAL first
+        assert!(resolved[0].server_instance_id.is_some());
         assert!(resolved[1].ipc_address.is_none()); // PEER second
+        assert!(resolved[1].server_instance_id.is_none());
     }
 
     #[test]
@@ -837,8 +850,8 @@ mod tests {
     }
 
     #[test]
-    fn route_digest_stable_when_only_ipc_address_changes() {
-        // Critical anti-entropy invariant: ipc_address must NOT contribute
+    fn route_digest_stable_when_only_ipc_only_identity_changes() {
+        // Critical anti-entropy invariant: owner-private IPC fields must NOT contribute
         // to the digest, because the owning relay stores Some(...) but
         // peers store None — if it contributed, the two views would never
         // converge and anti-entropy would loop forever.
@@ -847,6 +860,8 @@ mod tests {
         let d1 = rt.route_digest();
         let mut entry = local_entry("grid", "relay-a");
         entry.ipc_address = Some("ipc://changed".into());
+        entry.server_id = Some("server-changed".into());
+        entry.server_instance_id = Some("inst-changed".into());
         rt.register_route(entry);
         let d2 = rt.route_digest();
         let key = ("grid".to_string(), "relay-a".to_string(), false);
@@ -898,6 +913,7 @@ mod tests {
         );
         assert_eq!(resolved[0].relay_url, "http://relay-a:8080");
         assert_eq!(rt_b.list_routes()[0].server_id, None);
+        assert_eq!(rt_b.list_routes()[0].server_instance_id, None);
     }
 
     #[test]
@@ -923,15 +939,21 @@ mod tests {
         // must not leak it to clients (defense-in-depth).
         let mut entry = peer_entry("grid", "relay-b", 1000.0);
         entry.ipc_address = Some("ipc://leaked".into());
+        entry.server_id = Some("server-leaked".into());
+        entry.server_instance_id = Some("inst-leaked".into());
         let info = entry.to_route_info();
         assert!(info.ipc_address.is_none());
+        assert!(info.server_id.is_none());
+        assert!(info.server_instance_id.is_none());
     }
 
     #[test]
-    fn to_route_info_keeps_ipc_address_for_local() {
+    fn to_route_info_keeps_ipc_identity_for_local() {
         let entry = local_entry("grid", "relay-a");
         let info = entry.to_route_info();
         assert!(info.ipc_address.is_some());
+        assert!(info.server_id.is_some());
+        assert!(info.server_instance_id.is_some());
     }
 
     #[test]

@@ -8,7 +8,11 @@
 
 **Tech Stack:** Rust `c2-wire`, `c2-server`, `c2-ipc`, `c2-http`, `c2-runtime`; PyO3 native bindings in `sdk/python/native`; Python pytest integration tests; Cargo workspace tests.
 
-**Implementation status:** Planned. Do not start production code changes until this plan has been reviewed in the current dirty worktree.
+**Implementation status:** Implemented on `dev-feature`. The final verification
+set for this plan passed on 2026-05-07: focused Rust package tests,
+`cargo test --manifest-path core/Cargo.toml --workspace`, native
+`cargo check`, rebuilt `c3`, full Python SDK pytest with relay tests running,
+stale-symbol audit, `cargo fmt --check`, and `git diff --check`.
 
 ---
 

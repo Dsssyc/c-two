@@ -1,7 +1,7 @@
 """Integration tests for the relay mesh resource discovery system.
 
 Tests cover:
-- Single-relay register/resolve/unregister (backward compat)
+- Single-relay register/resolve/unregister
 - Two-relay gossip route propagation
 - Route withdrawal propagation across peers
 - Peer discovery and listing
@@ -23,6 +23,15 @@ def _http_post(url: str, body: dict) -> urllib.request.Request:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+
+
+def _register_body(name: str, server_id: str, address: str) -> dict[str, str]:
+    return {
+        "name": name,
+        "server_id": server_id,
+        "server_instance_id": f"{server_id}-instance",
+        "address": address,
+    }
 
 
 def _http_get_json(url: str):
@@ -81,7 +90,7 @@ def _wait_for_peer(url: str, relay_id: str, *, timeout: float = 8.0):
 
 
 class TestSingleRelay:
-    """Tests with one relay — backward compatibility."""
+    """Tests with one relay."""
 
     def test_register_and_resolve(self, start_c3_relay):
         relay = start_c3_relay(skip_ipc_validation=True)
@@ -90,7 +99,7 @@ class TestSingleRelay:
         # Register a mock upstream.
         req = _http_post(
             f"{base}/_register",
-            {"name": "grid", "server_id": "test-grid", "address": "ipc://test_grid"},
+            _register_body("grid", "test-grid", "ipc://test_grid"),
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
             assert resp.status == 201
@@ -140,7 +149,7 @@ class TestTwoRelayMesh:
         # Register on relay A.
         req = _http_post(
             f"{url_a}/_register",
-            {"name": "grid", "server_id": "grid-a", "address": "ipc://grid_a"},
+            _register_body("grid", "grid-a", "ipc://grid_a"),
         )
         urllib.request.urlopen(req, timeout=5)
 
@@ -148,6 +157,7 @@ class TestTwoRelayMesh:
         routes = _wait_for_route(url_b, "grid")
         assert len(routes) >= 1
         assert routes[0]["name"] == "grid"
+        assert routes[0]["server_instance_id"] is None
 
         # Both relays should see each other as peers.
         peers_a = _http_get_json(f"{url_a}/_peers")
@@ -171,7 +181,7 @@ class TestTwoRelayMesh:
         # Register on A.
         req = _http_post(
             f"{url_a}/_register",
-            {"name": "net", "server_id": "net-a", "address": "ipc://net_a"},
+            _register_body("net", "net-a", "ipc://net_a"),
         )
         urllib.request.urlopen(req, timeout=5)
 
@@ -231,7 +241,7 @@ class TestTwoRelayMesh:
         # Register on A.
         req = _http_post(
             f"{url_a}/_register",
-            {"name": "solver", "server_id": "solver-a", "address": "ipc://solver_a"},
+            _register_body("solver", "solver-a", "ipc://solver_a"),
         )
         urllib.request.urlopen(req, timeout=5)
 

@@ -228,6 +228,7 @@ pub struct IpcClient {
     rid_counter: AtomicU32,
     pub(crate) route_tables: HashMap<String, MethodTable>,
     server_segments: Vec<(String, u32)>,
+    pub(crate) server_identity: Option<c2_wire::handshake::ServerIdentity>,
     /// Server SHM pool state for reading buddy reply responses.
     pub(crate) server_pool: Arc<StdMutex<Option<ServerPoolState>>>,
     recv_handle: Arc<StdMutex<Option<tokio::task::JoinHandle<()>>>>,
@@ -303,6 +304,7 @@ impl IpcClient {
             rid_counter: AtomicU32::new(1),
             route_tables: HashMap::new(),
             server_segments: Vec::new(),
+            server_identity: None,
             server_pool: Arc::new(StdMutex::new(None)),
             recv_handle: Arc::new(StdMutex::new(None)),
             connected: Arc::new(AtomicBool::new(false)),
@@ -328,6 +330,7 @@ impl IpcClient {
             rid_counter: AtomicU32::new(1),
             route_tables: HashMap::new(),
             server_segments: Vec::new(),
+            server_identity: None,
             server_pool: Arc::new(StdMutex::new(None)),
             recv_handle: Arc::new(StdMutex::new(None)),
             connected: Arc::new(AtomicBool::new(false)),
@@ -355,6 +358,9 @@ impl IpcClient {
 
         // Perform handshake.
         let hs = self.do_handshake(&mut writer, reader).await?;
+        let server_identity = hs.server_identity.clone().ok_or_else(|| {
+            IpcError::Handshake("server handshake missing server identity".into())
+        })?;
 
         // Store method tables from the handshake response.
         for route in &hs.routes {
@@ -362,6 +368,7 @@ impl IpcClient {
             self.route_tables.insert(route.name.clone(), table);
         }
         self.server_segments = hs.segments.clone();
+        self.server_identity = Some(server_identity);
 
         // Open server SHM segments into a ServerPoolState for buddy response reads.
         if !hs.segments.is_empty() {
@@ -453,6 +460,11 @@ impl IpcClient {
                 "Server does not support v2 call frames".into(),
             ));
         }
+        if hs.server_identity.is_none() {
+            return Err(IpcError::Handshake(
+                "server handshake missing server identity".into(),
+            ));
+        }
 
         // Spawn recv loop with the reader.
         let pending = self.pending.clone();
@@ -486,6 +498,25 @@ impl IpcClient {
     /// Get a reference to the reassembly pool (for materialising Handle responses).
     pub fn reassembly_pool_arc(&self) -> Arc<RwLock<MemPool>> {
         self.chunk_registry.pool().clone()
+    }
+
+    /// Identity announced by the connected IPC server handshake.
+    pub fn server_identity(&self) -> Option<&c2_wire::handshake::ServerIdentity> {
+        self.server_identity.as_ref()
+    }
+
+    /// Stable logical server ID announced by the connected IPC server.
+    pub fn server_id(&self) -> Option<&str> {
+        self.server_identity
+            .as_ref()
+            .map(|identity| identity.server_id.as_str())
+    }
+
+    /// Per-server-incarnation ID announced by the connected IPC server.
+    pub fn server_instance_id(&self) -> Option<&str> {
+        self.server_identity
+            .as_ref()
+            .map(|identity| identity.server_instance_id.as_str())
     }
 
     /// Send a CRM call and wait for the response (inline path only).
@@ -1149,6 +1180,20 @@ mod tests {
             "prefix exceeds SHM name limit: {}",
             prefix1.len()
         );
+    }
+
+    #[test]
+    fn client_projects_server_identity() {
+        let identity = c2_wire::handshake::ServerIdentity {
+            server_id: "identity-server".to_string(),
+            server_instance_id: "identity-instance".to_string(),
+        };
+        let mut client = IpcClient::new("ipc://identity_projection");
+        client.server_identity = Some(identity.clone());
+
+        assert_eq!(client.server_identity(), Some(&identity));
+        assert_eq!(client.server_id(), Some("identity-server"));
+        assert_eq!(client.server_instance_id(), Some("identity-instance"));
     }
 
     #[tokio::test]

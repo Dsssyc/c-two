@@ -169,6 +169,21 @@ impl SyncClient {
     pub fn route_names(&self) -> Vec<&str> {
         self.inner.route_names()
     }
+
+    /// Identity announced by the connected IPC server handshake.
+    pub fn server_identity(&self) -> Option<&c2_wire::handshake::ServerIdentity> {
+        self.inner.server_identity()
+    }
+
+    /// Stable logical server ID announced by the connected IPC server.
+    pub fn server_id(&self) -> Option<&str> {
+        self.inner.server_id()
+    }
+
+    /// Per-server-incarnation ID announced by the connected IPC server.
+    pub fn server_instance_id(&self) -> Option<&str> {
+        self.inner.server_instance_id()
+    }
 }
 
 // ── Test-only helpers ────────────────────────────────────────────────────
@@ -214,5 +229,19 @@ pub(crate) mod tests {
         assert_eq!(result, 42);
         let result2 = h2.block_on(async { 43 });
         assert_eq!(result2, 43);
+    }
+
+    #[test]
+    fn sync_client_projects_server_identity() {
+        let identity = c2_wire::handshake::ServerIdentity {
+            server_id: "identity-server".to_string(),
+            server_instance_id: "identity-instance".to_string(),
+        };
+        let mut client = SyncClient::new_unconnected("ipc://identity_projection_sync");
+        client.inner.server_identity = Some(identity.clone());
+
+        assert_eq!(client.server_identity(), Some(&identity));
+        assert_eq!(client.server_id(), Some("identity-server"));
+        assert_eq!(client.server_instance_id(), Some("identity-instance"));
     }
 }

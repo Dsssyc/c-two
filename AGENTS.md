@@ -83,7 +83,7 @@ uv sync --group examples
 
 # CLI tool
 c3 --version
-c3 relay --upstream grid=server-grid@ipc://my_server --bind 0.0.0.0:8080
+c3 relay --upstream grid=my_server@ipc://my_server --bind 0.0.0.0:8080
 ```
 
 Tests use `pytest` with a 30-second per-test timeout. Tests live under
@@ -283,6 +283,12 @@ resolution is allowed only when the anchor endpoint is loopback/local; nonlocal
 relay responses must be treated as HTTP relay targets even if they include an
 `ipc_address`.
 
+Relay-discovered IPC fast paths must validate endpoint identity in Rust before
+accepting the IPC client. The relay response identity (`server_id` and
+`server_instance_id`) must match the identity returned by the IPC handshake,
+and then the requested route name must exist. Do not reintroduce Python-side or
+route-name-only trust decisions for relay IPC.
+
 The Python SDK does not embed or start a relay server. Start `c3 relay` outside
 the SDK, through the CLI, Docker Compose, Kubernetes, or other orchestration.
 Do not add SDK APIs that embed, start, or manage relay-server lifecycle.
@@ -340,7 +346,7 @@ Do not add CLI command behavior under `sdk/python/src/c_two`.
 | `--relay-id` | `C2_RELAY_ID` | auto UUID | Stable relay identifier |
 | `--advertise-url` | `C2_RELAY_ADVERTISE_URL` | derived | Publicly reachable URL for peers |
 | `--idle-timeout` | `C2_RELAY_IDLE_TIMEOUT` | `60` | IPC idle disconnect timeout in seconds; `0` disables time-based eviction |
-| `--upstream` | none | empty | Pre-register upstream as `NAME=SERVER_ID@ADDRESS` |
+| `--upstream` | none | empty | Pre-register upstream as `NAME=SERVER_ID@ADDRESS`; `SERVER_ID` must match the IPC server handshake identity |
 
 Relay-aware clients use `C2_RELAY_ROUTE_MAX_ATTEMPTS` to cap route acquisition
 attempts before reporting failure. This setting belongs to the client side, not

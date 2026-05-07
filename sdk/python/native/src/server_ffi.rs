@@ -323,6 +323,7 @@ impl PyServer {
         heartbeat_timeout, max_total_chunks, chunk_gc_interval,
         chunk_threshold_ratio, chunk_assembler_timeout,
         max_reassembly_bytes, chunk_size,
+        server_id=None, server_instance_id=None,
     ))]
     fn new(
         address: &str,
@@ -344,6 +345,8 @@ impl PyServer {
         chunk_assembler_timeout: f64,
         max_reassembly_bytes: u64,
         chunk_size: u64,
+        server_id: Option<String>,
+        server_instance_id: Option<String>,
     ) -> PyResult<Self> {
         let config = ServerIpcConfig {
             base: BaseIpcConfig {
@@ -375,8 +378,21 @@ impl PyServer {
         config
             .validate()
             .map_err(|e| PyValueError::new_err(format!("invalid IPC server config: {e}")))?;
-        let server =
-            Server::new(address, config).map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
+        let server = match (server_id, server_instance_id) {
+            (Some(server_id), Some(server_instance_id)) => Server::new_with_identity(
+                address,
+                config,
+                c2_server::ServerIdentity {
+                    server_id,
+                    server_instance_id,
+                },
+            ),
+            (None, None) => Server::new(address, config),
+            _ => Err(c2_server::ServerError::Config(
+                "server_id and server_instance_id must be provided together".to_string(),
+            )),
+        }
+        .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
         Ok(Self {
             inner: Arc::new(server),
             rt: Mutex::new(None),

@@ -180,6 +180,7 @@ impl PyRuntimeSession {
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         let dict = PyDict::new(py);
         dict.set_item("server_id", identity.server_id)?;
+        dict.set_item("server_instance_id", identity.server_instance_id)?;
         dict.set_item("ipc_address", identity.ipc_address)?;
         Ok(dict)
     }
@@ -290,7 +291,9 @@ impl PyRuntimeSession {
         let module = py.import("c_two.transport.server.native")?;
         let class = module.getattr("NativeServerBridge")?;
         let kwargs = PyDict::new(py);
-        kwargs.set_item("bind_address", identity.ipc_address)?;
+        kwargs.set_item("bind_address", &identity.ipc_address)?;
+        kwargs.set_item("server_id", &identity.server_id)?;
+        kwargs.set_item("server_instance_id", &identity.server_instance_id)?;
         if let Some(overrides) = self.inner.server_ipc_overrides() {
             kwargs.set_item(
                 "ipc_overrides",
@@ -539,8 +542,18 @@ impl PyRuntimeSession {
             })
             .map_err(runtime_error_to_py)?;
         match target {
-            RelayResolvedConnection::Ipc { address } => {
-                match self.acquire_relay_ipc_client(py, route_name, &address) {
+            RelayResolvedConnection::Ipc {
+                address,
+                server_id,
+                server_instance_id,
+            } => {
+                match self.acquire_relay_ipc_client(
+                    py,
+                    route_name,
+                    &address,
+                    &server_id,
+                    &server_instance_id,
+                ) {
                     Ok(client) => Ok(PyRelayConnectedClient {
                         mode: "ipc".to_string(),
                         target: address,
@@ -582,6 +595,8 @@ impl PyRuntimeSession {
         py: Python<'_>,
         route_name: &str,
         address: &str,
+        expected_server_id: &str,
+        expected_server_instance_id: &str,
     ) -> Result<Arc<SyncClient>, RelayIpcConnectError> {
         let addr = address.to_string();
         let pool = self.pool.inner;
@@ -605,7 +620,16 @@ impl PyRuntimeSession {
             }
             Err(_) => return Err(RelayIpcConnectError::Unavailable),
         };
-        self.inner.mark_client_config_frozen();
+
+        let identity_matches = client.server_identity().is_some_and(|identity| {
+            identity.server_id == expected_server_id
+                && identity.server_instance_id == expected_server_instance_id
+        });
+        if !identity_matches {
+            pool.release(&addr);
+            return Err(RelayIpcConnectError::Unavailable);
+        }
+
         if !client
             .route_names()
             .into_iter()
@@ -614,6 +638,7 @@ impl PyRuntimeSession {
             pool.release(&addr);
             return Err(RelayIpcConnectError::Unavailable);
         }
+        self.inner.mark_client_config_frozen();
         Ok(client)
     }
 
@@ -716,6 +741,7 @@ fn register_outcome_to_dict<'py>(
     let dict = PyDict::new(py);
     dict.set_item("route_name", outcome.route_name)?;
     dict.set_item("server_id", outcome.server_id)?;
+    dict.set_item("server_instance_id", outcome.server_instance_id)?;
     dict.set_item("ipc_address", outcome.ipc_address)?;
     dict.set_item("relay_registered", outcome.relay_registered)?;
     Ok(dict)

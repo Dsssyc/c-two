@@ -13,6 +13,7 @@ fn scrub_peer_snapshot(mut snapshot: FullSync) -> FullSync {
     for entry in snapshot.routes.iter_mut() {
         entry.ipc_address = None;
         entry.server_id = None;
+        entry.server_instance_id = None;
     }
     snapshot
         .tombstones
@@ -83,6 +84,7 @@ pub async fn handle_peer_announce(
                     relay_id,
                     relay_url,
                     server_id: None,
+                    server_instance_id: None,
                     ipc_address: None,
                     crm_ns,
                     crm_ver,
@@ -523,6 +525,7 @@ mod tests {
                 relay_id: "relay-b".into(),
                 relay_url: "http://spoofed:8080".into(),
                 server_id: None,
+                server_instance_id: None,
                 ipc_address: None,
                 crm_ns: "test.ns".into(),
                 crm_ver: "0.1.0".into(),
@@ -613,6 +616,7 @@ mod tests {
                 relay_id: "relay-a".into(),
                 relay_url: "http://relay-a:8080".into(),
                 server_id: Some("server-secret".into()),
+                server_instance_id: Some("instance-secret".into()),
                 ipc_address: Some("ipc://secret".into()),
                 crm_ns: "test.ns".into(),
                 crm_ver: "0.1.0".into(),
@@ -748,6 +752,7 @@ mod tests {
                 relay_id: "relay-a".into(),
                 relay_url: "http://relay-a:8080".into(),
                 server_id: Some("server-local".into()),
+                server_instance_id: Some("instance-local".into()),
                 ipc_address: Some("ipc://local".into()),
                 crm_ns: "test.ns".into(),
                 crm_ver: "0.1.0".into(),
@@ -762,6 +767,7 @@ mod tests {
                 relay_id: "relay-c".into(),
                 relay_url: "http://spoofed:8080".into(),
                 server_id: None,
+                server_instance_id: None,
                 ipc_address: None,
                 crm_ns: "test.ns".into(),
                 crm_ver: "0.1.0".into(),
@@ -866,6 +872,7 @@ mod tests {
                 relay_id: "relay-b".into(),
                 relay_url: "http://relay-b:8080".into(),
                 server_id: None,
+                server_instance_id: None,
                 ipc_address: None,
                 crm_ns: "test.ns".into(),
                 crm_ver: "0.1.0".into(),
@@ -902,6 +909,7 @@ mod tests {
                 relay_id: "relay-a".into(),
                 relay_url: "http://relay-a:8080".into(),
                 server_id: Some("server-secret".into()),
+                server_instance_id: Some("instance-secret".into()),
                 ipc_address: Some("ipc://secret".into()),
                 crm_ns: "test.ns".into(),
                 crm_ver: "0.1.0".into(),
@@ -928,6 +936,7 @@ mod tests {
                 relay_id: "relay-a".into(),
                 relay_url: "http://relay-a:8080".into(),
                 server_id: Some("server-grid".into()),
+                server_instance_id: Some("instance-grid".into()),
                 ipc_address: Some("ipc://grid".into()),
                 crm_ns: "test.ns".into(),
                 crm_ver: "0.1.0".into(),

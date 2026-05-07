@@ -20,7 +20,9 @@ use c2_server::dispatcher::CrmRoute;
 use crate::{
     RegisterOutcome, RelayCleanupError, RuntimeRouteSpec, ShutdownOutcome, UnregisterOutcome,
 };
-use crate::{auto_server_id, ipc_address_for_server_id, validate_server_id};
+use crate::{
+    auto_server_id, auto_server_instance_id, ipc_address_for_server_id, validate_server_id,
+};
 
 pub type ServerIpcConfigOverrides = c2_config::ServerIpcConfigOverrides;
 pub type ClientIpcConfigOverrides = c2_config::ClientIpcConfigOverrides;
@@ -28,6 +30,7 @@ pub type ClientIpcConfigOverrides = c2_config::ClientIpcConfigOverrides;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeIdentity {
     pub server_id: String,
+    pub server_instance_id: String,
     pub ipc_address: String,
 }
 
@@ -109,6 +112,8 @@ struct RelayProjection {
 pub enum RelayResolvedConnection {
     Ipc {
         address: String,
+        server_id: String,
+        server_instance_id: String,
     },
     Http {
         client: RelayAwareHttpClient,
@@ -151,6 +156,7 @@ impl RuntimeSession {
         let identity = RuntimeIdentity {
             ipc_address: ipc_address_for_server_id(&server_id),
             server_id,
+            server_instance_id: auto_server_instance_id(),
         };
         state.identity = Some(identity.clone());
         Ok(identity)
@@ -310,6 +316,7 @@ impl RuntimeSession {
             if let Err(err) = projection.control.register(
                 &spec.name,
                 &identity.server_id,
+                &identity.server_instance_id,
                 &identity.ipc_address,
                 &spec.crm_ns,
                 &spec.crm_ver,
@@ -334,6 +341,7 @@ impl RuntimeSession {
         Ok(RegisterOutcome {
             route_name,
             server_id: identity.server_id,
+            server_instance_id: identity.server_instance_id,
             ipc_address: identity.ipc_address,
             relay_registered,
         })
@@ -464,7 +472,11 @@ impl RuntimeSession {
             },
         );
         match client.resolve_target().map_err(runtime_http_error)? {
-            RelayResolvedTarget::Ipc { address } => Ok(RelayResolvedConnection::Ipc { address }),
+            RelayResolvedTarget::Ipc { candidate } => Ok(RelayResolvedConnection::Ipc {
+                address: candidate.address,
+                server_id: candidate.server_id,
+                server_instance_id: candidate.server_instance_id,
+            }),
             RelayResolvedTarget::Http { relay_url } => {
                 Ok(RelayResolvedConnection::Http { client, relay_url })
             }

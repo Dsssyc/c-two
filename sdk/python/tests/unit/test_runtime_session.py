@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 
@@ -12,6 +14,8 @@ def test_native_runtime_session_explicit_identity_is_lazy() -> None:
 
     identity = session.ensure_server()
     assert identity['server_id'] == 'unit-server'
+    assert isinstance(identity['server_instance_id'], str)
+    assert identity['server_instance_id']
     assert identity['ipc_address'] == 'ipc://unit-server'
     assert session.server_id == 'unit-server'
     assert session.server_address == 'ipc://unit-server'
@@ -50,6 +54,30 @@ def test_registry_identity_is_native_owned() -> None:
     assert 'import os' not in source
     assert '_auto_server_id' not in source
     assert '_address_for_server_id' not in source
+
+
+def test_runtime_session_passes_server_instance_identity_to_bridge(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeBridge:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(
+        'c_two.transport.server.native.NativeServerBridge',
+        FakeBridge,
+    )
+
+    from c_two._native import RuntimeSession
+
+    session = RuntimeSession(shm_threshold=4096)
+    session.ensure_server_bridge()
+
+    assert isinstance(captured['server_id'], str)
+    assert isinstance(captured['server_instance_id'], str)
+    assert captured['server_id']
+    assert captured['server_instance_id']
+    assert captured['server_id'] != captured['server_instance_id']
 
 
 def test_failed_server_construction_does_not_publish_identity() -> None:
@@ -596,3 +624,55 @@ def test_set_relay_anchor_blank_clears_native_override() -> None:
     finally:
         settings.relay_anchor_address = previous
         registry.shutdown()
+
+
+def test_relay_ipc_acceptance_does_not_trust_route_name_only() -> None:
+    repo_root = Path(__file__).resolve().parents[4]
+    source = (
+        repo_root / 'sdk/python/native/src/runtime_session_ffi.rs'
+    ).read_text(encoding='utf-8')
+    acquire_body = source.split('fn acquire_relay_ipc_client(', 1)[1].split(
+        'fn acquire_relay_http_client(',
+        1,
+    )[0]
+
+    assert 'expected_server_id' in acquire_body
+    assert 'expected_server_instance_id' in acquire_body
+    identity_checks = [
+        pos for needle in ('server_identity()', 'server_instance_id()')
+        if (pos := acquire_body.find(needle)) >= 0
+    ]
+    assert identity_checks
+    assert min(identity_checks) < acquire_body.find('route_names()')
+
+
+def test_relay_ipc_identity_mismatch_falls_back_to_http_not_hard_error() -> None:
+    repo_root = Path(__file__).resolve().parents[4]
+    source = (
+        repo_root / 'sdk/python/native/src/runtime_session_ffi.rs'
+    ).read_text(encoding='utf-8')
+    connect_body = source.split('fn connect_via_relay(', 1)[1].split(
+        'fn shutdown_ipc_clients(',
+        1,
+    )[0]
+
+    assert 'RelayIpcConnectError::Unavailable' in connect_body
+    assert 'acquire_relay_http_client' in connect_body
+    assert (
+        connect_body.find('RelayIpcConnectError::Unavailable')
+        < connect_body.find('acquire_relay_http_client')
+    )
+
+
+def test_relay_ipc_identity_boundary_is_native_owned() -> None:
+    repo_root = Path(__file__).resolve().parents[4]
+    registry_source = (
+        repo_root / 'sdk/python/src/c_two/transport/registry.py'
+    ).read_text(encoding='utf-8')
+    native_source = (
+        repo_root / 'sdk/python/native/src/runtime_session_ffi.rs'
+    ).read_text(encoding='utf-8')
+
+    assert 'server_instance_id' not in registry_source
+    assert 'expected_server_instance_id' in native_source
+    assert 'route_names()' in native_source

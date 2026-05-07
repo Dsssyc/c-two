@@ -54,6 +54,35 @@ def test_ping_ignores_bad_relay_env(monkeypatch, direct_server):
     assert ping(address, timeout=0.5) is True
 
 
+def test_explicit_ipc_connect_ignores_bad_relay_anchor(monkeypatch):
+    import c_two as cc
+
+    monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
+
+    @cc.crm(namespace='test.identity.direct', version='0.1.0')
+    class Direct:
+        def ping(self) -> str:
+            ...
+
+    class DirectResource:
+        def ping(self) -> str:
+            return 'direct-ipc'
+
+    cc.shutdown()
+    try:
+        cc.register(Direct, DirectResource(), name='direct-identity')
+        address = cc.server_address()
+        assert address is not None
+        monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', 'http://127.0.0.1:9')
+        client = cc.connect(Direct, name='direct-identity', address=address)
+        try:
+            assert client.ping() == 'direct-ipc'
+        finally:
+            cc.close(client)
+    finally:
+        cc.shutdown()
+
+
 def test_shutdown_stops_direct_ipc_without_relay(monkeypatch):
     monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
     address = f'ipc://{_unique_region("shutdown")}'

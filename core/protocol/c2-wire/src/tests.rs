@@ -257,6 +257,13 @@ mod control_tests {
 mod handshake_tests {
     use crate::handshake::*;
 
+    fn test_identity() -> ServerIdentity {
+        ServerIdentity {
+            server_id: "test-server".to_string(),
+            server_instance_id: "test-instance".to_string(),
+        }
+    }
+
     #[test]
     fn client_handshake_roundtrip() {
         let segments = vec![
@@ -271,6 +278,61 @@ mod handshake_tests {
         assert_eq!(decoded.segments[0].0, "seg0");
         assert_eq!(decoded.segments[0].1, 268_435_456);
         assert_eq!(decoded.capability_flags, CAP_CALL_V2 | CAP_METHOD_IDX);
+        assert_eq!(decoded.server_identity, None);
+        assert!(decoded.routes.is_empty());
+    }
+
+    #[test]
+    fn server_handshake_roundtrip_includes_server_identity() {
+        let routes = vec![RouteInfo {
+            name: "grid".to_string(),
+            methods: vec![MethodEntry {
+                name: "ping".to_string(),
+                index: 0,
+            }],
+        }];
+        let identity = ServerIdentity {
+            server_id: "grid-server".to_string(),
+            server_instance_id: "inst-001".to_string(),
+        };
+
+        let encoded = encode_server_handshake(
+            &[],
+            CAP_CALL_V2 | CAP_METHOD_IDX,
+            &routes,
+            "/cc3rtest",
+            &identity,
+        )
+        .expect("server handshake encodes");
+        let decoded = decode_handshake(&encoded).expect("server handshake decodes");
+
+        assert_eq!(decoded.server_identity.as_ref(), Some(&identity));
+        assert_eq!(decoded.routes, routes);
+    }
+
+    #[test]
+    fn server_handshake_rejects_trailing_bytes() {
+        let mut encoded = encode_server_handshake(
+            &[],
+            CAP_CALL_V2 | CAP_METHOD_IDX,
+            &[],
+            "/cc3rtest",
+            &test_identity(),
+        )
+        .expect("server handshake encodes");
+        encoded.push(0xff);
+
+        let err = decode_handshake(&encoded).expect_err("trailing byte must be rejected");
+        assert!(err.to_string().contains("trailing bytes"));
+    }
+
+    #[test]
+    fn client_handshake_has_no_server_identity() {
+        let encoded = encode_client_handshake(&[], CAP_CALL_V2, "/cc3ctest")
+            .expect("client handshake encodes");
+        let decoded = decode_handshake(&encoded).expect("client handshake decodes");
+
+        assert_eq!(decoded.server_identity, None);
         assert!(decoded.routes.is_empty());
     }
 
@@ -309,11 +371,14 @@ mod handshake_tests {
                 ],
             },
         ];
-        let encoded = encode_server_handshake(&segments, CAP_CALL_V2, &routes, "").unwrap();
+        let identity = test_identity();
+        let encoded =
+            encode_server_handshake(&segments, CAP_CALL_V2, &routes, "", &identity).unwrap();
         let decoded = decode_handshake(&encoded).unwrap();
 
         assert_eq!(decoded.segments.len(), 1);
         assert_eq!(decoded.capability_flags, CAP_CALL_V2);
+        assert_eq!(decoded.server_identity.as_ref(), Some(&identity));
         assert_eq!(decoded.routes.len(), 2);
 
         let grid = &decoded.routes[0];
@@ -336,7 +401,8 @@ mod handshake_tests {
             methods: vec![],
         }];
 
-        let err = encode_server_handshake(&[], CAP_CALL_V2, &routes, "").unwrap_err();
+        let err =
+            encode_server_handshake(&[], CAP_CALL_V2, &routes, "", &test_identity()).unwrap_err();
         assert!(err.to_string().contains("route name"));
     }
 
@@ -352,7 +418,8 @@ mod handshake_tests {
                 .collect(),
         }];
 
-        let err = encode_server_handshake(&[], CAP_CALL_V2, &routes, "").unwrap_err();
+        let err =
+            encode_server_handshake(&[], CAP_CALL_V2, &routes, "", &test_identity()).unwrap_err();
         assert!(err.to_string().contains("method count"));
     }
 
@@ -365,12 +432,13 @@ mod handshake_tests {
 
     #[test]
     fn empty_handshake() {
-        // Version 6, prefix_len=0, 0 segments, cap_flags=0
-        let buf = [6, 0, 0, 0, 0, 0];
+        // Version 7, prefix_len=0, 0 segments, cap_flags=0
+        let buf = [7, 0, 0, 0, 0, 0];
         let decoded = decode_handshake(&buf).unwrap();
         assert_eq!(decoded.prefix, "");
         assert!(decoded.segments.is_empty());
         assert_eq!(decoded.capability_flags, 0);
+        assert_eq!(decoded.server_identity, None);
         assert!(decoded.routes.is_empty());
     }
 }
@@ -452,22 +520,23 @@ mod cross_lang_tests {
 
     #[test]
     fn canonical_client_handshake_fixture_decodes() {
-        // v6: [06][00 prefix_len][01 00 seg_count][00 00 00 10 size][04 seg0][03 00 caps]
-        let bytes = hex_to_bytes("060001000000001004736567300300");
+        // v7: [07][00 prefix_len][01 00 seg_count][00 00 00 10 size][04 seg0][03 00 caps]
+        let bytes = hex_to_bytes("070001000000001004736567300300");
         let hs = decode_handshake(&bytes).unwrap();
         assert_eq!(hs.prefix, "");
         assert_eq!(hs.segments.len(), 1);
         assert_eq!(hs.segments[0].0, "seg0");
         assert_eq!(hs.segments[0].1, 268_435_456);
         assert_eq!(hs.capability_flags, CAP_CALL_V2 | CAP_METHOD_IDX);
+        assert_eq!(hs.server_identity, None);
         assert!(hs.routes.is_empty());
     }
 
     #[test]
     fn canonical_server_handshake_fixture_decodes() {
-        // v6: [06][00 prefix_len] then same body
+        // v7: client handshake prefix, server identity, then route table.
         let bytes = hex_to_bytes(
-            "0600010000000008047372763003000100046772696402000568656c6c6f0000036164640100",
+            "0700010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696402000568656c6c6f0000036164640100",
         );
         let hs = decode_handshake(&bytes).unwrap();
         assert_eq!(hs.prefix, "");
@@ -475,6 +544,13 @@ mod cross_lang_tests {
         assert_eq!(hs.segments[0].0, "srv0");
         assert_eq!(hs.segments[0].1, 134_217_728);
         assert_eq!(hs.capability_flags, CAP_CALL_V2 | CAP_METHOD_IDX);
+        assert_eq!(
+            hs.server_identity.as_ref(),
+            Some(&ServerIdentity {
+                server_id: "server-grid".into(),
+                server_instance_id: "inst-grid".into(),
+            })
+        );
         assert_eq!(hs.routes.len(), 1);
         assert_eq!(hs.routes[0].name, "grid");
         assert_eq!(hs.routes[0].methods.len(), 2);
@@ -522,8 +598,8 @@ mod cross_lang_tests {
     fn rust_encode_matches_canonical_client_handshake_fixture() {
         let segments = vec![("seg0".into(), 268_435_456u32)];
         let encoded = encode_client_handshake(&segments, CAP_CALL_V2 | CAP_METHOD_IDX, "").unwrap();
-        // v6: [06][00 prefix_len][01 00 seg_count][00 00 00 10 size][04 name_len][seg0][03 00 caps]
-        let expected = hex_to_bytes("060001000000001004736567300300");
+        // v7: [07][00 prefix_len][01 00 seg_count][00 00 00 10 size][04 name_len][seg0][03 00 caps]
+        let expected = hex_to_bytes("070001000000001004736567300300");
         assert_eq!(encoded, expected);
     }
 
@@ -543,11 +619,21 @@ mod cross_lang_tests {
                 },
             ],
         }];
-        let encoded =
-            encode_server_handshake(&segments, CAP_CALL_V2 | CAP_METHOD_IDX, &routes, "").unwrap();
-        // v6: [06][00 prefix_len] then same body as v5
+        let identity = ServerIdentity {
+            server_id: "server-grid".into(),
+            server_instance_id: "inst-grid".into(),
+        };
+        let encoded = encode_server_handshake(
+            &segments,
+            CAP_CALL_V2 | CAP_METHOD_IDX,
+            &routes,
+            "",
+            &identity,
+        )
+        .unwrap();
+        // v7: [07][00 prefix_len] then segments/caps, identity, and route table.
         let expected = hex_to_bytes(
-            "0600010000000008047372763003000100046772696402000568656c6c6f0000036164640100",
+            "0700010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696402000568656c6c6f0000036164640100",
         );
         assert_eq!(encoded, expected);
     }

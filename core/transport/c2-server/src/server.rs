@@ -45,6 +45,7 @@ use c2_wire::flags::{
     FLAG_SIGNAL,
 };
 use c2_wire::frame::{self, decode_frame_body, encode_frame};
+pub use c2_wire::handshake::ServerIdentity;
 use c2_wire::handshake::{
     CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX, MAX_METHODS, MAX_ROUTES, MethodEntry, RouteInfo,
     decode_handshake, encode_server_handshake, validate_name_len,
@@ -127,6 +128,7 @@ impl ServerLifecycleState {
 /// the [`Dispatcher`].  Each connection runs in its own tokio task with a
 /// dedicated heartbeat probe.
 pub struct Server {
+    identity: ServerIdentity,
     config: ServerIpcConfig,
     socket_path: PathBuf,
     /// **tokio async RwLock** — guards CRM dispatch table; requires `.read().await`
@@ -150,7 +152,21 @@ impl Server {
     /// Address format: `ipc://region_id`
     /// → socket at `/tmp/c_two_ipc/region_id.sock`
     pub fn new(address: &str, config: ServerIpcConfig) -> Result<Self, ServerError> {
+        let identity = ServerIdentity {
+            server_id: server_id_from_ipc_address(address)?,
+            server_instance_id: uuid::Uuid::new_v4().simple().to_string(),
+        };
+        Self::new_with_identity(address, config, identity)
+    }
+
+    /// Create a new server with an explicit identity.
+    pub fn new_with_identity(
+        address: &str,
+        config: ServerIpcConfig,
+        identity: ServerIdentity,
+    ) -> Result<Self, ServerError> {
         config.validate().map_err(ServerError::Config)?;
+        validate_server_identity(&identity)?;
         let socket_path = parse_socket_path(address)?;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let reassembly_cfg = PoolConfig {
@@ -195,6 +211,7 @@ impl Server {
             .map_err(|e| ServerError::Config(format!("response pool init: {e}")))?;
         let (lifecycle_tx, _lifecycle_rx) = watch::channel(ServerLifecycleState::Initialized);
         Ok(Self {
+            identity,
             config,
             socket_path,
             dispatcher: RwLock::new(Dispatcher::new()),
@@ -206,6 +223,21 @@ impl Server {
             chunk_registry,
             response_pool: Arc::new(parking_lot::RwLock::new(response_pool)),
         })
+    }
+
+    /// Identity announced in server→client handshake ACKs.
+    pub fn identity(&self) -> &ServerIdentity {
+        &self.identity
+    }
+
+    /// Stable logical server identity.
+    pub fn server_id(&self) -> &str {
+        &self.identity.server_id
+    }
+
+    /// Per-server-incarnation identity.
+    pub fn server_instance_id(&self) -> &str {
+        &self.identity.server_instance_id
     }
 
     /// Register a CRM route with the dispatcher.
@@ -508,9 +540,57 @@ fn validate_route_for_wire(route: &CrmRoute) -> Result<(), ServerError> {
     Ok(())
 }
 
+fn validate_server_identity(identity: &ServerIdentity) -> Result<(), ServerError> {
+    c2_config::validate_server_id(&identity.server_id).map_err(ServerError::Config)?;
+    validate_identity_wire_len("server_id", &identity.server_id).map_err(ServerError::Config)?;
+    validate_identity_component("server_instance_id", &identity.server_instance_id)
+        .map_err(ServerError::Config)
+}
+
+fn validate_identity_wire_len(label: &str, value: &str) -> Result<(), String> {
+    let actual = value.len();
+    if actual > c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES {
+        return Err(format!(
+            "{label} cannot exceed {} bytes",
+            c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES
+        ));
+    }
+    Ok(())
+}
+
+fn validate_identity_component(label: &str, value: &str) -> Result<(), String> {
+    validate_identity_wire_len(label, value)?;
+    if value.is_empty() {
+        return Err(format!("{label} cannot be empty"));
+    }
+    if value.trim() != value {
+        return Err(format!(
+            "{label} cannot contain leading or trailing whitespace"
+        ));
+    }
+    if value == "." || value == ".." || value.contains('/') || value.contains('\\') {
+        return Err(format!("{label} cannot contain path separators"));
+    }
+    if !value.is_ascii() {
+        return Err(format!("{label} must be ASCII"));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(format!("{label} cannot contain control characters"));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Address helpers
 // ---------------------------------------------------------------------------
+
+fn server_id_from_ipc_address(address: &str) -> Result<String, ServerError> {
+    let region = address
+        .strip_prefix("ipc://")
+        .ok_or_else(|| ServerError::Config(format!("invalid IPC address: {address}")))?;
+    validate_region_id(region).map_err(ServerError::Config)?;
+    Ok(region.to_string())
+}
 
 fn parse_socket_path(address: &str) -> Result<PathBuf, ServerError> {
     let region = address
@@ -720,8 +800,14 @@ async fn handle_handshake(
     drop(dispatcher);
 
     let cap = CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED;
-    let hs_bytes = encode_server_handshake(&server_segments, cap, &routes, &server_prefix)
-        .map_err(|e| ServerError::Protocol(e.to_string()))?;
+    let hs_bytes = encode_server_handshake(
+        &server_segments,
+        cap,
+        &routes,
+        &server_prefix,
+        server.identity(),
+    )
+    .map_err(|e| ServerError::Protocol(e.to_string()))?;
     let frame = encode_frame(request_id, FLAG_HANDSHAKE | FLAG_RESPONSE, &hs_bytes);
 
     writer.lock().await.write_all(&frame).await?;
@@ -1654,6 +1740,75 @@ mod tests {
     fn server_new_default_config() {
         let s = Server::new("ipc://test_srv", ServerIpcConfig::default()).unwrap();
         assert_eq!(s.socket_path(), Path::new("/tmp/c_two_ipc/test_srv.sock"));
+    }
+
+    #[test]
+    fn server_new_derives_stable_server_id_and_instance_identity() {
+        let first = Server::new("ipc://identity_srv", ServerIpcConfig::default()).unwrap();
+        let second = Server::new("ipc://identity_srv", ServerIpcConfig::default()).unwrap();
+
+        assert_eq!(first.server_id(), "identity_srv");
+        assert_eq!(first.identity().server_id, "identity_srv");
+        assert_eq!(first.server_instance_id().len(), 32);
+        assert_ne!(first.server_instance_id(), second.server_instance_id());
+    }
+
+    #[test]
+    fn server_new_with_identity_uses_validated_identity() {
+        let identity = c2_wire::handshake::ServerIdentity {
+            server_id: "server-explicit".to_string(),
+            server_instance_id: "instance-explicit".to_string(),
+        };
+
+        let server = Server::new_with_identity(
+            "ipc://identity_explicit",
+            ServerIpcConfig::default(),
+            identity.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(server.identity(), &identity);
+        assert_eq!(server.server_id(), "server-explicit");
+        assert_eq!(server.server_instance_id(), "instance-explicit");
+    }
+
+    #[test]
+    fn server_new_with_identity_rejects_invalid_instance_id() {
+        let too_long = "a".repeat(c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES + 1);
+        for server_instance_id in ["../bad", "实例", too_long.as_str()] {
+            let identity = c2_wire::handshake::ServerIdentity {
+                server_id: "server-explicit".to_string(),
+                server_instance_id: server_instance_id.to_string(),
+            };
+
+            let err = Server::new_with_identity(
+                "ipc://identity_bad",
+                ServerIpcConfig::default(),
+                identity,
+            )
+            .err()
+            .expect("invalid identity should be rejected");
+
+            assert!(err.to_string().contains("server_instance_id"));
+        }
+    }
+
+    #[test]
+    fn server_new_with_identity_rejects_server_id_too_long_for_wire() {
+        let identity = c2_wire::handshake::ServerIdentity {
+            server_id: "s".repeat(c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES + 1),
+            server_instance_id: "instance-explicit".to_string(),
+        };
+
+        let err = Server::new_with_identity(
+            "ipc://identity_bad_server_id",
+            ServerIpcConfig::default(),
+            identity,
+        )
+        .err()
+        .expect("overlong server_id should be rejected");
+
+        assert!(err.to_string().contains("server_id"));
     }
 
     #[test]

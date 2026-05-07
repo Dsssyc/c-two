@@ -32,15 +32,22 @@ impl Default for RelayAwareClientConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayLocalIpcCandidate {
+    pub address: String,
+    pub server_id: String,
+    pub server_instance_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelayResolvedTarget {
-    Ipc { address: String },
+    Ipc { candidate: RelayLocalIpcCandidate },
     Http { relay_url: String },
 }
 
 impl RelayResolvedTarget {
     pub fn as_url(&self) -> &str {
         match self {
-            Self::Ipc { address } => address,
+            Self::Ipc { candidate } => &candidate.address,
             Self::Http { relay_url } => relay_url,
         }
     }
@@ -151,10 +158,10 @@ impl RelayAwareHttpClient {
                 }
             };
 
-            if let Some(address) =
-                select_local_ipc_address(prefer_local_ipc, self.anchor_allows_local_ipc, &routes)
+            if let Some(candidate) =
+                select_local_ipc_candidate(prefer_local_ipc, self.anchor_allows_local_ipc, &routes)
             {
-                return Ok(RelayResolvedTarget::Ipc { address });
+                return Ok(RelayResolvedTarget::Ipc { candidate });
             }
 
             let ordered = self.order_routes(routes, &excluded_routes);
@@ -369,15 +376,21 @@ fn resolve_retryable(err: &HttpError) -> bool {
     )
 }
 
-fn select_local_ipc_address(
+fn select_local_ipc_candidate(
     prefer_local_ipc: bool,
     anchor_allows_local_ipc: bool,
     routes: &[RelayRouteInfo],
-) -> Option<String> {
+) -> Option<RelayLocalIpcCandidate> {
     if !prefer_local_ipc || !anchor_allows_local_ipc {
         return None;
     }
-    routes.iter().find_map(|route| route.ipc_address.clone())
+    routes.iter().find_map(|route| {
+        Some(RelayLocalIpcCandidate {
+            address: route.ipc_address.clone()?,
+            server_id: route.server_id.clone()?,
+            server_instance_id: route.server_instance_id.clone()?,
+        })
+    })
 }
 
 fn relay_anchor_allows_local_ipc(anchor_url: &str) -> bool {
@@ -426,6 +439,8 @@ mod tests {
                 name: name.clone(),
                 relay_url: state.stale_url.clone(),
                 ipc_address: None,
+                server_id: None,
+                server_instance_id: None,
                 crm_ns: String::new(),
                 crm_ver: String::new(),
             },
@@ -433,6 +448,8 @@ mod tests {
                 name,
                 relay_url: state.live_url.clone(),
                 ipc_address: None,
+                server_id: None,
+                server_instance_id: None,
                 crm_ns: String::new(),
                 crm_ver: String::new(),
             },
@@ -476,6 +493,8 @@ mod tests {
             name,
             relay_url: state.live_url.clone(),
             ipc_address: None,
+            server_id: None,
+            server_instance_id: None,
             crm_ns: String::new(),
             crm_ver: String::new(),
         }])
@@ -518,6 +537,8 @@ mod tests {
                 name: name.clone(),
                 relay_url: state.live_url.clone(),
                 ipc_address: None,
+                server_id: None,
+                server_instance_id: None,
                 crm_ns: String::new(),
                 crm_ver: String::new(),
             },
@@ -525,6 +546,8 @@ mod tests {
                 name,
                 relay_url: state.stale_url.clone(),
                 ipc_address: Some("ipc://local-grid".to_string()),
+                server_id: Some("local-grid".to_string()),
+                server_instance_id: Some("inst-local-grid".to_string()),
                 crm_ns: String::new(),
                 crm_ver: String::new(),
             },
@@ -668,22 +691,80 @@ mod tests {
             name: "grid".to_string(),
             relay_url: "http://relay.example".to_string(),
             ipc_address: Some("ipc://local-grid".to_string()),
+            server_id: Some("local-grid".to_string()),
+            server_instance_id: Some("inst-local-grid".to_string()),
             crm_ns: String::new(),
             crm_ver: String::new(),
         }];
 
         assert_eq!(
-            select_local_ipc_address(true, true, &routes).as_deref(),
-            Some("ipc://local-grid")
+            select_local_ipc_candidate(true, true, &routes).map(|candidate| candidate.address),
+            Some("ipc://local-grid".to_string())
         );
-        assert_eq!(select_local_ipc_address(true, false, &routes), None);
-        assert_eq!(select_local_ipc_address(false, true, &routes), None);
+        assert_eq!(select_local_ipc_candidate(true, false, &routes), None);
+        assert_eq!(select_local_ipc_candidate(false, true, &routes), None);
 
         assert!(relay_anchor_allows_local_ipc("http://127.0.0.1:8080"));
         assert!(relay_anchor_allows_local_ipc("http://[::1]:8080"));
         assert!(relay_anchor_allows_local_ipc("http://localhost:8080"));
         assert!(!relay_anchor_allows_local_ipc("http://192.0.2.10:8080"));
         assert!(!relay_anchor_allows_local_ipc("http://relay.example:8080"));
+    }
+
+    #[test]
+    fn local_ipc_selection_requires_identity_complete_route() {
+        let complete = RelayRouteInfo {
+            name: "grid".to_string(),
+            relay_url: "http://127.0.0.1:8080".to_string(),
+            ipc_address: Some("ipc://grid-server".to_string()),
+            server_id: Some("grid-server".to_string()),
+            server_instance_id: Some("inst-a".to_string()),
+            crm_ns: String::new(),
+            crm_ver: String::new(),
+        };
+        let missing_instance = RelayRouteInfo {
+            server_instance_id: None,
+            ..complete.clone()
+        };
+        let missing_server_id = RelayRouteInfo {
+            server_id: None,
+            ..complete.clone()
+        };
+
+        assert_eq!(
+            select_local_ipc_candidate(true, true, &[missing_instance]),
+            None,
+        );
+        assert_eq!(
+            select_local_ipc_candidate(true, true, &[missing_server_id]),
+            None,
+        );
+        assert_eq!(
+            select_local_ipc_candidate(true, true, &[complete.clone()]),
+            Some(RelayLocalIpcCandidate {
+                address: "ipc://grid-server".to_string(),
+                server_id: "grid-server".to_string(),
+                server_instance_id: "inst-a".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn relay_resolved_ipc_target_carries_expected_identity() {
+        let route = RelayRouteInfo {
+            name: "grid".to_string(),
+            relay_url: "http://127.0.0.1:8080".to_string(),
+            ipc_address: Some("ipc://grid-server".to_string()),
+            server_id: Some("grid-server".to_string()),
+            server_instance_id: Some("inst-a".to_string()),
+            crm_ns: String::new(),
+            crm_ver: String::new(),
+        };
+
+        let candidate = select_local_ipc_candidate(true, true, &[route]).expect("candidate");
+        assert_eq!(candidate.address, "ipc://grid-server");
+        assert_eq!(candidate.server_id, "grid-server");
+        assert_eq!(candidate.server_instance_id, "inst-a");
     }
 
     #[tokio::test]

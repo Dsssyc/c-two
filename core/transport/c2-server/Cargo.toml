@@ -12,3 +12,4 @@ c2-mem = { path = "../../foundation/c2-mem" }
 parking_lot = { workspace = true }
 tokio = { version = "1", features = ["net", "rt-multi-thread", "sync", "macros", "io-util", "time"] }
 tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }

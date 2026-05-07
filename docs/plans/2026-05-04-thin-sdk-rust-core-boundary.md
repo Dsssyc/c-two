@@ -33,6 +33,9 @@ Required invariants:
   process's control-plane relay anchor. Remote HTTP data-plane calls must go
   directly to the selected route's `relay_url`, and direct IPC selection from
   relay resolution is allowed only for loopback/local anchors.
+- Relay-discovered direct IPC is accepted only after native IPC handshake
+  identity matches the relay route's `server_id` and `server_instance_id`;
+  route-name-only acceptance is forbidden.
 - Thread-local same-process dispatch is an SDK/language optimization, not a
   replacement for cross-process IPC.
 
@@ -298,6 +301,12 @@ works when relay is absent.
 - Name-only relay connections may select direct IPC only when the configured
   relay anchor is loopback/local. Nonlocal anchor responses are forced through
   HTTP routing even if an `ipc_address` is present.
+- Relay-discovered direct IPC is accepted only after native IPC handshake
+  identity matches the relay route's `server_id` and `server_instance_id`;
+  route-name-only acceptance is forbidden.
+- Relay `/_resolve` exposes `ipc_address`, `server_id`, and
+  `server_instance_id` only to loopback callers for local routes. Non-loopback
+  callers and peer routes receive HTTP route targets without IPC-only fields.
 - Remote HTTP data-plane calls use the resolved route's `relay_url` directly,
   avoiding a client -> anchor relay -> remote relay forwarding hop.
 - Relay `/_resolve` strips `ipc_address` for non-loopback HTTP callers as
@@ -578,6 +587,9 @@ Every implementation spawned from this reference should preserve:
 - Relay-aware name resolution uses Rust relay-aware HTTP client when configured.
 - Relay anchor resolution cannot trick a client configured with a nonlocal
   anchor into dialing arbitrary local IPC.
+- Relay-discovered IPC cannot be accepted from route names alone; the IPC
+  handshake must prove the exact relay-advertised server instance before any
+  CRM call is sent over that IPC client.
 - Remote relay HTTP calls use the resolved route's `relay_url` directly rather
   than adding an anchor-relay forwarding hop.
 - Thread-local same-process calls do not serialize Python objects.

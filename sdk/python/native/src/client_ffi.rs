@@ -539,6 +539,18 @@ impl PyRustClient {
             .collect()
     }
 
+    /// Stable logical server identity advertised by the IPC handshake.
+    #[getter]
+    fn server_id(&self) -> Option<String> {
+        self.inner.server_id().map(ToOwned::to_owned)
+    }
+
+    /// Per-process server incarnation identity advertised by the IPC handshake.
+    #[getter]
+    fn server_instance_id(&self) -> Option<String> {
+        self.inner.server_instance_id().map(ToOwned::to_owned)
+    }
+
     /// Close the connection.
     ///
     /// `SyncClient::close` takes `&mut self` which is incompatible with

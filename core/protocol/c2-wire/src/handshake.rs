@@ -3,7 +3,7 @@
 //! ## Client → Server
 //!
 //! ```text
-//! [1B version=6]
+//! [1B version=7]
 //! [1B prefix_len][prefix UTF-8]
 //! [2B seg_count LE]
 //! [per-segment: [4B size LE][1B name_len][name UTF-8]]
@@ -15,6 +15,8 @@
 //! Same prefix, plus:
 //!
 //! ```text
+//! [1B server_id_len][server_id UTF-8]
+//! [1B server_instance_id_len][server_instance_id UTF-8]
 //! [2B route_count LE]
 //! [per-route:
 //!     [1B name_len][route_name UTF-8]
@@ -27,7 +29,7 @@ use crate::control::EncodeError;
 use crate::frame::DecodeError;
 
 /// Handshake version number.
-pub const HANDSHAKE_VERSION: u8 = 6;
+pub const HANDSHAKE_VERSION: u8 = 7;
 
 // ── Capability flags (2 bytes) ───────────────────────────────────────────
 
@@ -63,6 +65,13 @@ pub struct RouteInfo {
     pub methods: Vec<MethodEntry>,
 }
 
+/// Server identity exchanged in server→client handshake ACKs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerIdentity {
+    pub server_id: String,
+    pub server_instance_id: String,
+}
+
 /// Decoded handshake payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Handshake {
@@ -72,6 +81,8 @@ pub struct Handshake {
     pub segments: Vec<(String, u32)>,
     /// Capability flags.
     pub capability_flags: u16,
+    /// Server identity (only present in server→client ACK).
+    pub server_identity: Option<ServerIdentity>,
     /// Routes with method tables (only present in server→client ACK).
     pub routes: Vec<RouteInfo>,
 }
@@ -119,6 +130,7 @@ pub fn encode_server_handshake(
     capability_flags: u16,
     routes: &[RouteInfo],
     prefix: &str,
+    identity: &ServerIdentity,
 ) -> Result<Vec<u8>, EncodeError> {
     if routes.len() > MAX_ROUTES {
         return Err(EncodeError::FieldTooLong {
@@ -128,6 +140,14 @@ pub fn encode_server_handshake(
         });
     }
     let mut buf = encode_client_handshake(segments, capability_flags, prefix)?;
+    validate_name_len("server_id", &identity.server_id)?;
+    validate_name_len("server_instance_id", &identity.server_instance_id)?;
+    let server_id_b = identity.server_id.as_bytes();
+    buf.push(server_id_b.len() as u8);
+    buf.extend_from_slice(server_id_b);
+    let instance_b = identity.server_instance_id.as_bytes();
+    buf.push(instance_b.len() as u8);
+    buf.extend_from_slice(instance_b);
     buf.extend_from_slice(&(routes.len() as u16).to_le_bytes());
     for route in routes {
         validate_name_len("route name", &route.name)?;
@@ -222,62 +242,97 @@ pub fn decode_handshake(buf: &[u8]) -> Result<Handshake, DecodeError> {
     let capability_flags = read_u16(buf, off);
     off += 2;
 
-    // Routes (optional — only in server→client ACK)
-    let mut routes = Vec::new();
-    if off + 2 <= len {
-        let route_count = read_u16(buf, off) as usize;
-        off += 2;
-        if route_count > MAX_ROUTES {
-            return Err(DecodeError::InvalidValue {
-                field: "route count",
-                value: route_count as u64,
-            });
-        }
-        routes.reserve(route_count);
-        for _ in 0..route_count {
-            check_remaining(buf, off, 1, "route name_len")?;
-            let r_len = buf[off] as usize;
-            off += 1;
-            check_remaining(buf, off, r_len, "route name")?;
-            let r_name = read_str(buf, off, r_len)?;
-            off += r_len;
+    // Client handshakes end after capability flags. Server ACKs append
+    // identity and route table data.
+    if off == len {
+        return Ok(Handshake {
+            prefix,
+            segments,
+            capability_flags,
+            server_identity: None,
+            routes: Vec::new(),
+        });
+    }
 
-            check_remaining(buf, off, 2, "method count")?;
-            let m_count = read_u16(buf, off) as usize;
-            off += 2;
-            if m_count > MAX_METHODS {
-                return Err(DecodeError::InvalidValue {
-                    field: "method count",
-                    value: m_count as u64,
-                });
-            }
-            let mut methods = Vec::with_capacity(m_count);
-            for _ in 0..m_count {
-                check_remaining(buf, off, 1, "method name_len")?;
-                let m_len = buf[off] as usize;
-                off += 1;
-                check_remaining(buf, off, m_len, "method name")?;
-                let m_name = read_str(buf, off, m_len)?;
-                off += m_len;
-                check_remaining(buf, off, 2, "method index")?;
-                let m_idx = read_u16(buf, off);
-                off += 2;
-                methods.push(MethodEntry {
-                    name: m_name,
-                    index: m_idx,
-                });
-            }
-            routes.push(RouteInfo {
-                name: r_name,
-                methods,
+    check_remaining(buf, off, 1, "server_id length")?;
+    let server_id_len = buf[off] as usize;
+    off += 1;
+    check_remaining(buf, off, server_id_len, "server_id")?;
+    let server_id = read_str(buf, off, server_id_len)?;
+    off += server_id_len;
+
+    check_remaining(buf, off, 1, "server_instance_id length")?;
+    let instance_len = buf[off] as usize;
+    off += 1;
+    check_remaining(buf, off, instance_len, "server_instance_id")?;
+    let server_instance_id = read_str(buf, off, instance_len)?;
+    off += instance_len;
+
+    // Routes (server→client ACK)
+    let mut routes = Vec::new();
+    check_remaining(buf, off, 2, "route count")?;
+    let route_count = read_u16(buf, off) as usize;
+    off += 2;
+    if route_count > MAX_ROUTES {
+        return Err(DecodeError::InvalidValue {
+            field: "route count",
+            value: route_count as u64,
+        });
+    }
+    routes.reserve(route_count);
+    for _ in 0..route_count {
+        check_remaining(buf, off, 1, "route name_len")?;
+        let r_len = buf[off] as usize;
+        off += 1;
+        check_remaining(buf, off, r_len, "route name")?;
+        let r_name = read_str(buf, off, r_len)?;
+        off += r_len;
+
+        check_remaining(buf, off, 2, "method count")?;
+        let m_count = read_u16(buf, off) as usize;
+        off += 2;
+        if m_count > MAX_METHODS {
+            return Err(DecodeError::InvalidValue {
+                field: "method count",
+                value: m_count as u64,
             });
         }
+        let mut methods = Vec::with_capacity(m_count);
+        for _ in 0..m_count {
+            check_remaining(buf, off, 1, "method name_len")?;
+            let m_len = buf[off] as usize;
+            off += 1;
+            check_remaining(buf, off, m_len, "method name")?;
+            let m_name = read_str(buf, off, m_len)?;
+            off += m_len;
+            check_remaining(buf, off, 2, "method index")?;
+            let m_idx = read_u16(buf, off);
+            off += 2;
+            methods.push(MethodEntry {
+                name: m_name,
+                index: m_idx,
+            });
+        }
+        routes.push(RouteInfo {
+            name: r_name,
+            methods,
+        });
+    }
+    if off != len {
+        return Err(DecodeError::InvalidValue {
+            field: "trailing bytes",
+            value: (len - off) as u64,
+        });
     }
 
     Ok(Handshake {
         prefix,
         segments,
         capability_flags,
+        server_identity: Some(ServerIdentity {
+            server_id,
+            server_instance_id,
+        }),
         routes,
     })
 }

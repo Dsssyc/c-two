@@ -16,6 +16,7 @@ use crate::relay::types::{Locality, RouteEntry};
 pub(crate) enum ControlError {
     InvalidName { reason: String },
     InvalidServerId { reason: String },
+    InvalidServerInstanceId { reason: String },
     AddressMismatch { existing_address: String },
     DuplicateRoute { existing_address: String },
     OwnerMismatch,
@@ -50,6 +51,7 @@ pub(crate) enum RouteCommand {
     RegisterLocal {
         name: String,
         server_id: String,
+        server_instance_id: String,
         address: String,
         crm_ns: String,
         crm_ver: String,
@@ -124,7 +126,24 @@ impl<'a> RouteAuthority<'a> {
 
     pub(crate) fn validate_server_id(&self, server_id: &str) -> Result<(), ControlError> {
         c2_config::validate_server_id(server_id)
-            .map_err(|reason| ControlError::InvalidServerId { reason })
+            .map_err(|reason| ControlError::InvalidServerId { reason })?;
+        if server_id.len() > c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES {
+            return Err(ControlError::InvalidServerId {
+                reason: format!(
+                    "server_id cannot exceed {} bytes",
+                    c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_server_instance_id(
+        &self,
+        server_instance_id: &str,
+    ) -> Result<(), ControlError> {
+        validate_server_instance_id(server_instance_id)
+            .map_err(|reason| ControlError::InvalidServerInstanceId { reason })
     }
 
     pub(crate) fn register_local_preflight(
@@ -223,6 +242,7 @@ impl<'a> RouteAuthority<'a> {
             RouteCommand::RegisterLocal {
                 name,
                 server_id,
+                server_instance_id,
                 address,
                 crm_ns,
                 crm_ver,
@@ -231,6 +251,7 @@ impl<'a> RouteAuthority<'a> {
             } => self.register_local(
                 name,
                 server_id,
+                server_instance_id,
                 address,
                 crm_ns,
                 crm_ver,
@@ -261,6 +282,7 @@ impl<'a> RouteAuthority<'a> {
         &self,
         name: String,
         server_id: String,
+        server_instance_id: String,
         address: String,
         crm_ns: String,
         crm_ver: String,
@@ -269,6 +291,7 @@ impl<'a> RouteAuthority<'a> {
     ) -> Result<RouteCommandResult, ControlError> {
         self.validate_route_name(&name)?;
         self.validate_server_id(&server_id)?;
+        self.validate_server_instance_id(&server_instance_id)?;
 
         let mut route_table = self.state.route_table_write();
         if let Some(existing) = route_table.local_route(&name) {
@@ -295,6 +318,7 @@ impl<'a> RouteAuthority<'a> {
             relay_id: self.state.relay_id().to_string(),
             relay_url: self.state.config().effective_advertise_url(),
             server_id: Some(server_id),
+            server_instance_id: Some(server_instance_id),
             ipc_address: Some(address.clone()),
             crm_ns,
             crm_ver,
@@ -364,6 +388,7 @@ impl<'a> RouteAuthority<'a> {
             .ok_or(ControlError::OwnerMismatch)?;
         entry.relay_url = peer_url;
         entry.server_id = None;
+        entry.server_instance_id = None;
         entry.ipc_address = None;
         entry.locality = Locality::Peer;
         route_table.register_route(entry);
@@ -437,4 +462,31 @@ enum OwnerProbe {
     RouteMissing,
     Dead,
     Stale,
+}
+
+fn validate_server_instance_id(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("invalid server_instance_id: cannot be empty".to_string());
+    }
+    if value.len() > c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES {
+        return Err(format!(
+            "invalid server_instance_id: cannot exceed {} bytes",
+            c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES
+        ));
+    }
+    if value.trim() != value {
+        return Err(
+            "invalid server_instance_id: cannot contain leading or trailing whitespace".to_string(),
+        );
+    }
+    if value == "." || value == ".." || value.contains('/') || value.contains('\\') {
+        return Err("invalid server_instance_id: cannot contain path separators".to_string());
+    }
+    if !value.is_ascii() {
+        return Err("invalid server_instance_id: must be ASCII".to_string());
+    }
+    if value.chars().any(char::is_control) {
+        return Err("invalid server_instance_id: cannot contain control characters".to_string());
+    }
+    Ok(())
 }

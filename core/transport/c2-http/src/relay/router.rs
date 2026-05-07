@@ -98,7 +98,7 @@ pub fn build_router(state: Arc<RelayState>) -> Router {
 
 /// `POST /_register` — register a new upstream CRM.
 ///
-/// Body: `{"name": "grid", "server_id": "...", "address": "ipc://...", "crm_ns": "...", "crm_ver": "..."}`
+/// Body: `{"name": "grid", "server_id": "...", "server_instance_id": "...", "address": "ipc://...", "crm_ns": "...", "crm_ver": "..."}`
 /// Returns: 201 on success, 409 on duplicate, 502 on connection failure.
 async fn handle_register(
     State(state): State<Arc<RelayState>>,
@@ -116,6 +116,12 @@ async fn handle_register(
         Some(id) => id.to_string(),
         None => return (StatusCode::BAD_REQUEST, "Missing \"server_id\"").into_response(),
     };
+    let server_instance_id = match body.get("server_instance_id").and_then(|v| v.as_str()) {
+        Some(id) => id.to_string(),
+        None => {
+            return (StatusCode::BAD_REQUEST, "Missing \"server_instance_id\"").into_response();
+        }
+    };
     let crm_ns = body
         .get("crm_ns")
         .and_then(|v| v.as_str())
@@ -126,6 +132,12 @@ async fn handle_register(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+
+    if let Err(ControlError::InvalidServerInstanceId { reason }) =
+        RouteAuthority::new(&state).validate_server_instance_id(&server_instance_id)
+    {
+        return (StatusCode::BAD_REQUEST, reason).into_response();
+    }
 
     let replacement = match RouteAuthority::new(&state)
         .prepare_register(&name, &server_id, &address)
@@ -150,7 +162,8 @@ async fn handle_register(
             return duplicate_route_response(&name, &existing_address);
         }
         Err(ControlError::InvalidName { reason })
-        | Err(ControlError::InvalidServerId { reason }) => {
+        | Err(ControlError::InvalidServerId { reason })
+        | Err(ControlError::InvalidServerInstanceId { reason }) => {
             return (StatusCode::BAD_REQUEST, reason).into_response();
         }
         Err(ControlError::OwnerMismatch) | Err(ControlError::NotFound) => {
@@ -169,6 +182,17 @@ async fn handle_register(
                 Json(serde_json::json!({"error": format!("Failed to connect upstream '{name}' at {address}: {e}")})),
             ).into_response();
         }
+        let identity_matches = c.server_id() == Some(server_id.as_str())
+            && c.server_instance_id() == Some(server_instance_id.as_str());
+        if !identity_matches {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": format!("IPC server identity mismatch for upstream '{name}' at {address}"),
+                })),
+            )
+                .into_response();
+        }
         Arc::new(c)
     };
 
@@ -176,6 +200,7 @@ async fn handle_register(
     let entry = match state.commit_register_upstream(
         name.clone(),
         server_id,
+        server_instance_id,
         address,
         crm_ns,
         crm_ver,
@@ -327,6 +352,8 @@ async fn handle_resolve(
     if !expose_ipc_address {
         for route in &mut routes {
             route.ipc_address = None;
+            route.server_id = None;
+            route.server_instance_id = None;
         }
     }
     Json(routes).into_response()
@@ -551,6 +578,7 @@ pub(crate) mod tests {
             serde_json::json!({
                 "name": name,
                 "server_id": server_id,
+                "server_instance_id": format!("{server_id}-instance"),
                 "address": address,
             })
             .to_string(),
@@ -684,6 +712,7 @@ pub(crate) mod tests {
         state.commit_register_upstream(
             "grid".into(),
             "server-grid".into(),
+            "inst-grid".into(),
             "ipc://grid".into(),
             String::new(),
             String::new(),
@@ -699,6 +728,8 @@ pub(crate) mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(routes[0].ipc_address.as_deref(), Some("ipc://grid"));
+        assert_eq!(routes[0].server_id.as_deref(), Some("server-grid"));
+        assert_eq!(routes[0].server_instance_id.as_deref(), Some("inst-grid"));
 
         let (status, routes) = get_resolve_routes_from(
             state,
@@ -708,19 +739,77 @@ pub(crate) mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(routes[0].ipc_address, None);
+        assert_eq!(routes[0].server_id, None);
+        assert_eq!(routes[0].server_instance_id, None);
     }
 
     #[tokio::test]
     async fn register_rejects_invalid_server_id_at_control_boundary() {
         let state = test_state();
+        let too_long = "s".repeat(c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES + 1);
         assert_eq!(
             post_register(state.clone(), "grid", " ", "ipc://grid").await,
             StatusCode::BAD_REQUEST
         );
         assert_eq!(
-            post_register(state, "grid", "bad/path", "ipc://grid").await,
+            post_register(state.clone(), "grid", "bad/path", "ipc://grid").await,
             StatusCode::BAD_REQUEST
         );
+        assert_eq!(
+            post_register(state, "grid", &too_long, "ipc://grid").await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn register_rejects_invalid_server_instance_id_at_control_boundary() {
+        let state = test_state();
+        let too_long = "a".repeat(c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES + 1);
+        for server_instance_id in ["../bad", too_long.as_str()] {
+            let app = build_router(state.clone());
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/_register")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "name": "grid",
+                                "server_id": "server-grid",
+                                "server_instance_id": server_instance_id,
+                                "address": "ipc://grid",
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(String::from_utf8_lossy(&body).contains("server_instance_id"));
+        }
+    }
+
+    #[tokio::test]
+    async fn register_rejects_ipc_handshake_identity_mismatch() {
+        let state = test_state();
+        let address = format!(
+            "ipc://relay_identity_mismatch_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let server = start_live_server(&address, "server-actual").await;
+
+        assert_eq!(
+            post_register(state, "grid", "server-claimed", &address).await,
+            StatusCode::BAD_GATEWAY
+        );
+
+        server.shutdown();
     }
 
     #[tokio::test]
@@ -748,6 +837,7 @@ pub(crate) mod tests {
         state.commit_register_upstream(
             "grid".into(),
             "server-grid".into(),
+            "inst-grid".into(),
             "ipc://missing-grid".into(),
             String::new(),
             String::new(),
@@ -840,8 +930,18 @@ pub(crate) mod tests {
             .unwrap();
     }
 
-    async fn start_live_server(address: &str) -> Arc<Server> {
-        let server = Arc::new(Server::new(address, ServerIpcConfig::default()).unwrap());
+    async fn start_live_server(address: &str, server_id: &str) -> Arc<Server> {
+        let server = Arc::new(
+            Server::new_with_identity(
+                address,
+                ServerIpcConfig::default(),
+                c2_server::ServerIdentity {
+                    server_id: server_id.to_string(),
+                    server_instance_id: format!("{server_id}-instance"),
+                },
+            )
+            .unwrap(),
+        );
         register_echo_route(&server, "grid").await;
         let run_server = server.clone();
         tokio::spawn(async move {
@@ -874,9 +974,9 @@ pub(crate) mod tests {
             std::process::id(),
             unique_suffix()
         );
-        let old_server = start_live_server(&old_address).await;
+        let old_server = start_live_server(&old_address, "server-old").await;
         register_echo_route(&old_server, "counter").await;
-        let new_server = start_live_server(&new_address).await;
+        let new_server = start_live_server(&new_address, "server-new").await;
 
         assert_eq!(
             post_register(state.clone(), "grid", "server-old", &old_address).await,
@@ -906,7 +1006,7 @@ pub(crate) mod tests {
             std::process::id(),
             unique_suffix()
         );
-        let stale_server = start_live_server(&stale_address).await;
+        let stale_server = start_live_server(&stale_address, "server-grid").await;
 
         assert_eq!(
             post_register(state.clone(), "grid", "server-grid", &stale_address).await,
@@ -935,7 +1035,7 @@ pub(crate) mod tests {
             std::process::id(),
             unique_suffix()
         );
-        let stale_server = start_live_server(&stale_address).await;
+        let stale_server = start_live_server(&stale_address, "server-grid").await;
 
         assert_eq!(
             post_register(state.clone(), "grid", "server-grid", &stale_address).await,
@@ -965,7 +1065,7 @@ pub(crate) mod tests {
             std::process::id(),
             unique_suffix()
         );
-        let stale_server = start_live_server(&stale_address).await;
+        let stale_server = start_live_server(&stale_address, "server-grid").await;
 
         assert_eq!(
             post_register(state.clone(), "grid", "server-grid", &stale_address).await,
@@ -999,8 +1099,8 @@ pub(crate) mod tests {
             std::process::id(),
             unique_suffix()
         );
-        let old_server = start_live_server(&old_address).await;
-        let new_server = start_live_server(&new_address).await;
+        let old_server = start_live_server(&old_address, "server-old").await;
+        let new_server = start_live_server(&new_address, "server-new").await;
 
         assert_eq!(
             post_register(state.clone(), "grid", "server-old", &old_address).await,
@@ -1034,8 +1134,8 @@ pub(crate) mod tests {
             std::process::id(),
             unique_suffix()
         );
-        let old_server = start_live_server(&old_address).await;
-        let new_server = start_live_server(&new_address).await;
+        let old_server = start_live_server(&old_address, "server-old").await;
+        let new_server = start_live_server(&new_address, "server-new").await;
 
         assert_eq!(
             post_register(state.clone(), "grid", "server-old", &old_address).await,
@@ -1065,7 +1165,7 @@ pub(crate) mod tests {
             std::process::id(),
             unique_suffix()
         );
-        let server = start_live_server(&address).await;
+        let server = start_live_server(&address, "server-grid").await;
 
         assert_eq!(
             post_register(state.clone(), "grid", "server-grid", &address).await,
@@ -1119,8 +1219,8 @@ pub(crate) mod tests {
             std::process::id(),
             unique_suffix()
         );
-        let first_server = start_live_server(&first_address).await;
-        let second_server = start_live_server(&second_address).await;
+        let first_server = start_live_server(&first_address, "server-first").await;
+        let second_server = start_live_server(&second_address, "server-second").await;
 
         let first = {
             let state = state.clone();
@@ -1173,7 +1273,7 @@ pub(crate) mod tests {
             std::process::id(),
             unique_suffix()
         );
-        let server = start_live_server(&address).await;
+        let server = start_live_server(&address, "server-grid").await;
 
         assert_eq!(
             post_register(state.clone(), "grid", "server-grid", &address).await,
@@ -1202,7 +1302,7 @@ pub(crate) mod tests {
             std::process::id(),
             unique_suffix()
         );
-        let server = start_live_server(&address).await;
+        let server = start_live_server(&address, "server-grid").await;
 
         assert_eq!(
             post_register(state.clone(), "grid", "server-grid", &address).await,
@@ -1228,7 +1328,7 @@ pub(crate) mod tests {
             std::process::id(),
             unique_suffix()
         );
-        let server = start_live_server(&address).await;
+        let server = start_live_server(&address, "server-grid").await;
 
         assert_eq!(
             post_register(state.clone(), "grid", "server-grid", &address).await,

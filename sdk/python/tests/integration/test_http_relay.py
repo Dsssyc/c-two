@@ -35,6 +35,18 @@ def _release_http(url: str):
     RustHttpClientPool.instance().release(url)
 
 
+def _server_instance_id_for(registry: _ProcessRegistry, address: str) -> str:
+    """Read the IPC server instance identity from the native handshake."""
+    client = registry._runtime_session.acquire_ipc_client(address)  # noqa: SLF001
+    try:
+        instance_id = client.server_instance_id
+        assert isinstance(instance_id, str)
+        assert instance_id
+        return instance_id
+    finally:
+        registry._runtime_session.release_ipc_client(address)  # noqa: SLF001
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -59,6 +71,7 @@ def relay_stack(start_c3_relay):
     cc.register(Counter, CounterImpl(), name='counter')
     ipc_addr = cc.server_address()
     server_id = cc.server_id()
+    server_instance_id = _server_instance_id_for(_ProcessRegistry.get(), ipc_addr)
 
     relay = start_c3_relay()
     relay_url = relay.url
@@ -67,7 +80,12 @@ def relay_stack(start_c3_relay):
         for name in ('hello', 'counter'):
             resp = http.post(
                 f'{relay_url}/_register',
-                json={'name': name, 'server_id': server_id, 'address': ipc_addr},
+                json={
+                    'name': name,
+                    'server_id': server_id,
+                    'server_instance_id': server_instance_id,
+                    'address': ipc_addr,
+                },
             )
             assert resp.status_code == 201
 
@@ -253,13 +271,19 @@ class TestCcConnectHttp:
         cc.register(Hello, HelloImpl(), name=slashed_name)
         ipc_addr = cc.server_address()
         server_id = cc.server_id()
+        server_instance_id = _server_instance_id_for(_ProcessRegistry.get(), ipc_addr)
 
         relay = start_c3_relay()
         relay_url = relay.url
         with httpx.Client(trust_env=False, timeout=5.0) as http:
             resp = http.post(
                 f'{relay_url}/_register',
-                json={'name': slashed_name, 'server_id': server_id, 'address': ipc_addr},
+                json={
+                    'name': slashed_name,
+                    'server_id': server_id,
+                    'server_instance_id': server_instance_id,
+                    'address': ipc_addr,
+                },
             )
             assert resp.status_code == 201
 
@@ -312,6 +336,31 @@ class TestCcConnectHttp:
             crm = resolver.connect(Hello, name=name)
             assert crm.client._mode == 'ipc'
             assert crm.greeting('RuntimeRelay') == 'Hello, RuntimeRelay!'
+        finally:
+            if crm is not None:
+                resolver.close(crm)
+            resolver.shutdown()
+            settings.relay_anchor_address = previous_relay
+            registrar.shutdown()
+            settings.relay_anchor_address = previous_relay
+
+    def test_name_only_connect_uses_verified_ipc_for_local_anchor(self, start_c3_relay):
+        name = 'identity/verified/local-ipc'
+        relay = start_c3_relay()
+        relay_url = relay.url
+        previous_relay = settings.relay_anchor_address
+        registrar = _ProcessRegistry()
+        resolver = _ProcessRegistry()
+        crm = None
+        try:
+            registrar.set_relay_anchor(relay_url)
+            registrar.register(Hello, HelloImpl(), name=name)
+            resolver.set_relay_anchor(relay_url)
+
+            crm = resolver.connect(Hello, name=name)
+
+            assert crm.client._mode == 'ipc'  # noqa: SLF001
+            assert crm.greeting('Identity') == 'Hello, Identity!'
         finally:
             if crm is not None:
                 resolver.close(crm)
@@ -400,6 +449,7 @@ class TestRelayControlPlane:
         cc.register(Hello, HelloImpl(), name='hello')
         ipc_addr = cc.server_address()
         server_id = cc.server_id()
+        server_instance_id = _server_instance_id_for(_ProcessRegistry.get(), ipc_addr)
 
         relay = start_c3_relay()
         relay_url = relay.url
@@ -408,7 +458,12 @@ class TestRelayControlPlane:
             # Register via control endpoint.
             resp = http.post(
                 f'{relay_url}/_register',
-                json={'name': 'hello', 'server_id': server_id, 'address': ipc_addr},
+                json={
+                    'name': 'hello',
+                    'server_id': server_id,
+                    'server_instance_id': server_instance_id,
+                    'address': ipc_addr,
+                },
             )
             assert resp.status_code == 201
             assert resp.json()['registered'] == 'hello'
@@ -420,6 +475,7 @@ class TestRelayControlPlane:
             assert any(r['name'] == 'hello' for r in routes)
             route = next(r for r in routes if r['name'] == 'hello')
             assert 'server_id' not in route
+            assert 'server_instance_id' not in route
             assert 'ipc_address' not in route
 
         # Verify data-plane call works.
@@ -436,6 +492,7 @@ class TestRelayControlPlane:
         cc.register(Hello, HelloImpl(), name='hello')
         ipc_addr = cc.server_address()
         server_id = cc.server_id()
+        server_instance_id = _server_instance_id_for(_ProcessRegistry.get(), ipc_addr)
 
         relay = start_c3_relay()
         relay_url = relay.url
@@ -443,14 +500,24 @@ class TestRelayControlPlane:
         with httpx.Client(trust_env=False, timeout=5.0) as http:
             resp = http.post(
                 f'{relay_url}/_register',
-                json={'name': 'hello', 'server_id': server_id, 'address': ipc_addr},
+                json={
+                    'name': 'hello',
+                    'server_id': server_id,
+                    'server_instance_id': server_instance_id,
+                    'address': ipc_addr,
+                },
             )
             assert resp.status_code == 201
 
             # Same-relay duplicate registration uses upsert semantics.
             resp = http.post(
                 f'{relay_url}/_register',
-                json={'name': 'hello', 'server_id': server_id, 'address': ipc_addr},
+                json={
+                    'name': 'hello',
+                    'server_id': server_id,
+                    'server_instance_id': server_instance_id,
+                    'address': ipc_addr,
+                },
             )
             assert resp.status_code == 200
 
@@ -459,6 +526,7 @@ class TestRelayControlPlane:
         cc.register(Hello, HelloImpl(), name='hello')
         ipc_addr = cc.server_address()
         server_id = cc.server_id()
+        server_instance_id = _server_instance_id_for(_ProcessRegistry.get(), ipc_addr)
 
         relay = start_c3_relay()
         relay_url = relay.url
@@ -467,7 +535,12 @@ class TestRelayControlPlane:
             # Register, then unregister.
             http.post(
                 f'{relay_url}/_register',
-                json={'name': 'hello', 'server_id': server_id, 'address': ipc_addr},
+                json={
+                    'name': 'hello',
+                    'server_id': server_id,
+                    'server_instance_id': server_instance_id,
+                    'address': ipc_addr,
+                },
             )
             resp = http.post(
                 f'{relay_url}/_unregister',
@@ -505,6 +578,7 @@ class TestRelayControlPlane:
         cc.register(Counter, CounterImpl(), name='counter')
         ipc_addr = cc.server_address()
         server_id = cc.server_id()
+        server_instance_id = _server_instance_id_for(_ProcessRegistry.get(), ipc_addr)
 
         relay = start_c3_relay()
         relay_url = relay.url
@@ -513,7 +587,12 @@ class TestRelayControlPlane:
             for name in ('hello', 'counter'):
                 resp = http.post(
                     f'{relay_url}/_register',
-                    json={'name': name, 'server_id': server_id, 'address': ipc_addr},
+                    json={
+                        'name': name,
+                        'server_id': server_id,
+                        'server_instance_id': server_instance_id,
+                        'address': ipc_addr,
+                    },
                 )
                 assert resp.status_code == 201
 

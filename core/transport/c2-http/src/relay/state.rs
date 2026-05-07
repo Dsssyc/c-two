@@ -82,6 +82,7 @@ impl RelayState {
         &self,
         name: String,
         server_id: String,
+        server_instance_id: String,
         address: String,
         crm_ns: String,
         crm_ver: String,
@@ -95,6 +96,7 @@ impl RelayState {
         match RouteAuthority::new(self).execute(RouteCommand::RegisterLocal {
             name,
             server_id,
+            server_instance_id,
             address,
             crm_ns,
             crm_ver,
@@ -114,6 +116,11 @@ impl RelayState {
                 RegisterCommitResult::Duplicate { existing_address }
             }
             Err(ControlError::InvalidServerId { .. }) | Err(ControlError::InvalidName { .. }) => {
+                RegisterCommitResult::ConflictingOwner {
+                    existing_address: "<invalid>".to_string(),
+                }
+            }
+            Err(ControlError::InvalidServerInstanceId { .. }) => {
                 RegisterCommitResult::ConflictingOwner {
                     existing_address: "<invalid>".to_string(),
                 }
@@ -157,7 +164,8 @@ impl RelayState {
             Err(ControlError::OwnerMismatch)
             | Err(ControlError::AddressMismatch { .. })
             | Err(ControlError::InvalidName { .. })
-            | Err(ControlError::InvalidServerId { .. }) => UnregisterResult::OwnerMismatch,
+            | Err(ControlError::InvalidServerId { .. })
+            | Err(ControlError::InvalidServerInstanceId { .. }) => UnregisterResult::OwnerMismatch,
             Err(ControlError::DuplicateRoute { .. }) => UnregisterResult::OwnerMismatch,
         }
     }
@@ -407,6 +415,7 @@ mod tests {
         match state.commit_register_upstream(
             name.to_string(),
             server_id.to_string(),
+            format!("{server_id}-instance"),
             address.to_string(),
             String::new(),
             String::new(),
@@ -513,6 +522,7 @@ mod tests {
                 relay_id: "peer-1".into(),
                 relay_url: "http://peer-1:8080".into(),
                 server_id: None,
+                server_instance_id: None,
                 ipc_address: None,
                 crm_ns: "ns".into(),
                 crm_ver: "0.1.0".into(),
@@ -543,6 +553,7 @@ mod tests {
                 relay_id: "test-relay".into(),
                 relay_url: "http://elsewhere:8080".into(),
                 server_id: None,
+                server_instance_id: None,
                 ipc_address: None,
                 crm_ns: "test.ns".into(),
                 crm_ver: "0.1.0".into(),
@@ -602,6 +613,7 @@ mod tests {
                 relay_id: "test-relay".into(),
                 relay_url: "http://localhost:9999".into(),
                 server_id: Some("server-old".into()),
+                server_instance_id: Some("instance-old".into()),
                 ipc_address: Some("ipc://grid-old".into()),
                 crm_ns: String::new(),
                 crm_ver: String::new(),
@@ -639,6 +651,7 @@ mod tests {
         let first_result = state.commit_register_upstream(
             "grid".into(),
             "server-first".into(),
+            "instance-first".into(),
             "ipc://first".into(),
             String::new(),
             String::new(),
@@ -653,6 +666,7 @@ mod tests {
         let second_result = state.commit_register_upstream(
             "grid".into(),
             "server-second".into(),
+            "instance-second".into(),
             "ipc://second".into(),
             String::new(),
             String::new(),
@@ -682,6 +696,7 @@ mod tests {
         let result = state.commit_register_upstream(
             "grid".into(),
             "server-new".into(),
+            "instance-new".into(),
             "ipc://new".into(),
             String::new(),
             String::new(),
@@ -723,6 +738,7 @@ mod tests {
         let result = state.commit_register_upstream(
             "grid".into(),
             "server-racer".into(),
+            "instance-racer".into(),
             "ipc://replacement".into(),
             String::new(),
             String::new(),
@@ -760,6 +776,7 @@ mod tests {
         let result = state.commit_register_upstream(
             "grid".into(),
             "server-new".into(),
+            "instance-new".into(),
             "ipc://replacement".into(),
             String::new(),
             String::new(),
@@ -795,6 +812,7 @@ mod tests {
         let result = state.commit_register_upstream(
             "grid".into(),
             "server-grid".into(),
+            "instance-grid".into(),
             "ipc://grid".into(),
             String::new(),
             String::new(),
@@ -821,6 +839,7 @@ mod tests {
         let result = state.commit_register_upstream(
             "grid".into(),
             "server-grid".into(),
+            "instance-grid".into(),
             "ipc://new".into(),
             String::new(),
             String::new(),
@@ -868,6 +887,7 @@ mod tests {
         let result = state.commit_register_upstream(
             "grid".into(),
             "server-grid".into(),
+            "instance-grid".into(),
             "ipc://grid".into(),
             String::new(),
             String::new(),

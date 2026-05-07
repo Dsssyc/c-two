@@ -18,6 +18,7 @@ pub struct RuntimeRouteSpec {
 pub struct RegisterOutcome {
     pub route_name: String,
     pub server_id: String,
+    pub server_instance_id: String,
     pub ipc_address: String,
     pub relay_registered: bool,
 }

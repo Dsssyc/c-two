@@ -187,12 +187,13 @@ impl PyRustRelayControlClient {
         })
     }
 
-    #[pyo3(signature = (name, server_id, ipc_address, crm_ns="", crm_ver=""))]
+    #[pyo3(signature = (name, server_id, server_instance_id, ipc_address, crm_ns="", crm_ver=""))]
     fn register(
         &self,
         py: Python<'_>,
         name: &str,
         server_id: &str,
+        server_instance_id: &str,
         ipc_address: &str,
         crm_ns: &str,
         crm_ver: &str,
@@ -200,11 +201,21 @@ impl PyRustRelayControlClient {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         let server_id = server_id.to_string();
+        let server_instance_id = server_instance_id.to_string();
         let ipc_address = ipc_address.to_string();
         let crm_ns = crm_ns.to_string();
         let crm_ver = crm_ver.to_string();
-        py.detach(move || inner.register(&name, &server_id, &ipc_address, &crm_ns, &crm_ver))
-            .map_err(py_http_error)
+        py.detach(move || {
+            inner.register(
+                &name,
+                &server_id,
+                &server_instance_id,
+                &ipc_address,
+                &crm_ns,
+                &crm_ver,
+            )
+        })
+        .map_err(py_http_error)
     }
 
     fn unregister(&self, py: Python<'_>, name: &str, server_id: &str) -> PyResult<()> {
