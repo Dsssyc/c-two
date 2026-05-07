@@ -9,9 +9,12 @@
 //! - `tokio::sync::RwLock` — async lock for `Dispatcher` (must `.await`)
 //! - `parking_lot::RwLock` — sync lock for `MemPool` (blocking, no `.await`)
 
+use std::io::ErrorKind;
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::OwnedWriteHalf;
@@ -96,6 +99,27 @@ impl From<std::io::Error> for ServerError {
 // Server
 // ---------------------------------------------------------------------------
 
+/// Native lifecycle state for the IPC server accept loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerLifecycleState {
+    Initialized,
+    Starting,
+    Ready,
+    Stopping,
+    Stopped,
+    Failed(String),
+}
+
+impl ServerLifecycleState {
+    pub fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready)
+    }
+
+    pub fn is_running(&self) -> bool {
+        matches!(self, Self::Starting | Self::Ready | Self::Stopping)
+    }
+}
+
 /// The main IPC server.
 ///
 /// Binds a UDS socket, accepts connections, and dispatches CRM calls through
@@ -109,6 +133,7 @@ pub struct Server {
     dispatcher: RwLock<Dispatcher>,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
+    lifecycle_tx: watch::Sender<ServerLifecycleState>,
     conn_counter: AtomicU64,
     /// Sharded chunk reassembly lifecycle manager.
     chunk_registry: Arc<c2_wire::chunk::ChunkRegistry>,
@@ -166,12 +191,14 @@ impl Server {
         response_pool
             .ensure_ready()
             .map_err(|e| ServerError::Config(format!("response pool init: {e}")))?;
+        let (lifecycle_tx, _lifecycle_rx) = watch::channel(ServerLifecycleState::Initialized);
         Ok(Self {
             config,
             socket_path,
             dispatcher: RwLock::new(Dispatcher::new()),
             shutdown_tx,
             shutdown_rx,
+            lifecycle_tx,
             conn_counter: AtomicU64::new(0),
             chunk_registry,
             response_pool: Arc::new(parking_lot::RwLock::new(response_pool)),
@@ -220,6 +247,57 @@ impl Server {
         &self.socket_path
     }
 
+    fn set_lifecycle_state(&self, state: ServerLifecycleState) {
+        self.lifecycle_tx.send_replace(state);
+    }
+
+    pub fn lifecycle_state(&self) -> ServerLifecycleState {
+        self.lifecycle_tx.borrow().clone()
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.lifecycle_state().is_ready()
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.lifecycle_state().is_running()
+    }
+
+    pub async fn wait_until_ready(&self, timeout: Duration) -> Result<(), ServerError> {
+        let mut rx = self.lifecycle_tx.subscribe();
+        let wait = async {
+            loop {
+                let state = rx.borrow().clone();
+                match state {
+                    ServerLifecycleState::Ready => return Ok(()),
+                    ServerLifecycleState::Failed(message) => {
+                        return Err(ServerError::Config(format!(
+                            "server failed to start: {message}",
+                        )));
+                    }
+                    ServerLifecycleState::Stopped => {
+                        return Err(ServerError::Config(
+                            "server stopped before becoming ready".to_string(),
+                        ));
+                    }
+                    ServerLifecycleState::Initialized
+                    | ServerLifecycleState::Starting
+                    | ServerLifecycleState::Stopping => {}
+                }
+                rx.changed().await.map_err(|_| {
+                    ServerError::Config("server readiness channel closed".to_string())
+                })?;
+            }
+        };
+
+        tokio::time::timeout(timeout, wait).await.map_err(|_| {
+            ServerError::Config(format!(
+                "server did not become ready within {:.3}s",
+                timeout.as_secs_f64(),
+            ))
+        })?
+    }
+
     /// Get a shared reference to the response pool (for zero-copy dispatch).
     pub fn response_pool_arc(&self) -> Arc<parking_lot::RwLock<MemPool>> {
         Arc::clone(&self.response_pool)
@@ -237,10 +315,23 @@ impl Server {
 
     /// Run the accept loop.  Blocks until [`shutdown`](Self::shutdown) is called.
     pub async fn run(self: &Arc<Self>) -> Result<(), ServerError> {
-        std::fs::create_dir_all(IPC_SOCK_DIR)?;
-        let _ = std::fs::remove_file(&self.socket_path);
+        self.set_lifecycle_state(ServerLifecycleState::Starting);
 
-        let listener = UnixListener::bind(&self.socket_path)?;
+        let startup = async {
+            std::fs::create_dir_all(IPC_SOCK_DIR)?;
+            remove_stale_socket_file(&self.socket_path)?;
+            let listener = UnixListener::bind(&self.socket_path)?;
+            Ok::<UnixListener, ServerError>(listener)
+        }
+        .await;
+
+        let listener = match startup {
+            Ok(listener) => listener,
+            Err(err) => {
+                self.set_lifecycle_state(ServerLifecycleState::Failed(err.to_string()));
+                return Err(err);
+            }
+        };
 
         #[cfg(unix)]
         {
@@ -249,6 +340,7 @@ impl Server {
                 std::fs::set_permissions(&self.socket_path, std::fs::Permissions::from_mode(0o600));
         }
 
+        self.set_lifecycle_state(ServerLifecycleState::Ready);
         info!(path = %self.socket_path.display(), "server listening");
 
         // Spawn periodic GC sweep for expired chunk assemblies.
@@ -286,6 +378,7 @@ impl Server {
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
                         info!("server shutting down");
+                        self.set_lifecycle_state(ServerLifecycleState::Stopping);
                         break;
                     }
                 }
@@ -293,11 +386,15 @@ impl Server {
         }
 
         let _ = std::fs::remove_file(&self.socket_path);
+        self.set_lifecycle_state(ServerLifecycleState::Stopped);
         Ok(())
     }
 
     /// Signal the server to stop and remove the socket file.
     pub fn shutdown(&self) {
+        if self.is_running() {
+            self.set_lifecycle_state(ServerLifecycleState::Stopping);
+        }
         let _ = self.shutdown_tx.send(true);
         let _ = std::fs::remove_file(&self.socket_path);
     }
@@ -330,6 +427,29 @@ fn parse_socket_path(address: &str) -> Result<PathBuf, ServerError> {
         .ok_or_else(|| ServerError::Config(format!("invalid IPC address: {address}")))?;
     validate_region_id(region).map_err(ServerError::Config)?;
     Ok(PathBuf::from(IPC_SOCK_DIR).join(format!("{region}.sock")))
+}
+
+fn remove_stale_socket_file(socket_path: &Path) -> Result<(), ServerError> {
+    if !socket_path.exists() {
+        return Ok(());
+    }
+
+    match StdUnixStream::connect(socket_path) {
+        Ok(_) => Err(ServerError::Config(format!(
+            "IPC socket {} already has an active listener",
+            socket_path.display(),
+        ))),
+        Err(err)
+            if matches!(
+                err.kind(),
+                ErrorKind::ConnectionRefused | ErrorKind::NotFound
+            ) =>
+        {
+            let _ = std::fs::remove_file(socket_path);
+            Ok(())
+        }
+        Err(err) => Err(ServerError::Io(err)),
+    }
 }
 
 fn validate_region_id(region: &str) -> Result<(), String> {
@@ -1299,6 +1419,106 @@ mod tests {
             ..ServerIpcConfig::default()
         };
         assert!(Server::new("ipc://x", cfg).is_err());
+    }
+
+    fn unique_readiness_address(prefix: &str) -> String {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        format!("ipc://{prefix}_{}_{}", std::process::id(), n)
+    }
+
+    #[tokio::test]
+    async fn wait_until_ready_times_out_before_start() {
+        let server = Arc::new(
+            Server::new(
+                &unique_readiness_address("ready_timeout"),
+                ServerIpcConfig::default(),
+            )
+            .unwrap(),
+        );
+
+        let err = server
+            .wait_until_ready(Duration::from_millis(1))
+            .await
+            .expect_err("server that was never started must time out");
+
+        assert!(err.to_string().contains("did not become ready"));
+        assert_eq!(server.lifecycle_state(), ServerLifecycleState::Initialized);
+        assert!(!server.is_ready());
+        assert!(!server.is_running());
+    }
+
+    #[tokio::test]
+    async fn run_sets_ready_then_shutdown_sets_stopped() {
+        let server = Arc::new(
+            Server::new(
+                &unique_readiness_address("ready_state"),
+                ServerIpcConfig::default(),
+            )
+            .unwrap(),
+        );
+        let runner = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { server.run().await })
+        };
+
+        server
+            .wait_until_ready(Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(server.lifecycle_state(), ServerLifecycleState::Ready);
+        assert!(server.is_ready());
+        assert!(server.is_running());
+        assert!(StdUnixStream::connect(server.socket_path()).is_ok());
+
+        server.shutdown();
+        runner.await.unwrap().unwrap();
+        assert_eq!(server.lifecycle_state(), ServerLifecycleState::Stopped);
+        assert!(!server.is_ready());
+        assert!(!server.is_running());
+    }
+
+    #[tokio::test]
+    async fn active_socket_is_not_unlinked_by_second_server() {
+        let address = unique_readiness_address("active_socket");
+        let first = Arc::new(Server::new(&address, ServerIpcConfig::default()).unwrap());
+        let first_runner = {
+            let first = Arc::clone(&first);
+            tokio::spawn(async move { first.run().await })
+        };
+        first
+            .wait_until_ready(Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(StdUnixStream::connect(first.socket_path()).is_ok());
+
+        let second = Arc::new(Server::new(&address, ServerIpcConfig::default()).unwrap());
+        let second_result = tokio::time::timeout(Duration::from_millis(200), {
+            let second = Arc::clone(&second);
+            async move { second.run().await }
+        })
+        .await;
+
+        match second_result {
+            Ok(Err(err)) => {
+                let message = err.to_string();
+                assert!(
+                    message.contains("already has an active listener")
+                        || message.contains("address already in use"),
+                    "unexpected error: {message}",
+                );
+            }
+            Ok(Ok(())) => panic!("second server unexpectedly started and stopped cleanly"),
+            Err(_) => {
+                second.shutdown();
+                panic!("second server hung instead of rejecting the active socket");
+            }
+        }
+
+        assert!(first.is_ready());
+        assert!(StdUnixStream::connect(first.socket_path()).is_ok());
+        first.shutdown();
+        first_runner.await.unwrap().unwrap();
     }
 
     // -- route registration --
