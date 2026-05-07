@@ -180,3 +180,40 @@ def test_runtime_session_does_not_infer_started_from_socket_file():
     session_rs = root / "core" / "runtime" / "c2-runtime" / "src" / "session.rs"
     source = session_rs.read_text(encoding="utf-8")
     assert "socket_path().exists()" not in source
+
+
+def test_python_server_dispatcher_does_not_own_response_allocation():
+    import inspect
+    from c_two.transport.server.native import NativeServerBridge
+
+    source = inspect.getsource(NativeServerBridge._make_dispatcher)
+    forbidden = [
+        "response_pool",
+        "len(res_part) >",
+        "write_from_buffer",
+        "bytes(res_part)",
+        "seg_idx",
+        "is_dedicated",
+    ]
+    offenders = [needle for needle in forbidden if needle in source]
+    assert offenders == []
+
+
+def test_native_server_response_parser_does_not_accept_shm_coordinate_tuples():
+    root = Path(__file__).resolve().parents[4]
+    server_ffi = root / "sdk" / "python" / "native" / "src" / "server_ffi.rs"
+    source = server_ffi.read_text(encoding="utf-8")
+    start = source.index("fn parse_response_meta")
+    end = source.index("// ---------------------------------------------------------------------------", start)
+    parser_source = source[start:end]
+
+    forbidden = [
+        "PyTuple",
+        "seg_idx: int",
+        "offset: int",
+        "data_size: int",
+        "is_dedicated: bool",
+        "seg_idx, offset, data_size",
+    ]
+    offenders = [needle for needle in forbidden if needle in parser_source]
+    assert offenders == []
