@@ -57,6 +57,7 @@ use crate::dispatcher::{
     CrmError, CrmRoute, Dispatcher, RequestData, ResponseMeta, cleanup_request,
 };
 use crate::heartbeat::run_heartbeat;
+use crate::response::buddy_response_data_size;
 use crate::scheduler::{Scheduler, SchedulerAcquireError};
 
 const IPC_SOCK_DIR: &str = "/tmp/c_two_ipc";
@@ -383,6 +384,11 @@ impl Server {
     /// Return the configured response SHM threshold.
     pub fn response_shm_threshold(&self) -> u64 {
         self.config.shm_threshold
+    }
+
+    /// Return the configured maximum logical response payload size.
+    pub fn response_max_payload_size(&self) -> u64 {
+        self.config.max_payload_size
     }
 
     /// Return true if a route is currently registered.
@@ -791,15 +797,34 @@ async fn send_route_execution_result(
 ) {
     match result {
         Ok(meta) => {
-            send_response_meta(
+            if let Err(err) = send_response_meta(
                 &server.response_pool,
                 writer,
                 request_id,
                 meta,
                 server.config.shm_threshold,
                 server.config.chunk_size as usize,
+                server.config.max_payload_size,
             )
             .await
+            {
+                match err {
+                    ResponseSendError::UserVisible(message) => {
+                        write_reply(
+                            writer,
+                            request_id,
+                            &ReplyControl::Error(error_wire(
+                                ErrorCode::ResourceOutputSerializing,
+                                message,
+                            )),
+                        )
+                        .await;
+                    }
+                    ResponseSendError::Transport(message) => {
+                        warn!(request_id, error = %message, "response send failed");
+                    }
+                }
+            }
         }
         Err(RouteExecutionError::Crm(CrmError::UserError(b))) => {
             write_reply(writer, request_id, &ReplyControl::Error(b)).await;
@@ -1206,6 +1231,79 @@ async fn dispatch_chunked_call(
 
 const REPLY_FLAGS: u32 = FLAG_RESPONSE | FLAG_REPLY_V2;
 
+fn checked_frame_total_len(payload_len: usize, context: &str) -> Result<u32, String> {
+    let total_len = 12usize
+        .checked_add(payload_len)
+        .ok_or_else(|| format!("{context} length overflow"))?;
+    u32::try_from(total_len)
+        .map_err(|_| format!("{context} length {total_len} exceeds u32 frame limit"))
+}
+
+fn inline_reply_total_len(data_len: usize) -> Result<u32, String> {
+    let ctrl_len = encode_reply_control(&ReplyControl::Success).len();
+    let payload_len = ctrl_len
+        .checked_add(data_len)
+        .ok_or_else(|| "inline reply frame length overflow".to_string())?;
+    checked_frame_total_len(payload_len, "inline reply frame")
+}
+
+fn reply_chunk_count(data_len: usize, chunk_size: usize) -> Result<u32, String> {
+    if chunk_size == 0 {
+        return Err("chunk_size must be > 0".to_string());
+    }
+    if data_len == 0 {
+        return Ok(0);
+    }
+    let chunks = data_len.div_ceil(chunk_size);
+    u32::try_from(chunks).map_err(|_| {
+        format!(
+            "chunk count {chunks} exceeds reply chunk metadata limit {}",
+            u32::MAX
+        )
+    })
+}
+
+fn ensure_response_meta_len(
+    data_len: usize,
+    max_payload_size: u64,
+) -> Result<(), ResponseSendError> {
+    let data_len_u64 = u64::try_from(data_len).unwrap_or(u64::MAX);
+    if data_len_u64 > max_payload_size {
+        return Err(ResponseSendError::UserVisible(format!(
+            "response payload size {data_len} exceeds max_payload_size {max_payload_size}"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+enum BuddyReplyError {
+    Fallback(String),
+    Fatal(String),
+}
+
+impl std::fmt::Display for BuddyReplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fallback(message) | Self::Fatal(message) => f.write_str(message),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ResponseSendError {
+    UserVisible(String),
+    Transport(String),
+}
+
+impl std::fmt::Display for ResponseSendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UserVisible(message) | Self::Transport(message) => f.write_str(message),
+        }
+    }
+}
+
 async fn write_reply(writer: &Arc<Mutex<OwnedWriteHalf>>, request_id: u64, ctrl: &ReplyControl) {
     let payload = encode_reply_control(ctrl);
     let frame = encode_frame(request_id, REPLY_FLAGS, &payload);
@@ -1214,10 +1312,16 @@ async fn write_reply(writer: &Arc<Mutex<OwnedWriteHalf>>, request_id: u64, ctrl:
 
 /// Write a success reply: control header (STATUS_SUCCESS) + result data.
 /// Uses stack buffer for small responses (≤1024B total frame) to avoid heap allocation.
-async fn write_reply_with_data(writer: &Arc<Mutex<OwnedWriteHalf>>, request_id: u64, data: &[u8]) {
+async fn write_reply_with_data(
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    request_id: u64,
+    data: &[u8],
+) -> Result<(), ResponseSendError> {
     let ctrl_bytes = encode_reply_control(&ReplyControl::Success);
-    let payload_len = ctrl_bytes.len() + data.len();
-    let total_len = (12 + payload_len) as u32;
+    let payload_len = ctrl_bytes.len().checked_add(data.len()).ok_or_else(|| {
+        ResponseSendError::UserVisible("inline reply frame length overflow".to_string())
+    })?;
+    let total_len = inline_reply_total_len(data.len()).map_err(ResponseSendError::UserVisible)?;
     let frame_size = frame::HEADER_SIZE + payload_len;
 
     if frame_size <= 1024 {
@@ -1231,25 +1335,45 @@ async fn write_reply_with_data(writer: &Arc<Mutex<OwnedWriteHalf>>, request_id: 
         off += ctrl_bytes.len();
         buf[off..off + data.len()].copy_from_slice(data);
         off += data.len();
-        let _ = writer.lock().await.write_all(&buf[..off]).await;
+        writer
+            .lock()
+            .await
+            .write_all(&buf[..off])
+            .await
+            .map_err(|e| ResponseSendError::Transport(format!("inline reply write failed: {e}")))?;
     } else {
         // Large response: heap Vec (existing path)
-        let mut payload = Vec::with_capacity(ctrl_bytes.len() + data.len());
+        let mut payload = Vec::with_capacity(payload_len);
         payload.extend_from_slice(&ctrl_bytes);
         payload.extend_from_slice(data);
         let frame = encode_frame(request_id, REPLY_FLAGS, &payload);
-        let _ = writer.lock().await.write_all(&frame).await;
+        writer
+            .lock()
+            .await
+            .write_all(&frame)
+            .await
+            .map_err(|e| ResponseSendError::Transport(format!("inline reply write failed: {e}")))?;
     }
+    Ok(())
 }
 
 /// Write a success reply via buddy SHM: allocate from response pool, write
-/// data, send 11-byte pointer frame. Falls back to inline on alloc failure.
+/// data, send 11-byte pointer frame. The caller chooses inline or chunked
+/// fallback when SHM is unavailable.
 async fn write_buddy_reply_with_data(
     response_pool: &parking_lot::RwLock<MemPool>,
     writer: &Arc<Mutex<OwnedWriteHalf>>,
     request_id: u64,
     data: &[u8],
-) -> Result<(), String> {
+) -> Result<(), BuddyReplyError> {
+    let data_size = buddy_response_data_size(data.len()).ok_or_else(|| {
+        BuddyReplyError::Fallback(format!(
+            "response payload size {} exceeds buddy response wire limit {}",
+            data.len(),
+            u32::MAX
+        ))
+    })?;
+
     // 1. Allocate from response pool.
     let alloc = {
         let mut pool = response_pool.write();
@@ -1258,7 +1382,7 @@ async fn write_buddy_reply_with_data(
     let alloc = match alloc {
         Ok(a) => a,
         Err(e) => {
-            return Err(format!("alloc failed: {e}"));
+            return Err(BuddyReplyError::Fallback(format!("alloc failed: {e}")));
         }
     };
 
@@ -1280,14 +1404,14 @@ async fn write_buddy_reply_with_data(
             let mut pool = response_pool.write();
             let _ = pool.free(&alloc);
         }
-        return Err("data_ptr failed".into());
+        return Err(BuddyReplyError::Fallback("data_ptr failed".into()));
     }
 
     // 3. Encode buddy payload + reply control.
     let bp = BuddyPayload {
         seg_idx: alloc.seg_idx as u16,
         offset: alloc.offset,
-        data_size: data.len() as u32,
+        data_size,
         is_dedicated: alloc.is_dedicated,
     };
     let buddy_bytes = encode_buddy_payload(&bp);
@@ -1300,7 +1424,13 @@ async fn write_buddy_reply_with_data(
     // 4. Send frame with FLAG_BUDDY.
     let flags = FLAG_RESPONSE | FLAG_REPLY_V2 | FLAG_BUDDY;
     let frame = encode_frame(request_id, flags, &payload);
-    let _ = writer.lock().await.write_all(&frame).await;
+    if let Err(err) = writer.lock().await.write_all(&frame).await {
+        let mut pool = response_pool.write();
+        let _ = pool.free(&alloc);
+        return Err(BuddyReplyError::Fatal(format!(
+            "buddy reply write failed: {err}"
+        )));
+    }
 
     // 5. Server-side free for dedicated segments: the client will lazy-open
     //    and read from SHM before gc_delay expires.  Buddy allocs use SHM
@@ -1321,20 +1451,27 @@ async fn write_chunked_reply(
     request_id: u64,
     data: &[u8],
     chunk_size: usize,
-) {
-    let total_chunks = ((data.len() + chunk_size - 1) / chunk_size) as u32;
+) -> Result<(), ResponseSendError> {
+    let total_chunks =
+        reply_chunk_count(data.len(), chunk_size).map_err(ResponseSendError::UserVisible)?;
     let total_size = data.len() as u64;
 
     for (idx, chunk) in data.chunks(chunk_size).enumerate() {
-        let meta = encode_reply_chunk_meta(total_size, total_chunks, idx as u32);
+        let chunk_idx = u32::try_from(idx).map_err(|_| {
+            ResponseSendError::UserVisible(format!(
+                "chunk index {idx} exceeds reply chunk metadata limit"
+            ))
+        })?;
+        let meta = encode_reply_chunk_meta(total_size, total_chunks, chunk_idx);
         let mut flags = REPLY_FLAGS | FLAG_CHUNKED;
-        if idx as u32 == total_chunks - 1 {
+        if chunk_idx == total_chunks - 1 {
             flags |= FLAG_CHUNK_LAST;
         }
 
         // Build frame: header + meta + chunk data
         let payload_len = REPLY_CHUNK_META_SIZE + chunk.len();
-        let total_len = (12 + payload_len) as u32;
+        let total_len = checked_frame_total_len(payload_len, "chunked reply frame")
+            .map_err(ResponseSendError::UserVisible)?;
 
         let mut frame = Vec::with_capacity(frame::HEADER_SIZE + payload_len);
         frame.extend_from_slice(&total_len.to_le_bytes());
@@ -1343,8 +1480,11 @@ async fn write_chunked_reply(
         frame.extend_from_slice(&meta);
         frame.extend_from_slice(chunk);
 
-        let _ = writer.lock().await.write_all(&frame).await;
+        writer.lock().await.write_all(&frame).await.map_err(|e| {
+            ResponseSendError::Transport(format!("chunked reply write failed: {e}"))
+        })?;
     }
+    Ok(())
 }
 
 /// Dispatch a `ResponseMeta` to the appropriate reply path.
@@ -1355,9 +1495,11 @@ async fn send_response_meta(
     meta: ResponseMeta,
     shm_threshold: u64,
     chunk_size: usize,
-) {
+    max_payload_size: u64,
+) -> Result<(), ResponseSendError> {
     match meta {
         ResponseMeta::Inline(data) => {
+            ensure_response_meta_len(data.len(), max_payload_size)?;
             smart_reply_with_data(
                 response_pool,
                 writer,
@@ -1366,10 +1508,10 @@ async fn send_response_meta(
                 shm_threshold,
                 chunk_size,
             )
-            .await;
+            .await?;
         }
         ResponseMeta::Empty => {
-            write_reply_with_data(writer, request_id, &[]).await;
+            write_reply_with_data(writer, request_id, &[]).await?;
         }
         ResponseMeta::ShmAlloc {
             seg_idx,
@@ -1377,6 +1519,13 @@ async fn send_response_meta(
             data_size,
             is_dedicated,
         } => {
+            if u64::from(data_size) > max_payload_size {
+                let mut pool = response_pool.write();
+                let _ = pool.free_at(seg_idx as u32, offset, data_size, is_dedicated);
+                return Err(ResponseSendError::UserVisible(format!(
+                    "response payload size {data_size} exceeds max_payload_size {max_payload_size}"
+                )));
+            }
             // CRM already wrote into our response pool — send buddy pointer.
             let bp = BuddyPayload {
                 seg_idx,
@@ -1391,7 +1540,13 @@ async fn send_response_meta(
             payload.extend_from_slice(&ctrl_bytes);
             let flags = FLAG_RESPONSE | FLAG_REPLY_V2 | FLAG_BUDDY;
             let frame = encode_frame(request_id, flags, &payload);
-            let _ = writer.lock().await.write_all(&frame).await;
+            if let Err(err) = writer.lock().await.write_all(&frame).await {
+                let mut pool = response_pool.write();
+                let _ = pool.free_at(seg_idx as u32, offset, data_size, is_dedicated);
+                return Err(ResponseSendError::Transport(format!(
+                    "prepared SHM reply write failed: {err}"
+                )));
+            }
 
             // Server-side free for dedicated segments (same as write_buddy_reply_with_data).
             if is_dedicated {
@@ -1400,6 +1555,7 @@ async fn send_response_meta(
             }
         }
     }
+    Ok(())
 }
 
 /// Choose buddy SHM or inline reply based on data size and threshold.
@@ -1410,23 +1566,31 @@ async fn smart_reply_with_data(
     data: &[u8],
     shm_threshold: u64,
     chunk_size: usize,
-) {
+) -> Result<(), ResponseSendError> {
     if data.len() as u64 > shm_threshold {
-        // Try buddy SHM first
-        if write_buddy_reply_with_data(response_pool, writer, request_id, data)
-            .await
-            .is_err()
-        {
-            // SHM failed — use chunked for large data, inline for small
-            if data.len() > chunk_size {
-                write_chunked_reply(writer, request_id, data, chunk_size).await;
-            } else {
-                write_reply_with_data(writer, request_id, data).await;
+        // Try buddy SHM first only when the buddy wire metadata can represent
+        // the payload. Larger responses must go straight to chunked fallback.
+        if buddy_response_data_size(data.len()).is_some() {
+            match write_buddy_reply_with_data(response_pool, writer, request_id, data).await {
+                Ok(()) => return Ok(()),
+                Err(BuddyReplyError::Fallback(_)) => {}
+                Err(BuddyReplyError::Fatal(message)) => {
+                    return Err(ResponseSendError::Transport(message));
+                }
             }
         }
-    } else {
-        write_reply_with_data(writer, request_id, data).await;
+
+        // SHM failed or is not representable. Use chunked for large data and
+        // for any data that cannot fit in a single inline frame.
+        if data.len() > chunk_size || inline_reply_total_len(data.len()).is_err() {
+            return write_chunked_reply(writer, request_id, data, chunk_size).await;
+        }
     }
+
+    if inline_reply_total_len(data.len()).is_err() {
+        return write_chunked_reply(writer, request_id, data, chunk_size).await;
+    }
+    write_reply_with_data(writer, request_id, data).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1510,6 +1674,35 @@ mod tests {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
         format!("ipc://{prefix}_{}_{}", std::process::id(), n)
+    }
+
+    fn unique_response_pool_prefix(label: &str) -> String {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        format!("/c2sw{:04x}{:04x}", std::process::id() as u16, n as u16) + label
+    }
+
+    fn small_response_pool(label: &str) -> parking_lot::RwLock<MemPool> {
+        parking_lot::RwLock::new(MemPool::new_with_prefix(
+            PoolConfig {
+                segment_size: 64 * 1024,
+                min_block_size: 4096,
+                max_segments: 1,
+                max_dedicated_segments: 1,
+                dedicated_crash_timeout_secs: 0.0,
+                ..PoolConfig::default()
+            },
+            unique_response_pool_prefix(label),
+        ))
+    }
+
+    fn closed_writer() -> Arc<Mutex<OwnedWriteHalf>> {
+        let (client, server) = StdUnixStream::pair().unwrap();
+        client.shutdown(std::net::Shutdown::Both).unwrap();
+        server.set_nonblocking(true).unwrap();
+        let server = UnixStream::from_std(server).unwrap();
+        let (_read_half, write_half) = server.into_split();
+        Arc::new(Mutex::new(write_half))
     }
 
     #[tokio::test]
@@ -2039,6 +2232,145 @@ mod tests {
         assert_eq!(&slice[16..18], b"cc");
         drop(p);
         pool.write().release_handle(finished.handle);
+    }
+
+    #[test]
+    fn buddy_response_wire_limit_rejects_oversized_payloads() {
+        assert_eq!(
+            crate::response::buddy_response_data_size(u32::MAX as usize),
+            Some(u32::MAX)
+        );
+        assert_eq!(
+            crate::response::buddy_response_data_size(u32::MAX as usize + 1),
+            None
+        );
+    }
+
+    #[test]
+    fn reply_chunk_count_rejects_unrepresentable_chunk_counts() {
+        assert!(reply_chunk_count(0, 0).unwrap_err().contains("chunk_size"));
+        assert_eq!(reply_chunk_count(0, 128).unwrap(), 0);
+        assert_eq!(reply_chunk_count(1025, 512).unwrap(), 3);
+
+        let err = reply_chunk_count(u32::MAX as usize + 1, 1).unwrap_err();
+        assert!(err.contains("chunk count"));
+    }
+
+    #[test]
+    fn inline_reply_frame_len_rejects_unrepresentable_frames() {
+        assert!(inline_reply_total_len(16).is_ok());
+
+        let err = inline_reply_total_len(u32::MAX as usize).unwrap_err();
+        assert!(err.contains("inline reply frame"));
+    }
+
+    #[tokio::test]
+    async fn buddy_reply_write_failure_frees_allocated_response_block() {
+        let pool = small_response_pool("a");
+        let writer = closed_writer();
+        let payload = b"x".repeat(8192);
+
+        let err = write_buddy_reply_with_data(&pool, &writer, 7, payload.as_slice())
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("buddy reply write failed"));
+        assert_eq!(pool.read().stats().alloc_count, 0);
+    }
+
+    #[tokio::test]
+    async fn prepared_shm_reply_write_failure_frees_allocated_response_block() {
+        let pool = small_response_pool("b");
+        let alloc = pool.write().alloc(8192).unwrap();
+        let writer = closed_writer();
+
+        let err = send_response_meta(
+            &pool,
+            &writer,
+            7,
+            ResponseMeta::ShmAlloc {
+                seg_idx: alloc.seg_idx as u16,
+                offset: alloc.offset,
+                data_size: 8192,
+                is_dedicated: alloc.is_dedicated,
+            },
+            1024,
+            4096,
+            16 * 1024,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("prepared SHM reply write failed"));
+        assert_eq!(pool.read().stats().alloc_count, 0);
+    }
+
+    #[tokio::test]
+    async fn inline_response_over_max_payload_is_rejected_before_transport() {
+        let pool = small_response_pool("c");
+        let writer = closed_writer();
+
+        let err = send_response_meta(
+            &pool,
+            &writer,
+            7,
+            ResponseMeta::Inline(b"x".repeat(1025)),
+            1024,
+            4096,
+            1024,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("response payload size 1025 exceeds max_payload_size 1024")
+        );
+        assert_eq!(pool.read().stats().alloc_count, 0);
+    }
+
+    #[tokio::test]
+    async fn prepared_shm_response_over_max_payload_is_rejected_and_freed() {
+        let pool = small_response_pool("d");
+        let alloc = pool.write().alloc(8192).unwrap();
+        let writer = closed_writer();
+
+        let err = send_response_meta(
+            &pool,
+            &writer,
+            7,
+            ResponseMeta::ShmAlloc {
+                seg_idx: alloc.seg_idx as u16,
+                offset: alloc.offset,
+                data_size: 8192,
+                is_dedicated: alloc.is_dedicated,
+            },
+            1024,
+            4096,
+            4096,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("response payload size 8192 exceeds max_payload_size 4096")
+        );
+        assert_eq!(pool.read().stats().alloc_count, 0);
+    }
+
+    #[tokio::test]
+    async fn smart_reply_treats_buddy_write_failure_as_fatal() {
+        let pool = small_response_pool("e");
+        let writer = closed_writer();
+        let payload = b"x".repeat(8192);
+
+        let err = smart_reply_with_data(&pool, &writer, 7, payload.as_slice(), 1024, 4096)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("buddy reply write failed"));
+        assert_eq!(pool.read().stats().alloc_count, 0);
     }
 
     // -- handshake extraction --

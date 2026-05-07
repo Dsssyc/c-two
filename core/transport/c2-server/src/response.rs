@@ -4,13 +4,18 @@ use c2_mem::MemPool;
 
 use crate::dispatcher::ResponseMeta;
 
+/// Return the buddy response wire `data_size` when the payload length is
+/// representable by the current buddy payload metadata.
+pub(crate) fn buddy_response_data_size(len: usize) -> Option<u32> {
+    u32::try_from(len).ok()
+}
+
 /// Try to prepare a large response directly in the server response SHM pool.
 ///
 /// Returns `Ok(None)` when the caller should materialise owned inline bytes and
 /// let `send_response_meta()` choose inline or chunked fallback. Allocation
 /// failure is therefore not a CRM failure. Errors are reserved for cases where
-/// an allocation was made but the payload could not be copied safely, or where
-/// the current buddy response wire format cannot represent the allocation.
+/// an allocation was made but the payload could not be copied safely.
 pub fn try_prepare_shm_response<F>(
     response_pool: &parking_lot::RwLock<MemPool>,
     shm_threshold: u64,
@@ -23,12 +28,10 @@ where
     if len == 0 || len as u64 <= shm_threshold {
         return Ok(None);
     }
-    if len > u32::MAX as usize {
-        return Err(format!(
-            "response payload size {len} exceeds buddy response wire limit {}",
-            u32::MAX
-        ));
-    }
+    let data_size = match buddy_response_data_size(len) {
+        Some(size) => size,
+        None => return Ok(None),
+    };
 
     let alloc = {
         let mut pool = response_pool.write();
@@ -72,7 +75,7 @@ where
     Ok(Some(ResponseMeta::ShmAlloc {
         seg_idx: alloc.seg_idx as u16,
         offset: alloc.offset,
-        data_size: len as u32,
+        data_size,
         is_dedicated: alloc.is_dedicated,
     }))
 }
@@ -183,6 +186,19 @@ mod tests {
 
         let meta = super::try_prepare_shm_response(&pool, 1024, 8192, |_| {
             panic!("allocation failure should not request a SHM destination")
+        })
+        .unwrap();
+
+        assert!(meta.is_none());
+        assert_eq!(pool.read().stats().alloc_count, 0);
+    }
+
+    #[test]
+    fn oversized_buddy_wire_payload_falls_back_without_allocation() {
+        let pool = test_pool();
+
+        let meta = super::try_prepare_shm_response(&pool, 1024, u32::MAX as usize + 1, |_| {
+            panic!("oversized buddy response should not request a SHM destination")
         })
         .unwrap();
 

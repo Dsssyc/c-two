@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 import c_two as cc
+from c_two.error import ResourceSerializeOutput
 from c_two.config import settings
 from c_two.transport.registry import _ProcessRegistry
 
@@ -150,5 +151,31 @@ def test_small_response_remains_inline():
         finally:
             held.release()
         assert cc.hold_stats()["active_holds"] == 0
+    finally:
+        cc.close(client)
+
+
+def test_response_over_max_payload_size_returns_resource_output_error():
+    settings.shm_threshold = 1024
+    cc.set_server(
+        ipc_overrides={
+            "pool_segment_size": 8192,
+            "max_payload_size": 8192,
+            "max_frame_size": 16384,
+        }
+    )
+    cc.register(
+        BytesResponseCRM,
+        BytesResponseResource(),
+        name="response_over_max_payload",
+    )
+    cc.serve(blocking=False)
+    client = _connect(BytesResponseCRM, "response_over_max_payload")
+    try:
+        with pytest.raises(ResourceSerializeOutput) as exc_info:
+            client.payload(8193)
+        assert "response payload size 8193 exceeds max_payload_size 8192" in str(
+            exc_info.value
+        )
     finally:
         cc.close(client)

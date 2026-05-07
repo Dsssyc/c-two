@@ -19,6 +19,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict};
 
 use c2_config::{BaseIpcConfig, ServerIpcConfig};
+use c2_error::{C2Error, ErrorCode};
 use c2_mem::MemPool;
 use c2_server::Server;
 use c2_server::dispatcher::{CrmCallback, CrmError, CrmRoute, RequestData, ResponseMeta};
@@ -46,6 +47,7 @@ pub(crate) fn parse_concurrency_mode(mode: &str) -> PyResult<ConcurrencyMode> {
 pub(crate) struct PyCrmCallback {
     py_callable: Py<PyAny>,
     shm_threshold: u64,
+    max_payload_size: u64,
 }
 
 // SAFETY: Py<PyAny> is Send when accessed only under the GIL.
@@ -81,7 +83,13 @@ impl CrmCallback for PyCrmCallback {
             // Call Python: dispatcher(route_name, method_idx, shm_buffer)
             let args = (route_name, method_idx, buf_obj);
             match self.py_callable.call1(py, args) {
-                Ok(result) => parse_response_meta(py, result, &response_pool, self.shm_threshold),
+                Ok(result) => parse_response_meta(
+                    py,
+                    result,
+                    &response_pool,
+                    self.shm_threshold,
+                    self.max_payload_size,
+                ),
                 Err(e) => {
                     // Check for .error_bytes attribute (CrmCallError from Python).
                     let val = e.value(py);
@@ -163,6 +171,7 @@ impl PyServer {
         let callback = Arc::new(PyCrmCallback {
             py_callable: dispatcher,
             shm_threshold: self.inner.response_shm_threshold(),
+            max_payload_size: self.inner.response_max_payload_size(),
         });
 
         let route = CrmRoute {
@@ -477,6 +486,7 @@ fn parse_response_meta(
     result: Py<PyAny>,
     response_pool: &parking_lot::RwLock<MemPool>,
     shm_threshold: u64,
+    max_payload_size: u64,
 ) -> Result<ResponseMeta, CrmError> {
     let result = result.bind(py);
 
@@ -491,16 +501,17 @@ fn parse_response_meta(
         if data.is_empty() {
             return Ok(ResponseMeta::Empty);
         }
+        ensure_response_len_within_limit(data.len(), max_payload_size)?;
         if let Some(meta) =
             try_prepare_shm_response(response_pool, shm_threshold, data.len(), |dst| {
                 dst.copy_from_slice(data);
                 Ok(())
             })
-            .map_err(CrmError::InternalError)?
+            .map_err(resource_output_error)?
         {
             return Ok(meta);
         }
-        return Ok(ResponseMeta::Inline(data.to_vec()));
+        return Ok(ResponseMeta::Inline(copy_slice_to_response_vec(data)?));
     }
 
     // Generic buffer exporter → direct SHM preparation for large payloads.
@@ -509,23 +520,57 @@ fn parse_response_meta(
         if len == 0 {
             return Ok(ResponseMeta::Empty);
         }
+        ensure_response_len_within_limit(len, max_payload_size)?;
         if let Some(meta) = try_prepare_shm_response(response_pool, shm_threshold, len, |dst| {
             buffer.copy_to_slice(py, dst).map_err(|e| e.to_string())
         })
-        .map_err(CrmError::InternalError)?
+        .map_err(resource_output_error)?
         {
             return Ok(meta);
         }
-        let mut data = vec![0_u8; len];
+        let mut data = allocate_response_vec(len)?;
         buffer
             .copy_to_slice(py, &mut data)
-            .map_err(|e| CrmError::InternalError(format!("failed to copy response buffer: {e}")))?;
+            .map_err(|e| resource_output_error(format!("failed to copy response buffer: {e}")))?;
         return Ok(ResponseMeta::Inline(data));
     }
 
-    Err(CrmError::InternalError(
-        "dispatcher must return None or a bytes-like buffer".to_string(),
+    Err(resource_output_error(
+        "dispatcher must return None or a bytes-like buffer",
     ))
+}
+
+fn resource_output_error(message: impl Into<String>) -> CrmError {
+    CrmError::UserError(
+        C2Error::new(ErrorCode::ResourceOutputSerializing, message.into()).to_wire_bytes(),
+    )
+}
+
+fn ensure_response_len_within_limit(len: usize, max_payload_size: u64) -> Result<(), CrmError> {
+    let len_u64 = u64::try_from(len).unwrap_or(u64::MAX);
+    if len_u64 > max_payload_size {
+        return Err(resource_output_error(format!(
+            "response payload size {len} exceeds max_payload_size {max_payload_size}"
+        )));
+    }
+    Ok(())
+}
+
+fn allocate_response_vec(len: usize) -> Result<Vec<u8>, CrmError> {
+    let mut data = Vec::new();
+    data.try_reserve_exact(len)
+        .map_err(|e| resource_output_error(format!("failed to allocate response buffer: {e}")))?;
+    data.resize(len, 0);
+    Ok(data)
+}
+
+fn copy_slice_to_response_vec(data: &[u8]) -> Result<Vec<u8>, CrmError> {
+    let mut owned = Vec::new();
+    owned.try_reserve_exact(data.len()).map_err(|e| {
+        resource_output_error(format!("failed to allocate response fallback buffer: {e}"))
+    })?;
+    owned.extend_from_slice(data);
+    Ok(owned)
 }
 
 // ---------------------------------------------------------------------------

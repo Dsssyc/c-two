@@ -197,6 +197,10 @@ orchestration, and same-process direct-call glue. Rust handles IPC, wire
 framing, SHM, response allocation/transport selection, route concurrency
 enforcement, runtime session state, HTTP relay transport, and relay-aware route
 fallback.
+Response allocation must enforce native IPC payload limits before allocating
+owned fallback buffers, skip buddy SHM when buddy wire metadata cannot
+represent the payload, and use checked chunked fallback rather than truncating
+frame or chunk metadata.
 
 | File | Purpose |
 | --- | --- |

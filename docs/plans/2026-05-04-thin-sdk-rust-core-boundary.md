@@ -460,21 +460,31 @@ SHM coordinate tuples, or converts `memoryview` outputs with `bytes(...)` for
 transport.
 
 Rust `c2-server::response::try_prepare_shm_response()` owns threshold-based
-large response SHM preparation and post-allocation cleanup. PyO3
+large response SHM preparation and post-allocation cleanup. Payloads that are
+valid for the configured response path but too large for buddy SHM wire
+metadata fall back to owned bytes so the Rust server can choose chunked
+transport rather than reporting a CRM failure. PyO3
 `parse_response_meta()` accepts `bytes` and generic `PyBuffer<u8>` exporters,
 attempts direct Python-buffer-to-response-SHM writes for large outputs, and
 only materializes owned inline bytes for small outputs or SHM allocation
-fallback. Existing `send_response_meta()` remains the final inline / buddy SHM
-/ chunked transport selector for owned bytes.
+fallback. It rejects outputs above `ServerIpcConfig.max_payload_size` before
+allocating fallback buffers. Existing `send_response_meta()` remains the final
+inline / buddy SHM / chunked transport selector for owned bytes, with core-side
+`max_payload_size` enforcement plus checked inline frame length, buddy
+data-size, and chunk-count limits.
 
 **Verified coverage**
 
 - Rust helper tests cover below-threshold no-allocation behavior, large
   direct SHM writes, allocation-failure fallback, and cleanup after copy
   failure.
+- Rust reply-selection tests cover oversized buddy wire fallback, inline frame
+  length limits, chunk-count overflow rejection, and response allocation
+  cleanup when reply writes fail.
 - Direct IPC integration tests cover large `bytes` responses, large
-  `memoryview` responses, and small inline responses through `cc.hold()`
-  retained storage accounting.
+  `memoryview` responses, small inline responses through `cc.hold()` retained
+  storage accounting, and `max_payload_size` rejection as a resource output
+  serialization error.
 - Boundary tests prevent Python response-pool allocation and PyO3 SHM
   coordinate tuple parsing from being reintroduced.
 - Direct IPC response allocation remains relay-independent, including with a

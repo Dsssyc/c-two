@@ -492,6 +492,31 @@ The large-buffer path must call `try_prepare_shm_response(...)` before materiali
 
 Allocation failure should not fail the CRM call by itself. It should fall back to owned inline data so existing `send_response_meta()` can choose chunked reply when the payload is too large for inline. Only copy/write failure after an allocation should return an error, because the response data cannot be trusted.
 
+Post-implementation hardening: "too large for buddy SHM wire metadata" is also
+a fallback condition, not a CRM failure. `try_prepare_shm_response()` returns
+`Ok(None)` for payload lengths that cannot be represented by buddy `data_size`,
+and `smart_reply_with_data()` must not attempt a second buddy allocation for
+that same oversized payload before chunking. Chunked fallback must validate the
+`u32` chunk-count metadata before sending any chunks.
+
+### Risk: Fallback materialization bypasses configured memory limits
+
+Native fallback to owned bytes is allowed only after checking the configured
+`ServerIpcConfig.max_payload_size`. PyO3 must reject over-limit resource output
+as `ResourceOutputSerializing` before allocating a fallback `Vec<u8>`, and
+`c2-server` must enforce the same limit for generic Rust `ResponseMeta::Inline`
+or `ResponseMeta::ShmAlloc` callbacks so non-Python SDKs cannot bypass the
+core limit. Fallback allocation should use fallible reservation so allocation
+pressure produces a controlled CRM error rather than a process abort where Rust
+can avoid it.
+
+### Risk: Reply write failure leaks server-side response allocations
+
+When a buddy or pre-prepared SHM reply cannot be written to the socket, no
+client will receive coordinates and therefore no client can release the
+allocation. The server must free the allocated response block on write failure
+before returning the error.
+
 ### Risk: Tuple compatibility lingers as zombie code
 
 The tuple protocol is an internal artifact of Python-owned allocation. Keeping it after native response preparation would leave two allocation authorities. Remove tuple parsing and update boundary tests to keep it removed.
@@ -511,6 +536,13 @@ Issue7 is complete only when all of the following are true:
 - Python dispatcher accepts no response pool and performs no response allocation decision.
 - PyO3 response parser accepts `None` or buffer-protocol payloads and rejects coordinate tuples.
 - Rust-native response preparation owns threshold-based SHM allocation and cleanup.
+- Payloads above buddy SHM wire limits fall back to checked chunked transport
+  without attempting oversized SHM allocation.
+- PyO3 enforces server `max_payload_size` before fallback allocation, and
+  `c2-server` enforces it again for all response metadata before transport.
+  Over-limit resource output is reported as `ResourceOutputSerializing`.
+- Reply write failures free server-side response allocations that the client
+  cannot release.
 - Large `bytes` and large `memoryview` responses use SHM/handle/file-spill retained storage in direct IPC hold-mode tests.
 - Small responses remain inline.
 - Full Rust and Python test suites pass.
