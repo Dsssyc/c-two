@@ -382,34 +382,36 @@ share without forcing payload copies or SHM promotion for inline results.
 
 ### P2. Server route slot lifecycle and readiness
 
-**Planned ownership**
+**Implemented ownership**
 
-Implementation plan: `docs/plans/2026-05-07-server-readiness-rust-authority.md`.
+Status: implemented on `dev-feature` by
+`docs/plans/2026-05-07-server-readiness-rust-authority.md`.
 
-Rust `c2-server` should own IPC server lifecycle state and readiness
-notification. Python `NativeServerBridge` should keep CRM slot objects and
-Python callback dispatch, but delegate readiness to native `RustServer` APIs
-rather than polling socket files or maintaining `_started`.
+Rust `c2-server` owns IPC server lifecycle state and readiness notification.
+Native startup exposes `start_and_wait(timeout)` and state projection through
+`is_running` / `is_ready`. Python `NativeServerBridge` keeps CRM slot objects
+and Python callback dispatch, but it no longer polls socket files, maintains a
+separate `_started` flag, or infers readiness from filesystem state.
 
-**Implementation target**
+Rust also tracks whether a concrete `Server` instance actually bound its socket
+path before it is allowed to unlink that path during shutdown. This prevents a
+failed second server startup from removing the active socket owned by an
+already-running server.
 
-1. Add native lifecycle states and `wait_until_ready(timeout)` to `c2-server`.
-2. Expose PyO3 `RustServer.start_and_wait(timeout_seconds)`, `is_ready`, and
-   native-backed `is_running`.
-3. Remove Python socket-file polling and Python-owned `_started` state.
-4. Make runtime shutdown outcomes use native lifecycle state instead of
-   `socket_path().exists()`.
-5. Prevent active-socket unlinking when a second server starts with an address
-   already owned by a running server.
+**Verified coverage**
 
-**Required tests**
-
-- `start()` returns only after direct IPC ping/connect can succeed.
-- Active-socket startup fails without unlinking the first server's socket.
-- Timeout reports a useful error without leaving a stale native runtime.
-- Direct IPC readiness is relay-independent.
-- Boundary tests prevent Python socket polling and `_started` state from
-  returning.
+- `Server.start(timeout=...)` returns only after direct IPC ping/connect can
+  succeed.
+- Starting a second server on an active IPC socket fails without unlinking the
+  first server's socket path.
+- Calling shutdown on a server that failed to bind does not unlink another
+  server's active socket path.
+- Runtime shutdown outcomes use native lifecycle state instead of
+  `socket_path().exists()`.
+- Direct IPC readiness remains relay-independent, including with a bad relay
+  environment variable.
+- Boundary tests prevent Python socket polling and Python-owned `_started`
+  lifecycle state from being reintroduced.
 
 ### P2. Response allocation decision
 
