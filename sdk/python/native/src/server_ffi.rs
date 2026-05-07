@@ -239,6 +239,25 @@ impl PyServer {
         self.inner.is_running()
     }
 
+    fn stop_runtime_and_wait(&self, timeout: Duration) -> PyResult<()> {
+        self.inner.shutdown();
+
+        let rt = {
+            let mut rt_guard = self.rt.lock();
+            rt_guard.take()
+        };
+
+        let wait_result = if let Some(rt) = rt {
+            let result = rt.block_on(self.inner.wait_until_stopped(timeout));
+            rt.shutdown_background();
+            result
+        } else {
+            Ok(())
+        };
+        self.inner.finalize_runtime_stopped();
+        wait_result.map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
     fn start_runtime_and_wait(&self, timeout: Duration) -> PyResult<()> {
         let server_for_run = Arc::clone(&self.inner);
         let server_for_wait = Arc::clone(&self.inner);
@@ -254,6 +273,10 @@ impl PyServer {
             if rt_guard.is_some() {
                 return Err(PyRuntimeError::new_err("server is already running"));
             }
+
+            self.inner
+                .begin_start_attempt()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
             rt.spawn(async move {
                 if let Err(e) = server_for_run.run().await {
@@ -275,12 +298,13 @@ impl PyServer {
         match readiness {
             Ok(()) => Ok(()),
             Err(err) => {
-                self.inner.shutdown();
-                let rt = self.rt.lock().take();
-                if let Some(rt) = rt {
-                    rt.shutdown_background();
-                }
                 let message = err.to_string();
+                let cleanup = self.stop_runtime_and_wait(Duration::from_secs(5));
+                let message = if let Err(cleanup_err) = cleanup {
+                    format!("{message}; cleanup failed: {cleanup_err}")
+                } else {
+                    message
+                };
                 if message.contains("did not become ready") {
                     Err(PyTimeoutError::new_err(message))
                 } else {
@@ -426,22 +450,7 @@ impl PyServer {
     /// Signals the accept loop to stop, then drops the tokio runtime
     /// (joining all worker threads). The GIL is released during shutdown.
     fn shutdown(&self, py: Python<'_>) -> PyResult<()> {
-        let server = Arc::clone(&self.inner);
-
-        py.detach(|| {
-            server.shutdown();
-
-            let rt = {
-                let mut rt_guard = self.rt.lock();
-                rt_guard.take()
-            };
-
-            if let Some(rt) = rt {
-                rt.shutdown_background();
-            }
-        });
-
-        Ok(())
+        py.detach(|| self.stop_runtime_and_wait(Duration::from_secs(5)))
     }
 
     /// Remove a CRM route. Returns `True` if it existed.

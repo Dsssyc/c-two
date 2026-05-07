@@ -271,6 +271,29 @@ impl Server {
         self.lifecycle_state().is_running()
     }
 
+    /// Fence a new native start attempt.
+    ///
+    /// This resets the one-shot shutdown signal and moves stale terminal
+    /// lifecycle states (`Stopped` / `Failed`) back to `Starting` before the
+    /// async accept loop is spawned. Callers that start `run()` on a background
+    /// runtime should invoke this synchronously before they begin waiting for
+    /// readiness, otherwise a waiter can observe the previous attempt's
+    /// terminal state before the spawned task is polled.
+    pub fn begin_start_attempt(&self) -> Result<(), ServerError> {
+        match self.lifecycle_state() {
+            ServerLifecycleState::Initialized
+            | ServerLifecycleState::Stopped
+            | ServerLifecycleState::Failed(_) => {
+                self.shutdown_tx.send_replace(false);
+                self.set_lifecycle_state(ServerLifecycleState::Starting);
+                Ok(())
+            }
+            state => Err(ServerError::Config(format!(
+                "server cannot start while lifecycle state is {state:?}",
+            ))),
+        }
+    }
+
     pub async fn wait_until_ready(&self, timeout: Duration) -> Result<(), ServerError> {
         let mut rx = self.lifecycle_tx.subscribe();
         let wait = async {
@@ -306,6 +329,52 @@ impl Server {
         })?
     }
 
+    pub async fn wait_until_stopped(&self, timeout: Duration) -> Result<(), ServerError> {
+        let mut rx = self.lifecycle_tx.subscribe();
+        let wait = async {
+            loop {
+                let state = rx.borrow().clone();
+                match state {
+                    ServerLifecycleState::Initialized
+                    | ServerLifecycleState::Stopped
+                    | ServerLifecycleState::Failed(_) => return Ok(()),
+                    ServerLifecycleState::Starting
+                    | ServerLifecycleState::Ready
+                    | ServerLifecycleState::Stopping => {}
+                }
+                rx.changed().await.map_err(|_| {
+                    ServerError::Config("server lifecycle channel closed".to_string())
+                })?;
+            }
+        };
+
+        tokio::time::timeout(timeout, wait).await.map_err(|_| {
+            ServerError::Config(format!(
+                "server did not stop within {:.3}s",
+                timeout.as_secs_f64(),
+            ))
+        })?
+    }
+
+    /// Mark runtime-backed server work as stopped after its runtime is gone.
+    ///
+    /// This is a shutdown cleanup fence for runtime owners. It does not erase
+    /// startup failure diagnostics, but it prevents a force-dropped runtime from
+    /// leaving `Starting`, `Ready`, or `Stopping` as a stale non-terminal state.
+    pub fn finalize_runtime_stopped(&self) {
+        self.remove_owned_socket_file();
+        match self.lifecycle_state() {
+            ServerLifecycleState::Starting
+            | ServerLifecycleState::Ready
+            | ServerLifecycleState::Stopping => {
+                self.set_lifecycle_state(ServerLifecycleState::Stopped);
+            }
+            ServerLifecycleState::Initialized
+            | ServerLifecycleState::Stopped
+            | ServerLifecycleState::Failed(_) => {}
+        }
+    }
+
     /// Get a shared reference to the response pool (for zero-copy dispatch).
     pub fn response_pool_arc(&self) -> Arc<parking_lot::RwLock<MemPool>> {
         Arc::clone(&self.response_pool)
@@ -323,7 +392,9 @@ impl Server {
 
     /// Run the accept loop.  Blocks until [`shutdown`](Self::shutdown) is called.
     pub async fn run(self: &Arc<Self>) -> Result<(), ServerError> {
-        self.set_lifecycle_state(ServerLifecycleState::Starting);
+        if !matches!(self.lifecycle_state(), ServerLifecycleState::Starting) {
+            self.begin_start_attempt()?;
+        }
 
         let startup = async {
             std::fs::create_dir_all(IPC_SOCK_DIR)?;
@@ -1564,6 +1635,147 @@ mod tests {
         assert!(StdUnixStream::connect(first.socket_path()).is_ok());
         first.shutdown();
         first_runner.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn same_server_can_start_again_after_shutdown() {
+        let server = Arc::new(
+            Server::new(
+                &unique_readiness_address("restart_after_shutdown"),
+                ServerIpcConfig::default(),
+            )
+            .unwrap(),
+        );
+
+        server.begin_start_attempt().unwrap();
+        let first_runner = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { server.run().await })
+        };
+        server
+            .wait_until_ready(Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(StdUnixStream::connect(server.socket_path()).is_ok());
+
+        server.shutdown();
+        first_runner.await.unwrap().unwrap();
+        assert_eq!(server.lifecycle_state(), ServerLifecycleState::Stopped);
+
+        server.begin_start_attempt().unwrap();
+        let second_runner = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { server.run().await })
+        };
+        server
+            .wait_until_ready(Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(StdUnixStream::connect(server.socket_path()).is_ok());
+
+        server.shutdown();
+        second_runner.await.unwrap().unwrap();
+        assert_eq!(server.lifecycle_state(), ServerLifecycleState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn failed_bind_can_retry_after_socket_released() {
+        let address = unique_readiness_address("retry_after_failed_bind");
+        let first = Arc::new(Server::new(&address, ServerIpcConfig::default()).unwrap());
+        first.begin_start_attempt().unwrap();
+        let first_runner = {
+            let first = Arc::clone(&first);
+            tokio::spawn(async move { first.run().await })
+        };
+        first
+            .wait_until_ready(Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        let second = Arc::new(Server::new(&address, ServerIpcConfig::default()).unwrap());
+        second.begin_start_attempt().unwrap();
+        let failed = second
+            .run()
+            .await
+            .expect_err("active socket should reject the first attempt");
+        assert!(
+            failed.to_string().contains("active listener")
+                || failed.to_string().contains("address already in use"),
+            "unexpected error: {failed}",
+        );
+        assert!(matches!(
+            second.lifecycle_state(),
+            ServerLifecycleState::Failed(_)
+        ));
+
+        first.shutdown();
+        first_runner.await.unwrap().unwrap();
+
+        second.begin_start_attempt().unwrap();
+        let second_runner = {
+            let second = Arc::clone(&second);
+            tokio::spawn(async move { second.run().await })
+        };
+        second
+            .wait_until_ready(Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(StdUnixStream::connect(second.socket_path()).is_ok());
+
+        second.shutdown();
+        second_runner.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_until_stopped_fences_restart_after_shutdown() {
+        let server = Arc::new(
+            Server::new(
+                &unique_readiness_address("wait_stop_restart"),
+                ServerIpcConfig::default(),
+            )
+            .unwrap(),
+        );
+
+        server.begin_start_attempt().unwrap();
+        let runner = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { server.run().await })
+        };
+        server
+            .wait_until_ready(Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        server.shutdown();
+        server
+            .wait_until_stopped(Duration::from_secs(2))
+            .await
+            .unwrap();
+        server
+            .begin_start_attempt()
+            .expect("stopped lifecycle should permit a new start attempt");
+
+        runner.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn finalize_runtime_stopped_terminalizes_running_states_but_preserves_failed() {
+        let server = Server::new(
+            &unique_readiness_address("finalize_runtime"),
+            ServerIpcConfig::default(),
+        )
+        .unwrap();
+
+        server.set_lifecycle_state(ServerLifecycleState::Stopping);
+        server.finalize_runtime_stopped();
+        assert_eq!(server.lifecycle_state(), ServerLifecycleState::Stopped);
+
+        server.set_lifecycle_state(ServerLifecycleState::Failed("bind failed".to_string()));
+        server.finalize_runtime_stopped();
+        assert_eq!(
+            server.lifecycle_state(),
+            ServerLifecycleState::Failed("bind failed".to_string()),
+        );
     }
 
     // -- route registration --

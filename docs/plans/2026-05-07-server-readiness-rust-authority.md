@@ -25,6 +25,22 @@ process calls `NativeServerBridge.shutdown()`, so bridge cleanup must always
 call idempotent native shutdown to drain the PyO3 runtime handle; lifecycle
 `is_running == false` is not a valid reason to skip runtime cleanup.
 
+Final strict review found one more lifecycle edge: readiness waiters could see
+the previous attempt's terminal `Stopped` / `Failed` state before the newly
+spawned accept-loop task had a chance to set `Starting`. The implementation now
+uses a Rust-side start-attempt fence before PyO3 spawns and waits: it resets the
+one-shot shutdown signal, moves terminal state back to `Starting`, then waits
+for readiness for the current attempt. This keeps restart after normal shutdown
+and retry after a failed duplicate bind inside native lifecycle authority,
+without adding Python polling or retry logic.
+
+The shutdown-side fix is deliberately shared by explicit `RustServer.shutdown()`
+and `start_and_wait()` failure cleanup. PyO3 signals native shutdown, waits for
+`wait_until_stopped()`, drops the runtime, then calls a terminal cleanup fence
+that converts stale runtime-owned `Starting` / `Ready` / `Stopping` states to
+`Stopped` without overwriting `Failed(_)` diagnostics. This avoids solving
+normal shutdown while leaving timeout or failed-start cleanup poisoned.
+
 ---
 
 ## 0.x Clean-Cut Constraint

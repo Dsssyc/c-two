@@ -185,3 +185,66 @@ def test_bridge_shutdown_after_direct_ipc_shutdown_allows_new_server(monkeypatch
             replacement.shutdown()
     finally:
         server.shutdown()
+
+
+def test_same_bridge_can_start_after_normal_shutdown(monkeypatch):
+    monkeypatch.delenv('C2_RELAY_ADDRESS', raising=False)
+    address = f'ipc://{_unique_region("restart_same_bridge")}'
+    server = Server(
+        bind_address=address,
+        crm_class=Hello,
+        crm_instance=HelloImpl(),
+        name='hello',
+    )
+    try:
+        for _ in range(50):
+            server.start(timeout=5.0)
+            assert ping(address, timeout=0.5) is True
+            server.shutdown()
+            assert server.is_started() is False
+            assert ping(address, timeout=0.5) is False
+    finally:
+        server.shutdown()
+
+
+def test_failed_start_can_retry_after_active_socket_released(monkeypatch):
+    monkeypatch.delenv('C2_RELAY_ADDRESS', raising=False)
+    address = f'ipc://{_unique_region("retry_failed_start")}'
+    first = Server(
+        bind_address=address,
+        crm_class=Hello,
+        crm_instance=HelloImpl(),
+        name='hello',
+    )
+    second = Server(
+        bind_address=address,
+        crm_class=Hello,
+        crm_instance=HelloImpl(),
+        name='hello2',
+    )
+    try:
+        first.start(timeout=5.0)
+        assert ping(address, timeout=0.5) is True
+
+        with pytest.raises(
+            RuntimeError,
+            match='active listener|address already in use|failed to start',
+        ):
+            second.start(timeout=1.0)
+
+        first.shutdown()
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if not ping(address, timeout=0.2):
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail('first server still responds after shutdown')
+
+        second.start(timeout=5.0)
+        assert ping(address, timeout=0.5) is True
+    finally:
+        try:
+            second.shutdown()
+        finally:
+            first.shutdown()

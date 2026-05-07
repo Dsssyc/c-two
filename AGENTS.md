@@ -247,12 +247,18 @@ Server lifecycle/readiness belongs to Rust. Python `NativeServerBridge` may
 expose `start()`, `is_started()`, and shutdown facades, but must delegate
 readiness to native `RustServer.start_and_wait()` and native state projection.
 Do not reintroduce Python socket-file polling, `os.path.exists(socket_path)`
-readiness checks, or Python-owned `_started` authority. A Rust `Server` may only
-unlink its IPC socket path after that concrete instance successfully bound the
-socket; failed duplicate startups must not remove another server's active
-socket path. Bridge shutdown must still call idempotent native shutdown to
-drain the PyO3 runtime handle even when native lifecycle state is already
-stopped by an external direct IPC shutdown signal.
+readiness checks, or Python-owned `_started` authority. Each native start
+attempt must be fenced in Rust before readiness waiters run: reset stale
+`Stopped` / `Failed` lifecycle state and the one-shot shutdown signal, then
+observe readiness for that attempt. A Rust `Server` may only unlink its IPC
+socket path after that concrete instance successfully bound the socket; failed
+duplicate startups must not remove another server's active socket path. Bridge
+shutdown must still call idempotent native shutdown to drain the PyO3 runtime
+handle even when native lifecycle state is already stopped by an external direct
+IPC shutdown signal. Native `RustServer.shutdown()` is a lifecycle barrier:
+after it returns, runtime-owned server work must be terminal (`Initialized`,
+`Stopped`, or `Failed`) so a following start attempt does not observe stale
+`Stopping` state.
 
 Python resource servers create an auto-generated `ipc://` address. Use
 `cc.server_address()` after registration only when a same-host process needs to
