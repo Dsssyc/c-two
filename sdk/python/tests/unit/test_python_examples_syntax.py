@@ -38,7 +38,7 @@ for key, value in vars(args).items():
     child_env = {
         k: v
         for k, v in os.environ.items()
-        if k not in {"C2_ENV_FILE", "C2_RELAY_ADDRESS"}
+        if k not in {"C2_ENV_FILE", "C2_RELAY_ANCHOR_ADDRESS"}
     }
     child_env["C2_ENV_FILE"] = ""
     child_env.update(env or {})
@@ -117,14 +117,14 @@ def test_ipc_client_requires_address():
 
 def test_ipc_client_uses_given_address(tmp_path):
     env_file = tmp_path / ".env"
-    env_file.write_text("C2_RELAY_ADDRESS=http://127.0.0.1:9137\n", encoding="utf-8")
+    env_file.write_text("C2_RELAY_ANCHOR_ADDRESS=http://127.0.0.1:9137\n", encoding="utf-8")
 
     result = _parse_args(
         "ipc_client.py",
         ["ipc://manual-address"],
         env={
             "C2_ENV_FILE": str(env_file),
-            "C2_RELAY_ADDRESS": "http://127.0.0.1:9140",
+            "C2_RELAY_ANCHOR_ADDRESS": "http://127.0.0.1:9140",
         },
     )
 
@@ -141,7 +141,7 @@ def test_ipc_client_rejects_http():
 
 def test_relay_client_cli_wins(tmp_path):
     env_file = tmp_path / ".env"
-    env_file.write_text("C2_RELAY_ADDRESS=http://127.0.0.1:9137\n", encoding="utf-8")
+    env_file.write_text("C2_RELAY_ANCHOR_ADDRESS=http://127.0.0.1:9137\n", encoding="utf-8")
 
     result = _parse_args(
         "relay_client.py",
@@ -169,7 +169,7 @@ def test_relay_client_default():
 
 def test_relay_client_env_file(tmp_path):
     env_file = tmp_path / ".env"
-    env_file.write_text("C2_RELAY_ADDRESS=http://127.0.0.1:9137\n", encoding="utf-8")
+    env_file.write_text("C2_RELAY_ANCHOR_ADDRESS=http://127.0.0.1:9137\n", encoding="utf-8")
 
     result = _parse_args(
         "relay_client.py",

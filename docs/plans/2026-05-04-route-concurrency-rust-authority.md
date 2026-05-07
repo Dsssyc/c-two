@@ -840,7 +840,7 @@ Run:
 
 ```bash
 uv sync --reinstall-package c-two
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_name_collision.py sdk/python/tests/unit/test_ipc_config.py -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_name_collision.py sdk/python/tests/unit/test_ipc_config.py -q --timeout=30
 ```
 
 Expected: the constructor no longer injects a Python-owned `max_workers` default, and the native handle is visible to the slot.
@@ -1045,7 +1045,7 @@ Replace `begin()` / `execute()` / `pending_count` assertions in `sdk/python/test
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_scheduler.py sdk/python/tests/unit/test_security.py sdk/python/tests/unit/test_proxy_concurrency.py -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_scheduler.py sdk/python/tests/unit/test_security.py sdk/python/tests/unit/test_proxy_concurrency.py -q --timeout=30
 ```
 
 Expected: the tests now describe the thin adapter and the direct-call hot path, not Python-owned scheduler state.
@@ -1206,13 +1206,13 @@ The shared handle must allow existing guards to complete after closure, but any 
 
 Keep and extend the existing regression in
 `sdk/python/tests/integration/test_remote_scheduler_config.py` so an explicit
-direct IPC address still works when `C2_RELAY_ADDRESS` points at an invalid
+direct IPC address still works when `C2_RELAY_ANCHOR_ADDRESS` points at an invalid
 host.
 
 Use an explicit address:
 
 ```python
-monkeypatch.setenv('C2_RELAY_ADDRESS', 'http://127.0.0.1:9')
+monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', 'http://127.0.0.1:9')
 client = cc.connect(RemoteSchedulerProbe, name='direct_without_relay', address=cc.server_address())
 assert client.max_active().value == 0
 ```
@@ -1222,7 +1222,7 @@ assert client.max_active().value == 0
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_name_collision.py sdk/python/tests/integration/test_concurrency_safety.py sdk/python/tests/integration/test_remote_scheduler_config.py -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_name_collision.py sdk/python/tests/integration/test_concurrency_safety.py sdk/python/tests/integration/test_remote_scheduler_config.py -q --timeout=30
 ```
 
 Expected: unregister/shutdown remain idempotent, local calls fail after close, and direct IPC remains relay-independent.
@@ -1311,7 +1311,7 @@ Run:
 
 ```bash
 uv sync --reinstall-package c-two
-C2_RELAY_ADDRESS= uv run pytest \
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest \
   sdk/python/tests/unit/test_scheduler.py \
   sdk/python/tests/unit/test_proxy_concurrency.py \
   sdk/python/tests/unit/test_security.py \
@@ -1337,7 +1337,7 @@ The focused Python matrix must include:
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30
 ```
 
 Expected: the suite passes without any test depending on Python-owned scheduler internals.

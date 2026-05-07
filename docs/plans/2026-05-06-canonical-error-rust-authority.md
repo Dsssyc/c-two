@@ -34,7 +34,7 @@ Final verification evidence captured during implementation:
 - Focused Python error/native/boundary tests: 83 passed.
 - `sdk/python/tests/integration/test_error_propagation.py`: 32 passed.
 - `cargo test --manifest-path core/Cargo.toml --workspace`: passed.
-- `C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30 -rs`:
+- `C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30 -rs`:
   648 passed, 2 skipped for optional example dependencies.
 - Stale-symbol search for legacy codec names in active code and tests: no
   matches.
@@ -413,7 +413,7 @@ def test_native_error_ffi_does_not_export_legacy_codec_names():
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_native_error_registry.py -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_native_error_registry.py -q --timeout=30
 ```
 
 Expected: FAIL because `_native.encode_error_wire` and `_native.decode_error_wire_parts` are not exported yet.
@@ -495,7 +495,7 @@ Run:
 
 ```bash
 uv sync --reinstall-package c-two
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_native_error_registry.py -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_native_error_registry.py -q --timeout=30
 ```
 
 Expected: PASS.
@@ -596,7 +596,7 @@ class TestNativeErrorRegistryParity:
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_error.py::TestNativeErrorRegistryParity -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_error.py::TestNativeErrorRegistryParity -q --timeout=30
 ```
 
 Expected: FAIL because `error._native.encode_error_wire`, `error._native.decode_error_wire_parts`, and registry-generated enum behavior are not wired into `error.py` yet.
@@ -698,7 +698,7 @@ Do not add any UTF-8 decode, split, or integer parsing logic in Python.
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_error.py -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_error.py -q --timeout=30
 ```
 
 Expected: PASS.
@@ -708,7 +708,7 @@ Expected: PASS.
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_mesh_errors.py -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_mesh_errors.py -q --timeout=30
 ```
 
 Expected: PASS.
@@ -768,7 +768,7 @@ def test_error_facade_does_not_reimplement_wire_codec():
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_sdk_boundary.py::test_error_facade_does_not_reimplement_wire_codec -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_sdk_boundary.py::test_error_facade_does_not_reimplement_wire_codec -q --timeout=30
 ```
 
 Expected: PASS.
@@ -873,7 +873,7 @@ Expected: PASS.
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest \
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest \
   sdk/python/tests/unit/test_error.py \
   sdk/python/tests/unit/test_native_error_registry.py \
   sdk/python/tests/unit/test_mesh_errors.py \
@@ -888,7 +888,7 @@ Expected: PASS.
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/integration/test_error_propagation.py -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/integration/test_error_propagation.py -q --timeout=30
 ```
 
 Expected: PASS.
@@ -918,7 +918,7 @@ Expected: PASS.
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30 -rs
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30 -rs
 ```
 
 Expected: PASS, allowing only documented skips for optional example dependencies or unavailable local relay binary.

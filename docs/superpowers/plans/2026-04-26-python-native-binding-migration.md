@@ -300,7 +300,7 @@ uv sync --reinstall-package c-two
 Run Python SDK tests:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests -q --timeout=30
 ```
 
 Run repository-level Rust checks separately:
@@ -323,7 +323,7 @@ cargo test --manifest-path core/Cargo.toml --workspace
 
 # Python SDK native extension and tests
 uv sync --reinstall-package c-two
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests -q --timeout=30
 ```
 
 - [x] **Step 5: Update Copilot instructions**
@@ -455,7 +455,7 @@ Expected: PASS and rebuilds `c_two._native` from `sdk/python/native/Cargo.toml`.
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests -q --timeout=30
 ```
 
 Expected: PASS.

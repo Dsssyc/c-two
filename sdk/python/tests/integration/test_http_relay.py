@@ -274,63 +274,63 @@ class TestCcConnectHttp:
         name = 'runtime/session/env-relay-connect'
         relay = start_c3_relay()
         relay_url = relay.url
-        previous_relay = settings.relay_address
+        previous_relay = settings.relay_anchor_address
         registrar = _ProcessRegistry()
         resolver = _ProcessRegistry()
         crm = None
         try:
-            monkeypatch.setenv('C2_RELAY_ADDRESS', relay_url)
-            settings.relay_address = None
+            monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', relay_url)
+            settings.relay_anchor_address = None
             registrar.register(Hello, HelloImpl(), name=name)
             assert registrar.get_server_address() is not None
 
             crm = resolver.connect(Hello, name=name)
-            assert crm.client._mode == 'http'
+            assert crm.client._mode == 'ipc'
             assert crm.greeting('EnvRelay') == 'Hello, EnvRelay!'
         finally:
             if crm is not None:
                 resolver.close(crm)
             resolver.shutdown()
-            settings.relay_address = previous_relay
+            settings.relay_anchor_address = previous_relay
             registrar.shutdown()
-            settings.relay_address = previous_relay
+            settings.relay_anchor_address = previous_relay
 
     def test_no_address_connect_uses_runtime_session_relay_projection(self, start_c3_relay):
         name = 'runtime/session/relay-connect'
         relay = start_c3_relay()
         relay_url = relay.url
-        previous_relay = settings.relay_address
+        previous_relay = settings.relay_anchor_address
         registrar = _ProcessRegistry()
         resolver = _ProcessRegistry()
         crm = None
         try:
-            registrar.set_relay(relay_url)
+            registrar.set_relay_anchor(relay_url)
             registrar.register(Hello, HelloImpl(), name=name)
             assert registrar.get_server_address() is not None
 
-            resolver.set_relay(relay_url)
+            resolver.set_relay_anchor(relay_url)
             crm = resolver.connect(Hello, name=name)
-            assert crm.client._mode == 'http'
+            assert crm.client._mode == 'ipc'
             assert crm.greeting('RuntimeRelay') == 'Hello, RuntimeRelay!'
         finally:
             if crm is not None:
                 resolver.close(crm)
             resolver.shutdown()
-            settings.relay_address = previous_relay
+            settings.relay_anchor_address = previous_relay
             registrar.shutdown()
-            settings.relay_address = previous_relay
+            settings.relay_anchor_address = previous_relay
 
     def test_no_address_relay_connect_maps_missing_route_to_resource_not_found(self, start_c3_relay):
         relay = start_c3_relay()
-        previous_relay = settings.relay_address
+        previous_relay = settings.relay_anchor_address
         registry = _ProcessRegistry()
         try:
-            registry.set_relay(relay.url)
+            registry.set_relay_anchor(relay.url)
             with pytest.raises(ResourceNotFound, match="Resource 'missing-route' not found"):
                 registry.connect(Hello, name='missing-route')
         finally:
             registry.shutdown()
-            settings.relay_address = previous_relay
+            settings.relay_anchor_address = previous_relay
 
     def test_relay_traffic_bypasses_system_proxy(self, monkeypatch, start_c3_relay):
         """All relay HTTP traffic must ignore HTTP_PROXY by default.
@@ -354,15 +354,15 @@ class TestCcConnectHttp:
         name = 'proxy/bypass/test'
         relay = start_c3_relay()
         relay_url = relay.url
-        previous_relay = settings.relay_address
+        previous_relay = settings.relay_anchor_address
         registrar = _ProcessRegistry()
         resolver = _ProcessRegistry()
         crm = None
         try:
-            registrar.set_relay(relay_url)
+            registrar.set_relay_anchor(relay_url)
             # Registration uses the Rust relay control client and must bypass proxies.
             registrar.register(Hello, HelloImpl(), name=name)
-            resolver.set_relay(relay_url)
+            resolver.set_relay_anchor(relay_url)
 
             # No-address connect resolves through the Rust relay control client.
             crm = resolver.connect(Hello, name=name)
@@ -372,9 +372,9 @@ class TestCcConnectHttp:
             if crm is not None:
                 resolver.close(crm)
             resolver.shutdown()
-            settings.relay_address = previous_relay
+            settings.relay_anchor_address = previous_relay
             registrar.shutdown()
-            settings.relay_address = previous_relay
+            settings.relay_anchor_address = previous_relay
 
 
 # ---------------------------------------------------------------------------

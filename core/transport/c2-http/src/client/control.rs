@@ -303,7 +303,12 @@ mod tests {
             let addr = listener.local_addr().unwrap();
             let app = crate::relay::router::build_router(state);
             let server = tokio::spawn(async move {
-                axum::serve(listener, app).await.unwrap();
+                axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .await
+                .unwrap();
             });
             (addr, server)
         });

@@ -11,7 +11,7 @@ from c_two.transport.registry import _ProcessRegistry
 @pytest.fixture(autouse=True)
 def _cleanup(monkeypatch):
     old_threshold = settings._shm_threshold  # noqa: SLF001
-    monkeypatch.delenv("C2_RELAY_ADDRESS", raising=False)
+    monkeypatch.delenv("C2_RELAY_ANCHOR_ADDRESS", raising=False)
     cc.shutdown()
     _ProcessRegistry._instance = None  # noqa: SLF001
     yield
@@ -90,7 +90,7 @@ def test_large_bytes_response_uses_native_non_inline_storage_without_relay(monke
     settings.shm_threshold = 1024
     cc.register(BytesResponseCRM, BytesResponseResource(), name="bytes_response")
     cc.serve(blocking=False)
-    monkeypatch.setenv("C2_RELAY_ADDRESS", "http://127.0.0.1:9")
+    monkeypatch.setenv("C2_RELAY_ANCHOR_ADDRESS", "http://127.0.0.1:9")
     client = _connect(BytesResponseCRM, "bytes_response")
     try:
         held = cc.hold(client.payload)(8192)

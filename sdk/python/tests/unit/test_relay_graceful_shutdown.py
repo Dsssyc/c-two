@@ -44,14 +44,14 @@ class TestUnregisterRelayAbsence:
 
     def setup_method(self):
         self.registry = _ProcessRegistry()
-        settings.relay_address = None
+        settings.relay_anchor_address = None
 
     def teardown_method(self):
         try:
             self.registry.shutdown()
         except Exception:
             pass
-        settings.relay_address = None
+        settings.relay_anchor_address = None
 
     def test_unregister_no_relay(self):
         """Unregister works when relay calls are no-ops."""
@@ -62,7 +62,7 @@ class TestUnregisterRelayAbsence:
         """Explicit unregister reports relay cleanup failure after local removal."""
         impl = RelayShutdownCRM()
         self.registry.register(IRelayShutdownCRM, impl, name='test_down')
-        self.registry.set_relay('http://127.0.0.1:9')
+        self.registry.set_relay_anchor('http://127.0.0.1:9')
 
         with pytest.raises(RuntimeError, match='Relay unregistration failed'):
             self.registry.unregister('test_down')
@@ -76,7 +76,7 @@ class TestUnregisterRelayAbsence:
         """Shutdown logs info when relay is unreachable (no error)."""
         impl = RelayShutdownCRM()
         self.registry.register(IRelayShutdownCRM, impl, name='test_sd')
-        self.registry.set_relay('http://127.0.0.1:9')
+        self.registry.set_relay_anchor('http://127.0.0.1:9')
 
         with caplog.at_level(logging.INFO):
             self.registry.shutdown()  # Should not raise
@@ -109,7 +109,7 @@ class TestUnregisterRelayAbsence:
         assert second.cleanup_calls == 1
 
     def test_register_surfaces_relay_http_error_from_native_session(self):
-        self.registry.set_relay('http://127.0.0.1:9')
+        self.registry.set_relay_anchor('http://127.0.0.1:9')
 
         with pytest.raises(RuntimeError, match='relay error'):
             self.registry.register(IRelayShutdownCRM, RelayShutdownCRM(), name='test_relay_fail')

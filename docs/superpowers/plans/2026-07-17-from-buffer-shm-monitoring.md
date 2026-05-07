@@ -193,7 +193,7 @@ class TestFromBufferMeta:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/unit/test_transferable.py::TestFromBufferMeta -v`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/unit/test_transferable.py::TestFromBufferMeta -v`
 Expected: `test_from_buffer_converted_to_staticmethod` FAILS (from_buffer not converted)
 
 - [ ] **Step 3: Implement TransferableMeta changes**
@@ -234,12 +234,12 @@ class TransferableMeta(ABCMeta):
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/unit/test_transferable.py::TestFromBufferMeta -v`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/unit/test_transferable.py::TestFromBufferMeta -v`
 Expected: All 5 tests PASS
 
 - [ ] **Step 5: Run full test suite to verify no regressions**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30`
 Expected: 586+ pass, 0 fail (ignoring pre-existing flaky test)
 
 - [ ] **Step 6: Commit**
@@ -357,7 +357,7 @@ class TestAutoDetectBufferMode:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/unit/test_transferable.py::TestAutoDetectBufferMode -v`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/unit/test_transferable.py::TestAutoDetectBufferMode -v`
 Expected: FAIL — `auto_transfer` doesn't support `buffer=None` / auto-detection
 
 - [ ] **Step 3: Implement `transfer()` changes**
@@ -506,12 +506,12 @@ def auto_transfer(func=None, *, input=None, output=None, buffer=None):
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/unit/test_transferable.py::TestAutoDetectBufferMode -v`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/unit/test_transferable.py::TestAutoDetectBufferMode -v`
 Expected: All 7 tests PASS
 
 - [ ] **Step 6: Run full suite**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30`
 Expected: 593+ pass, 0 fail
 
 - [ ] **Step 7: Commit**
@@ -673,7 +673,7 @@ class TestFromBufferDispatch:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/unit/test_transferable.py::TestFromBufferDispatch -v`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/unit/test_transferable.py::TestFromBufferDispatch -v`
 Expected: FAIL — crm_to_com doesn't dispatch to from_buffer yet
 
 - [ ] **Step 3: Implement crm_to_com changes**
@@ -763,12 +763,12 @@ Also fix the release callback to use try/finally (lines 406-411):
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/unit/test_transferable.py::TestFromBufferDispatch -v`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/unit/test_transferable.py::TestFromBufferDispatch -v`
 Expected: All 3 tests PASS
 
 - [ ] **Step 6: Run full suite**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30`
 Expected: All pass
 
 - [ ] **Step 7: Commit**
@@ -966,7 +966,7 @@ class TestHoldRegistryThreadSafety:
 
 - [ ] **Step 2: Run tests — expect ImportError**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/unit/test_hold_registry.py -v`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/unit/test_hold_registry.py -v`
 Expected: FAIL with ImportError (module doesn't exist yet)
 
 - [ ] **Step 3: Implement HoldRegistry**
@@ -1083,12 +1083,12 @@ class HoldRegistry:
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/unit/test_hold_registry.py -v`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/unit/test_hold_registry.py -v`
 Expected: All 10 tests PASS
 
 - [ ] **Step 5: Run full suite**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30`
 Expected: All pass
 
 - [ ] **Step 6: Commit**
@@ -1192,7 +1192,7 @@ With:
 
 - [ ] **Step 4: Run full test suite**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30`
 Expected: All pass (hold tracking is additive, no behavior change)
 
 - [ ] **Step 5: Commit**
@@ -1270,7 +1270,7 @@ Expected: `{'active_holds': 0, 'total_held_bytes': 0, 'oldest_hold_seconds': 0}`
 
 - [ ] **Step 4: Run full suite**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30`
 Expected: All pass
 
 - [ ] **Step 5: Commit**
@@ -1368,12 +1368,12 @@ class TestFromBufferEndToEnd:
 
 - [ ] **Step 2: Run new tests**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/unit/test_transferable.py::TestFromBufferEndToEnd -v`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/unit/test_transferable.py::TestFromBufferEndToEnd -v`
 Expected: All 3 PASS
 
 - [ ] **Step 3: Run full test suite — final validation**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30`
 Expected: All pass (600+ tests)
 
 - [ ] **Step 4: Run Rust checks**

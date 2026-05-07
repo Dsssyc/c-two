@@ -13,6 +13,7 @@ use parking_lot::Mutex;
 
 use c2_http::client::{
     HttpError, RelayAwareClientConfig, RelayAwareHttpClient, RelayControlClient,
+    RelayResolvedTarget,
 };
 use c2_server::dispatcher::CrmRoute;
 
@@ -36,7 +37,7 @@ pub struct RuntimeSessionOptions {
     pub server_ipc_overrides: Option<ServerIpcConfigOverrides>,
     pub client_ipc_overrides: Option<ClientIpcConfigOverrides>,
     pub shm_threshold: Option<u64>,
-    pub relay_address: Option<String>,
+    pub relay_anchor_address: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,15 +95,25 @@ struct RuntimeSessionState {
     shm_threshold: Option<u64>,
     client_config_frozen: bool,
     identity: Option<RuntimeIdentity>,
-    relay_address_override: Option<String>,
+    relay_anchor_address_override: Option<String>,
     relay_projection: Option<RelayProjection>,
 }
 
 #[derive(Clone)]
 struct RelayProjection {
-    relay_address: String,
+    relay_anchor_address: String,
     relay_use_proxy: bool,
     control: Arc<RelayControlClient>,
+}
+
+pub enum RelayResolvedConnection {
+    Ipc {
+        address: String,
+    },
+    Http {
+        client: RelayAwareHttpClient,
+        relay_url: String,
+    },
 }
 
 impl RuntimeSession {
@@ -118,9 +129,9 @@ impl RuntimeSession {
                 shm_threshold: options.shm_threshold,
                 client_config_frozen: false,
                 identity: None,
-                relay_address_override: options
-                    .relay_address
-                    .map(|addr| canonical_relay_address(&addr)),
+                relay_anchor_address_override: options
+                    .relay_anchor_address
+                    .map(|addr| canonical_relay_anchor_address(&addr)),
                 relay_projection: None,
             }),
         })
@@ -220,25 +231,28 @@ impl RuntimeSession {
         self.state.lock().identity.clone()
     }
 
-    pub fn set_relay_address(&self, relay_address: Option<String>) {
+    pub fn set_relay_anchor_address(&self, relay_anchor_address: Option<String>) {
         let mut state = self.state.lock();
-        let relay_address = relay_address.map(|addr| canonical_relay_address(&addr));
-        if state.relay_address_override != relay_address {
+        let relay_anchor_address =
+            relay_anchor_address.map(|addr| canonical_relay_anchor_address(&addr));
+        if state.relay_anchor_address_override != relay_anchor_address {
             state.relay_projection = None;
         }
-        state.relay_address_override = relay_address;
+        state.relay_anchor_address_override = relay_anchor_address;
     }
 
-    pub fn relay_address_override(&self) -> Option<String> {
-        self.state.lock().relay_address_override.clone()
+    pub fn relay_anchor_address_override(&self) -> Option<String> {
+        self.state.lock().relay_anchor_address_override.clone()
     }
 
-    pub fn effective_relay_address(&self) -> Result<Option<String>, RuntimeSessionError> {
-        if let Some(address) = self.state.lock().relay_address_override.clone() {
+    pub fn effective_relay_anchor_address(&self) -> Result<Option<String>, RuntimeSessionError> {
+        if let Some(address) = self.state.lock().relay_anchor_address_override.clone() {
             return Ok(Some(address));
         }
-        c2_config::ConfigResolver::resolve_relay_address(c2_config::ConfigSources::from_process())
-            .map_err(|e| RuntimeSessionError::Relay(e.to_string()))
+        c2_config::ConfigResolver::resolve_relay_anchor_address(
+            c2_config::ConfigSources::from_process(),
+        )
+        .map_err(|e| RuntimeSessionError::Relay(e.to_string()))
     }
 
     pub fn register_route(
@@ -246,12 +260,13 @@ impl RuntimeSession {
         server: &Arc<c2_server::Server>,
         route: CrmRoute,
         spec: RuntimeRouteSpec,
-        relay_address: Option<&str>,
+        relay_anchor_address: Option<&str>,
         relay_use_proxy: bool,
     ) -> Result<RegisterOutcome, RuntimeSessionError> {
         let identity = self.ensure_server()?;
         let route_name = spec.name.clone();
-        let effective_relay_address = self.effective_relay_address_arg(relay_address)?;
+        let effective_relay_anchor_address =
+            self.effective_relay_anchor_address_arg(relay_anchor_address)?;
         if route.name != spec.name {
             return Err(RuntimeSessionError::Server(format!(
                 "route/spec name mismatch: route={:?}, spec={:?}",
@@ -283,15 +298,15 @@ impl RuntimeSession {
         })?;
 
         let mut relay_registered = false;
-        if let Some(relay_address) = effective_relay_address.as_deref() {
-            let projection = match self.relay_projection_for_address(relay_address, relay_use_proxy)
-            {
-                Ok(projection) => projection,
-                Err(err) => {
-                    let _ = rt.block_on(server.unregister_route(&route_name));
-                    return Err(err);
-                }
-            };
+        if let Some(relay_anchor_address) = effective_relay_anchor_address.as_deref() {
+            let projection =
+                match self.relay_projection_for_address(relay_anchor_address, relay_use_proxy) {
+                    Ok(projection) => projection,
+                    Err(err) => {
+                        let _ = rt.block_on(server.unregister_route(&route_name));
+                        return Err(err);
+                    }
+                };
             if let Err(err) = projection.control.register(
                 &spec.name,
                 &identity.server_id,
@@ -328,28 +343,30 @@ impl RuntimeSession {
         &self,
         server: &Arc<c2_server::Server>,
         name: &str,
-        relay_address: Option<&str>,
+        relay_anchor_address: Option<&str>,
         relay_use_proxy: bool,
     ) -> Result<UnregisterOutcome, RuntimeSessionError> {
         let route_name = name.to_string();
-        let effective_relay_address = self.effective_relay_address_arg(relay_address)?;
+        let effective_relay_anchor_address =
+            self.effective_relay_anchor_address_arg(relay_anchor_address)?;
         let rt = Self::server_runtime()?;
         let local_removed = rt.block_on(server.unregister_route(&route_name));
         if !local_removed {
             return Err(RuntimeSessionError::MissingRoute(route_name));
         }
 
-        let relay_error = if let Some(relay_address) = effective_relay_address.as_deref() {
-            let identity = self.ensure_server()?;
-            self.relay_cleanup(
-                Some(relay_address),
-                relay_use_proxy,
-                &route_name,
-                &identity.server_id,
-            )
-        } else {
-            None
-        };
+        let relay_error =
+            if let Some(relay_anchor_address) = effective_relay_anchor_address.as_deref() {
+                let identity = self.ensure_server()?;
+                self.relay_cleanup(
+                    Some(relay_anchor_address),
+                    relay_use_proxy,
+                    &route_name,
+                    &identity.server_id,
+                )
+            } else {
+                None
+            };
         Ok(UnregisterOutcome {
             route_name,
             local_removed,
@@ -361,14 +378,14 @@ impl RuntimeSession {
         &self,
         server: Option<&Arc<c2_server::Server>>,
         route_names: Vec<String>,
-        relay_address: Option<&str>,
+        relay_anchor_address: Option<&str>,
         relay_use_proxy: bool,
     ) -> ShutdownOutcome {
-        let effective_relay_address = self
-            .effective_relay_address_arg(relay_address)
+        let effective_relay_anchor_address = self
+            .effective_relay_anchor_address_arg(relay_anchor_address)
             .ok()
             .flatten();
-        let identity = if effective_relay_address.is_some() && !route_names.is_empty() {
+        let identity = if effective_relay_anchor_address.is_some() && !route_names.is_empty() {
             self.current_identity()
                 .or_else(|| self.ensure_server().ok())
         } else {
@@ -389,7 +406,7 @@ impl RuntimeSession {
                     }
                     if let Some(identity) = identity.as_ref() {
                         if let Some(relay_error) = self.relay_cleanup(
-                            effective_relay_address.as_deref(),
+                            effective_relay_anchor_address.as_deref(),
                             relay_use_proxy,
                             route_name,
                             &identity.server_id,
@@ -402,7 +419,7 @@ impl RuntimeSession {
                 for route_name in &route_names {
                     if let Some(identity) = identity.as_ref() {
                         if let Some(relay_error) = self.relay_cleanup(
-                            effective_relay_address.as_deref(),
+                            effective_relay_anchor_address.as_deref(),
                             relay_use_proxy,
                             route_name,
                             &identity.server_id,
@@ -416,7 +433,7 @@ impl RuntimeSession {
         } else if let Some(identity) = identity.as_ref() {
             for route_name in &route_names {
                 if let Some(relay_error) = self.relay_cleanup(
-                    effective_relay_address.as_deref(),
+                    effective_relay_anchor_address.as_deref(),
                     relay_use_proxy,
                     route_name,
                     &identity.server_id,
@@ -429,21 +446,52 @@ impl RuntimeSession {
         outcome
     }
 
-    pub fn connect_via_relay(
+    pub fn resolve_relay_connection(
         &self,
         route_name: &str,
         relay_use_proxy: bool,
         max_attempts: usize,
-    ) -> Result<Arc<RelayAwareHttpClient>, RuntimeSessionError> {
+        call_timeout_secs: f64,
+    ) -> Result<RelayResolvedConnection, RuntimeSessionError> {
         let projection = self.relay_projection(relay_use_proxy)?;
         let client = RelayAwareHttpClient::new_with_control(
             Arc::clone(&projection.control),
             route_name,
             projection.relay_use_proxy,
-            RelayAwareClientConfig { max_attempts },
+            RelayAwareClientConfig {
+                max_attempts,
+                call_timeout_secs,
+            },
         );
-        client.connect().map_err(runtime_http_error)?;
-        Ok(Arc::new(client))
+        match client.resolve_target().map_err(runtime_http_error)? {
+            RelayResolvedTarget::Ipc { address } => Ok(RelayResolvedConnection::Ipc { address }),
+            RelayResolvedTarget::Http { relay_url } => {
+                Ok(RelayResolvedConnection::Http { client, relay_url })
+            }
+        }
+    }
+
+    pub fn connect_relay_http_client(
+        &self,
+        route_name: &str,
+        relay_use_proxy: bool,
+        max_attempts: usize,
+        call_timeout_secs: f64,
+    ) -> Result<(RelayAwareHttpClient, String), RuntimeSessionError> {
+        let projection = self.relay_projection(relay_use_proxy)?;
+        let client = RelayAwareHttpClient::new_with_control(
+            Arc::clone(&projection.control),
+            route_name,
+            projection.relay_use_proxy,
+            RelayAwareClientConfig {
+                max_attempts,
+                call_timeout_secs,
+            },
+        );
+        match client.resolve_http_target().map_err(runtime_http_error)? {
+            RelayResolvedTarget::Http { relay_url } => Ok((client, relay_url)),
+            RelayResolvedTarget::Ipc { .. } => unreachable!("HTTP relay connect returned IPC"),
+        }
     }
 
     pub fn clear_relay_projection_cache(&self) {
@@ -456,22 +504,22 @@ impl RuntimeSession {
         &self,
         relay_use_proxy: bool,
     ) -> Result<RelayProjection, RuntimeSessionError> {
-        let relay_address = self
-            .effective_relay_address()?
+        let relay_anchor_address = self
+            .effective_relay_anchor_address()?
             .ok_or(RuntimeSessionError::MissingRelayAddress)?;
-        self.relay_projection_for_address(&relay_address, relay_use_proxy)
+        self.relay_projection_for_address(&relay_anchor_address, relay_use_proxy)
     }
 
     fn relay_projection_for_address(
         &self,
-        relay_address: &str,
+        relay_anchor_address: &str,
         relay_use_proxy: bool,
     ) -> Result<RelayProjection, RuntimeSessionError> {
-        let relay_address = canonical_relay_address(relay_address);
+        let relay_anchor_address = canonical_relay_anchor_address(relay_anchor_address);
         {
             let state = self.state.lock();
             if let Some(projection) = state.relay_projection.as_ref() {
-                if projection.relay_address == relay_address
+                if projection.relay_anchor_address == relay_anchor_address
                     && projection.relay_use_proxy == relay_use_proxy
                 {
                     return Ok(projection.clone());
@@ -480,11 +528,11 @@ impl RuntimeSession {
         }
 
         let control = Arc::new(
-            RelayControlClient::new(&relay_address, relay_use_proxy)
+            RelayControlClient::new(&relay_anchor_address, relay_use_proxy)
                 .map_err(|e| RuntimeSessionError::Relay(e.to_string()))?,
         );
         let projection = RelayProjection {
-            relay_address,
+            relay_anchor_address,
             relay_use_proxy,
             control,
         };
@@ -502,22 +550,23 @@ impl RuntimeSession {
 
     fn relay_cleanup(
         &self,
-        relay_address: Option<&str>,
+        relay_anchor_address: Option<&str>,
         relay_use_proxy: bool,
         route_name: &str,
         server_id: &str,
     ) -> Option<RelayCleanupError> {
-        let relay_address = relay_address?;
-        let projection = match self.relay_projection_for_address(relay_address, relay_use_proxy) {
-            Ok(projection) => projection,
-            Err(err) => {
-                return Some(RelayCleanupError {
-                    route_name: route_name.to_string(),
-                    status_code: None,
-                    message: err.to_string(),
-                });
-            }
-        };
+        let relay_anchor_address = relay_anchor_address?;
+        let projection =
+            match self.relay_projection_for_address(relay_anchor_address, relay_use_proxy) {
+                Ok(projection) => projection,
+                Err(err) => {
+                    return Some(RelayCleanupError {
+                        route_name: route_name.to_string(),
+                        status_code: None,
+                        message: err.to_string(),
+                    });
+                }
+            };
         match projection.control.unregister(route_name, server_id) {
             Ok(()) => None,
             Err(HttpError::ServerError(status_code, body)) => Some(RelayCleanupError {
@@ -537,18 +586,18 @@ impl RuntimeSession {
         }
     }
 
-    fn effective_relay_address_arg(
+    fn effective_relay_anchor_address_arg(
         &self,
-        relay_address: Option<&str>,
+        relay_anchor_address: Option<&str>,
     ) -> Result<Option<String>, RuntimeSessionError> {
-        match relay_address {
+        match relay_anchor_address {
             Some(address) => Ok(Some(address.to_string())),
-            None => self.effective_relay_address(),
+            None => self.effective_relay_anchor_address(),
         }
     }
 }
 
-fn canonical_relay_address(address: &str) -> String {
+fn canonical_relay_anchor_address(address: &str) -> String {
     address.trim().trim_end_matches('/').to_string()
 }
 
@@ -626,7 +675,7 @@ mod tests {
             server_ipc_overrides: None,
             client_ipc_overrides: None,
             shm_threshold: None,
-            relay_address: None,
+            relay_anchor_address: None,
         })
         .expect("session should accept valid server id");
 
@@ -651,7 +700,7 @@ mod tests {
                 server_ipc_overrides: None,
                 client_ipc_overrides: None,
                 shm_threshold: None,
-                relay_address: None,
+                relay_anchor_address: None,
             })
             .expect_err("invalid server id should be rejected");
             assert!(
@@ -682,7 +731,7 @@ mod tests {
             server_ipc_overrides: None,
             client_ipc_overrides: None,
             shm_threshold: None,
-            relay_address: None,
+            relay_anchor_address: None,
         })
         .expect("session should accept valid server id");
 
@@ -709,7 +758,7 @@ mod tests {
             server_ipc_overrides: Some(overrides),
             client_ipc_overrides: None,
             shm_threshold: None,
-            relay_address: None,
+            relay_anchor_address: None,
         })
         .expect("session should accept valid options");
 
@@ -731,7 +780,7 @@ mod tests {
             server_ipc_overrides: None,
             client_ipc_overrides: Some(overrides),
             shm_threshold: None,
-            relay_address: None,
+            relay_anchor_address: None,
         })
         .expect("session should accept valid options");
 
@@ -742,22 +791,22 @@ mod tests {
     }
 
     #[test]
-    fn relay_address_override_is_canonicalized_and_clear_cache_is_safe() {
+    fn relay_anchor_address_override_is_canonicalized_and_clear_cache_is_safe() {
         let session = RuntimeSession::new(RuntimeSessionOptions {
-            relay_address: Some(" http://relay.test/ ".to_string()),
+            relay_anchor_address: Some(" http://relay.test/ ".to_string()),
             ..Default::default()
         })
         .expect("session");
 
         assert_eq!(
-            session.relay_address_override().as_deref(),
+            session.relay_anchor_address_override().as_deref(),
             Some("http://relay.test"),
         );
 
         session.clear_relay_projection_cache();
-        session.set_relay_address(Some("http://relay-b.test/".to_string()));
+        session.set_relay_anchor_address(Some("http://relay-b.test/".to_string()));
         assert_eq!(
-            session.relay_address_override().as_deref(),
+            session.relay_anchor_address_override().as_deref(),
             Some("http://relay-b.test"),
         );
     }

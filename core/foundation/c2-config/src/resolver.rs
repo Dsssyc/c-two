@@ -140,7 +140,7 @@ pub struct RelayConfigOverrides {
 
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeConfigOverrides {
-    pub relay_address: Option<String>,
+    pub relay_anchor_address: Option<String>,
     pub relay: RelayConfigOverrides,
     pub server_ipc: ServerIpcConfigOverrides,
     pub client_ipc: ClientIpcConfigOverrides,
@@ -150,7 +150,7 @@ pub struct RuntimeConfigOverrides {
 
 #[derive(Debug, Clone)]
 pub struct ResolvedRuntimeConfig {
-    pub relay_address: Option<String>,
+    pub relay_anchor_address: Option<String>,
     pub relay: RelayConfig,
     pub server_ipc: ServerIpcConfig,
     pub client_ipc: ClientIpcConfig,
@@ -160,16 +160,17 @@ pub struct ResolvedRuntimeConfig {
 
 #[derive(Debug, Clone)]
 pub struct ResolvedRelayConfig {
-    pub relay_address: Option<String>,
+    pub relay_anchor_address: Option<String>,
     pub relay: RelayConfig,
     pub relay_use_proxy: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct ResolvedRelayClientConfig {
-    pub relay_address: Option<String>,
+    pub relay_anchor_address: Option<String>,
     pub relay_use_proxy: bool,
     pub relay_route_max_attempts: usize,
+    pub relay_call_timeout_secs: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,7 +215,7 @@ impl ConfigResolver {
         let client_ipc = resolve_client_ipc_config(&catalog, overrides.client_ipc, shm_threshold)?;
 
         Ok(ResolvedRuntimeConfig {
-            relay_address: relay_client.relay_address,
+            relay_anchor_address: relay_client.relay_anchor_address,
             relay,
             server_ipc,
             client_ipc,
@@ -229,10 +230,10 @@ impl ConfigResolver {
     ) -> Result<ResolvedRelayConfig, ConfigError> {
         let catalog = EnvCatalog::load(sources)?;
         let relay = resolve_relay_server_config(&catalog, overrides.relay.clone())?;
-        let relay_address = overrides
-            .relay_address
+        let relay_anchor_address = overrides
+            .relay_anchor_address
             .clone()
-            .or_else(|| catalog.optional_string("C2_RELAY_ADDRESS"));
+            .or_else(|| catalog.optional_string("C2_RELAY_ANCHOR_ADDRESS"));
         let relay_use_proxy = resolve_relay_use_proxy(&catalog, &overrides)?;
         let relay = RelayConfig {
             use_proxy: relay_use_proxy,
@@ -240,15 +241,17 @@ impl ConfigResolver {
         };
 
         Ok(ResolvedRelayConfig {
-            relay_address,
+            relay_anchor_address,
             relay,
             relay_use_proxy,
         })
     }
 
-    pub fn resolve_relay_address(sources: ConfigSources) -> Result<Option<String>, ConfigError> {
+    pub fn resolve_relay_anchor_address(
+        sources: ConfigSources,
+    ) -> Result<Option<String>, ConfigError> {
         let catalog = EnvCatalog::load(sources)?;
-        Ok(catalog.optional_string("C2_RELAY_ADDRESS"))
+        Ok(catalog.optional_string("C2_RELAY_ANCHOR_ADDRESS"))
     }
 
     pub fn resolve_relay_use_proxy(sources: ConfigSources) -> Result<bool, ConfigError> {
@@ -259,6 +262,11 @@ impl ConfigResolver {
     pub fn resolve_relay_route_max_attempts(sources: ConfigSources) -> Result<usize, ConfigError> {
         let catalog = EnvCatalog::load(sources)?;
         resolve_relay_route_max_attempts(&catalog)
+    }
+
+    pub fn resolve_relay_call_timeout_secs(sources: ConfigSources) -> Result<f64, ConfigError> {
+        let catalog = EnvCatalog::load(sources)?;
+        resolve_relay_call_timeout_secs(&catalog)
     }
 
     pub fn resolve_server_ipc(
@@ -294,17 +302,19 @@ fn resolve_relay_client_config(
     catalog: &EnvCatalog,
     overrides: &RuntimeConfigOverrides,
 ) -> Result<ResolvedRelayClientConfig, ConfigError> {
-    let relay_address = overrides
-        .relay_address
+    let relay_anchor_address = overrides
+        .relay_anchor_address
         .clone()
-        .or_else(|| catalog.optional_string("C2_RELAY_ADDRESS"));
+        .or_else(|| catalog.optional_string("C2_RELAY_ANCHOR_ADDRESS"));
     let relay_use_proxy = resolve_relay_use_proxy(catalog, overrides)?;
     let relay_route_max_attempts = resolve_relay_route_max_attempts(catalog)?;
+    let relay_call_timeout_secs = resolve_relay_call_timeout_secs(catalog)?;
 
     Ok(ResolvedRelayClientConfig {
-        relay_address,
+        relay_anchor_address,
         relay_use_proxy,
         relay_route_max_attempts,
+        relay_call_timeout_secs,
     })
 }
 
@@ -333,6 +343,15 @@ fn resolve_relay_route_max_attempts(catalog: &EnvCatalog) -> Result<usize, Confi
         )));
     }
     Ok(attempts as usize)
+}
+
+fn resolve_relay_call_timeout_secs(catalog: &EnvCatalog) -> Result<f64, ConfigError> {
+    let timeout = catalog
+        .optional_f64("C2_RELAY_CALL_TIMEOUT")
+        .transpose()?
+        .unwrap_or(300.0);
+    duration_from_secs("C2_RELAY_CALL_TIMEOUT", timeout)?;
+    Ok(timeout)
 }
 
 fn resolve_env(sources: ConfigSources) -> Result<EnvMap, ConfigError> {
@@ -1089,27 +1108,27 @@ mod tests {
     }
 
     #[test]
-    fn relay_address_resolution_ignores_relay_server_env() {
+    fn relay_anchor_address_resolution_ignores_relay_server_env() {
         let sources = ConfigSources {
             env_file: EnvFilePolicy::Disabled,
             process_env: env(&[
-                ("C2_RELAY_ADDRESS", "http://127.0.0.1:8080"),
+                ("C2_RELAY_ANCHOR_ADDRESS", "http://127.0.0.1:8080"),
                 ("C2_RELAY_IDLE_TIMEOUT", "not-a-number"),
             ]),
         };
 
-        let resolved = ConfigResolver::resolve_relay_address(sources)
+        let resolved = ConfigResolver::resolve_relay_anchor_address(sources)
             .expect("relay address should not parse relay server-only env");
 
         assert_eq!(resolved.as_deref(), Some("http://127.0.0.1:8080"));
     }
 
     #[test]
-    fn relay_use_proxy_resolution_ignores_relay_address_and_ipc_env() {
+    fn relay_use_proxy_resolution_ignores_relay_anchor_address_and_ipc_env() {
         let sources = ConfigSources {
             env_file: EnvFilePolicy::Disabled,
             process_env: env(&[
-                ("C2_RELAY_ADDRESS", "http://127.0.0.1:8080"),
+                ("C2_RELAY_ANCHOR_ADDRESS", "http://127.0.0.1:8080"),
                 ("C2_RELAY_USE_PROXY", "yes"),
                 ("C2_IPC_POOL_SEGMENT_SIZE", "not-a-number"),
             ]),
@@ -1132,6 +1151,32 @@ mod tests {
             ConfigResolver::resolve_relay_route_max_attempts(sources).expect("resolve attempts");
 
         assert_eq!(attempts, 5);
+    }
+
+    #[test]
+    fn relay_call_timeout_resolves_from_env() {
+        let sources = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[("C2_RELAY_CALL_TIMEOUT", "900.5")]),
+        };
+
+        let timeout = ConfigResolver::resolve_relay_call_timeout_secs(sources)
+            .expect("resolve relay call timeout");
+
+        assert_eq!(timeout, 900.5);
+    }
+
+    #[test]
+    fn relay_call_timeout_zero_disables_total_timeout() {
+        let sources = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[("C2_RELAY_CALL_TIMEOUT", "0")]),
+        };
+
+        let timeout = ConfigResolver::resolve_relay_call_timeout_secs(sources)
+            .expect("resolve disabled relay call timeout");
+
+        assert_eq!(timeout, 0.0);
     }
 
     #[test]
@@ -1176,14 +1221,14 @@ mod tests {
     fn relay_server_resolution_uses_single_runtime_override_source() {
         let mut overrides = RuntimeConfigOverrides::default();
         overrides.relay.idle_timeout_secs = Some(5);
-        overrides.relay_address = Some("http://127.0.0.1:8080".to_string());
+        overrides.relay_anchor_address = Some("http://127.0.0.1:8080".to_string());
 
         let resolved = ConfigResolver::resolve_relay_server(overrides, ConfigSources::empty())
             .expect("relay server should resolve from one override source");
 
         assert_eq!(resolved.relay.idle_timeout_secs, 5);
         assert_eq!(
-            resolved.relay_address.as_deref(),
+            resolved.relay_anchor_address.as_deref(),
             Some("http://127.0.0.1:8080")
         );
     }

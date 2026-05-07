@@ -226,7 +226,7 @@ Phased approach to avoid intermediate broken states:
 - After each phase: `cargo check --workspace` (fast compilation check)
 - After Phase 2: `cargo test -p c2-wire` (chunk tests now in wire; no_std feature gate removed after merge)
 - After Phase 3: `cargo test -p c2-http` (relay + client tests)
-- After Phase 4: `C2_RELAY_ADDRESS= C2_ENV_FILE= uv run pytest tests/ -q --timeout=30` (full Python suite)
+- After Phase 4: `C2_RELAY_ANCHOR_ADDRESS= C2_ENV_FILE= uv run pytest tests/ -q --timeout=30` (full Python suite)
 - No new tests needed — existing tests cover all functionality, only import paths change
 
 ## Risks

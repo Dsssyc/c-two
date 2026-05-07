@@ -83,7 +83,7 @@ matrix.
 - Are docs, examples, and tests consistently using the standalone `c3 relay`
   workflow?
 - Do language SDKs only own client-side relay address selection via
-  `C2_RELAY_ADDRESS` or `cc.set_relay()` equivalents?
+  `C2_RELAY_ANCHOR_ADDRESS` or `cc.set_relay_anchor()` equivalents?
 
 ### 3. Workflow-policy tests still live under the Python SDK test tree
 

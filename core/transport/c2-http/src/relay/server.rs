@@ -290,7 +290,10 @@ impl RelayServer {
             });
         }
 
-        let server = axum::serve(listener, app);
+        let server = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        );
         let sweeper = Self::idle_sweeper(state.clone(), idle_timeout_secs);
 
         tokio::select! {

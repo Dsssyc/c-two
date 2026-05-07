@@ -43,14 +43,14 @@ uv sync
 # Force rebuild after Rust source changes
 uv sync --reinstall-package c-two
 
-# Run the full Python test suite. Empty C2_RELAY_ADDRESS avoids env interference.
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30
+# Run the full Python test suite. Empty C2_RELAY_ANCHOR_ADDRESS avoids env interference.
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30
 
 # Ensure the Python 3.10 compatibility syntax check executes instead of
 # skipping. Keep 3.10 coverage because downstream Taichi-based stacks can still
 # be pinned to Python 3.10.
 uv python install 3.10
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_python_examples_syntax.py::test_python_examples_compile_on_minimum_supported_python -q --timeout=30 -rs
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_python_examples_syntax.py::test_python_examples_compile_on_minimum_supported_python -q --timeout=30 -rs
 
 # Run one test file
 uv run pytest sdk/python/tests/unit/test_wire.py -q
@@ -63,7 +63,7 @@ cargo test --manifest-path core/Cargo.toml --workspace
 
 # Python SDK native extension and tests
 uv sync --reinstall-package c-two
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30
 
 # Single-process example with thread preference
 uv run python examples/python/local.py
@@ -95,7 +95,7 @@ skip. For broader 3.10 smoke coverage without replacing the default `.venv`,
 use a separate environment:
 
 ```bash
-UV_PROJECT_ENVIRONMENT=.venv-py310 C2_RELAY_ADDRESS= uv run --python 3.10 pytest sdk/python/tests/unit/test_python_examples_syntax.py -q --timeout=30 -rs
+UV_PROJECT_ENVIRONMENT=.venv-py310 C2_RELAY_ANCHOR_ADDRESS= uv run --python 3.10 pytest sdk/python/tests/unit/test_python_examples_syntax.py -q --timeout=30 -rs
 ```
 
 ## Architecture
@@ -151,7 +151,7 @@ Rust `c3 relay` runtime.
 
 | File | Purpose |
 | --- | --- |
-| `settings.py` | `C2Settings` facade for SDK code overrides such as `cc.set_relay()` and process transport policy |
+| `settings.py` | `C2Settings` facade for SDK code overrides such as `cc.set_relay_anchor()` and process transport policy |
 | `ipc.py` | Typed override schemas: `BaseIPCOverrides`, `ServerIPCOverrides`, `ClientIPCOverrides`; Rust owns defaults and validation |
 
 Config priority chain:
@@ -269,11 +269,19 @@ Python resource servers create an auto-generated `ipc://` address. Use
 `cc.server_address()` after registration only when a same-host process needs to
 connect directly.
 
-Relay priority:
+Relay anchor priority:
 
 ```text
-cc.set_relay() > C2_RELAY_ADDRESS > none
+cc.set_relay_anchor() > C2_RELAY_ANCHOR_ADDRESS > none
 ```
+
+`C2_RELAY_ANCHOR_ADDRESS` is the SDK process's relay anchor for control-plane
+registration and name resolution. It is not necessarily the relay that will
+carry every data-plane call: after resolution, remote HTTP calls use the
+selected route's `relay_url` directly. Direct IPC selection from relay
+resolution is allowed only when the anchor endpoint is loopback/local; nonlocal
+relay responses must be treated as HTTP relay targets even if they include an
+`ipc_address`.
 
 The Python SDK does not embed or start a relay server. Start `c3 relay` outside
 the SDK, through the CLI, Docker Compose, Kubernetes, or other orchestration.
@@ -431,7 +439,7 @@ The registry exposes a flat top-level API on the `cc` namespace:
 import c_two as cc
 
 # Server side
-cc.set_relay('http://relay-host:8080')
+cc.set_relay_anchor('http://relay-host:8080')
 cc.set_transport_policy(shm_threshold=64 * 1024)
 cc.set_server(ipc_overrides={'pool_segment_size': 2 * 1024 * 1024 * 1024})
 cc.register(Grid, grid_instance, name='grid')
@@ -450,7 +458,7 @@ grid.some_method(arg)
 cc.close(grid)
 
 # Client side, relay-based name resolution and routing
-cc.set_relay('http://relay-host:8080')
+cc.set_relay_anchor('http://relay-host:8080')
 grid = cc.connect(Grid, name='grid')
 grid.some_method(arg)
 cc.close(grid)
@@ -517,8 +525,9 @@ through Rust serialized dispatch for symmetry.
 
 | Variable | Purpose | Default |
 | --- | --- | --- |
-| `C2_RELAY_ADDRESS` | HTTP relay URL for CRM registration and client name resolution | none |
+| `C2_RELAY_ANCHOR_ADDRESS` | SDK relay anchor URL for CRM registration and client name resolution | none |
 | `C2_RELAY_ROUTE_MAX_ATTEMPTS` | Relay-aware client route acquisition attempts | `3` |
+| `C2_RELAY_CALL_TIMEOUT` | Relay HTTP CRM call timeout seconds; `0` disables the reqwest total timeout | `300` |
 | `C2_RELAY_BIND` | Relay HTTP listen address for `c3 relay --bind` | `0.0.0.0:8080` |
 | `C2_RELAY_ID` | Stable relay identifier for mesh protocol | auto UUID |
 | `C2_RELAY_ADVERTISE_URL` | Publicly reachable URL announced to mesh peers | derived |

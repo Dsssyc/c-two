@@ -289,13 +289,13 @@ jobs:
       - name: Run tests
         run: uv run pytest tests/ -q --timeout=30
         env:
-          C2_RELAY_ADDRESS: ""
+          C2_RELAY_ANCHOR_ADDRESS: ""
 ```
 
 Key design decisions:
 - `fail-fast: false` — let both Python versions complete even if one fails (shows full picture)
 - `name: test (py${{ matrix.python }})` — clear job names in GitHub UI
-- `C2_RELAY_ADDRESS: ""` — disables relay tests that require external server
+- `C2_RELAY_ANCHOR_ADDRESS: ""` — disables relay tests that require external server
 
 - [ ] **Step 2: Validate YAML syntax**
 
@@ -475,7 +475,7 @@ Expected: 6 passed
 
 - [ ] **Step 2: Run full test suite**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30`
 Expected: All tests pass (689+ currently)
 
 - [ ] **Step 3: Verify file tree**

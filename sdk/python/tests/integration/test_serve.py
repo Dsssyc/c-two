@@ -70,7 +70,7 @@ class TestServeSubprocess:
 
         env = os.environ.copy()
         env['SHUTDOWN_MARKER'] = str(marker)
-        env.pop('C2_RELAY_ADDRESS', None)
+        env.pop('C2_RELAY_ANCHOR_ADDRESS', None)
         env['PYTHONUNBUFFERED'] = '1'
 
         proc = subprocess.Popen(
@@ -117,7 +117,7 @@ class TestServeSubprocess:
         """)
 
         env = os.environ.copy()
-        env.pop('C2_RELAY_ADDRESS', None)
+        env.pop('C2_RELAY_ANCHOR_ADDRESS', None)
         env['PYTHONUNBUFFERED'] = '1'
 
         proc = subprocess.Popen(

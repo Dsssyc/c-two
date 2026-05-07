@@ -126,7 +126,7 @@ def __init__(
 - [ ] **Step 3: Run tests to verify compat**
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest tests/conftest.py tests/integration/test_server.py -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/conftest.py tests/integration/test_server.py -q --timeout=30
 ```
 Expected: All tests pass — NativeServerBridge now accepts the same constructor kwargs as old Server.
 
@@ -170,7 +170,7 @@ Change the lazy import entries for `Server` and `CRMSlot`:
 - [ ] **Step 3: Run tests to verify redirect works**
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30 -x
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30 -x
 ```
 Expected: All 606+ tests pass — Server now resolves to NativeServerBridge everywhere.
 
@@ -216,7 +216,7 @@ This resolves to `NativeServerBridge` via the updated `server/__init__.py`.
 - [ ] **Step 2: Run full test suite**
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30
 ```
 Expected: All 606+ tests pass with no import errors.
 
@@ -286,7 +286,7 @@ def wrap_error(exc: Exception) -> tuple[bytes, bytes]:
 - [ ] **Step 2: Run tests**
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30 -x
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30 -x
 ```
 Expected: All tests pass — only old server code used the deleted functions.
 
@@ -323,7 +323,7 @@ rm src/c_two/transport/server/core.py \
 - [ ] **Step 2: Run tests to verify no remaining imports**
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30 -x
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30 -x
 ```
 Expected: All tests pass. If any test fails with ImportError, it means we missed an import redirect in Task 3 — fix it before proceeding.
 
@@ -411,7 +411,7 @@ class MethodTable:
 - [ ] **Step 2: Run tests**
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30 -x
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30 -x
 ```
 Expected: All tests pass. `test_security.py::TestMethodTableSafety` and `test_transferable.py::TestPayloadTotalSize` should still work.
 
@@ -509,7 +509,7 @@ class IPCConfig:
 - [ ] **Step 2: Run tests**
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30 -x
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30 -x
 ```
 Expected: Some tests that import frame constants (`FRAME_STRUCT`, `FLAG_RESPONSE`, `encode_frame`) may fail. These will be handled in Task 9.
 
@@ -551,7 +551,7 @@ from .frame import IPCConfig
 - [ ] **Step 3: Run tests**
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30 -x
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30 -x
 ```
 Expected: Tests that imported MsgType, PING_BYTES, shm_frame, etc. will fail — these are handled in Task 9.
 
@@ -680,7 +680,7 @@ Keep all other test methods in the class that test concurrency behavior through 
 - [ ] **Step 6: Run full test suite**
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30
 ```
 Expected: All surviving tests pass. Total count will be lower (we deleted ~200 lines of tests).
 
@@ -726,7 +726,7 @@ Verify `__all__` only lists symbols that actually exist. Remove `CRMSlot` from `
 - [ ] **Step 4: Run full test suite one final time**
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30
 ```
 Expected: All tests pass. Record the final count.
 

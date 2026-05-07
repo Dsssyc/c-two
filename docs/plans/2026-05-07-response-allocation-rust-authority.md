@@ -123,7 +123,7 @@ Run:
 ```bash
 cargo test --manifest-path core/Cargo.toml -p c2-server
 cargo check --manifest-path sdk/python/native/Cargo.toml -q
-C2_RELAY_ADDRESS= uv run pytest \
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest \
   sdk/python/tests/unit/test_sdk_boundary.py \
   sdk/python/tests/integration/test_ipc_buddy_reply.py \
   sdk/python/tests/integration/test_buffer_lease_ipc.py \
@@ -341,7 +341,7 @@ If `_shm_threshold` is no longer used outside response allocation, remove the at
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_sdk_boundary.py -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_sdk_boundary.py -q --timeout=30
 ```
 
 Expected: existing boundary tests pass before adding issue7-specific guards.
@@ -401,7 +401,7 @@ Run:
 
 ```bash
 uv sync --reinstall-package c-two
-C2_RELAY_ADDRESS= uv run pytest \
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest \
   sdk/python/tests/unit/test_sdk_boundary.py \
   sdk/python/tests/integration/test_response_allocation_ipc.py \
   sdk/python/tests/integration/test_ipc_buddy_reply.py \
@@ -451,7 +451,7 @@ cargo fmt --manifest-path sdk/python/native/Cargo.toml -- --check
 cargo check --manifest-path sdk/python/native/Cargo.toml -q
 cargo test --manifest-path core/Cargo.toml --workspace
 uv sync --reinstall-package c-two
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30 -rs
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30 -rs
 git diff --check
 rg -n "response_pool|write_from_buffer|bytes\(res_part\)|PyTuple|seg_idx, offset, data_size|is_dedicated\) tuple" \
   sdk/python/src/c_two/transport/server/native.py \

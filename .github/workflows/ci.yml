@@ -168,4 +168,4 @@ jobs:
         if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
         run: uv run pytest sdk/python/tests -q --timeout=30
         env:
-          C2_RELAY_ADDRESS: ""
+          C2_RELAY_ANCHOR_ADDRESS: ""

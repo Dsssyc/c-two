@@ -20,14 +20,14 @@ uv sync
 # Force rebuild after Rust source changes (uv sync alone may skip it)
 uv sync --reinstall-package c-two
 
-# Run the full test suite (C2_RELAY_ADDRESS= avoids env interference)
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30
+# Run the full test suite (C2_RELAY_ANCHOR_ADDRESS= avoids env interference)
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30
 
 # Ensure the Python 3.10 compatibility syntax check executes instead of
 # skipping. Keep 3.10 coverage because some downstream users, including
 # Taichi-based stacks, are still pinned to Python 3.10.
 uv python install 3.10
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_python_examples_syntax.py::test_python_examples_compile_on_minimum_supported_python -q --timeout=30 -rs
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_python_examples_syntax.py::test_python_examples_compile_on_minimum_supported_python -q --timeout=30 -rs
 
 # Run a single test file
 uv run pytest sdk/python/tests/unit/test_wire.py -q
@@ -40,7 +40,7 @@ cargo test --manifest-path core/Cargo.toml --workspace
 
 # Python SDK native extension and tests
 uv sync --reinstall-package c-two
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30
 
 # Run example (single-process, thread preference)
 uv run python examples/python/local.py
@@ -63,7 +63,7 @@ c3 --version
 c3 relay --upstream grid=server-grid@ipc://my_server --bind 0.0.0.0:8080
 ```
 
-Tests use **pytest** with a 30-second per-test timeout. Tests live under `sdk/python/tests/unit/` and `sdk/python/tests/integration/`, with shared fixtures in `sdk/python/tests/fixtures/` (see `Hello` CRM contract and `HelloImpl` resource). The minimum-supported-Python syntax test discovers `python3.10` or `uv python find 3.10`; run `uv python install 3.10` before the suite if you need to guarantee it does not skip. For a broader 3.10 smoke test without replacing the default `.venv`, use `UV_PROJECT_ENVIRONMENT=.venv-py310 C2_RELAY_ADDRESS= uv run --python 3.10 pytest sdk/python/tests/unit/test_python_examples_syntax.py -q --timeout=30 -rs`.
+Tests use **pytest** with a 30-second per-test timeout. Tests live under `sdk/python/tests/unit/` and `sdk/python/tests/integration/`, with shared fixtures in `sdk/python/tests/fixtures/` (see `Hello` CRM contract and `HelloImpl` resource). The minimum-supported-Python syntax test discovers `python3.10` or `uv python find 3.10`; run `uv python install 3.10` before the suite if you need to guarantee it does not skip. For a broader 3.10 smoke test without replacing the default `.venv`, use `UV_PROJECT_ENVIRONMENT=.venv-py310 C2_RELAY_ANCHOR_ADDRESS= uv run --python 3.10 pytest sdk/python/tests/unit/test_python_examples_syntax.py -q --timeout=30 -rs`.
 
 ## 0.x And Phase Discipline
 
@@ -108,7 +108,7 @@ and default values. Relay server configuration belongs to the standalone Rust
 
 | File | Purpose |
 |------|---------|
-| `settings.py` | `C2Settings` facade for SDK code overrides such as `cc.set_relay()` and global transport policy |
+| `settings.py` | `C2Settings` facade for SDK code overrides such as `cc.set_relay_anchor()` and global transport policy |
 | `ipc.py` | Typed override schemas: `BaseIPCOverrides`, `ServerIPCOverrides`, `ClientIPCOverrides`; Rust `c2-config` owns defaults and validation |
 
 Config priority chain: explicit kwargs (`cc.set_*()`) → process environment / `.env` via the resolver → Rust defaults.
@@ -140,7 +140,7 @@ The transport layer is a thin Python orchestration shell around a Rust-native co
 canonical auto-generated `ipc://` address. Use `cc.server_address()` after
 registration to inspect the native session projection.
 
-**Relay priority:** `cc.set_relay()` > `C2_RELAY_ADDRESS` env var > none (standalone mode).
+**Relay priority:** `cc.set_relay_anchor()` > `C2_RELAY_ANCHOR_ADDRESS` env var > none (standalone mode).
 
 Direct `ipc://` is a complete standalone mode. Explicit `cc.connect(...,
 address="ipc://...")` must bypass relay discovery and continue to work with no
@@ -276,7 +276,7 @@ The registry exposes a flat top-level API on the `cc` namespace:
 import c_two as cc
 
 # Server side
-cc.set_relay('http://relay-host:8080')                   # optional: relay for name resolution
+cc.set_relay_anchor('http://relay-host:8080')                   # optional: relay for name resolution
 cc.set_transport_policy(shm_threshold=64*1024)           # optional: process-wide transport policy
 cc.set_server(ipc_overrides={'pool_segment_size': 2*1024*1024*1024})  # optional: server IPC overrides
 cc.register(Grid, grid_instance, name='grid')           # register a Grid resource
@@ -295,7 +295,7 @@ grid.some_method(arg)
 cc.close(grid)
 
 # Client side (relay-based name resolution)
-cc.set_relay('http://relay-host:8080')
+cc.set_relay_anchor('http://relay-host:8080')
 grid = cc.connect(Grid, name='grid')                    # relay resolves name → IPC address
 grid.some_method(arg)
 cc.close(grid)
@@ -329,7 +329,7 @@ Wire codec and transport code in Rust (`c2-wire`, `c2-ipc`, `c2-mem`) prioritize
 ### Environment Variables
 | Variable | Purpose | Default |
 |----------|---------|---------|
-| `C2_RELAY_ADDRESS` | HTTP relay URL for CRM registration and client name resolution | (none) |
+| `C2_RELAY_ANCHOR_ADDRESS` | HTTP relay URL for CRM registration and client name resolution | (none) |
 | `C2_RELAY_BIND` | Relay HTTP listen address (`c3 relay --bind`) | `0.0.0.0:8080` |
 | `C2_RELAY_ID` | Stable relay identifier for mesh protocol | auto UUID |
 | `C2_RELAY_ADVERTISE_URL` | Publicly reachable URL announced to mesh peers | (none) |

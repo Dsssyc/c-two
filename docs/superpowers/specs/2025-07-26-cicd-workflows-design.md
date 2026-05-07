@@ -46,7 +46,7 @@ concurrency:
 4. `astral-sh/setup-uv@v6` — uv 包管理器
 5. `uv sync` — 安装依赖 + 编译 Rust 扩展
 6. `uv run pytest tests/ -q --timeout=30` — 全量测试
-   - `C2_RELAY_ADDRESS=""` 环境变量跳过 relay 测试
+   - `C2_RELAY_ANCHOR_ADDRESS=""` 环境变量跳过 relay 测试
 
 ### 工具选择理由
 

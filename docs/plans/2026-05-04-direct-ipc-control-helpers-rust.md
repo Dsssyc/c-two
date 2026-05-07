@@ -20,7 +20,7 @@ C-Two is in the 0.x line. Do not keep Python raw-socket fallback behavior after 
 
 ## Non-Negotiable Runtime Constraints
 
-1. **Direct IPC remains relay-independent.** `ping("ipc://...")` and `shutdown("ipc://...")` must use only direct UDS IPC. They must not consult `C2_RELAY_ADDRESS`, relay route resolution, `c2-http`, or relay control clients.
+1. **Direct IPC remains relay-independent.** `ping("ipc://...")` and `shutdown("ipc://...")` must use only direct UDS IPC. They must not consult `C2_RELAY_ANCHOR_ADDRESS`, relay route resolution, `c2-http`, or relay control clients.
 2. **Canonical wire constants only.** Signal bytes and frame flags must come from `c2-wire`; do not duplicate numeric constants in Python or in a second Rust table.
 3. **Canonical address validation only.** IPC region validation and socket-path derivation must be owned by Rust. Python tests may keep a private helper only if it delegates to native validation and uses the native resolved path.
 4. **No data-plane changes.** This work touches control probes only. Do not change CRM call, SHM, buddy, chunked, scheduler, or relay-aware data paths.
@@ -623,7 +623,7 @@ Run:
 
 ```bash
 uv sync --reinstall-package c-two
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_ipc_address_validation.py -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_ipc_address_validation.py -q --timeout=30
 ```
 
 Expected: all IPC address validation tests pass.
@@ -669,7 +669,7 @@ def _wait_for_ping(address: str, timeout: float = 5.0) -> None:
 
 @pytest.fixture
 def direct_server(monkeypatch):
-    monkeypatch.delenv('C2_RELAY_ADDRESS', raising=False)
+    monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
     address = f'ipc://{_unique_region()}'
     server = Server(
         bind_address=address,
@@ -690,12 +690,12 @@ def test_ping_returns_true_against_direct_ipc_without_relay(direct_server):
 
 def test_ping_ignores_bad_relay_env(monkeypatch, direct_server):
     address, _server = direct_server
-    monkeypatch.setenv('C2_RELAY_ADDRESS', 'http://127.0.0.1:9')
+    monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', 'http://127.0.0.1:9')
     assert ping(address, timeout=0.5) is True
 
 
 def test_shutdown_stops_direct_ipc_without_relay(monkeypatch):
-    monkeypatch.delenv('C2_RELAY_ADDRESS', raising=False)
+    monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
     address = f'ipc://{_unique_region("shutdown")}'
     server = Server(
         bind_address=address,
@@ -729,7 +729,7 @@ def test_control_helpers_reject_invalid_addresses():
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/integration/test_direct_ipc_control.py -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/integration/test_direct_ipc_control.py -q --timeout=30
 ```
 
 Expected: all direct IPC control tests pass.
@@ -739,7 +739,7 @@ Expected: all direct IPC control tests pass.
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/integration/test_server.py sdk/python/tests/integration/test_heartbeat.py -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/integration/test_server.py sdk/python/tests/integration/test_heartbeat.py -q --timeout=30
 ```
 
 Expected: existing server and heartbeat tests pass with the native-backed facade.
@@ -798,7 +798,7 @@ Expected: build succeeds.
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest \
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest \
   sdk/python/tests/unit/test_ipc_address_validation.py \
   sdk/python/tests/integration/test_direct_ipc_control.py \
   sdk/python/tests/integration/test_server.py \
@@ -825,7 +825,7 @@ Expected: all commands pass.
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30
 cargo test --manifest-path core/Cargo.toml --workspace
 ```
 

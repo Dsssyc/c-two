@@ -262,7 +262,7 @@ def test_from_buffer_errors_round_trip_to_specific_subclasses():
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_error.py -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_error.py -q --timeout=30
 ```
 
 Expected: FAIL because Python mapping/classes do not exist yet.
@@ -318,7 +318,7 @@ ERROR_Code.ERROR_AT_CLIENT_OUTPUT_FROM_BUFFER: ClientOutputFromBuffer,
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_error.py -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_error.py -q --timeout=30
 ```
 
 Expected: PASS.
@@ -328,7 +328,7 @@ Expected: PASS.
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_native_error_registry.py sdk/python/tests/unit/test_sdk_boundary.py -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_native_error_registry.py sdk/python/tests/unit/test_sdk_boundary.py -q --timeout=30
 ```
 
 Expected: PASS. If `test_sdk_boundary.py` asserts the old registry count or mapping, update it to require the new Rust-owned entries and no Python parser fallback.
@@ -459,7 +459,7 @@ def test_view_output_deserialize_failure_remains_client_deserialize_output(self)
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_transferable.py::TestComToCrmBufferModes -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_transferable.py::TestComToCrmBufferModes -q --timeout=30
 ```
 
 Expected: FAIL because `ClientOutputFromBuffer` is not raised and the hold failure path does not release response deterministically.
@@ -546,7 +546,7 @@ This ensures `ClientOutputFromBuffer` is not rewrapped as `ClientDeserializeOutp
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_transferable.py::TestComToCrmBufferModes -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_transferable.py::TestComToCrmBufferModes -q --timeout=30
 ```
 
 Expected: PASS.
@@ -599,7 +599,7 @@ class BadInputResource:
 
 def test_resource_input_from_buffer_failure_uses_specific_error_and_releases_request(monkeypatch):
     settings.shm_threshold = 1024
-    monkeypatch.delenv("C2_RELAY_ADDRESS", raising=False)
+    monkeypatch.delenv("C2_RELAY_ANCHOR_ADDRESS", raising=False)
     cc.register(BadInputCRM, BadInputResource(), name="bad_input_from_buffer")
     cc.serve(blocking=False)
     address = cc.server_address()
@@ -650,7 +650,7 @@ def test_resource_input_deserialize_failure_remains_resource_deserialize_input(s
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/integration/test_buffer_lease_ipc.py::test_resource_input_from_buffer_failure_uses_specific_error_and_releases_request sdk/python/tests/unit/test_transferable.py::TestCrmToComBufferModes::test_resource_input_deserialize_failure_remains_resource_deserialize_input -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/integration/test_buffer_lease_ipc.py::test_resource_input_from_buffer_failure_uses_specific_error_and_releases_request sdk/python/tests/unit/test_transferable.py::TestCrmToComBufferModes::test_resource_input_deserialize_failure_remains_resource_deserialize_input -q --timeout=30
 ```
 
 Expected: the new from_buffer test fails because the current code reports `ResourceDeserializeInput` or leaks a retained request lease.
@@ -756,7 +756,7 @@ Do not add deprecated alias names.
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/integration/test_buffer_lease_ipc.py::test_resource_input_from_buffer_failure_uses_specific_error_and_releases_request sdk/python/tests/unit/test_transferable.py::TestCrmToComBufferModes::test_resource_input_deserialize_failure_remains_resource_deserialize_input -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/integration/test_buffer_lease_ipc.py::test_resource_input_from_buffer_failure_uses_specific_error_and_releases_request sdk/python/tests/unit/test_transferable.py::TestCrmToComBufferModes::test_resource_input_deserialize_failure_remains_resource_deserialize_input -q --timeout=30
 ```
 
 Expected: PASS.
@@ -825,7 +825,7 @@ Adjust the method/resource names to match the existing helper structure in `test
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_transferable.py::TestCrmToComBufferModes::test_resource_output_serialize_failure_is_resource_serialize_output -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_transferable.py::TestCrmToComBufferModes::test_resource_output_serialize_failure_is_resource_serialize_output -q --timeout=30
 ```
 
 Expected: FAIL if output serialization currently escapes outside the wrapper error packaging.
@@ -875,7 +875,7 @@ Ensure `serialized_result` is initialized before the `try` so the return path is
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_transferable.py::TestCrmToComBufferModes::test_resource_output_serialize_failure_is_resource_serialize_output -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_transferable.py::TestCrmToComBufferModes::test_resource_output_serialize_failure_is_resource_serialize_output -q --timeout=30
 ```
 
 Expected: PASS.
@@ -937,7 +937,7 @@ class BadOutputResource:
 )
 def test_client_output_from_buffer_failure_releases_response_for_inline_and_shm(monkeypatch, size, expected_storage):
     settings.shm_threshold = 1024
-    monkeypatch.delenv("C2_RELAY_ADDRESS", raising=False)
+    monkeypatch.delenv("C2_RELAY_ANCHOR_ADDRESS", raising=False)
     cc.register(BadOutputCRM, BadOutputResource(), name=f"bad_output_from_buffer_{size}")
     cc.serve(blocking=False)
     address = cc.server_address()
@@ -959,7 +959,7 @@ def test_client_output_from_buffer_failure_releases_response_for_inline_and_shm(
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/integration/test_buffer_lease_ipc.py::test_client_output_from_buffer_failure_releases_response_for_inline_and_shm -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/integration/test_buffer_lease_ipc.py::test_client_output_from_buffer_failure_releases_response_for_inline_and_shm -q --timeout=30
 ```
 
 Expected: PASS after Task 6 implementation.
@@ -1059,7 +1059,7 @@ Expected: build succeeds.
 - [ ] **Step 3: Run focused Python suites**
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest \
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest \
   sdk/python/tests/unit/test_error.py \
   sdk/python/tests/unit/test_native_error_registry.py \
   sdk/python/tests/unit/test_transferable.py \
@@ -1073,7 +1073,7 @@ Expected: PASS.
 - [ ] **Step 4: Run full Python test suite**
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30 -rs
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30 -rs
 ```
 
 Expected: PASS. Skips must be understood and documented in the final report.
@@ -1100,7 +1100,7 @@ Review the final diff manually and confirm:
 - Client output hold failure releases response before raising.
 - Resource input hold failure releases request buffer before returning remote error.
 - Resource output serialization errors return `ResourceSerializeOutput` over the wire.
-- Direct IPC tests run with `C2_RELAY_ADDRESS=` and do not require relay.
+- Direct IPC tests run with `C2_RELAY_ANCHOR_ADDRESS=` and do not require relay.
 - No Python weakref hold registry is reintroduced.
 - No compatibility aliases or zombie legacy modules are added.
 

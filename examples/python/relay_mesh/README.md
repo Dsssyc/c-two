@@ -39,7 +39,7 @@ python tools/dev/c3_tool.py --build --link
 ## Run (3 terminals)
 
 The resource and client use `http://127.0.0.1:8300` by default. Set
-`C2_RELAY_ADDRESS` only if you start the relay at a different address.
+`C2_RELAY_ANCHOR_ADDRESS` only if you start the relay at a different address.
 For multi-host runs, keep relay HTTP and `/_peer/*` mesh endpoints inside a
 trusted network boundary. Do not expose this demo relay directly to the public
 internet.
@@ -59,7 +59,7 @@ uv run python examples/python/relay_mesh/client.py
 
 - **Name-based discovery**: client uses `cc.connect(Grid, name='grid')` without
   knowing the CRM process's IPC address
-- **Relay registration**: CRM process calls `cc.set_relay()` so `cc.register()`
+- **Relay registration**: CRM process calls `cc.set_relay_anchor()` so `cc.register()`
   automatically announces the resource to the relay
 - **Transparent transport**: the same CRM contract works identically across
   thread-local, IPC, and HTTP relay modes

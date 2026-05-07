@@ -585,7 +585,7 @@ uv sync --reinstall-package c-two
 - [ ] **Step 2: Run full Python test suite**
 
 ```bash
-C2_RELAY_ADDRESS= C2_ENV_FILE= uv run pytest tests/ -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= C2_ENV_FILE= uv run pytest tests/ -q --timeout=30
 ```
 Expected: All 553 tests pass.
 

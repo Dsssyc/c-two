@@ -182,7 +182,7 @@ tokio::spawn(async move {
 ### Issue 2 (parking_lot)
 
 - `cargo test --workspace` — all Rust tests pass
-- `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30` — all Python tests pass
+- `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30` — all Python tests pass
 - `cargo check --workspace 2>&1 | grep "unused import"` — no leftover std::sync imports
 - Verify: `grep -r "std::sync::Mutex\|std::sync::RwLock" src/c_two/_native/ --include="*.rs"` returns zero results (except comments or documentation)
 

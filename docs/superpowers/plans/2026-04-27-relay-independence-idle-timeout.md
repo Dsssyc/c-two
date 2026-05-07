@@ -1223,7 +1223,7 @@ Relay-dependent tests and examples require a standalone `c3` binary in a source 
 python tools/dev/c3_tool.py --build --link
 ```
 
-The Python SDK does not embed or start the relay server. Start relay processes with `c3 relay` or through Docker Compose/Kubernetes, then point SDK code at them with `C2_RELAY_ADDRESS` or `cc.set_relay()`.
+The Python SDK does not embed or start the relay server. Start relay processes with `c3 relay` or through Docker Compose/Kubernetes, then point SDK code at them with `C2_RELAY_ANCHOR_ADDRESS` or `cc.set_relay_anchor()`.
 ```
 ```
 
@@ -1342,7 +1342,7 @@ Expected: tests pass, with example tests skipped only if optional example depend
 Run:
 
 ```bash
-C2_ENV_FILE= C2_RELAY_ADDRESS= uv run pytest sdk/python/tests -q --timeout=60
+C2_ENV_FILE= C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests -q --timeout=60
 ```
 
 Expected: tests pass.

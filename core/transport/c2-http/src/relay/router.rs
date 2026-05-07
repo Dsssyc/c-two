@@ -1,12 +1,16 @@
 //! Axum router for the multi-upstream relay server.
 
+use std::convert::Infallible;
+use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, Path, State},
     http::StatusCode,
+    http::request::Parts,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -24,6 +28,26 @@ enum RequestClient {
     Ready { lease: UpstreamLease },
     NotFound,
     Unreachable,
+}
+
+struct OptionalConnectInfo(Option<SocketAddr>);
+
+impl<S> FromRequestParts<S> for OptionalConnectInfo
+where
+    S: Send + Sync,
+{
+    type Rejection = Infallible;
+
+    fn from_request_parts(
+        parts: &mut Parts,
+        _state: &S,
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        let remote_addr = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|ConnectInfo(addr)| *addr);
+        std::future::ready(Ok(Self(remote_addr)))
+    }
 }
 
 fn duplicate_route_response(name: &str, existing_address: &str) -> Response {
@@ -287,8 +311,10 @@ async fn handle_health(State(state): State<Arc<RelayState>>) -> impl IntoRespons
 async fn handle_resolve(
     Path(name): Path<String>,
     State(state): State<Arc<RelayState>>,
+    OptionalConnectInfo(remote_addr): OptionalConnectInfo,
 ) -> impl IntoResponse {
-    let routes = state.resolve(&name);
+    let expose_ipc_address = remote_addr.is_some_and(|addr| addr.ip().is_loopback());
+    let mut routes = state.resolve(&name);
     if routes.is_empty() {
         return (
             StatusCode::NOT_FOUND,
@@ -297,6 +323,11 @@ async fn handle_resolve(
             })),
         )
             .into_response();
+    }
+    if !expose_ipc_address {
+        for route in &mut routes {
+            route.ipc_address = None;
+        }
     }
     Json(routes).into_response()
 }
@@ -457,6 +488,7 @@ async fn echo_handler(body: Bytes) -> Response {
 pub(crate) mod tests {
     use super::*;
     use axum::body::{Body, to_bytes};
+    use axum::extract::ConnectInfo;
     use axum::http::{Request, StatusCode};
     use c2_config::RelayConfig;
     use c2_ipc::IpcClient;
@@ -465,10 +497,12 @@ pub(crate) mod tests {
         Server, ServerIpcConfig,
     };
     use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
     use tower::ServiceExt;
 
     use crate::relay::peer::PeerEnvelope;
+    use crate::relay::types::RouteInfo;
 
     struct NoopDisseminator;
 
@@ -606,19 +640,74 @@ pub(crate) mod tests {
 
     async fn get_resolve(state: Arc<RelayState>, name: &str) -> StatusCode {
         let app = build_router(state);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri(format!("/_resolve/{name}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
+        let mut request = Request::builder()
+            .method("GET")
+            .uri(format!("/_resolve/{name}"))
+            .body(Body::empty())
             .unwrap();
+        request.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            12345,
+        )));
+        let response = app.oneshot(request).await.unwrap();
         let status = response.status();
         let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         status
+    }
+
+    async fn get_resolve_routes_from(
+        state: Arc<RelayState>,
+        name: &str,
+        remote_addr: SocketAddr,
+    ) -> (StatusCode, Vec<RouteInfo>) {
+        let app = build_router(state);
+        let mut request = Request::builder()
+            .method("GET")
+            .uri(format!("/_resolve/{name}"))
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(remote_addr));
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let routes = if status == StatusCode::OK {
+            serde_json::from_slice(&body).unwrap()
+        } else {
+            Vec::new()
+        };
+        (status, routes)
+    }
+
+    #[tokio::test]
+    async fn resolve_exposes_ipc_address_only_to_loopback_clients() {
+        let state = test_state();
+        state.commit_register_upstream(
+            "grid".into(),
+            "server-grid".into(),
+            "ipc://grid".into(),
+            String::new(),
+            String::new(),
+            Arc::new(IpcClient::new("ipc://grid")),
+            None,
+        );
+
+        let (status, routes) = get_resolve_routes_from(
+            state.clone(),
+            "grid",
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(routes[0].ipc_address.as_deref(), Some("ipc://grid"));
+
+        let (status, routes) = get_resolve_routes_from(
+            state,
+            "grid",
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)), 12345),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(routes[0].ipc_address, None);
     }
 
     #[tokio::test]

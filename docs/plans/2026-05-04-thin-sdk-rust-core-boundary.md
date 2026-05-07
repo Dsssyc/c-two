@@ -23,12 +23,16 @@ Required invariants:
 
 - `cc.connect(..., address="ipc://...")` must bypass relay and connect through
   `c2-ipc` directly.
-- `cc.register(...)` without `C2_RELAY_ADDRESS` must still start a local IPC
+- `cc.register(...)` without `C2_RELAY_ANCHOR_ADDRESS` must still start a local IPC
   server and expose `cc.server_address()`.
 - A bad or unavailable relay must not break explicit direct IPC connections.
 - Rust-side runtime work must build a standalone IPC session first; relay
   registration/name resolution is only an optional projection above that
   session.
+- Relay-backed name resolution uses `C2_RELAY_ANCHOR_ADDRESS` as the SDK
+  process's control-plane relay anchor. Remote HTTP data-plane calls must go
+  directly to the selected route's `relay_url`, and direct IPC selection from
+  relay resolution is allowed only for loopback/local anchors.
 - Thread-local same-process dispatch is an SDK/language optimization, not a
   replacement for cross-process IPC.
 
@@ -80,12 +84,12 @@ code, not merely planned in a separate implementation document.
 | --- | --- | --- | --- |
 | 1 | Remote IPC scheduler config and execution semantics | Implemented | See `docs/plans/2026-05-04-remote-ipc-scheduler-rust-config.md`; this section below records Rust `c2-server` ownership and verified IPC/thread-local coverage. |
 | 2 | Direct IPC probe/control helpers | Implemented | See `docs/plans/2026-05-04-direct-ipc-control-helpers-rust.md`; `c2-ipc` owns socket-path derivation plus ping/shutdown control helpers, and Python `client/util.py` is a thin native facade. |
-| 3 | Process runtime/session state | Implemented | See `docs/plans/2026-05-05-runtime-session-rust-authority.md`; `core/runtime/c2-runtime` owns identity, route transactions, client pools, relay projection, and shutdown/unregister outcomes. |
+| 3 | Process runtime/session state | Implemented | See `docs/plans/2026-05-05-runtime-session-rust-authority.md`; `core/runtime/c2-runtime` owns identity, route transactions, client pools, relay-anchor projection/name resolution, and shutdown/unregister outcomes. |
 | 4 | Canonical error registry and wire bytes | Implemented | See `docs/plans/2026-05-06-canonical-error-rust-authority.md`; Rust `c2-error` owns registry/wire bytes and Python delegates through native codec bindings. |
 | 5 | SDK-visible buffer lease lifecycle | Implemented | See `docs/plans/2026-05-06-unified-buffer-lease-rust-authority.md`; `c2-mem` owns retained buffer lease accounting and Python exposes only hold/result facades. |
 | 6 | Server route slot lifecycle and readiness | Implemented | See `docs/plans/2026-05-07-server-readiness-rust-authority.md`; `c2-server` owns readiness, lifecycle transitions, socket unlink authority, and shutdown barriers. |
 | 7 | Response allocation decision | Implemented | See `docs/plans/2026-05-07-response-allocation-rust-authority.md`; Python response-pool allocation was removed and low-copy response buffer preparation now lives in Rust native/core. |
-| 8 | IPC config validation duplication | Backlog | Python still duplicates IPC override key validation that should be delegated to native config resolution. |
+| 8 | IPC config validation duplication | Planned | See `docs/plans/2026-05-07-ipc-config-validation-rust-authority.md`; next work removes Python allowed/forbidden-key checks and makes Rust/native config parsing the single validation authority. |
 | 9 | Native method table facade | Backlog / low priority | Method discovery remains language-specific enough that this should only proceed if it removes real duplicated wire authority. |
 
 ### P1. Remote IPC scheduler config and execution semantics
@@ -288,6 +292,16 @@ works when relay is absent.
 - Relay register failure does not leave split-brain local/Rust route state.
 - Explicit unregister preserves local correctness even if relay cleanup fails.
 - Name-only relay connections go through native `RuntimeSession.connect_via_relay()`.
+- Relay anchor config uses the clean-cut `C2_RELAY_ANCHOR_ADDRESS` /
+  `cc.set_relay_anchor(...)` surface. The retired `C2_RELAY_ADDRESS` /
+  `cc.set_relay(...)` names are not read as aliases.
+- Name-only relay connections may select direct IPC only when the configured
+  relay anchor is loopback/local. Nonlocal anchor responses are forced through
+  HTTP routing even if an `ipc_address` is present.
+- Remote HTTP data-plane calls use the resolved route's `relay_url` directly,
+  avoiding a client -> anchor relay -> remote relay forwarding hop.
+- Relay `/_resolve` strips `ipc_address` for non-loopback HTTP callers as
+  defense-in-depth; peer routes already omit IPC addresses.
 - Shutdown drains native IPC/HTTP clients and consumes native relay cleanup
   outcomes before clearing Python local bindings.
 
@@ -492,23 +506,36 @@ data-size, and chunk-count limits.
 
 ### P2. IPC config validation duplication
 
-**Current Python ownership**
+**Planned ownership**
 
-`sdk/python/src/c_two/config/ipc.py` keeps allowed-key and forbidden-key checks
-that duplicate native resolver checks in `sdk/python/native/src/config_ffi.rs`.
+Status: implementation plan drafted in
+`docs/plans/2026-05-07-ipc-config-validation-rust-authority.md`.
 
-**Implementation sketch**
+Python `sdk/python/src/c_two/config/ipc.py` still keeps allowed-key and
+forbidden-key checks that duplicate native resolver checks in
+`sdk/python/native/src/config_ffi.rs`. The planned repair keeps Python
+`TypedDict` schemas as SDK type hints, removes Python `_normalize_*` and
+`_clean_ipc_overrides` validation helpers, passes override mappings directly
+into native config parsing, and makes Rust/native validation produce the
+canonical user-facing errors.
 
-1. Keep Python `TypedDict` definitions for SDK type hints.
-2. Pass override mappings directly to native resolver.
-3. Let native resolver produce consistent validation errors.
-4. Remove duplicate Python key-validation paths.
+The implementation plan also moves the IPC override key catalog into
+`core/foundation/c2-config` so PyO3 bindings consume Rust-core field lists
+instead of maintaining SDK-side allowed-key tables. PyO3 snapshots arbitrary
+Python mappings before parsing, preserving copy/freeze semantics without
+letting Python own validation state.
 
-**Required tests**
+**Required coverage**
 
-- Unknown server/client IPC override errors still point to the offending key.
+- Unknown server/client IPC override errors still point to the offending key
+  and come from native validation.
 - `shm_threshold` remains a global transport policy override, not an IPC role
   override.
+- Mapping subclasses are accepted and snapshotted by native parsing.
+- Non-mapping override inputs and non-string override keys fail with precise
+  native `TypeError` messages.
+- Boundary tests prevent Python allowed-key, forbidden-key, and `_normalize_*`
+  validation helpers from being reintroduced.
 
 ### P3. Native method table facade
 
@@ -549,6 +576,10 @@ Every implementation spawned from this reference should preserve:
 - Bad relay does not affect explicit `ipc://` connection.
 - Name-only connect without relay fails clearly when the resource is not local.
 - Relay-aware name resolution uses Rust relay-aware HTTP client when configured.
+- Relay anchor resolution cannot trick a client configured with a nonlocal
+  anchor into dialing arbitrary local IPC.
+- Remote relay HTTP calls use the resolved route's `relay_url` directly rather
+  than adding an anchor-relay forwarding hop.
 - Thread-local same-process calls do not serialize Python objects.
 - SHM-backed remote IPC requests arrive as `ShmBuffer`/`memoryview`.
 - Large result replies keep using Rust transport selection and avoid avoidable

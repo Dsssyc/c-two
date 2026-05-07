@@ -9,25 +9,110 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::sync::Arc;
 
+use c2_http::client::RelayAwareHttpClient;
+use c2_ipc::{ClientPool, IpcError, SyncClient};
 use c2_mem::BufferLeaseTracker;
 use c2_runtime::{
-    RegisterOutcome, RelayCleanupError, RuntimeRouteSpec, RuntimeSession, RuntimeSessionOptions,
-    ShutdownOutcome, UnregisterOutcome,
+    RegisterOutcome, RelayCleanupError, RelayResolvedConnection, RuntimeRouteSpec, RuntimeSession,
+    RuntimeSessionOptions, ShutdownOutcome, UnregisterOutcome,
 };
 use c2_server::scheduler::AccessLevel;
 
-use crate::client_ffi::{PyRustClient, PyRustClientPool};
+use crate::client_ffi::{PyRustClient, PyRustClientPool, call_sync_client};
 use crate::config_ffi::{
     client_ipc_overrides_to_dict, client_ipc_to_dict, parse_client_ipc_overrides,
     parse_server_ipc_overrides, server_ipc_overrides_to_dict,
 };
 use crate::http_ffi::{
-    PyRustHttpClient, PyRustRelayAwareHttpClient, acquire_http_client_from_global_pool,
+    PyRustHttpClient, acquire_http_client_from_global_pool, call_relay_aware_http_client,
     http_client_refcount_from_global_pool, release_http_client_from_global_pool,
     shutdown_http_clients_from_global_pool,
 };
 use crate::lease_ffi::PyBufferLeaseTracker;
 use crate::server_ffi::{PyServer, parse_concurrency_mode};
+
+enum RelayConnectedInner {
+    Ipc {
+        client: Arc<SyncClient>,
+        pool: &'static ClientPool,
+    },
+    Http {
+        client: Arc<RelayAwareHttpClient>,
+    },
+}
+
+enum RelayIpcConnectError {
+    Config(PyErr),
+    Unavailable,
+}
+
+#[pyclass(name = "RelayConnectedClient", frozen)]
+pub struct PyRelayConnectedClient {
+    mode: String,
+    target: String,
+    inner: RelayConnectedInner,
+    closed: Mutex<bool>,
+}
+
+impl PyRelayConnectedClient {
+    fn close_inner(&self) {
+        let mut closed = self.closed.lock();
+        if *closed {
+            return;
+        }
+        *closed = true;
+        match &self.inner {
+            RelayConnectedInner::Ipc { pool, .. } => pool.release(&self.target),
+            RelayConnectedInner::Http { .. } => {}
+        }
+    }
+}
+
+impl Drop for PyRelayConnectedClient {
+    fn drop(&mut self) {
+        self.close_inner();
+    }
+}
+
+#[pymethods]
+impl PyRelayConnectedClient {
+    #[getter]
+    fn mode(&self) -> &str {
+        &self.mode
+    }
+
+    #[getter]
+    fn target(&self) -> &str {
+        &self.target
+    }
+
+    fn call<'py>(
+        &self,
+        py: Python<'py>,
+        route_name: &str,
+        method_name: &str,
+        data: &[u8],
+    ) -> PyResult<Py<PyAny>> {
+        if *self.closed.lock() {
+            return Err(PyRuntimeError::new_err("relay connected client is closed"));
+        }
+        match &self.inner {
+            RelayConnectedInner::Ipc { client, .. } => {
+                let response = call_sync_client(py, client, route_name, method_name, data)?;
+                Ok(Py::new(py, response)?.into_any())
+            }
+            RelayConnectedInner::Http { client } => {
+                Ok(call_relay_aware_http_client(py, client, method_name, data)?
+                    .into_any()
+                    .unbind())
+            }
+        }
+    }
+
+    fn close(&self) {
+        self.close_inner();
+    }
+}
 
 #[pyclass(name = "RuntimeSession", frozen)]
 pub struct PyRuntimeSession {
@@ -60,7 +145,7 @@ impl PyRuntimeSession {
             server_ipc_overrides,
             client_ipc_overrides,
             shm_threshold,
-            relay_address: None,
+            relay_anchor_address: None,
         })
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(Self {
@@ -138,19 +223,19 @@ impl PyRuntimeSession {
         Ok(())
     }
 
-    fn set_relay_address(&self, relay_address: Option<String>) {
-        self.inner.set_relay_address(relay_address);
+    fn set_relay_anchor_address(&self, relay_anchor_address: Option<String>) {
+        self.inner.set_relay_anchor_address(relay_anchor_address);
     }
 
     #[getter]
-    fn relay_address_override(&self) -> Option<String> {
-        self.inner.relay_address_override()
+    fn relay_anchor_address_override(&self) -> Option<String> {
+        self.inner.relay_anchor_address_override()
     }
 
     #[getter]
-    fn effective_relay_address(&self) -> PyResult<Option<String>> {
+    fn effective_relay_anchor_address(&self) -> PyResult<Option<String>> {
         self.inner
-            .effective_relay_address()
+            .effective_relay_anchor_address()
             .map_err(runtime_error_to_py)
     }
 
@@ -219,7 +304,7 @@ impl PyRuntimeSession {
         Ok(server_obj)
     }
 
-    #[pyo3(signature = (server_bridge, name, dispatcher, method_names, access_map, concurrency_mode, max_pending=None, max_workers=None, crm_ns="", crm_ver="", relay_address=None))]
+    #[pyo3(signature = (server_bridge, name, dispatcher, method_names, access_map, concurrency_mode, max_pending=None, max_workers=None, crm_ns="", crm_ver="", relay_anchor_address=None))]
     fn register_route<'py>(
         &self,
         py: Python<'py>,
@@ -233,7 +318,7 @@ impl PyRuntimeSession {
         max_workers: Option<usize>,
         crm_ns: &str,
         crm_ver: &str,
-        relay_address: Option<&str>,
+        relay_anchor_address: Option<&str>,
     ) -> PyResult<(
         Bound<'py, PyDict>,
         crate::route_concurrency_ffi::PyRouteConcurrency,
@@ -274,49 +359,54 @@ impl PyRuntimeSession {
             max_pending,
             max_workers,
         };
-        let relay_use_proxy = resolve_relay_use_proxy_if_needed(&self.inner, relay_address)?;
+        let relay_use_proxy = resolve_relay_use_proxy_if_needed(&self.inner, relay_anchor_address)?;
         let outcome = self
             .inner
             .register_route(
                 &server_ref.inner,
                 built.route,
                 spec,
-                relay_address,
+                relay_anchor_address,
                 relay_use_proxy,
             )
             .map_err(runtime_error_to_py)?;
         Ok((register_outcome_to_dict(py, outcome)?, built.route_handle))
     }
 
-    #[pyo3(signature = (server_bridge, name, relay_address=None))]
+    #[pyo3(signature = (server_bridge, name, relay_anchor_address=None))]
     fn unregister_route<'py>(
         &self,
         py: Python<'py>,
         server_bridge: Py<PyAny>,
         name: &str,
-        relay_address: Option<&str>,
+        relay_anchor_address: Option<&str>,
     ) -> PyResult<Bound<'py, PyDict>> {
         let server_ref = server_bridge
             .bind(py)
             .extract::<PyRef<PyServer>>()
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let relay_use_proxy = resolve_relay_use_proxy_if_needed(&self.inner, relay_address)?;
+        let relay_use_proxy = resolve_relay_use_proxy_if_needed(&self.inner, relay_anchor_address)?;
         let outcome = self
             .inner
-            .unregister_route(&server_ref.inner, name, relay_address, relay_use_proxy)
+            .unregister_route(
+                &server_ref.inner,
+                name,
+                relay_anchor_address,
+                relay_use_proxy,
+            )
             .map_err(runtime_error_to_py)?;
         unregister_outcome_to_dict(py, outcome)
     }
 
-    #[pyo3(signature = (server_bridge=None, route_names=None, relay_address=None))]
+    #[pyo3(signature = (server_bridge=None, route_names=None, relay_anchor_address=None))]
     fn shutdown<'py>(
         &self,
         py: Python<'py>,
         server_bridge: Option<Py<PyAny>>,
         route_names: Option<Vec<String>>,
-        relay_address: Option<&str>,
+        relay_anchor_address: Option<&str>,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let relay_use_proxy = resolve_relay_use_proxy_if_needed(&self.inner, relay_address)?;
+        let relay_use_proxy = resolve_relay_use_proxy_if_needed(&self.inner, relay_anchor_address)?;
         let route_names = route_names.unwrap_or_default();
         let server_bridge = match server_bridge {
             Some(server_bridge) => Some(server_bridge),
@@ -334,14 +424,14 @@ impl PyRuntimeSession {
             let mut outcome = self.inner.shutdown(
                 Some(&server_ref.inner),
                 route_names,
-                relay_address,
+                relay_anchor_address,
                 relay_use_proxy,
             );
             outcome.server_was_started = server_ref.runtime_is_running();
             outcome
         } else {
             self.inner
-                .shutdown(None, route_names, relay_address, relay_use_proxy)
+                .shutdown(None, route_names, relay_anchor_address, relay_use_proxy)
         };
         py.detach(|| self.pool.inner.shutdown_all());
         outcome.ipc_clients_drained = true;
@@ -395,7 +485,11 @@ impl PyRuntimeSession {
                     c2_config::ConfigSources::from_process(),
                 )
                 .map_err(|e| c2_http::client::HttpError::Transport(e.to_string()))?;
-                acquire_http_client_from_global_pool(&addr, use_proxy)
+                let call_timeout_secs = c2_config::ConfigResolver::resolve_relay_call_timeout_secs(
+                    c2_config::ConfigSources::from_process(),
+                )
+                .map_err(|e| c2_http::client::HttpError::Transport(e.to_string()))?;
+                acquire_http_client_from_global_pool(&addr, use_proxy, call_timeout_secs)
             })
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))?;
         Ok(PyRustHttpClient::from_arc(client))
@@ -417,29 +511,138 @@ impl PyRuntimeSession {
         &self,
         py: Python<'_>,
         route_name: &str,
-    ) -> PyResult<PyRustRelayAwareHttpClient> {
-        let relay_address = self
+    ) -> PyResult<PyRelayConnectedClient> {
+        let relay_anchor_address = self
             .inner
-            .effective_relay_address()
+            .effective_relay_anchor_address()
             .map_err(runtime_error_to_py)?
             .ok_or_else(|| PyLookupError::new_err("no relay address configured"))?;
         let use_proxy =
-            resolve_relay_use_proxy_if_needed(&self.inner, Some(relay_address.as_str()))?;
+            resolve_relay_use_proxy_if_needed(&self.inner, Some(relay_anchor_address.as_str()))?;
         let max_attempts = c2_config::ConfigResolver::resolve_relay_route_max_attempts(
             c2_config::ConfigSources::from_process(),
         )
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let client = py
+        let call_timeout_secs = c2_config::ConfigResolver::resolve_relay_call_timeout_secs(
+            c2_config::ConfigSources::from_process(),
+        )
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+        let target = py
             .detach(|| {
-                self.inner
-                    .connect_via_relay(route_name, use_proxy, max_attempts)
+                self.inner.resolve_relay_connection(
+                    route_name,
+                    use_proxy,
+                    max_attempts,
+                    call_timeout_secs,
+                )
             })
             .map_err(runtime_error_to_py)?;
-        Ok(PyRustRelayAwareHttpClient::from_arc(client))
+        match target {
+            RelayResolvedConnection::Ipc { address } => {
+                match self.acquire_relay_ipc_client(py, route_name, &address) {
+                    Ok(client) => Ok(PyRelayConnectedClient {
+                        mode: "ipc".to_string(),
+                        target: address,
+                        inner: RelayConnectedInner::Ipc {
+                            client,
+                            pool: self.pool.inner,
+                        },
+                        closed: Mutex::new(false),
+                    }),
+                    Err(RelayIpcConnectError::Config(err)) => Err(err),
+                    Err(RelayIpcConnectError::Unavailable) => self.acquire_relay_http_client(
+                        py,
+                        route_name,
+                        use_proxy,
+                        max_attempts,
+                        call_timeout_secs,
+                    ),
+                }
+            }
+            RelayResolvedConnection::Http { client, relay_url } => Ok(PyRelayConnectedClient {
+                mode: "http".to_string(),
+                target: relay_url,
+                inner: RelayConnectedInner::Http {
+                    client: Arc::new(client),
+                },
+                closed: Mutex::new(false),
+            }),
+        }
     }
 
     fn shutdown_ipc_clients(&self, py: Python<'_>) {
         py.detach(|| self.pool.inner.shutdown_all());
+    }
+}
+
+impl PyRuntimeSession {
+    fn acquire_relay_ipc_client(
+        &self,
+        py: Python<'_>,
+        route_name: &str,
+        address: &str,
+    ) -> Result<Arc<SyncClient>, RelayIpcConnectError> {
+        let addr = address.to_string();
+        let pool = self.pool.inner;
+        let mut runtime_overrides = c2_config::RuntimeConfigOverrides::default();
+        runtime_overrides.client_ipc = self.inner.client_ipc_overrides().unwrap_or_default();
+        runtime_overrides.shm_threshold = self.inner.shm_threshold_override();
+        let cfg = c2_config::ConfigResolver::resolve_client_ipc(
+            runtime_overrides.client_ipc.clone(),
+            runtime_overrides,
+            c2_config::ConfigSources::from_process(),
+        )
+        .map_err(|e| RelayIpcConnectError::Config(PyValueError::new_err(e.to_string())))?;
+        let client_result = py.detach({
+            let addr = addr.clone();
+            move || pool.acquire(&addr, Some(&cfg))
+        });
+        let client = match client_result {
+            Ok(client) => client,
+            Err(IpcError::Config(message)) => {
+                return Err(RelayIpcConnectError::Config(PyValueError::new_err(message)));
+            }
+            Err(_) => return Err(RelayIpcConnectError::Unavailable),
+        };
+        self.inner.mark_client_config_frozen();
+        if !client
+            .route_names()
+            .into_iter()
+            .any(|registered| registered == route_name)
+        {
+            pool.release(&addr);
+            return Err(RelayIpcConnectError::Unavailable);
+        }
+        Ok(client)
+    }
+
+    fn acquire_relay_http_client(
+        &self,
+        py: Python<'_>,
+        route_name: &str,
+        use_proxy: bool,
+        max_attempts: usize,
+        call_timeout_secs: f64,
+    ) -> PyResult<PyRelayConnectedClient> {
+        let (client, relay_url) = py
+            .detach(|| {
+                self.inner.connect_relay_http_client(
+                    route_name,
+                    use_proxy,
+                    max_attempts,
+                    call_timeout_secs,
+                )
+            })
+            .map_err(runtime_error_to_py)?;
+        Ok(PyRelayConnectedClient {
+            mode: "http".to_string(),
+            target: relay_url,
+            inner: RelayConnectedInner::Http {
+                client: Arc::new(client),
+            },
+            closed: Mutex::new(false),
+        })
     }
 }
 
@@ -490,12 +693,12 @@ fn runtime_error_to_py(err: c2_runtime::RuntimeSessionError) -> PyErr {
 
 fn resolve_relay_use_proxy_if_needed(
     session: &RuntimeSession,
-    relay_address: Option<&str>,
+    relay_anchor_address: Option<&str>,
 ) -> PyResult<bool> {
-    let has_relay = match relay_address {
+    let has_relay = match relay_anchor_address {
         Some(_) => true,
         None => session
-            .effective_relay_address()
+            .effective_relay_anchor_address()
             .map_err(runtime_error_to_py)?
             .is_some(),
     };
@@ -562,6 +765,7 @@ fn shutdown_outcome_to_dict<'py>(
 }
 
 pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<PyRelayConnectedClient>()?;
     m.add_class::<PyRuntimeSession>()?;
     Ok(())
 }

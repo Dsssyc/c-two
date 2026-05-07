@@ -1394,7 +1394,7 @@ impl PyNativeRelay {
 ```bash
 cd src/c_two/_native && cargo test -p c2-http --features relay
 uv sync --reinstall-package c-two
-C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30
 ```
 Expected: All Rust relay tests pass. All ~571 Python tests pass. Zero regressions.
 
@@ -2519,7 +2519,7 @@ class TestMeshErrors:
 
 - [ ] **Step 3: Run tests**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/unit/test_mesh_errors.py -q`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/unit/test_mesh_errors.py -q`
 Expected: 4 tests pass.
 
 - [ ] **Step 4: Add C2_RELAY_SEEDS to settings.py**
@@ -2566,20 +2566,20 @@ Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 **Files:**
 - Modify: `src/c_two/transport/registry.py`
 
-Update `cc.connect()` to resolve names via relay when no `address=` is given. Implement thread-safe route cache with 30s TTL. Add `set_relay()` convenience API.
+Update `cc.connect()` to resolve names via relay when no `address=` is given. Implement thread-safe route cache with 30s TTL. Add `set_relay_anchor()` convenience API.
 
-- [ ] **Step 0: Add set_relay() to registry.py and __init__.py**
+- [ ] **Step 0: Add set_relay_anchor() to registry.py and __init__.py**
 
 In `registry.py`, add to `_ProcessRegistry`:
 ```python
-def set_relay(self, address: str):
+def set_relay_anchor(self, address: str):
     """Set the relay address for name resolution."""
-    self._settings.relay_address = address
+    self._settings.relay_anchor_address = address
 ```
 
 In `__init__.py`, export:
 ```python
-set_relay = _registry.set_relay
+set_relay_anchor = _registry.set_relay_anchor
 ```
 
 - [ ] **Step 1: Add route cache to _ProcessRegistry**
@@ -2627,9 +2627,9 @@ def _resolve_via_relay(self, name: str) -> list[dict]:
     if cached is not None:
         return cached
 
-    relay_addr = self._settings.relay_address
+    relay_addr = self._settings.relay_anchor_address
     if not relay_addr:
-        raise RegistryUnavailable("No relay configured (set C2_RELAY_ADDRESS)")
+        raise RegistryUnavailable("No relay configured (set C2_RELAY_ANCHOR_ADDRESS)")
 
     url = f"{relay_addr}/_resolve/{name}"
     try:
@@ -2689,7 +2689,7 @@ def connect(self, icrm_cls, *, name=None, address=None, **kwargs):
 - [ ] **Step 4: Verify existing tests still pass**
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30
 ```
 Expected: All tests pass (existing tests use `address=` escape hatch or thread-local).
 
@@ -2729,7 +2729,7 @@ In `unregister()`, add `self._bg_cancel.set()` to cancel any pending background 
 def _relay_register(self, name: str, ipc_address: str,
                     icrm_ns: str, icrm_ver: str):
     """Notify relay about a new CRM registration. Retry 3x, then background."""
-    relay_addr = self._settings.relay_address
+    relay_addr = self._settings.relay_anchor_address
     if not relay_addr:
         return  # No relay configured — standalone mode.
 
@@ -2779,7 +2779,7 @@ def _schedule_background_relay_register(self, name, ipc_address, icrm_ns, icrm_v
                 return
             try:
                 req = urllib.request.Request(
-                    f"{self._settings.relay_address}/_register",
+                    f"{self._settings.relay_anchor_address}/_register",
                     data=payload,
                     headers={"Content-Type": "application/json"},
                     method="POST",
@@ -2800,7 +2800,7 @@ The existing `unregister()` method must call `self._relay_unregister(name)` afte
 ```python
 def _relay_unregister(self, name: str):
     """Notify relay about CRM unregistration."""
-    relay_addr = self._settings.relay_address
+    relay_addr = self._settings.relay_anchor_address
     if not relay_addr:
         return
     import urllib.request, json
@@ -2851,7 +2851,7 @@ Update each occurrence.
 - [ ] **Step 4: Run full test suite**
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30
 ```
 Expected: All tests pass.
 
@@ -3156,14 +3156,14 @@ class TestTwoRelayMesh:
 - [ ] **Step 2: Run integration tests**
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest tests/integration/test_relay_mesh.py -v --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/integration/test_relay_mesh.py -v --timeout=30
 ```
 Expected: All tests pass.
 
 - [ ] **Step 3: Run full test suite (final check)**
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30
 ```
 Expected: All existing tests + new tests pass. Zero regressions.
 

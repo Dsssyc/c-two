@@ -8,8 +8,8 @@ use c2_config::{
 };
 
 #[pyfunction]
-fn resolve_relay_address() -> PyResult<Option<String>> {
-    c2_config::ConfigResolver::resolve_relay_address(ConfigSources::from_process())
+fn resolve_relay_anchor_address() -> PyResult<Option<String>> {
+    c2_config::ConfigResolver::resolve_relay_anchor_address(ConfigSources::from_process())
         .map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
@@ -420,7 +420,7 @@ fn base_ipc_to_dict<'py>(
 }
 
 pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(resolve_relay_address, m)?)?;
+    m.add_function(wrap_pyfunction!(resolve_relay_anchor_address, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_relay_use_proxy, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_shm_threshold, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_server_ipc_config, m)?)?;

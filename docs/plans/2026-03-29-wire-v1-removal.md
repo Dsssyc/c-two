@@ -250,7 +250,7 @@ The v2 path builds `MethodTable` at handshake time from the ICRM class's `__meth
 ### Task 12: Run full test suite + commit
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30
 ```
 
 Expected: ~670+ tests pass. Commit all changes.

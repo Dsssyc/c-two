@@ -89,21 +89,21 @@ def test_explicit_ipc_connect_ignores_bad_relay_after_native_identity() -> None:
             return 'pong'
 
     cc.shutdown()
-    previous = settings.relay_address
+    previous = settings.relay_anchor_address
     try:
-        settings.relay_address = None
+        settings.relay_anchor_address = None
         cc.register(BadRelayCRM, BadRelayImpl(), name='bad-relay-route')
         address = cc.server_address()
         assert address is not None
 
-        settings.relay_address = 'http://127.0.0.1:9'
+        settings.relay_anchor_address = 'http://127.0.0.1:9'
         crm = cc.connect(BadRelayCRM, name='bad-relay-route', address=address)
         try:
             assert crm.ping() == 'pong'
         finally:
             cc.close(crm)
     finally:
-        settings.relay_address = previous
+        settings.relay_anchor_address = previous
         cc.shutdown()
 
 
@@ -117,16 +117,16 @@ def test_name_only_connect_without_relay_ignores_bad_relay_proxy_env(monkeypatch
             ...
 
     cc.shutdown()
-    previous = settings.relay_address
+    previous = settings.relay_anchor_address
     monkeypatch.setenv('C2_ENV_FILE', '')
     monkeypatch.setenv('C2_RELAY_USE_PROXY', 'not-a-bool')
-    monkeypatch.delenv('C2_RELAY_ADDRESS', raising=False)
+    monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
     try:
-        settings.relay_address = None
+        settings.relay_anchor_address = None
         with pytest.raises(LookupError, match='not registered locally'):
             cc.connect(NoRelayBadProxyCRM, name='missing-no-relay')
     finally:
-        settings.relay_address = previous
+        settings.relay_anchor_address = previous
         cc.shutdown()
 
 
@@ -144,11 +144,11 @@ def test_no_relay_register_unregister_ignores_bad_relay_proxy_env(monkeypatch) -
             return 'pong'
 
     cc.shutdown()
-    previous = settings.relay_address
+    previous = settings.relay_anchor_address
     monkeypatch.setenv('C2_ENV_FILE', '')
     monkeypatch.setenv('C2_RELAY_USE_PROXY', 'not-a-bool')
     try:
-        settings.relay_address = None
+        settings.relay_anchor_address = None
         cc.register(BadProxyEnvCRM, BadProxyEnvImpl(), name='bad-proxy-env')
         address = cc.server_address()
         assert address is not None
@@ -162,7 +162,7 @@ def test_no_relay_register_unregister_ignores_bad_relay_proxy_env(monkeypatch) -
         cc.unregister('bad-proxy-env')
         cc.shutdown()
     finally:
-        settings.relay_address = previous
+        settings.relay_anchor_address = previous
         cc.shutdown()
 
 
@@ -579,20 +579,20 @@ def test_runtime_session_shutdown_drains_explicit_http_pool(monkeypatch) -> None
     assert session.http_client_refcount(relay_url) == 0
 
 
-def test_set_relay_blank_clears_native_override() -> None:
+def test_set_relay_anchor_blank_clears_native_override() -> None:
     from c_two.config.settings import settings
     from c_two.transport.registry import _ProcessRegistry
 
     registry = _ProcessRegistry.get()
-    previous = settings._relay_address  # noqa: SLF001
+    previous = settings._relay_anchor_address  # noqa: SLF001
     try:
-        registry.set_relay('http://relay.test/')
-        assert registry._runtime_session.relay_address_override == 'http://relay.test'  # noqa: SLF001
+        registry.set_relay_anchor('http://relay.test/')
+        assert registry._runtime_session.relay_anchor_address_override == 'http://relay.test'  # noqa: SLF001
 
-        registry.set_relay('   ')
+        registry.set_relay_anchor('   ')
 
-        assert settings._relay_address is None  # noqa: SLF001
-        assert registry._runtime_session.relay_address_override is None  # noqa: SLF001
+        assert settings._relay_anchor_address is None  # noqa: SLF001
+        assert registry._runtime_session.relay_anchor_address_override is None  # noqa: SLF001
     finally:
-        settings.relay_address = previous
+        settings.relay_anchor_address = previous
         registry.shutdown()

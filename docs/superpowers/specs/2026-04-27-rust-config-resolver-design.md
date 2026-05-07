@@ -38,7 +38,7 @@ Process environment variables must override values loaded from `.env`. `C2_ENV_F
 
 ## Non-Goals
 
-- Do not move Python's ergonomic user APIs into Rust. Python still owns `cc.set_config()`, `cc.set_server()`, `cc.set_client()`, and `cc.set_relay()` as code-level override interfaces.
+- Do not move Python's ergonomic user APIs into Rust. Python still owns `cc.set_config()`, `cc.set_server()`, `cc.set_client()`, and `cc.set_relay_anchor()` as code-level override interfaces.
 - Do not put CLI presentation variables such as `NO_COLOR`, `CLICOLOR`, and `CLICOLOR_FORCE` into shared runtime config.
 - Do not make every environment read an implicit global side effect. The resolver should be explicit and testable.
 - Do not preserve `C2_IPC_ADDRESS` as a runtime setting unless a current implementation path is found. It appears in `.env.example` as residue but current runtime server addresses are auto-generated or passed explicitly.
@@ -52,7 +52,7 @@ These should be owned by the Rust resolver.
 | Variable | Current source | Current use | Resolver decision |
 | --- | --- | --- | --- |
 | `C2_ENV_FILE` | CLI, Python settings, tests, `.env.example` | Select env file; empty disables loading | Keep. Resolver controls env-file loading. |
-| `C2_RELAY_ADDRESS` | Python settings/docs/examples/tests | Relay URL for Python registration and name resolution | Keep. SDK-level resolved runtime setting. |
+| `C2_RELAY_ANCHOR_ADDRESS` | Python settings/docs/examples/tests | Relay URL for Python registration and name resolution | Keep. SDK-level resolved runtime setting. |
 | `C2_RELAY_BIND` | CLI clap, Python settings, `.env.example` | Relay server bind address | Keep. Relay server config. |
 | `C2_RELAY_ID` | CLI clap, Python settings, `.env.example` | Stable relay mesh ID | Keep. Relay server config. |
 | `C2_RELAY_ADVERTISE_URL` | CLI clap, Python settings, `.env.example` | Public relay URL | Keep. Relay server config. |
@@ -218,7 +218,7 @@ Env-file loading must not overwrite an existing process environment value. This 
 
 ### Env Parsing Rules
 
-- Empty strings should be treated as "unset" for optional string settings such as `C2_RELAY_ADDRESS`, `C2_RELAY_ID`, and `C2_RELAY_ADVERTISE_URL`.
+- Empty strings should be treated as "unset" for optional string settings such as `C2_RELAY_ANCHOR_ADDRESS`, `C2_RELAY_ID`, and `C2_RELAY_ADVERTISE_URL`.
 - Numeric parse failures should return structured config errors that include the environment variable name.
 - Boolean parsing should accept at least `1`, `true`, `yes`, `0`, `false`, and `no`, case-insensitively.
 - `C2_RELAY_SEEDS` should parse as comma-separated URLs with whitespace trimming and empty entries removed.
@@ -265,7 +265,7 @@ Python should migrate toward:
 - `cc.set_config(shm_threshold=..., relay_address=..., relay_use_proxy=...)`
 - `cc.set_server(**ipc_overrides)`, excluding derived-only fields such as `max_pool_memory`
 - `cc.set_client(**ipc_overrides)`, excluding derived-only fields such as `max_pool_memory`
-- `cc.set_relay(address)` as a compatibility wrapper for `set_config(relay_address=address)`
+- `cc.set_relay_anchor(address)` as a compatibility wrapper for `set_config(relay_address=address)`
 
 Python can keep `ServerIPCConfig` and `ClientIPCConfig` as compatibility facades, but they should be constructed from Rust-resolved config values. They should not own defaults or validation.
 
@@ -281,7 +281,7 @@ For `c3 relay`, clap should parse flags, then pass a `RelayConfigOverrides` obje
 CLI flags > process env > env file > RelayConfig defaults
 ```
 
-Registry subcommands currently require `--relay`. A later improvement may allow `C2_RELAY_ADDRESS` as a fallback through the resolver, but that is not required for the first implementation.
+Registry subcommands currently require `--relay`. A later improvement may allow `C2_RELAY_ANCHOR_ADDRESS` as a fallback through the resolver, but that is not required for the first implementation.
 
 CLI color variables remain local to CLI display code.
 
@@ -304,7 +304,7 @@ The target architecture should avoid hidden process-env reads in lower transport
 4. Update CLI relay to call the resolver instead of loading `.env` directly and relying on clap env defaults.
 5. Expose resolver functions through PyO3 for server/client/runtime config.
 6. Update Python config builders to call Rust resolver and return compatibility dataclasses from resolved values.
-7. Move Python `settings.relay_address` usage into registry-owned override state or a lightweight facade backed by resolver output.
+7. Move Python `settings.relay_anchor_address` usage into registry-owned override state or a lightweight facade backed by resolver output.
 8. Remove `pydantic-settings` from `sdk/python/pyproject.toml`.
 9. Remove `C2_IPC_MAX_POOL_MEMORY` from Python settings, `.env.example`, and public docs; expose `max_pool_memory` only as a resolved/derived value if compatibility requires read access.
 10. Update `.env.example`, CLI README, Python README, and root docs to list resolver-owned variables and canonical defaults.
@@ -328,7 +328,7 @@ Python:
 
 - `build_server_config()` and `build_client_config()` return Rust-resolved values.
 - Existing `cc.set_server()` and `cc.set_client()` kwargs beat env.
-- `cc.set_relay()` beats `C2_RELAY_ADDRESS`.
+- `cc.set_relay_anchor()` beats `C2_RELAY_ANCHOR_ADDRESS`.
 - Python tests no longer import `pydantic-settings`.
 - Python package installs without `pydantic-settings`.
 
@@ -348,5 +348,5 @@ Docs:
 
 1. Should the first implementation preserve Python's silent `pool_segment_size <= max_payload_size` clamp as compatibility behavior, or convert it immediately to validation error?
 2. Should `C2_HOLD_WARN_SECONDS` remain Python SDK-only for now, or should it be renamed/moved into a broader Rust-owned diagnostics config?
-3. Should CLI registry subcommands accept `C2_RELAY_ADDRESS` as a default relay URL in the first resolver migration, or remain explicit `--relay` only?
+3. Should CLI registry subcommands accept `C2_RELAY_ANCHOR_ADDRESS` as a default relay URL in the first resolver migration, or remain explicit `--relay` only?
 4. Should `max_reassembly_bytes` be split into separate total and per-request limits before implementation, or kept as one field during the resolver migration?

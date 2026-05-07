@@ -70,9 +70,17 @@ impl HttpClient {
         max_connections: usize,
         use_proxy: bool,
     ) -> Result<Self, HttpError> {
-        let client = crate::relay_client_builder_with_proxy(use_proxy)
-            .timeout(Duration::from_secs_f64(timeout_secs))
-            .pool_max_idle_per_host(max_connections)
+        if !timeout_secs.is_finite() || timeout_secs < 0.0 {
+            return Err(HttpError::Transport(
+                "HTTP call timeout must be finite and >= 0".to_string(),
+            ));
+        }
+        let mut builder = crate::relay_client_builder_with_proxy(use_proxy)
+            .pool_max_idle_per_host(max_connections);
+        if timeout_secs > 0.0 {
+            builder = builder.timeout(Duration::from_secs_f64(timeout_secs));
+        }
+        let client = builder
             .build()
             .map_err(|e| HttpError::Transport(e.to_string()))?;
         Ok(Self {
@@ -175,5 +183,38 @@ impl HttpClient {
     /// Base URL of this client.
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_timeout_is_accepted_to_disable_total_call_timeout() {
+        let client = HttpClient::new_with_proxy_policy("http://localhost:9991", 0.0, 100, false)
+            .expect("zero timeout should be accepted");
+
+        assert_eq!(client.base_url(), "http://localhost:9991");
+    }
+
+    #[test]
+    fn invalid_timeout_is_rejected_without_panic() {
+        for timeout in [-1.0, f64::NAN, f64::INFINITY] {
+            let err = match HttpClient::new_with_proxy_policy(
+                "http://localhost:9990",
+                timeout,
+                100,
+                false,
+            ) {
+                Ok(_) => panic!("invalid timeout should fail"),
+                Err(err) => err,
+            };
+
+            assert!(
+                err.to_string().contains("timeout"),
+                "unexpected error for {timeout}: {err}"
+            );
+        }
     }
 }

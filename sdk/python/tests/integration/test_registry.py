@@ -290,9 +290,9 @@ class TestErrors:
 
     def test_unreachable_relay_registration_rolls_back_local_registration(self):
         registry = _ProcessRegistry.get()
-        previous_relay = settings.relay_address
+        previous_relay = settings.relay_anchor_address
         try:
-            registry.set_relay('http://127.0.0.1:9')
+            registry.set_relay_anchor('http://127.0.0.1:9')
             with pytest.raises(Exception, match='relay error'):
                 registry.register(Hello, HelloImpl(), name='hello')
 
@@ -300,14 +300,14 @@ class TestErrors:
             assert registry.get_server_address() is None
             assert registry.get_server_id() is None
         finally:
-            settings.relay_address = previous_relay
+            settings.relay_anchor_address = previous_relay
 
     def test_failed_relay_registration_leaves_existing_route_usable(self):
         registry = _ProcessRegistry.get()
-        previous_relay = settings.relay_address
+        previous_relay = settings.relay_anchor_address
         try:
             cc.register(Hello, HelloImpl(), name='hello')
-            registry.set_relay('http://127.0.0.1:9')
+            registry.set_relay_anchor('http://127.0.0.1:9')
             with pytest.raises(Exception, match='relay error'):
                 registry.register(Counter, CounterImpl(), name='counter')
 
@@ -318,21 +318,21 @@ class TestErrors:
             finally:
                 cc.close(crm)
         finally:
-            settings.relay_address = previous_relay
+            settings.relay_anchor_address = previous_relay
 
-    def test_set_relay_updates_native_relay_projection_without_python_cache(self):
+    def test_set_relay_anchor_updates_native_relay_projection_without_python_cache(self):
         registry = _ProcessRegistry()
-        previous_relay = settings.relay_address
+        previous_relay = settings.relay_anchor_address
 
         try:
-            registry.set_relay('http://relay-b.test/')
+            registry.set_relay_anchor('http://relay-b.test/')
 
-            assert registry._runtime_session.relay_address_override == 'http://relay-b.test'  # noqa: SLF001
+            assert registry._runtime_session.relay_anchor_address_override == 'http://relay-b.test'  # noqa: SLF001
             assert not hasattr(registry, '_relay_control_client')
             assert not hasattr(registry, '_relay_control_address')
         finally:
             registry.shutdown()
-            settings.relay_address = previous_relay
+            settings.relay_anchor_address = previous_relay
 
     def test_relay_rejects_duplicate_name_from_second_registry(self, start_c3_relay):
         relay = start_c3_relay()
@@ -340,10 +340,10 @@ class TestErrors:
 
         first = _ProcessRegistry()
         second = _ProcessRegistry()
-        previous_relay = settings.relay_address
+        previous_relay = settings.relay_anchor_address
         try:
-            first.set_relay(relay_url)
-            second.set_relay(relay_url)
+            first.set_relay_anchor(relay_url)
+            second.set_relay_anchor(relay_url)
 
             first.register(Hello, HelloImpl(), name='hello')
 
@@ -355,4 +355,4 @@ class TestErrors:
         finally:
             second.shutdown()
             first.shutdown()
-            settings.relay_address = previous_relay
+            settings.relay_anchor_address = previous_relay

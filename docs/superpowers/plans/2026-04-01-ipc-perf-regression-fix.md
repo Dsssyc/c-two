@@ -639,12 +639,12 @@ class TestBuddyReply:
 
 - [ ] **Step 2: Run the test**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/integration/test_ipc_buddy_reply.py -v --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/integration/test_ipc_buddy_reply.py -v --timeout=30`
 Expected: All 4 tests pass.
 
 - [ ] **Step 3: Run full test suite for regression check**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30`
 Expected: All existing tests still pass (487+).
 
 - [ ] **Step 4: Commit**
@@ -670,7 +670,7 @@ uv sync --reinstall-package c-two
 - [ ] **Step 2: Run benchmark**
 
 ```bash
-C2_RELAY_ADDRESS= uv run python benchmarks/three_mode_benchmark.py
+C2_RELAY_ANCHOR_ADDRESS= uv run python benchmarks/three_mode_benchmark.py
 ```
 
 - [ ] **Step 3: Compare results**

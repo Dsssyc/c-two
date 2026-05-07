@@ -50,3 +50,90 @@
   - `uv run pytest sdk/python/tests/unit/test_name_collision.py sdk/python/tests/unit/test_relay_graceful_shutdown.py sdk/python/tests/unit/test_ipc_config.py -q`: 43 passed
   - `cargo test --manifest-path core/Cargo.toml -p c2-config -- --nocapture`: 40 passed
   - `git diff --check`: clean
+
+## 2026-05-07
+
+- Started relay local IPC preference and HTTP timeout repair.
+- Created `task_plan.md` for this task.
+- Reconfirmed code facts: relay local routes are unique per `(name, relay_id)`, local `RouteInfo` exposes `ipc_address`, peer route info strips it, and Python currently receives only a `RustRelayAwareHttpClient` for name-only relay connects.
+- Added failing tests for relay call timeout config resolution, Rust relay-aware local IPC target selection, and Python no-address relay connect IPC preference.
+- RED verification:
+  - `cargo test --manifest-path core/Cargo.toml -p c2-config relay_call_timeout -- --nocapture` fails because `ConfigResolver::resolve_relay_call_timeout_secs` does not exist.
+  - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay resolve_target_prefers_local_ipc_route_without_http_probe -- --nocapture` fails because `RelayAwareHttpClient::resolve_target_async` does not exist.
+  - Python RED command could not reach behavior because sandboxed `uv` attempted to fetch `maturin` from PyPI and network access was blocked.
+- Implemented relay HTTP call timeout config and plumbing:
+  - Added `C2_RELAY_CALL_TIMEOUT` resolution with default `300.0` seconds and `0.0` meaning no reqwest total timeout.
+  - Threaded timeout into explicit HTTP clients, relay-aware HTTP clients, and native runtime relay connects.
+  - Added pool timeout policy tracking so active pooled clients are not silently reused with a different timeout policy.
+- Phase 1/2 review found and fixed missing direct validation in `HttpClient::new_with_proxy_policy()` and missing timeout policy pool tests.
+- Verification:
+  - `cargo test --manifest-path core/Cargo.toml -p c2-config relay_call_timeout -- --nocapture`: 2 passed.
+  - `cargo test --manifest-path core/Cargo.toml -p c2-http timeout -- --nocapture`: 4 passed.
+  - `cargo test --manifest-path core/Cargo.toml -p c2-http policy -- --nocapture`: 5 passed.
+  - `cargo check --manifest-path core/Cargo.toml -p c2-runtime`: passed.
+- Restored context from session `019e01b1-19e3-7c81-b900-8ec51d781450`.
+- Current Phase 3 root cause: Rust target resolution exists in `c2-http`/`c2-runtime`, but Python registry still wraps `RuntimeSession.connect_via_relay()` as an HTTP proxy. Native FFI must project the selected target into the matching IPC/HTTP client before Python constructs the CRM proxy.
+- Implemented native relay connection projection:
+  - `c2-http` target selection now returns local `ipc://` without HTTP probing and probes HTTP targets before returning them.
+  - `RuntimeSession` exposes target selection instead of a stale relay-aware HTTP client constructor path.
+  - Python native `RuntimeSession.connect_via_relay()` now returns a `RelayConnectedClient` that owns either the IPC pool reference or HTTP pool reference and releases it on close/drop.
+  - Python registry wraps relay-connected clients as IPC or HTTP proxies based on native `mode`.
+- Quick verification:
+  - `cargo check --manifest-path sdk/python/native/Cargo.toml -p c2-python-native`: passed.
+  - `cargo check --manifest-path core/Cargo.toml -p c2-runtime`: passed.
+  - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay resolve_target_prefers_local_ipc_route_without_http_probe -- --nocapture`: 1 passed.
+- Phase 3 review found invalid IPC client config would have been hidden by HTTP fallback. Tightened fallback so only IPC unavailability/route-missing falls back; config errors propagate.
+- Python verification:
+  - Initial pytest commands used stale test names and reported "not found"; reran with current names.
+  - `env UV_CACHE_DIR=.uv-cache C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/integration/test_http_relay.py::TestCcConnectHttp::test_no_address_connect_uses_env_relay_projection sdk/python/tests/integration/test_http_relay.py::TestCcConnectHttp::test_no_address_connect_uses_runtime_session_relay_projection -q --timeout=30 -rs`: 2 passed.
+  - `env UV_CACHE_DIR=.uv-cache C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_ipc_config.py::test_relay_resolved_connect_delegates_route_validation_to_runtime_session sdk/python/tests/unit/test_ipc_config.py::test_relay_resolved_connect_maps_native_404_to_resource_not_found -q --timeout=30 -rs`: 2 passed.
+- Phase 4 cleanup removed the stale Python-native `RustRelayAwareHttpClient` export; relay-aware route selection remains a Rust core/native internal mechanism.
+- Staged review verification:
+  - `cargo test --manifest-path core/Cargo.toml -p c2-config relay_call_timeout -- --nocapture`: 2 passed.
+  - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay -- --nocapture`: 152 passed.
+  - `cargo check --manifest-path sdk/python/native/Cargo.toml -p c2-python-native`: passed.
+  - `env UV_CACHE_DIR=.uv-cache C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/integration/test_http_relay.py sdk/python/tests/unit/test_ipc_config.py -q --timeout=30 -rs`: 50 passed.
+- Final documentation review added `C2_RELAY_CALL_TIMEOUT` to `.env.example`, README relay guidance, and AGENTS env table, and updated stale runtime-session plan wording from `RustRelayAwareHttpClient` to `RelayConnectedClient`.
+- Final verification:
+  - `cargo fmt --manifest-path core/Cargo.toml --all --check`: passed.
+  - `cargo fmt --manifest-path sdk/python/native/Cargo.toml --all --check`: passed.
+  - `git diff --check`: passed.
+  - `cargo test --manifest-path core/Cargo.toml -p c2-runtime -- --nocapture`: 12 passed.
+  - `cargo test --manifest-path core/Cargo.toml -p c2-config -- --nocapture`: 46 passed.
+  - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay -- --nocapture`: 152 passed.
+  - `cargo check --manifest-path sdk/python/native/Cargo.toml -p c2-python-native`: passed.
+  - `env UV_CACHE_DIR=.uv-cache C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/integration/test_http_relay.py sdk/python/tests/unit/test_ipc_config.py sdk/python/tests/unit/test_name_collision.py -q --timeout=30 -rs`: 69 passed.
+- Started strict post-completion review requested by user, recorded as Phase 6 in `task_plan.md`.
+- Phase 6 strict review found a real regression in the native relay-connected HTTP branch: it held a bare `HttpClient`, which would bypass `RelayAwareHttpClient::call_async()` stale-route re-resolution for name-based relay connects that selected HTTP.
+- Added RED boundary test `test_relay_connected_http_mode_preserves_relay_aware_call_path`; confirmed it failed because `RelayConnectedInner::Http` used `Arc<HttpClient>`.
+- Fixed HTTP mode to hold an internal `RelayAwareHttpClient` and call it through shared PyO3 error mapping while keeping the removed Python-visible `RustRelayAwareHttpClient` class deleted.
+- Phase 6 performance review found the first fix would duplicate connect-time HTTP resolve/probe. Added a RED assertion requiring RuntimeSession FFI to use `resolve_relay_connection()`, then replaced the target-only API with `RelayResolvedConnection`, which carries either an IPC target or the already primed relay-aware HTTP client.
+- Updated the runtime-session authority plan to remove the stale `resolve_relay_http_target` API name and document `resolve_relay_connection()` / `connect_relay_http_client()`.
+- Phase 6 verification:
+  - `env UV_CACHE_DIR=.uv-cache C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_ipc_config.py::test_relay_connected_http_mode_preserves_relay_aware_call_path -q --timeout=30 -rs`: passed after both RED checks.
+  - `cargo check --manifest-path sdk/python/native/Cargo.toml -p c2-python-native`: passed.
+  - `cargo check --manifest-path core/Cargo.toml -p c2-runtime`: passed.
+  - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay -- --nocapture`: 152 passed.
+  - `cargo test --manifest-path core/Cargo.toml -p c2-config -- --nocapture`: 46 passed.
+  - `cargo test --manifest-path core/Cargo.toml -p c2-runtime -- --nocapture`: 12 passed.
+  - `env UV_CACHE_DIR=.uv-cache C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/integration/test_http_relay.py sdk/python/tests/unit/test_ipc_config.py sdk/python/tests/unit/test_name_collision.py -q --timeout=30 -rs`: 70 passed.
+  - `cargo fmt --manifest-path core/Cargo.toml --all --check`: passed.
+  - `cargo fmt --manifest-path sdk/python/native/Cargo.toml --all --check`: passed.
+  - `git diff --check`: passed.
+  - `env UV_CACHE_DIR=.uv-cache C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30 -rs`: 726 passed, 2 skipped.
+- Phase 7 relay-anchor/locality repair:
+  - Clean-cut renamed SDK relay discovery env/API to `C2_RELAY_ANCHOR_ADDRESS` and `cc.set_relay_anchor(...)`; removed old resolver/API aliases and updated Python settings/runtime projections to `relay_anchor_address`.
+  - Added relay-aware client locality gating so `ipc_address` from `_resolve` is used only when the configured relay anchor URL is loopback/local; nonlocal anchors continue through HTTP route selection.
+  - Added relay server defense-in-depth: `/_resolve` strips `ipc_address` unless the HTTP caller's socket address is loopback; `build_router` still works without connect-info extensions by conservatively omitting IPC addresses.
+  - Preserved remote HTTP performance shape: HTTP-mode name connections carry the already primed relay-aware client and call selected route `relay_url` directly, not anchor-relay forwarding.
+  - Updated AGENTS, README files, SDK README, and thin-SDK boundary document with relay-anchor semantics.
+- Phase 7 verification:
+  - `cargo check --manifest-path sdk/python/native/Cargo.toml -q`: passed.
+  - `cargo test --manifest-path core/Cargo.toml -p c2-config -p c2-runtime -p c2-http`: 46 + 14 + 12 passed.
+  - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay`: 154 passed.
+  - `C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_ipc_config.py::test_relay_anchor_env_replaces_old_relay_address_env sdk/python/tests/unit/test_ipc_config.py::test_public_relay_anchor_api_replaces_set_relay -q --timeout=30`: 2 passed.
+  - `C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_ipc_config.py sdk/python/tests/unit/test_runtime_session.py sdk/python/tests/unit/test_relay_graceful_shutdown.py sdk/python/tests/unit/test_name_collision.py sdk/python/tests/integration/test_http_relay.py sdk/python/tests/integration/test_registry.py sdk/python/tests/integration/test_remote_scheduler_config.py -q --timeout=30 -rs`: 141 passed.
+  - `C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30 -rs`: 730 passed.
+  - `cargo test --manifest-path core/Cargo.toml --workspace`: passed across all core crates.
+  - `git diff --check`: passed.
+  - `C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_runtime_session.py::test_explicit_ipc_connect_ignores_bad_relay_after_native_identity sdk/python/tests/integration/test_registry.py::TestRegisterConnect::test_connect_ipc -q --timeout=30 -rs`: 2 passed.

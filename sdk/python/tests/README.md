@@ -15,7 +15,7 @@ python tools/dev/c3_tool.py --build --link
 uv run pytest sdk/python/tests -q
 
 # Focused runtime-session / relay / direct IPC regressions
-C2_RELAY_ADDRESS= uv run pytest \
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest \
   sdk/python/tests/unit/test_runtime_session.py \
   sdk/python/tests/unit/test_name_collision.py \
   sdk/python/tests/unit/test_serve.py \

@@ -73,17 +73,17 @@ from c_two.transport.registry import _ProcessRegistry
 
 @pytest.fixture(autouse=True)
 def _clean_env_and_registry(monkeypatch):
-    previous_override_relay = settings._relay_address
+    previous_override_relay = settings._relay_anchor_address
     previous_override_shm_threshold = settings._shm_threshold
-    settings.relay_address = None
-    monkeypatch.delenv('C2_RELAY_ADDRESS', raising=False)
+    settings.relay_anchor_address = None
+    monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
     yield
     try:
         cc.shutdown()
     except Exception:
         pass
     _ProcessRegistry._instance = None
-    settings._relay_address = previous_override_relay
+    settings._relay_anchor_address = previous_override_relay
     settings._shm_threshold = previous_override_shm_threshold
 
 
@@ -339,7 +339,7 @@ def test_remote_ipc_read_parallel_allows_reads_and_serializes_writes():
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/integration/test_remote_scheduler_config.py -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/integration/test_remote_scheduler_config.py -q --timeout=30
 ```
 
 Expected before implementation: `test_remote_ipc_exclusive_serializes_reads` and `test_remote_ipc_parallel_allows_concurrent_writes` fail because the Rust route scheduler is still hardcoded to `ReadParallel`. The `read_parallel` test may pass before implementation.
@@ -452,7 +452,7 @@ Run:
 
 ```bash
 uv sync --reinstall-package c-two
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/integration/test_remote_scheduler_config.py -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/integration/test_remote_scheduler_config.py -q --timeout=30
 ```
 
 Expected after this task: remote mode propagation tests pass for `exclusive`, `parallel`, and `read_parallel`. Tests involving remote `max_pending` or `max_workers` are not added until Task 5.
@@ -503,7 +503,7 @@ def test_remote_ipc_registers_all_public_concurrency_modes(mode):
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/integration/test_remote_scheduler_config.py -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/integration/test_remote_scheduler_config.py -q --timeout=30
 ```
 
 Expected: all tests pass.
@@ -602,7 +602,7 @@ def test_remote_ipc_large_hold_input_reaches_python_as_shm_memoryview():
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/integration/test_remote_scheduler_config.py::test_remote_ipc_large_hold_input_reaches_python_as_shm_memoryview -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/integration/test_remote_scheduler_config.py::test_remote_ipc_large_hold_input_reaches_python_as_shm_memoryview -q --timeout=30
 ```
 
 Expected: pass. If this fails because `LargePayload.deserialize()` is used instead of `from_buffer`, inspect `sdk/python/src/c_two/crm/transfer.py` and adjust only the test annotations to trigger the existing hold path; do not change `PyCrmCallback::invoke()` to pass `bytes`.
@@ -801,7 +801,7 @@ Run:
 ```bash
 cargo test --manifest-path core/Cargo.toml -p c2-server scheduler
 uv sync --reinstall-package c-two
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/integration/test_remote_scheduler_config.py -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/integration/test_remote_scheduler_config.py -q --timeout=30
 ```
 
 Expected: Rust scheduler tests pass; Python remote tests pass.
@@ -889,7 +889,7 @@ assert proxy.supports_direct_call is True
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_scheduler.py sdk/python/tests/unit/test_proxy_concurrency.py sdk/python/tests/unit/test_security.py -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_scheduler.py sdk/python/tests/unit/test_proxy_concurrency.py sdk/python/tests/unit/test_security.py -q --timeout=30
 ```
 
 Expected: all tests pass and no test describes Python scheduler as the remote IPC authority.
@@ -923,8 +923,8 @@ def test_remote_ipc_scheduler_direct_address_ignores_bad_relay(monkeypatch):
 
     # Set a bad relay only after local registration. This isolates the invariant
     # under test: an explicit IPC address must bypass relay name resolution.
-    monkeypatch.setenv('C2_RELAY_ADDRESS', 'http://127.0.0.1:9')
-    settings.relay_address = None
+    monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', 'http://127.0.0.1:9')
+    settings.relay_anchor_address = None
 
     client = cc.connect(
         RemoteSchedulerProbe,
@@ -943,7 +943,7 @@ def test_remote_ipc_scheduler_direct_address_ignores_bad_relay(monkeypatch):
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/integration/test_remote_scheduler_config.py::test_remote_ipc_scheduler_direct_address_ignores_bad_relay -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/integration/test_remote_scheduler_config.py::test_remote_ipc_scheduler_direct_address_ignores_bad_relay -q --timeout=30
 ```
 
 Expected: pass. Failure here means scheduler changes coupled direct IPC to relay or let relay environment override explicit IPC address.
@@ -1030,7 +1030,7 @@ Expected: build succeeds.
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest \
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest \
   sdk/python/tests/integration/test_remote_scheduler_config.py \
   sdk/python/tests/unit/test_scheduler.py \
   sdk/python/tests/unit/test_proxy_concurrency.py \
@@ -1054,7 +1054,7 @@ Expected: all `c2-server` scheduler tests pass.
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30
 ```
 
 Expected: all Python SDK tests pass.

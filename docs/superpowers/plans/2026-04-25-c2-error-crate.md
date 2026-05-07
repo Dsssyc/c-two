@@ -433,7 +433,7 @@ def test_native_encode_legacy_error_matches_python_wire_format():
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_native_error_registry.py -q --timeout=60
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_native_error_registry.py -q --timeout=60
 ```
 
 Expected: FAIL because `_native.error_registry`, `_native.decode_error_legacy`, and `_native.encode_error_legacy` do not exist.
@@ -558,7 +558,7 @@ Place it before client/http registration so error helpers are available early.
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_native_error_registry.py -q --timeout=60
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_native_error_registry.py -q --timeout=60
 ```
 
 Expected: PASS.
@@ -625,7 +625,7 @@ class TestNativeErrorRegistryParity:
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_error.py -q --timeout=60
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_error.py -q --timeout=60
 ```
 
 Expected: FAIL on unknown numeric code because `ERROR_Code(code_value)` raises `ValueError`.
@@ -655,7 +655,7 @@ Keep the remaining subclass lookup unchanged.
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_error.py -q --timeout=60
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_error.py -q --timeout=60
 ```
 
 Expected: PASS.
@@ -774,7 +774,7 @@ git commit -m "feat: map relay control errors to canonical c2 errors"
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_error.py sdk/python/tests/unit/test_native_error_registry.py sdk/python/tests/unit/test_mesh_errors.py sdk/python/tests/unit/test_native_relay.py sdk/python/tests/integration/test_registry.py sdk/python/tests/integration/test_http_relay.py -q --timeout=60
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_error.py sdk/python/tests/unit/test_native_error_registry.py sdk/python/tests/unit/test_mesh_errors.py sdk/python/tests/unit/test_native_relay.py sdk/python/tests/integration/test_registry.py sdk/python/tests/integration/test_http_relay.py -q --timeout=60
 ```
 
 Expected: PASS.

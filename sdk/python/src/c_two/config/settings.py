@@ -6,29 +6,29 @@ class C2Settings:
 
     Environment variables and ``.env`` files are resolved by the Rust
     ``c2-config`` resolver. This object only stores Python code-level
-    overrides such as ``cc.set_relay()``.
+    overrides such as ``cc.set_relay_anchor()``.
     """
 
     def __init__(
         self,
         *,
-        relay_address: str | None = None,
+        relay_anchor_address: str | None = None,
         shm_threshold: int | None = None,
     ) -> None:
-        self._relay_address = _clean_optional_str(relay_address)
+        self._relay_anchor_address = _clean_optional_str(relay_anchor_address)
         self._shm_threshold: int | None = None
         if shm_threshold is not None:
             self.shm_threshold = shm_threshold
 
     @property
-    def relay_address(self) -> str | None:
-        if self._relay_address is not None:
-            return self._relay_address
-        return _resolve_relay_address()
+    def relay_anchor_address(self) -> str | None:
+        if self._relay_anchor_address is not None:
+            return self._relay_anchor_address
+        return _resolve_relay_anchor_address()
 
-    @relay_address.setter
-    def relay_address(self, value: str | None) -> None:
-        self._relay_address = _clean_optional_str(value)
+    @relay_anchor_address.setter
+    def relay_anchor_address(self, value: str | None) -> None:
+        self._relay_anchor_address = _clean_optional_str(value)
 
     @property
     def shm_threshold(self) -> int:
@@ -67,10 +67,10 @@ def _resolve_shm_threshold() -> int:
     return int(resolve_shm_threshold(shm_overrides))
 
 
-def _resolve_relay_address() -> str | None:
-    from c_two._native import resolve_relay_address
+def _resolve_relay_anchor_address() -> str | None:
+    from c_two._native import resolve_relay_anchor_address
 
-    return resolve_relay_address()
+    return resolve_relay_anchor_address()
 
 
 settings = C2Settings()

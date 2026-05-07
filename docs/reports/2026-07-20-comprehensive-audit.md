@@ -3,7 +3,7 @@
 **Date:** 2026-07-20  
 **Branch:** `dev-feature` (base `2e842ae`)  
 **Python:** 3.14.3 free-threading build (Clang 17.0.0)  
-**Test Baseline:** 711 tests pass (`C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`)
+**Test Baseline:** 711 tests pass (`C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30`)
 
 ---
 

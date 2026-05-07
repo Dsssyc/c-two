@@ -12,7 +12,7 @@ __all__ = [
     'Server', 'CRMSlot',
     'Scheduler', 'ConcurrencyConfig', 'ConcurrencyMode',
     'set_transport_policy', 'set_server', 'set_client',
-    'set_relay',
+    'set_relay_anchor',
     'register', 'connect', 'close',
     'unregister', 'server_address', 'server_id', 'shutdown', 'serve',
 ]
@@ -27,7 +27,7 @@ _LAZY_IMPORTS: dict[str, tuple[str, str]] = {
     'set_transport_policy': ('.registry',         'set_transport_policy'),
     'set_server':        ('.registry',            'set_server'),
     'set_client':        ('.registry',            'set_client'),
-    'set_relay':         ('.registry',            'set_relay'),
+    'set_relay_anchor':         ('.registry',            'set_relay_anchor'),
     'register':          ('.registry',            'register'),
     'connect':           ('.registry',            'connect'),
     'close':             ('.registry',            'close'),

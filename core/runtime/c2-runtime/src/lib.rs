@@ -12,4 +12,7 @@ pub use identity::{auto_server_id, ipc_address_for_server_id, validate_server_id
 pub use outcome::{
     RegisterOutcome, RelayCleanupError, RuntimeRouteSpec, ShutdownOutcome, UnregisterOutcome,
 };
-pub use session::{RuntimeIdentity, RuntimeSession, RuntimeSessionError, RuntimeSessionOptions};
+pub use session::{
+    RelayResolvedConnection, RuntimeIdentity, RuntimeSession, RuntimeSessionError,
+    RuntimeSessionOptions,
+};

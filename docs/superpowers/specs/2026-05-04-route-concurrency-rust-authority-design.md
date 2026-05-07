@@ -231,7 +231,7 @@ Cover the shared authority from both sides:
    - Verify `max_pending` and `max_workers` are enforced for both same-process and remote calls.
 
 4. **Relay independence**
-   - Verify a bad `C2_RELAY_ADDRESS` does not affect explicit `ipc://...` direct address calls.
+   - Verify a bad `C2_RELAY_ANCHOR_ADDRESS` does not affect explicit `ipc://...` direct address calls.
 
 5. **Zero-copy guardrail**
    - Verify the shared concurrency object does not change the SHM-to-`memoryview` path for large inputs.

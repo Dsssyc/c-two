@@ -152,7 +152,7 @@ Replace the dispatch function body in `_make_dispatcher()`. Key changes:
 - [ ] **Step 3: Run existing tests to verify no regression**
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30
 ```
 
 Expected: All 503+ tests pass. The change is transparent — CRM methods receive
@@ -644,7 +644,7 @@ def set_ipc_config(
 ```bash
 cd src/c_two/_native && cargo check -p c2-mem -p c2-ipc -p c2-server -p c2-ffi
 uv sync --reinstall-package c-two
-C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30
 ```
 
 Expected: Rust compiles, all Python tests pass. Functional behavior unchanged —
@@ -697,7 +697,7 @@ libc::madvise(ptr, map_size, libc::MADV_SEQUENTIAL);
 ```bash
 cd src/c_two/_native && cargo check -p c2-mem
 uv sync --reinstall-package c-two
-C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30
 ```
 
 Expected: Builds clean, all tests pass. madvise is advisory-only — failures are
@@ -824,7 +824,7 @@ def run_benchmark(segment_size: int) -> list[dict]:
     seg_label = f'{segment_size // (1 << 20)}MB'
 
     os.environ.pop('C2_IPC_ADDRESS', None)
-    os.environ.pop('C2_RELAY_ADDRESS', None)
+    os.environ.pop('C2_RELAY_ANCHOR_ADDRESS', None)
 
     cc.set_ipc_config(segment_size=segment_size, max_segments=4)
     cc.set_address(f'ipc:///tmp/c2_bench_{seg_label}_{os.getpid()}')

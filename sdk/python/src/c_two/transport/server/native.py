@@ -65,10 +65,10 @@ class CRMSlot:
                 self._dispatch_table[name] = (method, access, buffer_mode)
 
 
-def _session_has_relay(runtime_session: object, relay_address: str | None) -> bool:
-    if relay_address is not None:
+def _session_has_relay(runtime_session: object, relay_anchor_address: str | None) -> bool:
+    if relay_anchor_address is not None:
         return True
-    value = getattr(runtime_session, 'effective_relay_address', None)
+    value = getattr(runtime_session, 'effective_relay_anchor_address', None)
     if value is None:
         return False
     try:
@@ -160,7 +160,7 @@ class NativeServerBridge:
         *,
         name: str | None = None,
         runtime_session: object | None = None,
-        relay_address: str | None = None,
+        relay_anchor_address: str | None = None,
     ) -> str:
         routing_name = (
             name if name is not None else self._extract_namespace(crm_class)
@@ -201,7 +201,7 @@ class NativeServerBridge:
         with self._slots_lock:
             if routing_name in self._slots:
                 raise ValueError(f'Name already registered: {routing_name!r}')
-            if runtime_session is not None and _session_has_relay(runtime_session, relay_address) and not self.is_started():
+            if runtime_session is not None and _session_has_relay(runtime_session, relay_anchor_address) and not self.is_started():
                 self.start()
             if runtime_session is not None:
                 try:
@@ -216,7 +216,7 @@ class NativeServerBridge:
                         cc_config.max_workers,
                         getattr(crm_class, '__cc_namespace__', ''),
                         getattr(crm_class, '__cc_version__', ''),
-                        relay_address,
+                        relay_anchor_address,
                     )
                 except Exception as exc:
                     if (
@@ -250,7 +250,7 @@ class NativeServerBridge:
         name: str,
         *,
         runtime_session: object | None = None,
-        relay_address: str | None = None,
+        relay_anchor_address: str | None = None,
     ) -> dict[str, Any]:
         with self._slots_lock:
             slot = self._slots.get(name)
@@ -264,7 +264,7 @@ class NativeServerBridge:
         outcome = dict(runtime_session.unregister_route(
             self._rust_server,
             name,
-            relay_address,
+            relay_anchor_address,
         ))
         if not outcome.get('local_removed', False):
             raise KeyError(f'Name not registered in native server: {name!r}')
@@ -312,7 +312,7 @@ class NativeServerBridge:
         self,
         *,
         runtime_session: object | None = None,
-        relay_address: str | None = None,
+        relay_anchor_address: str | None = None,
     ) -> dict[str, Any]:
         with self._slots_lock:
             slots_by_name = dict(self._slots)
@@ -325,7 +325,7 @@ class NativeServerBridge:
         outcome = dict(runtime_session.shutdown(
             self._rust_server,
             route_names=route_names,
-            relay_address=relay_address,
+            relay_anchor_address=relay_anchor_address,
         ))
 
         removed_names = list(outcome.get('removed_routes') or [])

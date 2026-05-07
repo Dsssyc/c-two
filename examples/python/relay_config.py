@@ -5,7 +5,7 @@ from __future__ import annotations
 def resolved_relay_url(default: str | None = None) -> str | None:
     from c_two.config.settings import settings
 
-    return settings.relay_address or default
+    return settings.relay_anchor_address or default
 
 
 def ensure_http_relay_url(value: str | None) -> str:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import inspect
+from pathlib import Path
 from typing import get_type_hints
 
 import pytest
@@ -30,14 +31,14 @@ class UnitConfigCRM:
 def _reset_registry_and_settings(monkeypatch):
     cc.shutdown()
     _ProcessRegistry.reset()
-    settings.relay_address = None
+    settings.relay_anchor_address = None
     settings.shm_threshold = None
     monkeypatch.setenv('C2_ENV_FILE', '')
     for key in (
         'C2_SHM_THRESHOLD',
         'C2_IPC_POOL_SEGMENT_SIZE',
         'C2_IPC_REASSEMBLY_SEGMENT_SIZE',
-        'C2_RELAY_ADDRESS',
+        'C2_RELAY_ANCHOR_ADDRESS',
         'C2_RELAY_USE_PROXY',
         'C2_RELAY_ROUTE_MAX_ATTEMPTS',
     ):
@@ -45,7 +46,7 @@ def _reset_registry_and_settings(monkeypatch):
     yield
     cc.shutdown()
     _ProcessRegistry.reset()
-    settings.relay_address = None
+    settings.relay_anchor_address = None
     settings.shm_threshold = None
 
 
@@ -239,7 +240,7 @@ def test_server_id_rejects_empty_or_path_like_values():
 
 def test_relay_resolved_connect_delegates_route_validation_to_runtime_session(monkeypatch):
     registry = _ProcessRegistry.get()
-    settings.relay_address = 'http://registry-relay.test'
+    settings.relay_anchor_address = 'http://registry-relay.test'
     calls = []
 
     class FakeRuntimeSession:
@@ -249,11 +250,11 @@ def test_relay_resolved_connect_delegates_route_validation_to_runtime_session(mo
         server_ipc_overrides = None
         client_ipc_overrides = None
 
-        def set_relay_address(self, relay_address):  # noqa: ANN001
-            self.relay_address_override = relay_address
+        def set_relay_anchor_address(self, relay_address):  # noqa: ANN001
+            self.relay_anchor_address_override = relay_address
 
         def connect_via_relay(self, route_name: str):
-            calls.append((self.relay_address_override, route_name))
+            calls.append((self.relay_anchor_address_override, route_name))
             return FakeRelayAwareClient()
 
         def lease_tracker(self):
@@ -274,7 +275,7 @@ def test_relay_resolved_connect_delegates_route_validation_to_runtime_session(mo
 
 def test_relay_resolved_connect_uses_native_session_not_python_relay_client():
     registry = _ProcessRegistry.get()
-    settings.relay_address = 'http://registry-relay.test'
+    settings.relay_anchor_address = 'http://registry-relay.test'
 
     with pytest.raises(Exception):
         registry.connect(IUnitConfigCRM, name='unit-route')
@@ -284,14 +285,32 @@ def test_relay_resolved_connect_uses_native_session_not_python_relay_client():
     assert '_relay_control_client_for' not in source
 
 
+def test_relay_connected_http_mode_preserves_relay_aware_call_path():
+    repo_root = Path(__file__).resolve().parents[4]
+    source = (
+        repo_root / 'sdk/python/native/src/runtime_session_ffi.rs'
+    ).read_text(encoding='utf-8')
+
+    assert 'client: Arc<RelayAwareHttpClient>' in source
+    assert 'call_relay_aware_http_client(py, client, method_name, data)' in source
+    assert 'resolve_relay_connection(' in source
+    assert 'resolve_relay_target(' not in source
+
+    close_inner = source.split('fn close_inner(&self) {', 1)[1].split(
+        'impl Drop for PyRelayConnectedClient',
+        1,
+    )[0]
+    assert 'release_http_client_from_global_pool' not in close_inner
+
+
 def test_relay_resolved_connect_maps_native_404_to_resource_not_found(monkeypatch):
     registry = _ProcessRegistry.get()
-    settings.relay_address = 'http://registry-relay.test'
+    settings.relay_anchor_address = 'http://registry-relay.test'
 
     class FakeRuntimeSession:
         client_config_frozen = False
 
-        def set_relay_address(self, relay_address):  # noqa: ANN001
+        def set_relay_anchor_address(self, relay_address):  # noqa: ANN001
             pass
 
         def connect_via_relay(self, route_name: str):  # noqa: ARG002
@@ -347,17 +366,17 @@ def test_proxy_policy_does_not_resolve_ipc_env(monkeypatch):
 
 
 def test_relay_settings_do_not_resolve_ipc_env(monkeypatch):
-    monkeypatch.setenv('C2_RELAY_ADDRESS', 'http://127.0.0.1:8080')
+    monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', 'http://127.0.0.1:8080')
     monkeypatch.setenv('C2_IPC_POOL_SEGMENT_SIZE', 'not-a-number')
 
-    assert settings.relay_address == 'http://127.0.0.1:8080'
+    assert settings.relay_anchor_address == 'http://127.0.0.1:8080'
 
 
-def test_relay_address_resolution_ignores_relay_proxy_policy(monkeypatch):
-    monkeypatch.setenv('C2_RELAY_ADDRESS', 'http://127.0.0.1:8080')
+def test_relay_anchor_address_resolution_ignores_relay_proxy_policy(monkeypatch):
+    monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', 'http://127.0.0.1:8080')
     monkeypatch.setenv('C2_RELAY_USE_PROXY', 'not-a-bool')
 
-    assert settings.relay_address == 'http://127.0.0.1:8080'
+    assert settings.relay_anchor_address == 'http://127.0.0.1:8080'
 
 
 def test_shm_threshold_resolution_does_not_parse_ipc_env(monkeypatch):
@@ -365,3 +384,15 @@ def test_shm_threshold_resolution_does_not_parse_ipc_env(monkeypatch):
     monkeypatch.setenv('C2_IPC_POOL_SEGMENT_SIZE', 'not-a-number')
 
     assert settings.shm_threshold == 8192
+
+
+def test_relay_anchor_env_replaces_old_relay_address_env(monkeypatch):
+    monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', 'http://127.0.0.1:8080')
+    monkeypatch.setenv('C2_RELAY_ADDRESS', 'http://old-relay.test:8080')
+
+    assert settings.relay_anchor_address == 'http://127.0.0.1:8080'
+
+
+def test_public_relay_anchor_api_replaces_set_relay():
+    assert hasattr(cc, 'set_relay_anchor')
+    assert not hasattr(cc, 'set_relay')

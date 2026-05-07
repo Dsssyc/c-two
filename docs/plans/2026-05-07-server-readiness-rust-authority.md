@@ -132,7 +132,7 @@ Run:
 ```bash
 cargo test --manifest-path core/Cargo.toml -p c2-server
 cargo check --manifest-path sdk/python/native/Cargo.toml -q
-C2_RELAY_ADDRESS= uv run pytest \
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest \
   sdk/python/tests/unit/test_sdk_boundary.py \
   sdk/python/tests/integration/test_direct_ipc_control.py \
   sdk/python/tests/integration/test_server.py \
@@ -565,7 +565,7 @@ def test_start_and_wait_rejects_invalid_timeout(monkeypatch):
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_native_server_readiness.py -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_native_server_readiness.py -q --timeout=30
 ```
 
 Expected: failure because `RustServer.start_and_wait` and `is_ready` do not exist yet.
@@ -690,7 +690,7 @@ Run:
 ```bash
 cargo check --manifest-path sdk/python/native/Cargo.toml -q
 uv sync --reinstall-package c-two
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_native_server_readiness.py -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_native_server_readiness.py -q --timeout=30
 ```
 
 Expected: native crate checks, rebuild succeeds, and readiness API tests pass.
@@ -744,7 +744,7 @@ def test_python_server_bridge_does_not_own_readiness_polling():
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_sdk_boundary.py::test_python_server_bridge_does_not_own_readiness_polling -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_sdk_boundary.py::test_python_server_bridge_does_not_own_readiness_polling -q --timeout=30
 ```
 
 Expected: failure because `NativeServerBridge` still imports `os`, polls `os.path.exists`, and owns `_started`.
@@ -830,7 +830,7 @@ If the fake represents a started server, return `True`.
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest \
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest \
   sdk/python/tests/unit/test_sdk_boundary.py::test_python_server_bridge_does_not_own_readiness_polling \
   sdk/python/tests/unit/test_name_collision.py \
   -q --timeout=30
@@ -877,7 +877,7 @@ def test_runtime_session_does_not_infer_started_from_socket_file():
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_sdk_boundary.py::test_runtime_session_does_not_infer_started_from_socket_file -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_sdk_boundary.py::test_runtime_session_does_not_infer_started_from_socket_file -q --timeout=30
 ```
 
 Expected: failure because `RuntimeSession::shutdown()` still uses `server.socket_path().exists()`.
@@ -910,7 +910,7 @@ Run:
 
 ```bash
 cargo test --manifest-path core/Cargo.toml -p c2-runtime
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_sdk_boundary.py::test_runtime_session_does_not_infer_started_from_socket_file -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_sdk_boundary.py::test_runtime_session_does_not_infer_started_from_socket_file -q --timeout=30
 ```
 
 Expected: tests pass. Shutdown outcomes now use native lifecycle state.
@@ -941,7 +941,7 @@ Append this test to `sdk/python/tests/integration/test_direct_ipc_control.py`:
 
 ```python
 def test_server_start_returns_only_after_direct_ipc_ready(monkeypatch):
-    monkeypatch.delenv('C2_RELAY_ADDRESS', raising=False)
+    monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
     address = f'ipc://{_unique_region("ready")}'
     server = Server(
         bind_address=address,
@@ -962,7 +962,7 @@ Append this test to `sdk/python/tests/integration/test_direct_ipc_control.py`:
 
 ```python
 def test_server_start_readiness_ignores_bad_relay_env(monkeypatch):
-    monkeypatch.setenv('C2_RELAY_ADDRESS', 'http://127.0.0.1:9')
+    monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', 'http://127.0.0.1:9')
     address = f'ipc://{_unique_region("ready_bad_relay")}'
     server = Server(
         bind_address=address,
@@ -983,7 +983,7 @@ Append this test to `sdk/python/tests/integration/test_direct_ipc_control.py`:
 
 ```python
 def test_starting_second_server_does_not_unlink_active_socket(monkeypatch):
-    monkeypatch.delenv('C2_RELAY_ADDRESS', raising=False)
+    monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
     address = f'ipc://{_unique_region("active")}'
     first = Server(
         bind_address=address,
@@ -1020,7 +1020,7 @@ Do not bulk-edit every integration fixture in this task. Only newly added tests 
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/integration/test_direct_ipc_control.py -q --timeout=30 -rs
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/integration/test_direct_ipc_control.py -q --timeout=30 -rs
 ```
 
 Expected: direct IPC tests pass, including bad relay env and active-socket rejection.
@@ -1156,7 +1156,7 @@ Expected: native crate checks and package rebuild succeeds.
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest \
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest \
   sdk/python/tests/unit/test_native_server_readiness.py \
   sdk/python/tests/unit/test_sdk_boundary.py \
   sdk/python/tests/unit/test_name_collision.py \
@@ -1174,7 +1174,7 @@ Expected: focused tests pass.
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30 -rs
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30 -rs
 ```
 
 Expected: full Python SDK suite passes. Existing optional example skips may remain if optional dependencies are not installed.
@@ -1184,7 +1184,7 @@ Expected: full Python SDK suite passes. Existing optional example skips may rema
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30
 git diff --check
 ```
 
@@ -1208,7 +1208,7 @@ Expected: no matches in active source. If a match appears, remove it unless it i
 Run:
 
 ```bash
-C2_RELAY_ADDRESS=http://127.0.0.1:9 uv run pytest \
+C2_RELAY_ANCHOR_ADDRESS=http://127.0.0.1:9 uv run pytest \
   sdk/python/tests/integration/test_direct_ipc_control.py::test_server_start_readiness_ignores_bad_relay_env \
   sdk/python/tests/integration/test_direct_ipc_control.py::test_ping_ignores_bad_relay_env \
   -q --timeout=30 -rs

@@ -52,8 +52,8 @@ artifact; if a review discovers a gap, update this file before continuing.
    name resolution are optional projections above the base IPC session. Relay
    must never own server identity, IPC server lifecycle, direct IPC client
    pooling, route handles, or base route transaction state.
-3. **Explicit `ipc://` bypasses relay.** A bad `C2_RELAY_ADDRESS` or bad
-   `cc.set_relay(...)` value must not affect explicit direct IPC connections.
+3. **Explicit `ipc://` bypasses relay.** A bad `C2_RELAY_ANCHOR_ADDRESS` or bad
+   `cc.set_relay_anchor(...)` value must not affect explicit direct IPC connections.
 4. **Thread-local calls remain Python direct calls.** Same-process
    `cc.connect(CRMClass, name="route")` must still pass Python objects directly
    and must not be routed through serialized Rust bytes dispatch.
@@ -151,7 +151,7 @@ documented deletion of the stale Python authority.
 - Create `sdk/python/native/src/runtime_session_ffi.rs`: PyO3 `RuntimeSession` wrapper, route-registration bridge, client acquire/release wrappers, relay projection wrappers, and outcome conversion.
 - Modify `sdk/python/native/src/server_ffi.rs`: expose any reusable server-route construction pieces needed by runtime session without duplicating callback or SHM conversion logic.
 - Modify `sdk/python/native/src/client_ffi.rs`: share or wrap native client/response types so `RuntimeSession.acquire_ipc_client()` returns the same Python-visible call surface as `RustClientPool.acquire()`.
-- Modify `sdk/python/native/src/http_ffi.rs`: share or wrap HTTP and relay-aware HTTP clients so `RuntimeSession.acquire_http_client()` and `RuntimeSession.connect_via_relay()` return the same Python-visible call surfaces as `RustHttpClient` and `RustRelayAwareHttpClient`.
+- Modify `sdk/python/native/src/http_ffi.rs` and `runtime_session_ffi.rs`: share or wrap HTTP clients and relay-selected clients so `RuntimeSession.acquire_http_client()` and `RuntimeSession.connect_via_relay()` return Python-visible call surfaces without exposing a separate relay-aware HTTP client surface.
 - Modify `sdk/python/native/src/lib.rs`: register `runtime_session_ffi`.
 - Modify `sdk/python/src/c_two/transport/registry.py`: reduce `_ProcessRegistry` to a facade over native `RuntimeSession` plus Python local binding table.
 - Modify `sdk/python/src/c_two/transport/server/native.py`: keep CRM slot and dispatcher construction, but receive native route handles/session route outcomes from `RuntimeSession`.
@@ -468,11 +468,11 @@ impl RuntimeSession {
 
 - `cargo check --manifest-path core/Cargo.toml -p c2-runtime -q`
 - `cargo check --manifest-path sdk/python/native/Cargo.toml -q`
-- `C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_runtime_session.py sdk/python/tests/unit/test_name_collision.py sdk/python/tests/unit/test_serve.py sdk/python/tests/unit/test_relay_graceful_shutdown.py sdk/python/tests/integration/test_registry.py -q --timeout=30 -rs`
+- `C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_runtime_session.py sdk/python/tests/unit/test_name_collision.py sdk/python/tests/unit/test_serve.py sdk/python/tests/unit/test_relay_graceful_shutdown.py sdk/python/tests/integration/test_registry.py -q --timeout=30 -rs`
   → `77 passed`
 - `cargo test --manifest-path core/Cargo.toml -p c2-server -q`
 - `cargo test --manifest-path core/Cargo.toml -p c2-runtime -q`
-- `C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/integration/test_direct_ipc_control.py sdk/python/tests/integration/test_zero_copy_ipc.py sdk/python/tests/integration/test_remote_scheduler_config.py -q --timeout=30 -rs`
+- `C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/integration/test_direct_ipc_control.py sdk/python/tests/integration/test_zero_copy_ipc.py sdk/python/tests/integration/test_remote_scheduler_config.py -q --timeout=30 -rs`
   → `22 passed`
 
 **Phase exit criteria:**
@@ -597,7 +597,7 @@ Commands run during implementation:
 ```bash
 cargo test --manifest-path core/Cargo.toml -p c2-runtime -q
 cargo check --manifest-path sdk/python/native/Cargo.toml -q
-C2_RELAY_ADDRESS= uv run pytest \
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest \
   sdk/python/tests/unit/test_name_collision.py \
   sdk/python/tests/unit/test_relay_graceful_shutdown.py \
   sdk/python/tests/unit/test_runtime_session.py \
@@ -607,7 +607,7 @@ C2_RELAY_ADDRESS= uv run pytest \
   sdk/python/tests/integration/test_registry.py::TestErrors::test_register_then_unregister_then_reregister \
   -q --timeout=30 -rs
 
-C2_RELAY_ADDRESS= uv run pytest \
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest \
   sdk/python/tests/unit/test_runtime_session.py \
   sdk/python/tests/unit/test_name_collision.py \
   sdk/python/tests/unit/test_serve.py \
@@ -638,7 +638,7 @@ relay to direct IPC.
 **Implementation status:** implemented in the current worktree. Relay remains an
 optional projection above the standalone IPC session. `RuntimeSession` now stores
 the explicit relay address override, resolves the effective relay address from
-that override or `C2_RELAY_ADDRESS`, owns the reusable relay control-client
+that override or `C2_RELAY_ANCHOR_ADDRESS`, owns the reusable relay control-client
 projection/cache, performs relay registration/unregistration through `c2-http`,
 exposes `connect_via_relay()` for name-only relay connections, and exposes
 explicit HTTP address acquire/release/refcount/shutdown methods over the native
@@ -650,15 +650,23 @@ identity, server lifecycle, direct IPC clients, route handles, or scheduling.
 
 ```rust
 impl RuntimeSession {
-    pub fn set_relay_address(&self, relay_address: Option<String>);
-    pub fn relay_address_override(&self) -> Option<String>;
-    pub fn effective_relay_address(&self) -> Result<Option<String>, RuntimeSessionError>;
-    pub fn connect_via_relay(
+    pub fn set_relay_anchor_address(&self, relay_address: Option<String>);
+    pub fn relay_anchor_address_override(&self) -> Option<String>;
+    pub fn effective_relay_anchor_address(&self) -> Result<Option<String>, RuntimeSessionError>;
+    pub fn resolve_relay_connection(
         &self,
         route_name: &str,
         relay_use_proxy: bool,
         max_attempts: usize,
-    ) -> Result<Arc<RelayAwareHttpClient>, RuntimeSessionError>;
+        call_timeout_secs: f64,
+    ) -> Result<RelayResolvedConnection, RuntimeSessionError>;
+    pub fn connect_relay_http_client(
+        &self,
+        route_name: &str,
+        relay_use_proxy: bool,
+        max_attempts: usize,
+        call_timeout_secs: f64,
+    ) -> Result<(RelayAwareHttpClient, String), RuntimeSessionError>;
     pub fn clear_relay_projection_cache(&self);
 }
 
@@ -671,10 +679,10 @@ impl PyRuntimeSession {
 }
 ```
 
-PyO3 exposes `RuntimeSession.set_relay_address(...)`,
-`relay_address_override`, `effective_relay_address`,
-`connect_via_relay(name) -> RustRelayAwareHttpClient`, and explicit HTTP
-client pool projection methods so `registry.py` does not construct or cache
+PyO3 exposes `RuntimeSession.set_relay_anchor_address(...)`,
+`relay_anchor_address_override`, `effective_relay_anchor_address`,
+`connect_via_relay(name) -> RelayConnectedClient`, and explicit HTTP client
+pool projection methods so `registry.py` does not construct or cache
 relay-aware/control clients or own `RustHttpClientPool.instance()` itself.
 
 **Relay rules:**
@@ -682,13 +690,14 @@ relay-aware/control clients or own `RustHttpClientPool.instance()` itself.
 - `connect(..., address=None)` checks Python thread-local binding first.
 - If no local binding exists and no relay address resolves, Python raises the
   existing lookup error.
-- If relay address resolves, session creates a Rust `RelayAwareHttpClient`,
-  resolves/probes the route, and returns the native HTTP handle to the Python
+- If relay address resolves, the native session resolves a concrete relay target:
+  local `ipc://` routes become IPC clients, and HTTP routes are probed before
+  returning a `RelayConnectedClient` to the Python
   proxy.
 - Relay route max attempts and proxy policy are resolved through Rust
   `c2-config` in the PyO3 boundary only when a relay path is actually used, so
   malformed relay proxy env values do not break no-relay direct IPC paths.
-- `set_relay()` changes the native projection address; Python must not cache
+- `set_relay_anchor()` changes the native projection address; Python must not cache
   `RustRelayControlClient`, `_relay_control_client`, or `_relay_control_address`.
 - Registration starts the local IPC server before relay projection when an
   effective relay address exists, even when Python passes `relay_address=None`;
@@ -709,10 +718,10 @@ relay-aware/control clients or own `RustHttpClientPool.instance()` itself.
     `RuntimeSession.connect_via_relay()`;
   - real relay missing route maps to `ResourceNotFound`;
   - relay unavailable maps to `RegistryUnavailable`;
-  - `cc.set_relay()` updates `RuntimeSession.relay_address_override` and resets the
+  - `cc.set_relay_anchor()` updates `RuntimeSession.relay_anchor_address_override` and resets the
     session-owned relay projection when the address changes;
   - `registry.py` no longer has Python relay-control cache fields or direct
-    `RustRelayAwareHttpClient` construction;
+    relay-aware HTTP client construction;
   - explicit `ipc://` still works with relay unset or bad relay/proxy env;
   - relay registration starts the IPC server before relay upstream validation;
   - explicit HTTP `cc.connect(..., address=relay_url)` increments and releases
@@ -725,14 +734,14 @@ relay-aware/control clients or own `RustHttpClientPool.instance()` itself.
 ```bash
 cargo check --manifest-path sdk/python/native/Cargo.toml -q
 cargo test --manifest-path core/Cargo.toml -p c2-runtime -q
-C2_RELAY_ADDRESS= uv run pytest \
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest \
   sdk/python/tests/unit/test_runtime_session.py \
   sdk/python/tests/unit/test_relay_graceful_shutdown.py \
   sdk/python/tests/unit/test_ipc_config.py \
   sdk/python/tests/unit/test_sdk_boundary.py \
   sdk/python/tests/integration/test_registry.py \
   -q --timeout=30 -rs
-C2_RELAY_ADDRESS= uv run pytest \
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest \
   sdk/python/tests/integration/test_http_relay.py::TestCcConnectHttp::test_no_address_connect_uses_runtime_session_relay_projection \
   sdk/python/tests/integration/test_http_relay.py::TestCcConnectHttp::test_no_address_relay_connect_maps_missing_route_to_resource_not_found \
   sdk/python/tests/integration/test_http_relay.py::TestCcConnectHttp::test_connect_http_close_releases_pool \
@@ -747,7 +756,7 @@ Latest focused rerun after moving explicit HTTP pooling through
 ```bash
 cargo check --manifest-path sdk/python/native/Cargo.toml -q
 cargo test --manifest-path core/Cargo.toml -p c2-runtime -q
-C2_RELAY_ADDRESS= uv run pytest \
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest \
   sdk/python/tests/unit/test_runtime_session.py \
   sdk/python/tests/unit/test_sdk_boundary.py \
   sdk/python/tests/unit/test_ipc_config.py \
@@ -817,7 +826,7 @@ stale agent guidance from becoming the next SDK's reference implementation.
 - The plan is updated to reflect the final ownership split.
 - AGENTS and SDK guidance no longer describe deleted Python-owned behavior as
   supported.
-- `rg` checks for deleted private state names, direct `RustRelayAwareHttpClient`
+- `rg` checks for deleted private state names, direct relay-aware HTTP client
   or `RustHttpClientPool` construction in `registry.py`, and stale ownership
   claims are recorded in this section before the phase closes.
 
@@ -866,8 +875,8 @@ for stale in [
     assert stale not in docs, stale
 PY
 
-C2_RELAY_ADDRESS= uv run pytest \
-  sdk/python/tests/unit/test_runtime_session.py::test_set_relay_blank_clears_native_override \
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest \
+  sdk/python/tests/unit/test_runtime_session.py::test_set_relay_anchor_blank_clears_native_override \
   sdk/python/tests/unit/test_runtime_session.py::test_runtime_session_shutdown_drains_explicit_http_pool \
   sdk/python/tests/unit/test_sdk_boundary.py::test_registry_does_not_own_relay_control_plane_mechanisms \
   -q --timeout=30 -rs
@@ -876,7 +885,7 @@ C2_RELAY_ADDRESS= uv run pytest \
 Observed result: the source assertion returned no stale registry/runtime
 authority matches in production code or stale docs, and the focused pytest
 checks passed. The blank-relay regression test was added after review found
-that `cc.set_relay("   ")` cleared `settings` but left an empty native relay
+that `cc.set_relay_anchor("   ")` cleared `settings` but left an empty native relay
 override; the Python facade now projects the cleaned settings value into
 `RuntimeSession`.
 
@@ -981,9 +990,9 @@ verification set before the phase is considered done:
 git diff --check
 cargo test --manifest-path core/Cargo.toml --workspace
 uv sync --reinstall-package c-two
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30 -rs
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30 -rs
 uv sync --group examples
-C2_RELAY_ADDRESS= uv run pytest \
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest \
   sdk/python/tests/integration/test_http_relay.py \
   sdk/python/tests/integration/test_relay_mesh.py \
   sdk/python/tests/integration/test_registry.py \
@@ -996,7 +1005,7 @@ Relay tests must be run with a local `c3` available:
 
 ```bash
 python tools/dev/c3_tool.py --build --link
-C2_RELAY_ADDRESS= uv run pytest \
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest \
   sdk/python/tests/integration/test_http_relay.py \
   sdk/python/tests/integration/test_relay_mesh.py \
   -q --timeout=30 -rs
@@ -1008,7 +1017,7 @@ development Python when available:
 
 ```bash
 UV_PYTHON=3.10 uv sync --reinstall-package c-two
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30 -rs
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30 -rs
 ```
 
 ## Phase Acceptance Rules

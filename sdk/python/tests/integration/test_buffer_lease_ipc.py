@@ -98,10 +98,10 @@ def test_client_hold_inline_response_counts_and_releases_without_copy():
 
 def test_client_hold_shm_response_counts_and_releases_without_relay(monkeypatch):
     settings.shm_threshold = 1024
-    monkeypatch.delenv("C2_RELAY_ADDRESS", raising=False)
+    monkeypatch.delenv("C2_RELAY_ANCHOR_ADDRESS", raising=False)
     cc.register(PayloadCRM, PayloadResource(), name="payload")
     cc.serve(blocking=False)
-    monkeypatch.setenv("C2_RELAY_ADDRESS", "http://127.0.0.1:9")
+    monkeypatch.setenv("C2_RELAY_ANCHOR_ADDRESS", "http://127.0.0.1:9")
     client = _connect_payload()
     try:
         held = cc.hold(client.payload)(8192)
@@ -126,7 +126,7 @@ def test_client_hold_shm_response_counts_and_releases_without_relay(monkeypatch)
 @pytest.mark.parametrize("size", [16, 8192])
 def test_client_hold_deserialize_only_response_counts_until_release(monkeypatch, size):
     settings.shm_threshold = 1024
-    monkeypatch.delenv("C2_RELAY_ADDRESS", raising=False)
+    monkeypatch.delenv("C2_RELAY_ANCHOR_ADDRESS", raising=False)
     route_name = f"deserialize_only_payload_{size}"
     cc.register(DeserializeOnlyPayloadCRM, DeserializeOnlyPayloadResource(), name=route_name)
     cc.serve(blocking=False)
@@ -257,7 +257,7 @@ class BadInputResource:
 
 def test_resource_input_from_buffer_failure_uses_specific_error_and_releases_request(monkeypatch):
     settings.shm_threshold = 1024
-    monkeypatch.delenv("C2_RELAY_ADDRESS", raising=False)
+    monkeypatch.delenv("C2_RELAY_ANCHOR_ADDRESS", raising=False)
     cc.register(BadInputCRM, BadInputResource(), name="bad_input_from_buffer")
     cc.serve(blocking=False)
     address = cc.server_address()
@@ -301,7 +301,7 @@ class BadOutputResource:
 @pytest.mark.parametrize("size", [16, 8192])
 def test_client_output_from_buffer_failure_releases_response_for_inline_and_shm(monkeypatch, size):
     settings.shm_threshold = 1024
-    monkeypatch.delenv("C2_RELAY_ADDRESS", raising=False)
+    monkeypatch.delenv("C2_RELAY_ANCHOR_ADDRESS", raising=False)
     route_name = f"bad_output_from_buffer_{size}"
     cc.register(BadOutputCRM, BadOutputResource(), name=route_name)
     cc.serve(blocking=False)

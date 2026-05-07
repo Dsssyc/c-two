@@ -55,7 +55,7 @@ def _stop_process(proc: subprocess.Popen[str]) -> None:
 def _example_env() -> dict[str, str]:
     env = os.environ.copy()
     env["C2_ENV_FILE"] = ""
-    env["C2_RELAY_ADDRESS"] = ""
+    env["C2_RELAY_ANCHOR_ADDRESS"] = ""
     env["NO_PROXY"] = "127.0.0.1,localhost"
     env["no_proxy"] = "127.0.0.1,localhost"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -93,7 +93,7 @@ def test_ipc_example():
             cwd=root,
             env={
                 **_example_env(),
-                "C2_RELAY_ADDRESS": "http://127.0.0.1:1",
+                "C2_RELAY_ANCHOR_ADDRESS": "http://127.0.0.1:1",
             },
             capture_output=True,
             text=True,

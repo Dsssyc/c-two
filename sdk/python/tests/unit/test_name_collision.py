@@ -90,8 +90,8 @@ class TestServerNameCollision:
         events: list[str] = []
 
         class FakeRuntimeSession:
-            def unregister_route(self, rust_server, name, relay_address=None):  # noqa: ANN001, ARG002
-                events.append(f'native_unregister:{name}:{relay_address}')
+            def unregister_route(self, rust_server, name, relay_anchor_address=None):  # noqa: ANN001, ARG002
+                events.append(f'native_unregister:{name}:{relay_anchor_address}')
                 return {
                     'route_name': name,
                     'local_removed': True,
@@ -128,7 +128,7 @@ class TestServerNameCollision:
         bridge.unregister_crm(
             'grid',
             runtime_session=FakeRuntimeSession(),
-            relay_address='http://relay.test',
+            relay_anchor_address='http://relay.test',
         )
 
         assert events == [
@@ -143,7 +143,7 @@ class TestServerNameCollision:
         events: list[str] = []
 
         class FakeRuntimeSession:
-            def unregister_route(self, rust_server, name, relay_address=None):  # noqa: ANN001, ARG002
+            def unregister_route(self, rust_server, name, relay_anchor_address=None):  # noqa: ANN001, ARG002
                 events.append('native_unregister_missing')
                 return {
                     'route_name': name,
@@ -189,9 +189,9 @@ class TestServerNameCollision:
         events: list[str] = []
 
         class FakeRuntimeSession:
-            def shutdown(self, rust_server, route_names=None, relay_address=None):  # noqa: ANN001, ARG002
+            def shutdown(self, rust_server, route_names=None, relay_anchor_address=None):  # noqa: ANN001, ARG002
                 events.append(
-                    f'native_shutdown:{list(route_names or [])}:{relay_address}'
+                    f'native_shutdown:{list(route_names or [])}:{relay_anchor_address}'
                 )
                 return {
                     'removed_routes': list(route_names or []),
@@ -238,7 +238,7 @@ class TestServerNameCollision:
 
         bridge.shutdown(
             runtime_session=FakeRuntimeSession(),
-            relay_address='http://relay.test',
+            relay_anchor_address='http://relay.test',
         )
 
         assert events == [
@@ -254,7 +254,7 @@ class TestServerNameCollision:
         events: list[str] = []
 
         class FakeRuntimeSession:
-            def shutdown(self, rust_server, route_names=None, relay_address=None):  # noqa: ANN001, ARG002
+            def shutdown(self, rust_server, route_names=None, relay_anchor_address=None):  # noqa: ANN001, ARG002
                 events.append(f'native_shutdown:{list(route_names or [])}')
                 return {
                     'removed_routes': [],
@@ -309,7 +309,7 @@ class TestServerNameCollision:
         events: list[str] = []
 
         class FakeRuntimeSession:
-            def shutdown(self, rust_server, route_names=None, relay_address=None):  # noqa: ANN001, ARG002
+            def shutdown(self, rust_server, route_names=None, relay_anchor_address=None):  # noqa: ANN001, ARG002
                 events.append(f'native_shutdown:{list(route_names or [])}')
                 return {
                     'removed_routes': [],
@@ -409,10 +409,10 @@ class TestRegistryNameCollision:
     def _clean_registry(self):
         """Reset the global registry before/after each test."""
         _ProcessRegistry.reset()
-        settings.relay_address = None
+        settings.relay_anchor_address = None
         yield
         _ProcessRegistry.reset()
-        settings.relay_address = None
+        settings.relay_anchor_address = None
 
     def test_duplicate_name_raises(self):
         registry = _ProcessRegistry.get()

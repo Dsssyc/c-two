@@ -1,6 +1,7 @@
 //! Relay-aware HTTP client with route failover.
 
 use std::collections::HashSet;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,11 +19,30 @@ struct RelayErrorBody {
 #[derive(Debug, Clone, Copy)]
 pub struct RelayAwareClientConfig {
     pub max_attempts: usize,
+    pub call_timeout_secs: f64,
 }
 
 impl Default for RelayAwareClientConfig {
     fn default() -> Self {
-        Self { max_attempts: 3 }
+        Self {
+            max_attempts: 3,
+            call_timeout_secs: 300.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayResolvedTarget {
+    Ipc { address: String },
+    Http { relay_url: String },
+}
+
+impl RelayResolvedTarget {
+    pub fn as_url(&self) -> &str {
+        match self {
+            Self::Ipc { address } => address,
+            Self::Http { relay_url } => relay_url,
+        }
     }
 }
 
@@ -33,6 +53,7 @@ pub struct RelayAwareHttpClient {
     use_proxy: bool,
     config: RelayAwareClientConfig,
     current: Mutex<Option<String>>,
+    anchor_allows_local_ipc: bool,
 }
 
 impl RelayAwareHttpClient {
@@ -55,6 +76,7 @@ impl RelayAwareHttpClient {
         config: RelayAwareClientConfig,
     ) -> Self {
         Self {
+            anchor_allows_local_ipc: relay_anchor_allows_local_ipc(control.base_url()),
             control,
             pool: HttpClientPool::instance(),
             route_name: route_name.to_string(),
@@ -76,7 +98,37 @@ impl RelayAwareHttpClient {
             .block_on(self.connect_async())
     }
 
+    pub fn resolve_target(&self) -> Result<RelayResolvedTarget, HttpError> {
+        super::client::runtime()
+            .handle()
+            .block_on(self.resolve_target_async())
+    }
+
+    pub fn resolve_http_target(&self) -> Result<RelayResolvedTarget, HttpError> {
+        super::client::runtime()
+            .handle()
+            .block_on(self.resolve_http_target_async())
+    }
+
     async fn connect_async(&self) -> Result<(), HttpError> {
+        match self.select_target_async(false).await? {
+            RelayResolvedTarget::Http { .. } => Ok(()),
+            RelayResolvedTarget::Ipc { .. } => unreachable!("HTTP selection cannot return IPC"),
+        }
+    }
+
+    pub async fn resolve_target_async(&self) -> Result<RelayResolvedTarget, HttpError> {
+        self.select_target_async(true).await
+    }
+
+    pub async fn resolve_http_target_async(&self) -> Result<RelayResolvedTarget, HttpError> {
+        self.select_target_async(false).await
+    }
+
+    async fn select_target_async(
+        &self,
+        prefer_local_ipc: bool,
+    ) -> Result<RelayResolvedTarget, HttpError> {
         let attempts = self.config.max_attempts.max(1);
         let mut last_error = None;
         let mut excluded_routes = HashSet::new();
@@ -99,6 +151,12 @@ impl RelayAwareHttpClient {
                 }
             };
 
+            if let Some(address) =
+                select_local_ipc_address(prefer_local_ipc, self.anchor_allows_local_ipc, &routes)
+            {
+                return Ok(RelayResolvedTarget::Ipc { address });
+            }
+
             let ordered = self.order_routes(routes, &excluded_routes);
             if ordered.is_empty() {
                 return Err(last_error.unwrap_or_else(|| {
@@ -111,10 +169,11 @@ impl RelayAwareHttpClient {
 
             for route in ordered {
                 let relay_url = route.relay_url.trim_end_matches('/').to_string();
-                let client = match self
-                    .pool
-                    .acquire_with_proxy_policy(&relay_url, self.use_proxy)
-                {
+                let client = match self.pool.acquire_with_options(
+                    &relay_url,
+                    self.use_proxy,
+                    self.config.call_timeout_secs,
+                ) {
                     Ok(client) => RelayPoolGuard {
                         pool: self.pool,
                         relay_url: relay_url.clone(),
@@ -128,8 +187,8 @@ impl RelayAwareHttpClient {
 
                 match client.client.probe_route_async(&self.route_name).await {
                     Ok(()) => {
-                        *self.current.lock() = Some(relay_url);
-                        return Ok(());
+                        *self.current.lock() = Some(relay_url.clone());
+                        return Ok(RelayResolvedTarget::Http { relay_url });
                     }
                     Err(err) if route_is_stale(&err) => {
                         self.control.invalidate(&self.route_name);
@@ -189,10 +248,11 @@ impl RelayAwareHttpClient {
             }
             for route in ordered {
                 let relay_url = route.relay_url.trim_end_matches('/').to_string();
-                let client = match self
-                    .pool
-                    .acquire_with_proxy_policy(&relay_url, self.use_proxy)
-                {
+                let client = match self.pool.acquire_with_options(
+                    &relay_url,
+                    self.use_proxy,
+                    self.config.call_timeout_secs,
+                ) {
                     Ok(client) => RelayPoolGuard {
                         pool: self.pool,
                         relay_url: relay_url.clone(),
@@ -309,6 +369,32 @@ fn resolve_retryable(err: &HttpError) -> bool {
     )
 }
 
+fn select_local_ipc_address(
+    prefer_local_ipc: bool,
+    anchor_allows_local_ipc: bool,
+    routes: &[RelayRouteInfo],
+) -> Option<String> {
+    if !prefer_local_ipc || !anchor_allows_local_ipc {
+        return None;
+    }
+    routes.iter().find_map(|route| route.ipc_address.clone())
+}
+
+fn relay_anchor_allows_local_ipc(anchor_url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(anchor_url) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let ip_host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || ip_host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
 #[cfg(all(test, feature = "relay"))]
 mod tests {
     use super::*;
@@ -422,6 +508,30 @@ mod tests {
         (StatusCode::OK, out).into_response()
     }
 
+    async fn registry_resolve_with_local_ipc(
+        State(state): State<RegistryState>,
+        Path(name): Path<String>,
+    ) -> Response {
+        state.resolve_count.fetch_add(1, Ordering::SeqCst);
+        Json(vec![
+            RelayRouteInfo {
+                name: name.clone(),
+                relay_url: state.live_url.clone(),
+                ipc_address: None,
+                crm_ns: String::new(),
+                crm_ver: String::new(),
+            },
+            RelayRouteInfo {
+                name,
+                relay_url: state.stale_url.clone(),
+                ipc_address: Some("ipc://local-grid".to_string()),
+                crm_ns: String::new(),
+                crm_ver: String::new(),
+            },
+        ])
+        .into_response()
+    }
+
     async fn spawn_app(app: Router) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -454,7 +564,10 @@ mod tests {
             &registry_url,
             "grid",
             false,
-            RelayAwareClientConfig { max_attempts: 3 },
+            RelayAwareClientConfig {
+                max_attempts: 3,
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -496,7 +609,10 @@ mod tests {
             &registry_url,
             "grid",
             false,
-            RelayAwareClientConfig { max_attempts: 3 },
+            RelayAwareClientConfig {
+                max_attempts: 3,
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -507,6 +623,67 @@ mod tests {
 
         registry_handle.abort();
         live_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn resolve_target_prefers_local_ipc_route_without_http_probe() {
+        let resolve_count = Arc::new(AtomicUsize::new(0));
+        let registry_state = RegistryState {
+            stale_url: "http://127.0.0.1:9".to_string(),
+            live_url: "http://127.0.0.1:10".to_string(),
+            resolve_count: resolve_count.clone(),
+        };
+        let (registry_url, registry_handle) = spawn_app(
+            Router::new()
+                .route("/_resolve/{name}", get(registry_resolve_with_local_ipc))
+                .with_state(registry_state),
+        )
+        .await;
+
+        let client = RelayAwareHttpClient::new(
+            &registry_url,
+            "grid",
+            false,
+            RelayAwareClientConfig {
+                max_attempts: 3,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let target = client.resolve_target_async().await.unwrap();
+        assert_eq!(target.as_url(), "ipc://local-grid");
+        assert_eq!(
+            resolve_count.load(Ordering::SeqCst),
+            1,
+            "local IPC target selection should not probe or iterate HTTP routes"
+        );
+
+        registry_handle.abort();
+    }
+
+    #[test]
+    fn local_ipc_selection_requires_loopback_anchor() {
+        let routes = vec![RelayRouteInfo {
+            name: "grid".to_string(),
+            relay_url: "http://relay.example".to_string(),
+            ipc_address: Some("ipc://local-grid".to_string()),
+            crm_ns: String::new(),
+            crm_ver: String::new(),
+        }];
+
+        assert_eq!(
+            select_local_ipc_address(true, true, &routes).as_deref(),
+            Some("ipc://local-grid")
+        );
+        assert_eq!(select_local_ipc_address(true, false, &routes), None);
+        assert_eq!(select_local_ipc_address(false, true, &routes), None);
+
+        assert!(relay_anchor_allows_local_ipc("http://127.0.0.1:8080"));
+        assert!(relay_anchor_allows_local_ipc("http://[::1]:8080"));
+        assert!(relay_anchor_allows_local_ipc("http://localhost:8080"));
+        assert!(!relay_anchor_allows_local_ipc("http://192.0.2.10:8080"));
+        assert!(!relay_anchor_allows_local_ipc("http://relay.example:8080"));
     }
 
     #[tokio::test]
@@ -532,7 +709,10 @@ mod tests {
             &registry_url,
             "grid",
             false,
-            RelayAwareClientConfig { max_attempts: 1 },
+            RelayAwareClientConfig {
+                max_attempts: 1,
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -568,7 +748,10 @@ mod tests {
             &registry_url,
             "grid",
             false,
-            RelayAwareClientConfig { max_attempts: 1 },
+            RelayAwareClientConfig {
+                max_attempts: 1,
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -604,7 +787,10 @@ mod tests {
             &registry_url,
             "grid",
             false,
-            RelayAwareClientConfig { max_attempts: 3 },
+            RelayAwareClientConfig {
+                max_attempts: 3,
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -640,7 +826,10 @@ mod tests {
             &registry_url,
             "grid",
             false,
-            RelayAwareClientConfig { max_attempts: 1 },
+            RelayAwareClientConfig {
+                max_attempts: 1,
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -676,7 +865,10 @@ mod tests {
             &registry_url,
             "grid",
             false,
-            RelayAwareClientConfig { max_attempts: 3 },
+            RelayAwareClientConfig {
+                max_attempts: 3,
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -715,7 +907,10 @@ mod tests {
             &registry_url,
             "grid",
             false,
-            RelayAwareClientConfig { max_attempts: 3 },
+            RelayAwareClientConfig {
+                max_attempts: 3,
+                ..Default::default()
+            },
         )
         .unwrap();
 

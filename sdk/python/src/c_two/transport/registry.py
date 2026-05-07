@@ -116,13 +116,13 @@ class _ProcessRegistry:
     # Public API
     # ------------------------------------------------------------------
 
-    def set_relay(self, address: str) -> None:
-        """Set the relay address for name resolution.
+    def set_relay_anchor(self, address: str) -> None:
+        """Set the relay anchor address for name resolution.
 
-        Convenience wrapper — equivalent to setting ``C2_RELAY_ADDRESS``.
+        Convenience wrapper — equivalent to setting ``C2_RELAY_ANCHOR_ADDRESS``.
         """
-        settings.relay_address = address
-        self._runtime_session.set_relay_address(settings._relay_address)  # noqa: SLF001
+        settings.relay_anchor_address = address
+        self._runtime_session.set_relay_anchor_address(settings._relay_anchor_address)  # noqa: SLF001
 
     def set_transport_policy(self, *, shm_threshold: int | None = None) -> None:
         """Set process transport policy. Must be called before use."""
@@ -146,7 +146,7 @@ class _ProcessRegistry:
                 client_ipc_overrides=self._runtime_session.client_ipc_overrides,
                 shm_threshold=shm_threshold,
             )
-            runtime_session.set_relay_address(settings._relay_address)  # noqa: SLF001
+            runtime_session.set_relay_anchor_address(settings._relay_anchor_address)  # noqa: SLF001
             self._runtime_session = runtime_session
 
     def set_server(
@@ -204,7 +204,7 @@ class _ProcessRegistry:
         On the first call, a :class:`Server` is created and started
         automatically (lazy init).
 
-        If ``C2_RELAY_ADDRESS`` is set, the CRM is also registered with
+        If ``C2_RELAY_ANCHOR_ADDRESS`` is set, the CRM is also registered with
         the relay server through the Rust relay control client. A
         connection failure or non-2xx response raises an error.
 
@@ -247,7 +247,7 @@ class _ProcessRegistry:
                     concurrency,
                     name=name,
                     runtime_session=self._runtime_session,
-                    relay_address=None,
+                    relay_anchor_address=None,
                 )
 
                 # Start server if not yet running.
@@ -353,12 +353,23 @@ class _ProcessRegistry:
                         f'and no address was provided',
                     ) from exc
                 raise RegistryUnavailable(f"Relay unavailable: {exc}") from exc
-            proxy = CRMProxy.http(
-                client,
-                name,
-                on_terminate=lambda: client.close(),
-                lease_tracker=lease_tracker,
-            )
+            mode = getattr(client, 'mode', 'http')
+            if mode == 'ipc':
+                proxy = CRMProxy.ipc(
+                    client,
+                    name,
+                    on_terminate=lambda: client.close(),
+                    lease_tracker=lease_tracker,
+                )
+            elif mode == 'http':
+                proxy = CRMProxy.http(
+                    client,
+                    name,
+                    on_terminate=lambda: client.close(),
+                    lease_tracker=lease_tracker,
+                )
+            else:
+                raise RegistryUnavailable(f"Unsupported relay target mode: {mode!r}")
 
         crm = crm_class()
         crm.client = proxy
@@ -376,7 +387,7 @@ class _ProcessRegistry:
     def unregister(self, name: str) -> None:
         """Remove a CRM from the registry and server.
 
-        If ``C2_RELAY_ADDRESS`` is set, the CRM is also unregistered
+        If ``C2_RELAY_ANCHOR_ADDRESS`` is set, the CRM is also unregistered
         from the relay through the Rust relay control client.
 
         Parameters
@@ -393,7 +404,7 @@ class _ProcessRegistry:
         outcome = server.unregister_crm(
             name,
             runtime_session=runtime_session,
-            relay_address=None,
+            relay_anchor_address=None,
         )
         relay_error = outcome.get('relay_error')
         if relay_error is not None:
@@ -417,7 +428,7 @@ class _ProcessRegistry:
     def shutdown(self) -> None:
         """Full cleanup — shuts down server, terminates pooled clients.
 
-        If ``C2_RELAY_ADDRESS`` is set, all registered CRMs are
+        If ``C2_RELAY_ANCHOR_ADDRESS`` is set, all registered CRMs are
         unregistered from the relay before shutting down.
 
         Called automatically at process exit via :func:`atexit`.
@@ -429,13 +440,13 @@ class _ProcessRegistry:
             self._runtime_session = RuntimeSession(shm_threshold=settings.shm_threshold)
             self._server = None
 
-        runtime_session.set_relay_address(settings._relay_address)  # noqa: SLF001
+        runtime_session.set_relay_anchor_address(settings._relay_anchor_address)  # noqa: SLF001
 
         if server is not None:
             try:
                 outcome = server.shutdown(
                     runtime_session=runtime_session,
-                    relay_address=None,
+                    relay_anchor_address=None,
                 )
             except Exception:
                 log.warning('Error shutting down Server', exc_info=True)
@@ -445,7 +456,7 @@ class _ProcessRegistry:
                 outcome = dict(runtime_session.shutdown(
                     None,
                     route_names=[],
-                    relay_address=None,
+                    relay_anchor_address=None,
                 ))
             except Exception:
                 log.warning('Error shutting down RuntimeSession', exc_info=True)
@@ -575,7 +586,7 @@ class _ProcessRegistry:
         return self._server is not None and self._server.is_started()
 
     def _sync_relay_override(self) -> None:
-        self._runtime_session.set_relay_address(settings._relay_address)  # noqa: SLF001
+        self._runtime_session.set_relay_anchor_address(settings._relay_anchor_address)  # noqa: SLF001
 
 
 
@@ -602,9 +613,9 @@ def set_client(*, ipc_overrides: ClientIPCOverrides | None = None) -> None:
     _ProcessRegistry.get().set_client(ipc_overrides=ipc_overrides)
 
 
-def set_relay(address: str) -> None:
-    """Set the relay address for name resolution."""
-    _ProcessRegistry.get().set_relay(address)
+def set_relay_anchor(address: str) -> None:
+    """Set the relay anchor address for name resolution."""
+    _ProcessRegistry.get().set_relay_anchor(address)
 
 
 def register(

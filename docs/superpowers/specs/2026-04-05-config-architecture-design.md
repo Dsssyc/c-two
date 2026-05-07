@@ -34,7 +34,7 @@ Configuration is scattered and drifting:
 | **Duplicate defaults** | Python `IPCConfig` (in `transport/ipc/frame.py`) and Rust `IpcConfig` (in `c2-config/src/ipc.rs`) each define their own defaults; 6+ fields disagree |
 | **Partial FFI pass-through** | Python passes ~9 of 18 fields; Rust fills the rest with `..IpcConfig::default()`, causing silent config drift |
 | **Wrong module location** | Python `IPCConfig` lives in `transport/ipc/frame.py` — a transport-internal module, not discoverable as config |
-| **No .env support for IPC fields** | Only `C2_IPC_ADDRESS`, `C2_RELAY_ADDRESS`, `C2_ENV_FILE` are env-configurable; pool sizes, heartbeat, chunk params are not |
+| **No .env support for IPC fields** | Only `C2_IPC_ADDRESS`, `C2_RELAY_ANCHOR_ADDRESS`, `C2_ENV_FILE` are env-configurable; pool sizes, heartbeat, chunk params are not |
 | **Mutable config** | Python `IPCConfig` is a regular dataclass — can be mutated after construction, risking runtime inconsistency |
 | **Type inconsistency** | Some Rust fields are `u64`, others `usize`; Python uses `int` for everything |
 | **No server/client split** | One monolithic config struct serves both roles despite different field sets |
@@ -94,7 +94,7 @@ class C2Settings(BaseSettings):
 
     # Transport addresses
     ipc_address: str | None = None          # C2_IPC_ADDRESS
-    relay_address: str | None = None        # C2_RELAY_ADDRESS
+    relay_address: str | None = None        # C2_RELAY_ANCHOR_ADDRESS
     env_file: str = '.env'                  # C2_ENV_FILE
 
     # Hardware-related global param
@@ -776,6 +776,6 @@ All other fields use the `BaseIPCConfig` defaults.
 | Field | Type | Default | Env Var |
 |-------|------|---------|---------|
 | `ipc_address` | `str \| None` | `None` | `C2_IPC_ADDRESS` |
-| `relay_address` | `str \| None` | `None` | `C2_RELAY_ADDRESS` |
+| `relay_address` | `str \| None` | `None` | `C2_RELAY_ANCHOR_ADDRESS` |
 | `shm_threshold` | `int` | 4,096 | `C2_SHM_THRESHOLD` |
 | `env_file` | `str` | `.env` | `C2_ENV_FILE` |

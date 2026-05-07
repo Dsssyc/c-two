@@ -969,7 +969,7 @@ Expected: maturin finds the Cargo.toml at the new path, builds successfully.
 - [ ] **Step 3: Run full Python test suite**
 
 ```bash
-C2_RELAY_ADDRESS= C2_ENV_FILE= uv run pytest tests/ -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= C2_ENV_FILE= uv run pytest tests/ -q --timeout=30
 ```
 
 Expected: 553 tests pass (same as before restructure). Python imports are unchanged — `from c_two._native import ...` still works because c2-ffi exports the same pyclass names.
@@ -1060,7 +1060,7 @@ cd src/c_two/_native && cargo check --workspace
 cargo test -p c2-wire -p c2-mem
 
 # Python tests pass (run from repo root)
-cd ../../.. && C2_RELAY_ADDRESS= C2_ENV_FILE= uv run pytest tests/ -q --timeout=30
+cd ../../.. && C2_RELAY_ANCHOR_ADDRESS= C2_ENV_FILE= uv run pytest tests/ -q --timeout=30
 ```
 
 Expected: all green.

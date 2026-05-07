@@ -27,7 +27,7 @@ for entry in "1000:1K:30" "10000:10K:30" "100000:100K:20" "1000000:1M:10" "30000
       continue
     fi
     echo "==> N=$LBL ($N) variant=$V iters=$ITERS"
-    line=$(C2_RELAY_ADDRESS= uv run python sdk/python/benchmarks/kostya_ctwo_benchmark.py \
+    line=$(C2_RELAY_ANCHOR_ADDRESS= uv run python sdk/python/benchmarks/kostya_ctwo_benchmark.py \
       --variant "$V" --n "$N" --iters "$ITERS" --warmup 3 2>&1 | tail -5)
     p10=$(echo "$line" | awk '/^  p10/{print $2}')
     p50=$(echo "$line" | awk '/^  p50/{print $2}')

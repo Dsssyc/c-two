@@ -200,7 +200,7 @@ Run:
 ```bash
 cargo test --manifest-path core/Cargo.toml -p c2-mem
 cargo check --manifest-path sdk/python/native/Cargo.toml -q
-C2_RELAY_ADDRESS= uv run pytest \
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest \
   sdk/python/tests/unit/test_hold_registry.py \
   sdk/python/tests/unit/test_held_result.py \
   sdk/python/tests/integration/test_transfer_hold.py \
@@ -695,7 +695,7 @@ def test_native_buffer_lease_tracker_rejects_invalid_labels():
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_native_buffer_lease.py -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_native_buffer_lease.py -q --timeout=30
 ```
 
 Expected: failure because `_native.BufferLeaseTracker` is not exported.
@@ -928,7 +928,7 @@ Run:
 ```bash
 cargo check --manifest-path sdk/python/native/Cargo.toml -q
 uv sync --reinstall-package c-two
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_native_buffer_lease.py -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_native_buffer_lease.py -q --timeout=30
 ```
 
 Expected: cargo check passes and the new Python native lease tests pass.
@@ -984,7 +984,7 @@ def test_native_buffer_classes_expose_track_retained_methods():
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_native_buffer_lease.py::test_native_buffer_classes_expose_track_retained_methods -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_native_buffer_lease.py::test_native_buffer_classes_expose_track_retained_methods -q --timeout=30
 ```
 
 Expected: failure because `ResponseBuffer.track_retained` and `ShmBuffer.track_retained` do not exist.
@@ -1152,7 +1152,7 @@ Run:
 ```bash
 cargo check --manifest-path sdk/python/native/Cargo.toml -q
 uv sync --reinstall-package c-two
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_native_buffer_lease.py -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_native_buffer_lease.py -q --timeout=30
 ```
 
 Expected: native build passes and tests pass.
@@ -1224,7 +1224,7 @@ def test_runtime_session_lease_tracker_is_shared_by_stats():
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_buffer_lease.py -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_buffer_lease.py -q --timeout=30
 ```
 
 Expected: failure because `RuntimeSession.lease_tracker()` and `RuntimeSession.hold_stats()` do not exist.
@@ -1296,7 +1296,7 @@ Run:
 ```bash
 cargo check --manifest-path sdk/python/native/Cargo.toml -q
 uv sync --reinstall-package c-two
-C2_RELAY_ADDRESS= uv run pytest \
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest \
   sdk/python/tests/unit/test_buffer_lease.py \
   sdk/python/tests/unit/test_runtime_session.py \
   -q --timeout=30 -rs
@@ -1409,7 +1409,7 @@ def test_client_hold_inline_response_counts_and_releases_without_copy():
 
 def test_client_hold_shm_response_counts_and_releases_without_relay(monkeypatch):
     settings.shm_threshold = 1024
-    monkeypatch.setenv("C2_RELAY_ADDRESS", "http://127.0.0.1:9")
+    monkeypatch.setenv("C2_RELAY_ANCHOR_ADDRESS", "http://127.0.0.1:9")
     cc.register(PayloadCRM, PayloadResource(), name="payload")
     cc.serve(blocking=False)
     client = _connect_payload()
@@ -1449,7 +1449,7 @@ def test_client_hold_drop_releases_retained_response():
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/integration/test_buffer_lease_ipc.py -q --timeout=30 -rs
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/integration/test_buffer_lease_ipc.py -q --timeout=30 -rs
 ```
 
 Expected: failures because `CRMProxy` does not expose a lease tracker and client-side hold does not call `ResponseBuffer.track_retained()`.
@@ -1562,7 +1562,7 @@ This ordering is deliberate: failed `from_buffer()` paths must not leave stale r
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest \
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest \
   sdk/python/tests/integration/test_buffer_lease_ipc.py \
   sdk/python/tests/unit/test_held_result.py \
   -q --timeout=30 -rs
@@ -1650,7 +1650,7 @@ This test expects `hold_stats()` to include `by_direction`. Task 6 adds that fie
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/integration/test_buffer_lease_ipc.py::test_resource_input_hold_counts_inline_or_shm_until_request_buffer_release -q --timeout=30 -rs
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/integration/test_buffer_lease_ipc.py::test_resource_input_hold_counts_inline_or_shm_until_request_buffer_release -q --timeout=30 -rs
 ```
 
 Expected: failure because server-side hold still uses Python `HoldRegistry` and native stats do not include resource-input retained leases.
@@ -1792,7 +1792,7 @@ Run:
 cargo test --manifest-path core/Cargo.toml -p c2-mem
 cargo check --manifest-path sdk/python/native/Cargo.toml -q
 uv sync --reinstall-package c-two
-C2_RELAY_ADDRESS= uv run pytest \
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest \
   sdk/python/tests/integration/test_buffer_lease_ipc.py \
   sdk/python/tests/unit/test_sdk_boundary.py \
   sdk/python/tests/unit/test_name_collision.py \
@@ -1879,7 +1879,7 @@ This test covers the examples/grid shape without adding optional `pyarrow` to th
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/integration/test_buffer_lease_ipc.py::test_grid_like_hold_is_storage_transparent_for_inline_and_shm -q --timeout=30 -rs
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/integration/test_buffer_lease_ipc.py::test_grid_like_hold_is_storage_transparent_for_inline_and_shm -q --timeout=30 -rs
 ```
 
 Expected: test passes, proving small inline and large SHM/handle retained results share one public `cc.hold()` lifecycle.
@@ -1909,8 +1909,8 @@ or for table/list-returning helpers, call the same `deserialize_to_table(memoryv
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_python_examples_syntax.py -q --timeout=30 -rs
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/integration/test_python_examples.py -q --timeout=30 -rs
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_python_examples_syntax.py -q --timeout=30 -rs
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/integration/test_python_examples.py -q --timeout=30 -rs
 ```
 
 Expected: syntax tests pass. Integration examples pass if optional dependencies and local relay binary are available, or skip with explicit dependency/relay skip reasons.
@@ -2054,7 +2054,7 @@ Expected: native crate checks and Python package rebuild succeeds.
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest \
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest \
   sdk/python/tests/unit/test_native_buffer_lease.py \
   sdk/python/tests/unit/test_buffer_lease.py \
   sdk/python/tests/unit/test_sdk_boundary.py \
@@ -2073,7 +2073,7 @@ Expected: focused tests pass. Skips are acceptable only for pre-existing optiona
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30 -rs
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30 -rs
 ```
 
 Expected: full Python suite passes. Existing optional example skips may remain if examples dependencies are not installed.
@@ -2118,7 +2118,7 @@ Expected: retained tracking appears after successful hold output construction an
 Run:
 
 ```bash
-C2_RELAY_ADDRESS=http://127.0.0.1:9 uv run pytest \
+C2_RELAY_ANCHOR_ADDRESS=http://127.0.0.1:9 uv run pytest \
   sdk/python/tests/integration/test_buffer_lease_ipc.py::test_client_hold_shm_response_counts_and_releases_without_relay \
   sdk/python/tests/integration/test_direct_ipc_control.py \
   -q --timeout=30 -rs

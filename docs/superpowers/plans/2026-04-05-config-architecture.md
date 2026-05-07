@@ -513,7 +513,7 @@ Expected: all tests pass
 Run: `uv sync --reinstall-package c-two`
 Expected: builds successfully (FFI params unchanged → Python still works)
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/unit/ -q --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/unit/ -q --timeout=30`
 Expected: all unit tests pass
 
 ---
@@ -954,7 +954,7 @@ class TestBuildClientConfig:
 
 - [ ] **Step 3: Run tests**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/unit/test_ipc_config.py -v`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/unit/test_ipc_config.py -v`
 Expected: all tests pass
 
 - [ ] **Step 4: Commit**
@@ -1385,10 +1385,10 @@ Expected: builds successfully
 
 - [ ] **Step 2: Quick smoke test**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/unit/test_ipc_config.py -v`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/unit/test_ipc_config.py -v`
 Expected: all new config tests pass
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/unit/test_encoding.py -q --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/unit/test_encoding.py -q --timeout=30`
 Expected: existing unit tests still pass (no import breakage)
 
 **Note:** Integration tests may fail at this point due to old `IPCConfig` imports — that is fixed in Phase 4.
@@ -1522,7 +1522,7 @@ Expected: builds successfully
 
 - [ ] **Step 2: Run full test suite**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30`
 Expected: all 520+ tests pass
 
 - [ ] **Step 3: Run Rust tests**

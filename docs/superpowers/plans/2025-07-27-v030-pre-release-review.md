@@ -306,7 +306,7 @@ class TestUpstreamPoolShutdown:
 
 - [ ] **Step 2: Run tests to verify they pass**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/unit/test_upstream_pool.py -v`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/unit/test_upstream_pool.py -v`
 Expected: All tests pass.
 
 - [ ] **Step 3: Commit**
@@ -344,7 +344,7 @@ Append to the existing `TestRelayClickCommand` class:
 
 - [ ] **Step 2: Run tests**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/unit/test_cli_relay.py -v`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/unit/test_cli_relay.py -v`
 Expected: All existing + new tests pass.
 
 - [ ] **Step 3: Commit**
@@ -452,7 +452,7 @@ class TestUpstreamPoolGetDeadClient:
 
 - [ ] **Step 2: Run to verify test fails**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/unit/test_upstream_pool.py::TestUpstreamPoolGetDeadClient -v`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/unit/test_upstream_pool.py::TestUpstreamPoolGetDeadClient -v`
 Expected: `test_get_detects_dead_client_and_reconnects` FAILS (current code returns dead client).
 
 - [ ] **Step 3: Fix `get()` in relay/core.py**
@@ -484,7 +484,7 @@ Replace current `get()`:
 
 - [ ] **Step 4: Run tests to verify fix**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/unit/test_upstream_pool.py -v`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/unit/test_upstream_pool.py -v`
 Expected: All pass including the new test.
 
 - [ ] **Step 5: Commit**
@@ -538,7 +538,7 @@ Expected: All pass.
 Run:
 ```bash
 uv sync --reinstall-package c-two
-C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30
 ```
 Expected: 694+ pass.
 
@@ -586,7 +586,7 @@ Run:
 ```bash
 cd src/c_two/_native/c2-relay && cargo check
 uv sync --reinstall-package c-two
-C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30
 ```
 Expected: Clean build, 694+ tests pass.
 

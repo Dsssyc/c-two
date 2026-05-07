@@ -99,7 +99,7 @@ Expected: command exits successfully.
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest tests/unit/test_check_version.py tests/unit/test_wire.py -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/unit/test_check_version.py tests/unit/test_wire.py -q --timeout=30
 ```
 
 Expected: selected tests pass.
@@ -394,7 +394,7 @@ From the repository root:
 ```bash
 uv sync
 uv sync --reinstall-package c-two
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests -q --timeout=30
 ```
 
 Run Rust checks from the repository root:
@@ -416,7 +416,7 @@ uv run python examples/python/local.py
 Python-specific benchmarks live in `benchmarks/`:
 
 ```bash
-C2_RELAY_ADDRESS= uv run python sdk/python/benchmarks/segment_size_benchmark.py
+C2_RELAY_ANCHOR_ADDRESS= uv run python sdk/python/benchmarks/segment_size_benchmark.py
 ```
 ````
 
@@ -446,7 +446,7 @@ Expected: import succeeds and prints `0.4.7`.
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/unit/test_check_version.py sdk/python/tests/unit/test_wire.py -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_check_version.py sdk/python/tests/unit/test_wire.py -q --timeout=30
 ```
 
 Expected: selected tests pass.
@@ -684,7 +684,7 @@ Output: sdk/python/src/c_two/banner_unicode.txt
 In `.github/copilot-instructions.md`, update active paths and commands:
 
 ```markdown
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30
 uv run pytest sdk/python/tests/unit/test_wire.py -q
 uv run pytest sdk/python/tests/unit/test_transferable.py::TestTransferableDecorator::test_hello_data_round_trip -q
 cd core && cargo check --workspace
@@ -713,7 +713,7 @@ Keep the Rust crate table unchanged except for the workspace path.
 In `CONTRIBUTING.md`, update test and Rust commands to:
 
 ```markdown
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30
 uv run pytest sdk/python/tests/unit/test_wire.py -q
 uv run pytest sdk/python/tests/unit/test_transferable.py::TestTransferableDecorator::test_hello_data_round_trip -q
 cd core && cargo check --workspace
@@ -941,7 +941,7 @@ Expected: command exits successfully.
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests -q --timeout=30
 ```
 
 Expected: full Python test suite passes.
@@ -968,7 +968,7 @@ Expected: `local.py` exits successfully and the import smoke prints `Grid`.
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run python - <<'PY'
+C2_RELAY_ANCHOR_ADDRESS= uv run python - <<'PY'
 import importlib.util
 from pathlib import Path
 

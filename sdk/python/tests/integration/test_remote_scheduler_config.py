@@ -15,17 +15,17 @@ from c_two.transport.server.scheduler import ConcurrencyConfig, ConcurrencyMode
 
 @pytest.fixture(autouse=True)
 def _clean_env_and_registry(monkeypatch):
-    previous_override_relay = settings._relay_address  # noqa: SLF001
+    previous_override_relay = settings._relay_anchor_address  # noqa: SLF001
     previous_override_shm_threshold = settings._shm_threshold  # noqa: SLF001
-    settings.relay_address = None
-    monkeypatch.delenv('C2_RELAY_ADDRESS', raising=False)
+    settings.relay_anchor_address = None
+    monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
     yield
     try:
         cc.shutdown()
     except Exception:
         pass
     _ProcessRegistry._instance = None  # noqa: SLF001
-    settings._relay_address = previous_override_relay  # noqa: SLF001
+    settings._relay_anchor_address = previous_override_relay  # noqa: SLF001
     settings._shm_threshold = previous_override_shm_threshold  # noqa: SLF001
 
 
@@ -384,8 +384,8 @@ def test_remote_ipc_scheduler_direct_address_ignores_bad_relay(monkeypatch):
     assert direct_address is not None
     assert direct_address.startswith('ipc://')
 
-    monkeypatch.setenv('C2_RELAY_ADDRESS', 'http://127.0.0.1:9')
-    settings.relay_address = None
+    monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', 'http://127.0.0.1:9')
+    settings.relay_anchor_address = None
 
     client = cc.connect(
         RemoteSchedulerProbe,
