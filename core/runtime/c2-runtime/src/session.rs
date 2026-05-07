@@ -374,9 +374,7 @@ impl RuntimeSession {
         } else {
             self.current_identity()
         };
-        let server_was_started = server
-            .map(|server| server.socket_path().exists())
-            .unwrap_or(false);
+        let server_was_started = server.map(|server| server.is_running()).unwrap_or(false);
         let mut outcome = ShutdownOutcome {
             server_was_started,
             ..Default::default()

@@ -168,3 +168,12 @@ def test_python_server_bridge_does_not_own_readiness_polling():
 
     start_source = inspect.getsource(NativeServerBridge.start)
     assert "start_and_wait" in start_source
+
+
+def test_runtime_session_does_not_infer_started_from_socket_file():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[4]
+    session_rs = root / "core" / "runtime" / "c2-runtime" / "src" / "session.rs"
+    source = session_rs.read_text(encoding="utf-8")
+    assert "socket_path().exists()" not in source
