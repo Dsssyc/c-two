@@ -13,17 +13,18 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyRuntimeError, PyTimeoutError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyBytes, PyDict, PyTuple};
+use pyo3::types::{PyAny, PyBytes, PyDict};
 
 use c2_config::{BaseIpcConfig, ServerIpcConfig};
 use c2_mem::MemPool;
 use c2_server::Server;
 use c2_server::dispatcher::{CrmCallback, CrmError, CrmRoute, RequestData, ResponseMeta};
+use c2_server::response::try_prepare_shm_response;
 use c2_server::scheduler::{AccessLevel, ConcurrencyMode, Scheduler, SchedulerLimits};
 
-use crate::mem_ffi::PyMemPool;
 use crate::route_concurrency_ffi::PyRouteConcurrency;
 use crate::shm_buffer::PyShmBuffer;
 
@@ -44,7 +45,7 @@ pub(crate) fn parse_concurrency_mode(mode: &str) -> PyResult<ConcurrencyMode> {
 
 pub(crate) struct PyCrmCallback {
     py_callable: Py<PyAny>,
-    response_pool_obj: Py<PyAny>,
+    shm_threshold: u64,
 }
 
 // SAFETY: Py<PyAny> is Send when accessed only under the GIL.
@@ -59,9 +60,7 @@ impl CrmCallback for PyCrmCallback {
         route_name: &str,
         method_idx: u16,
         request: RequestData,
-        // Unused: cached as self.response_pool_obj at registration time to avoid
-        // re-creating PyMemPool on every call. Trait requires it for non-FFI impls.
-        _response_pool: Arc<parking_lot::RwLock<MemPool>>,
+        response_pool: Arc<parking_lot::RwLock<MemPool>>,
     ) -> Result<ResponseMeta, CrmError> {
         Python::attach(|py| {
             // Convert RequestData → PyShmBuffer
@@ -79,15 +78,10 @@ impl CrmCallback for PyCrmCallback {
             let buf_obj = Py::new(py, shm_buf)
                 .map_err(|e| CrmError::InternalError(format!("failed to create ShmBuffer: {e}")))?;
 
-            // Call Python: dispatcher(route_name, method_idx, shm_buffer, response_pool)
-            let args = (
-                route_name,
-                method_idx,
-                buf_obj,
-                self.response_pool_obj.bind(py),
-            );
+            // Call Python: dispatcher(route_name, method_idx, shm_buffer)
+            let args = (route_name, method_idx, buf_obj);
             match self.py_callable.call1(py, args) {
-                Ok(result) => parse_response_meta(py, result),
+                Ok(result) => parse_response_meta(py, result, &response_pool, self.shm_threshold),
                 Err(e) => {
                     // Check for .error_bytes attribute (CrmCallError from Python).
                     let val = e.value(py);
@@ -134,7 +128,7 @@ pub(crate) struct BuiltRoute {
 impl PyServer {
     pub(crate) fn build_route(
         &self,
-        py: Python<'_>,
+        _py: Python<'_>,
         name: &str,
         dispatcher: Py<PyAny>,
         method_names: Vec<String>,
@@ -164,18 +158,11 @@ impl PyServer {
             map.insert(idx, level);
         }
 
-        // Create PyMemPool wrapping the server's response pool
-        let response_pool_obj: Py<PyAny> = {
-            let pool_arc = self.inner.response_pool_arc();
-            let py_pool = PyMemPool::from_arc(pool_arc);
-            Py::new(py, py_pool)?.into_any()
-        };
-
         let scheduler = Scheduler::with_limits(mode, map, limits);
         let route_handle = PyRouteConcurrency::new(scheduler.clone());
         let callback = Arc::new(PyCrmCallback {
             py_callable: dispatcher,
-            response_pool_obj,
+            shm_threshold: self.inner.response_shm_threshold(),
         });
 
         let route = CrmRoute {
@@ -390,12 +377,11 @@ impl PyServer {
     /// Register a CRM route.
     ///
     /// `dispatcher` is a Python callable:
-    /// `(route_name: str, method_idx: int, request_buffer: ShmBuffer, response_pool: MemPool) -> None | bytes | tuple`
+    /// `(route_name: str, method_idx: int, request_buffer: ShmBuffer) -> None | bytes-like`
     ///
     /// Return value conventions:
     /// - `None` → empty response
-    /// - `bytes` → inline response data
-    /// - `(seg_idx, offset, data_size, is_dedicated)` → SHM-allocated response
+    /// - `bytes` / buffer-protocol object → native response selection
     ///
     /// `method_names` lists the CRM method names indexed by method_idx.
     /// `access_map` maps method_idx → "read" or "write".
@@ -485,9 +471,13 @@ impl PyServer {
 ///
 /// Expected return types:
 /// - `None` → `ResponseMeta::Empty`
-/// - `bytes` → `ResponseMeta::Inline(vec)`
-/// - `(seg_idx: int, offset: int, data_size: int, is_dedicated: bool)` → `ResponseMeta::ShmAlloc`
-fn parse_response_meta(py: Python<'_>, result: Py<PyAny>) -> Result<ResponseMeta, CrmError> {
+/// - `bytes` / buffer-protocol object → native response selection
+fn parse_response_meta(
+    py: Python<'_>,
+    result: Py<PyAny>,
+    response_pool: &parking_lot::RwLock<MemPool>,
+    shm_threshold: u64,
+) -> Result<ResponseMeta, CrmError> {
     let result = result.bind(py);
 
     // None → Empty
@@ -495,50 +485,46 @@ fn parse_response_meta(py: Python<'_>, result: Py<PyAny>) -> Result<ResponseMeta
         return Ok(ResponseMeta::Empty);
     }
 
-    // bytes → Inline
+    // bytes → direct SHM preparation for large payloads, otherwise owned data.
     if let Ok(bytes) = result.cast::<PyBytes>() {
-        return Ok(ResponseMeta::Inline(bytes.as_bytes().to_vec()));
+        let data = bytes.as_bytes();
+        if data.is_empty() {
+            return Ok(ResponseMeta::Empty);
+        }
+        if let Some(meta) =
+            try_prepare_shm_response(response_pool, shm_threshold, data.len(), |dst| {
+                dst.copy_from_slice(data);
+                Ok(())
+            })
+            .map_err(CrmError::InternalError)?
+        {
+            return Ok(meta);
+        }
+        return Ok(ResponseMeta::Inline(data.to_vec()));
     }
 
-    // tuple (seg_idx, offset, data_size, is_dedicated) → ShmAlloc
-    if let Ok(tup) = result.cast::<PyTuple>() {
-        if tup.len() != 4 {
-            return Err(CrmError::InternalError(format!(
-                "expected 4-element tuple (seg_idx, offset, data_size, is_dedicated), got {}-element tuple",
-                tup.len()
-            )));
+    // Generic buffer exporter → direct SHM preparation for large payloads.
+    if let Ok(buffer) = PyBuffer::<u8>::get(result) {
+        let len = buffer.len_bytes();
+        if len == 0 {
+            return Ok(ResponseMeta::Empty);
         }
-        let seg_idx: u16 = tup
-            .get_item(0)
-            .map_err(|e| CrmError::InternalError(format!("bad seg_idx: {e}")))?
-            .extract()
-            .map_err(|e| CrmError::InternalError(format!("bad seg_idx: {e}")))?;
-        let offset: u32 = tup
-            .get_item(1)
-            .map_err(|e| CrmError::InternalError(format!("bad offset: {e}")))?
-            .extract()
-            .map_err(|e| CrmError::InternalError(format!("bad offset: {e}")))?;
-        let data_size: u32 = tup
-            .get_item(2)
-            .map_err(|e| CrmError::InternalError(format!("bad data_size: {e}")))?
-            .extract()
-            .map_err(|e| CrmError::InternalError(format!("bad data_size: {e}")))?;
-        let is_dedicated: bool = tup
-            .get_item(3)
-            .map_err(|e| CrmError::InternalError(format!("bad is_dedicated: {e}")))?
-            .extract()
-            .map_err(|e| CrmError::InternalError(format!("bad is_dedicated: {e}")))?;
-        return Ok(ResponseMeta::ShmAlloc {
-            seg_idx,
-            offset,
-            data_size,
-            is_dedicated,
-        });
+        if let Some(meta) = try_prepare_shm_response(response_pool, shm_threshold, len, |dst| {
+            buffer.copy_to_slice(py, dst).map_err(|e| e.to_string())
+        })
+        .map_err(CrmError::InternalError)?
+        {
+            return Ok(meta);
+        }
+        let mut data = vec![0_u8; len];
+        buffer
+            .copy_to_slice(py, &mut data)
+            .map_err(|e| CrmError::InternalError(format!("failed to copy response buffer: {e}")))?;
+        return Ok(ResponseMeta::Inline(data));
     }
 
     Err(CrmError::InternalError(
-        "dispatcher must return None, bytes, or (seg_idx, offset, data_size, is_dedicated) tuple"
-            .to_string(),
+        "dispatcher must return None or a bytes-like buffer".to_string(),
     ))
 }
 

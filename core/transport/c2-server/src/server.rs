@@ -380,6 +380,11 @@ impl Server {
         Arc::clone(&self.response_pool)
     }
 
+    /// Return the configured response SHM threshold.
+    pub fn response_shm_threshold(&self) -> u64 {
+        self.config.shm_threshold
+    }
+
     /// Return true if a route is currently registered.
     pub async fn contains_route(&self, name: &str) -> bool {
         self.dispatcher.read().await.resolve(name).is_some()

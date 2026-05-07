@@ -98,7 +98,6 @@ class NativeServerBridge:
     ) -> None:
         self._config = _resolve_server_ipc_config(ipc_overrides)
         self._address = bind_address
-        self._shm_threshold = int(self._config['shm_threshold'])
         self._default_concurrency = concurrency
 
         self._slots: dict[str, CRMSlot] = {}
@@ -123,7 +122,7 @@ class NativeServerBridge:
 
         self._rust_server = RustServer(
             address=bind_address,
-            shm_threshold=self._shm_threshold,
+            shm_threshold=int(self._config['shm_threshold']),
             pool_enabled=self._config['pool_enabled'],
             pool_segment_size=self._config['pool_segment_size'],
             max_pool_segments=self._config['max_pool_segments'],
@@ -407,20 +406,18 @@ class NativeServerBridge:
 
     def _make_dispatcher(
         self, route_name: str, slot: CRMSlot,
-    ) -> Callable[[str, int, object, object], object]:
+    ) -> Callable[[str, int, object], object]:
         """Build the Python callable passed to ``RustServer.register_route()``.
 
         The callable is invoked from Rust's ``spawn_blocking`` with the GIL
-        held.  Signature: ``(route_name, method_idx, shm_buffer, response_pool)``.
+        held.  Signature: ``(route_name, method_idx, shm_buffer)``.
         It reads the request via ``memoryview(shm_buffer)``, resolves the
-        method, calls the resource, and returns result bytes (or *None* for empty
-        responses).  For large responses (> shm_threshold), allocates from
-        ``response_pool`` SHM and returns a ``(seg_idx, offset, data_size,
-        is_dedicated)`` tuple — Rust sends the buddy frame directly.
+        method, calls the resource, and returns serialized result data (or
+        *None* for empty responses). Rust native code owns the response
+        allocation choice for inline, SHM, or chunked transport.
         """
         idx_to_name = slot.method_table._idx_to_name
         dispatch_table = slot._dispatch_table
-        shm_threshold = self._shm_threshold
 
         lease_tracker = self._lease_tracker
         hold_warn_seconds = self._hold_warn_seconds
@@ -429,7 +426,7 @@ class NativeServerBridge:
 
         def dispatch(
             _route_name: str, method_idx: int,
-            request_buf: object, response_pool: object,
+            request_buf: object,
         ) -> object:
             # 1. Resolve method
             method_name = idx_to_name.get(method_idx)
@@ -516,20 +513,6 @@ class NativeServerBridge:
                 raise CrmCallError(err_part)
             if not res_part:
                 return None
-
-            # 4. For large responses, write to response pool SHM
-            if response_pool is not None and len(res_part) > shm_threshold:
-                try:
-                    alloc = response_pool.alloc(len(res_part))
-                    response_pool.write_from_buffer(res_part, alloc)
-                    seg_idx = int(alloc.seg_idx) & 0xFFFF
-                    return (seg_idx, alloc.offset, len(res_part), alloc.is_dedicated)
-                except Exception:
-                    pass
-
-            # Inline path — must be bytes for wire encoding.
-            if isinstance(res_part, memoryview):
-                res_part = bytes(res_part)
             return res_part
 
         return dispatch
