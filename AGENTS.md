@@ -235,6 +235,14 @@ relay environment variable points at an unavailable server. Relay is only a
 discovery/forwarding projection above IPC; do not make relay the owner of IPC
 registration, scheduling, or connection establishment.
 
+Direct IPC `shutdown("ipc://...")` under `c_two.transport.client.util` is an
+admin/control-plane helper for high-privilege same-host supervisors. It stops
+the addressed native IPC server; it is not ordinary CRM business-client
+behavior and is distinct from top-level `cc.shutdown()`, which cleans up the
+current process registry. Future name-based or HTTP/relay-propagated shutdown
+must be designed as an explicit authenticated admin control plane with clear
+route-level vs server-level scope, not as a hidden normal RPC side effect.
+
 Server lifecycle/readiness belongs to Rust. Python `NativeServerBridge` may
 expose `start()`, `is_started()`, and shutdown facades, but must delegate
 readiness to native `RustServer.start_and_wait()` and native state projection.
@@ -242,7 +250,9 @@ Do not reintroduce Python socket-file polling, `os.path.exists(socket_path)`
 readiness checks, or Python-owned `_started` authority. A Rust `Server` may only
 unlink its IPC socket path after that concrete instance successfully bound the
 socket; failed duplicate startups must not remove another server's active
-socket path.
+socket path. Bridge shutdown must still call idempotent native shutdown to
+drain the PyO3 runtime handle even when native lifecycle state is already
+stopped by an external direct IPC shutdown signal.
 
 Python resource servers create an auto-generated `ipc://` address. Use
 `cc.server_address()` after registration only when a same-host process needs to

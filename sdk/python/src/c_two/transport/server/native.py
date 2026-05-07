@@ -346,11 +346,10 @@ class NativeServerBridge:
         for slot in removed_slots:
             self._invoke_shutdown(slot)
 
-        if self.is_started():
-            try:
-                self._rust_server.shutdown()
-            except Exception:
-                logger.warning('Error shutting down RustServer', exc_info=True)
+        try:
+            self._rust_server.shutdown()
+        except Exception:
+            logger.warning('Error shutting down RustServer', exc_info=True)
         return outcome
 
     # ------------------------------------------------------------------

@@ -146,3 +146,42 @@ def test_starting_second_server_does_not_unlink_active_socket(monkeypatch):
         except Exception:
             pass
         first.shutdown()
+
+
+def test_bridge_shutdown_after_direct_ipc_shutdown_allows_new_server(monkeypatch):
+    monkeypatch.delenv('C2_RELAY_ADDRESS', raising=False)
+    address = f'ipc://{_unique_region("external_shutdown")}'
+    server = Server(
+        bind_address=address,
+        crm_class=Hello,
+        crm_instance=HelloImpl(),
+        name='hello',
+    )
+    try:
+        server.start(timeout=5.0)
+        assert ping(address, timeout=0.5) is True
+        assert shutdown(address, timeout=0.5) is True
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if not ping(address, timeout=0.2):
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail('server still responds to ping after IPC shutdown')
+
+        server.shutdown()
+
+        replacement = Server(
+            bind_address=address,
+            crm_class=Hello,
+            crm_instance=HelloImpl(),
+            name='hello',
+        )
+        try:
+            replacement.start(timeout=5.0)
+            assert ping(address, timeout=0.5) is True
+        finally:
+            replacement.shutdown()
+    finally:
+        server.shutdown()

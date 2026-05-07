@@ -169,6 +169,9 @@ def test_python_server_bridge_does_not_own_readiness_polling():
     start_source = inspect.getsource(NativeServerBridge.start)
     assert "start_and_wait" in start_source
 
+    shutdown_source = inspect.getsource(NativeServerBridge.shutdown)
+    assert "if self.is_started()" not in shutdown_source
+
 
 def test_runtime_session_does_not_infer_started_from_socket_file():
     from pathlib import Path

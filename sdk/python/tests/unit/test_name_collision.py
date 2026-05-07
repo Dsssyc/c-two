@@ -304,6 +304,39 @@ class TestServerNameCollision:
         assert events == ["native_shutdown:['grid']", 'rust_shutdown']
         assert bridge.names == ['grid']
 
+    def test_shutdown_drains_native_runtime_even_when_lifecycle_stopped(self):
+        """Bridge cleanup must not use native lifecycle as runtime-drain gate."""
+        events: list[str] = []
+
+        class FakeRuntimeSession:
+            def shutdown(self, rust_server, route_names=None, relay_address=None):  # noqa: ANN001, ARG002
+                events.append(f'native_shutdown:{list(route_names or [])}')
+                return {
+                    'removed_routes': [],
+                    'relay_errors': [],
+                    'server_was_started': False,
+                    'ipc_clients_drained': True,
+                    'http_clients_drained': False,
+                }
+
+        class FakeRustServer:
+            @property
+            def is_running(self) -> bool:
+                return False
+
+            def shutdown(self) -> None:
+                events.append('rust_shutdown')
+
+        bridge = object.__new__(NativeServerBridge)
+        bridge._slots = {}  # noqa: SLF001
+        bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
+        bridge._default_name = None  # noqa: SLF001
+        bridge._rust_server = FakeRustServer()  # noqa: SLF001
+
+        bridge.shutdown(runtime_session=FakeRuntimeSession())
+
+        assert events == ['native_shutdown:[]', 'rust_shutdown']
+
     def test_register_rolls_back_python_slot_when_rust_registration_fails(self, monkeypatch):
         events: list[str] = []
 

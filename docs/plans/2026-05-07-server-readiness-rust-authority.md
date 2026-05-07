@@ -19,6 +19,12 @@ instance successfully bound its socket before allowing that instance to unlink
 the socket during shutdown. This is part of the issue6 readiness/lifecycle
 boundary, not a separate compatibility path.
 
+Follow-up review also clarified that direct IPC `shutdown("ipc://...")` is an
+admin/control-plane helper. It may stop the native server before the owner
+process calls `NativeServerBridge.shutdown()`, so bridge cleanup must always
+call idempotent native shutdown to drain the PyO3 runtime handle; lifecycle
+`is_running == false` is not a valid reason to skip runtime cleanup.
+
 ---
 
 ## 0.x Clean-Cut Constraint

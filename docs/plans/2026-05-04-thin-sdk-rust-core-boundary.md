@@ -197,6 +197,14 @@ Malformed IPC addresses are rejected by Rust validation. Missing sockets return
 the same boolean probe behavior through the native helper without making relay
 part of the direct IPC control path.
 
+`shutdown("ipc://...")` is an admin/control-plane helper, not a normal CRM
+business-client method and not top-level `cc.shutdown()`. It intentionally
+allows a same-host high-privilege supervisor process to stop a child resource
+server by direct IPC address. Future name-based or cross-node shutdown should
+extend this as an explicit authenticated admin control plane, with separate
+route-level and server-level semantics, rather than hiding it behind ordinary
+CRM calls.
+
 **Why this is core behavior**
 
 Signal frames, UDS path derivation, and IPC liveness probes are wire/IPC
@@ -213,6 +221,9 @@ This strengthens direct IPC independence. These helpers must live under
 - `ping("ipc://...")` returns true against a direct IPC server with no relay.
 - `shutdown("ipc://...")` stops a direct IPC server with no relay.
 - Invalid IPC addresses are rejected through Rust validation.
+- Owner-side bridge cleanup remains idempotent after an external direct IPC
+  shutdown signal; native runtime draining must not depend on lifecycle
+  readiness still being `running`.
 
 ### P1. Process runtime/session state
 
