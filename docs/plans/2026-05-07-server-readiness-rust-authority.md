@@ -8,6 +8,17 @@
 
 **Tech Stack:** Rust `core/transport/c2-server`, PyO3 bindings in `sdk/python/native/src/server_ffi.rs`, Python SDK server bridge in `sdk/python/src/c_two/transport/server/native.py`, pytest integration/unit tests, Cargo tests.
 
+**Implementation status:** Implemented on `dev-feature`.
+
+**Final implementation note:** Task 5 integration coverage exposed an additional
+socket-ownership edge case: after a duplicate server failed to bind an active
+IPC socket, PyO3 startup cleanup called `shutdown()` on the failed server and
+could still unlink the first server's active socket path. The final
+implementation therefore tracks whether each concrete `c2-server::Server`
+instance successfully bound its socket before allowing that instance to unlink
+the socket during shutdown. This is part of the issue6 readiness/lifecycle
+boundary, not a separate compatibility path.
+
 ---
 
 ## 0.x Clean-Cut Constraint
