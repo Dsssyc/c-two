@@ -368,13 +368,13 @@ accurate.
 - Default view mode still releases immediately and does not materialize payloads
   or add retained accounting overhead.
 
-**Repair direction for future issue5 hardening**
+**Non-blocking future hardening notes**
 
 The current implementation covers the issue5 ownership boundary. Further work
 should be treated as hardening rather than a second architecture: keep `c2-mem`
 as the source of truth, keep `ResponseBuffer.release()` / `ShmBuffer.release()`
-as memory-release authority, and improve only the SDK/native seam. The next
-repair plan should focus on (1) locking down successful-hold tracking semantics
+as memory-release authority, and improve only the SDK/native seam. A future
+hardening plan can focus on (1) locking down successful-hold tracking semantics
 for both `from_buffer()` and deserialize-only outputs, (2) making native retained
 tracking calls idempotent and non-leaking under exceptional paths, and (3)
 extracting cross-SDK conformance tests that Go, Rust, Fortran, and Python can
@@ -382,28 +382,34 @@ share without forcing payload copies or SHM promotion for inline results.
 
 ### P2. Server route slot lifecycle and readiness
 
-**Current Python ownership**
+**Planned ownership**
 
-`NativeServerBridge.start()` starts Rust server and polls for socket-file
-existence. Python also maintains `_started` separately from native state.
+Implementation plan: `docs/plans/2026-05-07-server-readiness-rust-authority.md`.
 
-**Why this is core behavior**
+Rust `c2-server` should own IPC server lifecycle state and readiness
+notification. Python `NativeServerBridge` should keep CRM slot objects and
+Python callback dispatch, but delegate readiness to native `RustServer` APIs
+rather than polling socket files or maintaining `_started`.
 
-Server readiness is native IPC server lifecycle state. Polling socket files in
-every SDK would duplicate platform-specific details.
+**Implementation target**
 
-**Implementation sketch**
-
-1. Add a native `start_and_wait(timeout)` or readiness notification to
-   `RustServer`.
-2. Expose native `is_running`/readiness as the single source of truth.
-3. Remove Python socket-file polling and redundant `_started` state where
-   possible.
+1. Add native lifecycle states and `wait_until_ready(timeout)` to `c2-server`.
+2. Expose PyO3 `RustServer.start_and_wait(timeout_seconds)`, `is_ready`, and
+   native-backed `is_running`.
+3. Remove Python socket-file polling and Python-owned `_started` state.
+4. Make runtime shutdown outcomes use native lifecycle state instead of
+   `socket_path().exists()`.
+5. Prevent active-socket unlinking when a second server starts with an address
+   already owned by a running server.
 
 **Required tests**
 
-- `start()` returns only after direct IPC connection can be established.
-- Timeout reports a useful error without leaving stale socket files.
+- `start()` returns only after direct IPC ping/connect can succeed.
+- Active-socket startup fails without unlinking the first server's socket.
+- Timeout reports a useful error without leaving a stale native runtime.
+- Direct IPC readiness is relay-independent.
+- Boundary tests prevent Python socket polling and `_started` state from
+  returning.
 
 ### P2. Response allocation decision
 

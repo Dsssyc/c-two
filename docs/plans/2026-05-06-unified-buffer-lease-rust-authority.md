@@ -33,8 +33,8 @@ The current repair baseline is therefore:
   retained stats.
 - Preserve storage transparency: inline, SHM, handle, and file-spill retained
   responses use the same stats semantics without forcing SHM promotion.
-- Treat remaining issue5 work as hardening of the SDK/native seam, not a new
-  Python-owned lifecycle mechanism.
+- Treat any remaining issue5 work as non-blocking hardening of the SDK/native
+  seam, not a new Python-owned lifecycle mechanism.
 
 ## Corrected Scope For Issue 5
 
