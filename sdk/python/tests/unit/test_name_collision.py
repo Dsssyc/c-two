@@ -202,6 +202,10 @@ class TestServerNameCollision:
                 }
 
         class FakeRustServer:
+            @property
+            def is_running(self) -> bool:
+                return True
+
             def shutdown(self) -> None:
                 events.append('rust_shutdown')
 
@@ -231,7 +235,6 @@ class TestServerNameCollision:
         bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
         bridge._default_name = 'grid'  # noqa: SLF001
         bridge._rust_server = FakeRustServer()  # noqa: SLF001
-        bridge._started = True  # noqa: SLF001
 
         bridge.shutdown(
             runtime_session=FakeRuntimeSession(),
@@ -262,6 +265,10 @@ class TestServerNameCollision:
                 }
 
         class FakeRustServer:
+            @property
+            def is_running(self) -> bool:
+                return True
+
             def shutdown(self) -> None:
                 events.append('rust_shutdown')
 
@@ -291,7 +298,6 @@ class TestServerNameCollision:
         bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
         bridge._default_name = 'grid'  # noqa: SLF001
         bridge._rust_server = FakeRustServer()  # noqa: SLF001
-        bridge._started = True  # noqa: SLF001
 
         bridge.shutdown(runtime_session=FakeRuntimeSession())
 
@@ -321,7 +327,8 @@ class TestServerNameCollision:
                 events.append(f'rust_unregister:{name}')
                 return True
 
-            def is_started(self) -> bool:
+            @property
+            def is_running(self) -> bool:
                 return True
 
         class FakeCRM:
@@ -331,7 +338,6 @@ class TestServerNameCollision:
         bridge._slots = {}  # noqa: SLF001
         bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
         bridge._default_name = None  # noqa: SLF001
-        bridge._started = False  # noqa: SLF001
         bridge._shm_threshold = 1024  # noqa: SLF001
         bridge._default_concurrency = ConcurrencyConfig(max_workers=1)  # noqa: SLF001
         bridge._rust_server = FakeRustServer()  # noqa: SLF001

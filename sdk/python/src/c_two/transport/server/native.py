@@ -12,9 +12,7 @@ from __future__ import annotations
 import inspect
 import logging
 import math
-import os
 import threading
-import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -106,7 +104,6 @@ class NativeServerBridge:
         self._slots: dict[str, CRMSlot] = {}
         self._slots_lock = threading.Lock()
         self._default_name: str | None = None
-        self._started = False
 
         if lease_tracker is None:
             from c_two._native import BufferLeaseTracker
@@ -307,20 +304,10 @@ class NativeServerBridge:
     # ------------------------------------------------------------------
 
     def is_started(self) -> bool:
-        return self._started
+        return bool(getattr(self._rust_server, 'is_running', False))
 
     def start(self, timeout: float = 5.0) -> None:
-        self._rust_server.start()
-        # Wait for the UDS socket to be created by the Rust server.
-        socket_path = self._rust_server.socket_path
-        deadline = time.monotonic() + timeout
-        while not os.path.exists(socket_path):
-            if time.monotonic() > deadline:
-                raise RuntimeError(
-                    f'RustServer failed to start within {timeout}s',
-                )
-            time.sleep(0.01)
-        self._started = True
+        self._rust_server.start_and_wait(float(timeout))
 
     def shutdown(
         self,
@@ -359,12 +346,11 @@ class NativeServerBridge:
         for slot in removed_slots:
             self._invoke_shutdown(slot)
 
-        if self._started:
+        if self.is_started():
             try:
                 self._rust_server.shutdown()
             except Exception:
                 logger.warning('Error shutting down RustServer', exc_info=True)
-            self._started = False
         return outcome
 
     # ------------------------------------------------------------------

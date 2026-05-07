@@ -150,3 +150,21 @@ def test_python_does_not_own_buffer_lease_accounting():
             if needle in text:
                 offenders.append(f"{path.relative_to(root)}:{needle}")
     assert offenders == []
+
+
+def test_python_server_bridge_does_not_own_readiness_polling():
+    import inspect
+    from c_two.transport.server.native import NativeServerBridge
+
+    source = inspect.getsource(NativeServerBridge)
+    forbidden = [
+        "os.path.exists",
+        "while not os.path",
+        "self._started",
+        "_started =",
+    ]
+    offenders = [needle for needle in forbidden if needle in source]
+    assert offenders == []
+
+    start_source = inspect.getsource(NativeServerBridge.start)
+    assert "start_and_wait" in start_source
