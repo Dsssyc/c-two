@@ -11,8 +11,9 @@
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyTimeoutError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyTuple};
 
@@ -235,7 +236,58 @@ impl PyServer {
     }
 
     pub(crate) fn runtime_is_running(&self) -> bool {
-        self.rt.lock().is_some()
+        self.inner.is_running()
+    }
+
+    fn start_runtime_and_wait(&self, timeout: Duration) -> PyResult<()> {
+        let server_for_run = Arc::clone(&self.inner);
+        let server_for_wait = Arc::clone(&self.inner);
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .map_err(|e| PyRuntimeError::new_err(format!("failed to create runtime: {e}")))?;
+
+        {
+            let mut rt_guard = self.rt.lock();
+            if rt_guard.is_some() {
+                return Err(PyRuntimeError::new_err("server is already running"));
+            }
+
+            rt.spawn(async move {
+                if let Err(e) = server_for_run.run().await {
+                    eprintln!("c2-server error: {e}");
+                }
+            });
+
+            *rt_guard = Some(rt);
+        }
+
+        let readiness = {
+            let rt_guard = self.rt.lock();
+            let rt = rt_guard
+                .as_ref()
+                .ok_or_else(|| PyRuntimeError::new_err("server runtime missing after start"))?;
+            rt.block_on(server_for_wait.wait_until_ready(timeout))
+        };
+
+        match readiness {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.inner.shutdown();
+                let rt = self.rt.lock().take();
+                if let Some(rt) = rt {
+                    rt.shutdown_background();
+                }
+                let message = err.to_string();
+                if message.contains("did not become ready") {
+                    Err(PyTimeoutError::new_err(message))
+                } else {
+                    Err(PyRuntimeError::new_err(message))
+                }
+            }
+        }
     }
 }
 
@@ -354,34 +406,19 @@ impl PyServer {
     ///
     /// The GIL is released while the runtime spins up.
     fn start(&self, py: Python<'_>) -> PyResult<()> {
-        // Build the runtime while NOT holding the Mutex (avoid GIL↔Mutex deadlock).
-        let server = Arc::clone(&self.inner);
+        self.start_and_wait(py, 5.0)
+    }
 
-        py.detach(|| {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .enable_all()
-                .build()
-                .map_err(|e| PyRuntimeError::new_err(format!("failed to create runtime: {e}")))?;
-
-            {
-                let mut rt_guard = self.rt.lock();
-                if rt_guard.is_some() {
-                    return Err(PyRuntimeError::new_err("server is already running"));
-                }
-
-                // Spawn the accept loop on the runtime.
-                rt.spawn(async move {
-                    if let Err(e) = server.run().await {
-                        eprintln!("c2-server error: {e}");
-                    }
-                });
-
-                *rt_guard = Some(rt);
-            }
-
-            Ok(())
-        })
+    /// Start the server and wait until the native IPC listener is ready.
+    #[pyo3(signature = (timeout_seconds=5.0))]
+    fn start_and_wait(&self, py: Python<'_>, timeout_seconds: f64) -> PyResult<()> {
+        if !timeout_seconds.is_finite() || timeout_seconds < 0.0 {
+            return Err(PyValueError::new_err(
+                "timeout_seconds must be a non-negative finite number",
+            ));
+        }
+        let timeout = Duration::from_secs_f64(timeout_seconds);
+        py.detach(|| self.start_runtime_and_wait(timeout))
     }
 
     /// Gracefully shut down the server.
@@ -416,6 +453,12 @@ impl PyServer {
     #[getter]
     fn is_running(&self) -> bool {
         self.runtime_is_running()
+    }
+
+    /// Whether the server has reached native IPC readiness.
+    #[getter]
+    fn is_ready(&self) -> bool {
+        self.inner.is_ready()
     }
 
     /// The filesystem path of the UDS socket.
