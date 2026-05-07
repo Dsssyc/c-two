@@ -69,12 +69,12 @@ These are language-specific and should not be forced into the Rust core:
 
 ## Downshift Candidates
 
-### P1 Issue Status Ledger
+### Downshift Issue Status Ledger
 
-This ledger tracks the first four P1 downshift issues in this document against
-the current `dev-feature` branch. Do not mark an issue as implemented here
-unless the corresponding Python-owned authority has actually been removed or
-reduced in code, not merely planned in a separate implementation document.
+This ledger tracks downshift issues in this document against the current
+`dev-feature` branch. Do not mark an issue as implemented here unless the
+corresponding Python-owned authority has actually been removed or reduced in
+code, not merely planned in a separate implementation document.
 
 | Issue | Candidate | Current status | Evidence |
 | --- | --- | --- | --- |
@@ -82,6 +82,11 @@ reduced in code, not merely planned in a separate implementation document.
 | 2 | Direct IPC probe/control helpers | Implemented | See `docs/plans/2026-05-04-direct-ipc-control-helpers-rust.md`; `c2-ipc` owns socket-path derivation plus ping/shutdown control helpers, and Python `client/util.py` is a thin native facade. |
 | 3 | Process runtime/session state | Implemented | See `docs/plans/2026-05-05-runtime-session-rust-authority.md`; `core/runtime/c2-runtime` owns identity, route transactions, client pools, relay projection, and shutdown/unregister outcomes. |
 | 4 | Canonical error registry and wire bytes | Implemented | See `docs/plans/2026-05-06-canonical-error-rust-authority.md`; Rust `c2-error` owns registry/wire bytes and Python delegates through native codec bindings. |
+| 5 | SDK-visible buffer lease lifecycle | Implemented | See `docs/plans/2026-05-06-unified-buffer-lease-rust-authority.md`; `c2-mem` owns retained buffer lease accounting and Python exposes only hold/result facades. |
+| 6 | Server route slot lifecycle and readiness | Implemented | See `docs/plans/2026-05-07-server-readiness-rust-authority.md`; `c2-server` owns readiness, lifecycle transitions, socket unlink authority, and shutdown barriers. |
+| 7 | Response allocation decision | Planned next | See `docs/plans/2026-05-07-response-allocation-rust-authority.md`; implementation must remove Python response-pool allocation and move low-copy buffer preparation into Rust native/core. |
+| 8 | IPC config validation duplication | Backlog | Python still duplicates IPC override key validation that should be delegated to native config resolution. |
+| 9 | Native method table facade | Backlog / low priority | Method discovery remains language-specific enough that this should only proceed if it removes real duplicated wire authority. |
 
 ### P1. Remote IPC scheduler config and execution semantics
 
@@ -409,6 +414,18 @@ path before it is allowed to unlink that path during shutdown. This prevents a
 failed second server startup from removing the active socket owned by an
 already-running server.
 
+Each native start attempt is explicitly fenced by Rust before PyO3 begins
+waiting for readiness. The fence resets stale terminal lifecycle state
+(`Stopped` / `Failed`) and the one-shot shutdown signal so normal restart after
+shutdown, and retry after a failed bind once the socket is released, cannot be
+poisoned by a previous attempt.
+
+Native shutdown is also a lifecycle barrier. PyO3 waits for native stop
+notification before dropping the runtime and terminalizes runtime-owned
+`Starting` / `Ready` / `Stopping` states after forced runtime cleanup while
+preserving `Failed(_)` diagnostics. This prevents immediate restart from seeing
+transient `Stopping` after `RustServer.shutdown()` returns.
+
 **Verified coverage**
 
 - `Server.start(timeout=...)` returns only after direct IPC ping/connect can
@@ -417,6 +434,11 @@ already-running server.
   first server's socket path.
 - Calling shutdown on a server that failed to bind does not unlink another
   server's active socket path.
+- The same native server bridge can start again after normal shutdown.
+- Repeated tight start/shutdown cycles do not expose stale `Stopping` through
+  `is_started()` or poison the next start.
+- A duplicate server whose first start failed can retry successfully after the
+  active socket owner shuts down.
 - Runtime shutdown outcomes use native lifecycle state instead of
   `socket_path().exists()`.
 - Direct IPC readiness remains relay-independent, including with a bad relay
@@ -499,8 +521,9 @@ runtime/session, IPC control helpers, and error/config canonicalization.
    projection.
 4. Canonical Python error facade over `c2-error`.
 5. Hold lease tracking and server readiness cleanup.
-6. Config validation deduplication.
-7. Native method table cleanup only if still useful.
+6. Response allocation decision without payload-copy regression.
+7. Config validation deduplication.
+8. Native method table cleanup only if still useful.
 
 ## Regression Matrix For Future Work
 
