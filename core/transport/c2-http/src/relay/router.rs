@@ -140,7 +140,7 @@ async fn handle_register(
     }
 
     let replacement = match RouteAuthority::new(&state)
-        .prepare_register(&name, &server_id, &address)
+        .prepare_register(&name, &server_id, &server_instance_id, &address)
         .await
     {
         Ok(RegisterPreparation::Available { replacement }) => {
@@ -185,10 +185,21 @@ async fn handle_register(
         let identity_matches = c.server_id() == Some(server_id.as_str())
             && c.server_instance_id() == Some(server_instance_id.as_str());
         if !identity_matches {
+            close_client(c);
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({
                     "error": format!("IPC server identity mismatch for upstream '{name}' at {address}"),
+                })),
+            )
+                .into_response();
+        }
+        if !c.has_route(&name) {
+            close_client(c);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("IPC upstream at {address} does not export route '{name}'"),
                 })),
             )
                 .into_response();
@@ -230,6 +241,13 @@ async fn handle_register(
 
 fn close_arc_client(arc_client: Arc<IpcClient>) {
     tokio::spawn(async move { arc_client.close_shared().await });
+}
+
+fn close_client(client: IpcClient) {
+    tokio::spawn(async move {
+        let mut client = client;
+        client.close().await;
+    });
 }
 
 /// `POST /_unregister` — remove a CRM upstream.
@@ -512,62 +530,21 @@ async fn echo_handler(body: Bytes) -> Response {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
     use axum::body::{Body, to_bytes};
     use axum::extract::ConnectInfo;
     use axum::http::{Request, StatusCode};
-    use c2_config::RelayConfig;
     use c2_ipc::IpcClient;
-    use c2_server::{
-        ConcurrencyMode, CrmCallback, CrmError, CrmRoute, RequestData, ResponseMeta, Scheduler,
-        Server, ServerIpcConfig,
-    };
-    use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
     use tower::ServiceExt;
 
-    use crate::relay::peer::PeerEnvelope;
+    use crate::relay::test_support::{
+        register_echo_route, start_live_server, start_live_server_with_routes,
+        test_state_for_client,
+    };
     use crate::relay::types::RouteInfo;
-
-    struct NoopDisseminator;
-
-    impl crate::relay::disseminator::Disseminator for NoopDisseminator {
-        fn broadcast(
-            &self,
-            _envelope: PeerEnvelope,
-            _peers: &[crate::relay::types::PeerSnapshot],
-        ) -> Option<tokio::task::JoinHandle<()>> {
-            None
-        }
-    }
-
-    struct Echo;
-
-    impl CrmCallback for Echo {
-        fn invoke(
-            &self,
-            _route_name: &str,
-            _method_idx: u16,
-            _request: RequestData,
-            _response_pool: Arc<parking_lot::RwLock<c2_mem::MemPool>>,
-        ) -> Result<ResponseMeta, CrmError> {
-            Ok(ResponseMeta::Inline(b"echo".to_vec()))
-        }
-    }
-
-    pub(crate) fn test_state_for_client() -> Arc<RelayState> {
-        let config = RelayConfig {
-            relay_id: "test-relay".into(),
-            skip_ipc_validation: false,
-            ..RelayConfig::default()
-        };
-        Arc::new(RelayState::new(
-            Arc::new(config),
-            Arc::new(NoopDisseminator),
-        ))
-    }
 
     fn test_state() -> Arc<RelayState> {
         test_state_for_client()
@@ -813,6 +790,28 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn register_rejects_upstream_that_does_not_export_route() {
+        let state = test_state();
+        let address = format!(
+            "ipc://relay_missing_route_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let server = start_live_server_with_routes(&address, "server-grid", &["counter"]).await;
+
+        assert_eq!(
+            post_register(state.clone(), "grid", "server-grid", &address).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(
+            state.resolve("grid").is_empty(),
+            "relay must not advertise a route that the upstream handshake did not export"
+        );
+
+        server.shutdown();
+    }
+
+    #[tokio::test]
     async fn register_rejects_route_name_that_cannot_fit_wire_control() {
         let state = test_state();
         let long_name = "x".repeat(c2_wire::control::MAX_CALL_ROUTE_NAME_BYTES + 1);
@@ -913,52 +912,6 @@ pub(crate) mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(body.len(), payload.len());
-    }
-
-    async fn register_echo_route(server: &Arc<Server>, name: &str) {
-        server
-            .register_route(CrmRoute {
-                name: name.into(),
-                scheduler: Arc::new(Scheduler::new(
-                    ConcurrencyMode::ReadParallel,
-                    HashMap::new(),
-                )),
-                callback: Arc::new(Echo),
-                method_names: vec!["ping".into()],
-            })
-            .await
-            .unwrap();
-    }
-
-    async fn start_live_server(address: &str, server_id: &str) -> Arc<Server> {
-        let server = Arc::new(
-            Server::new_with_identity(
-                address,
-                ServerIpcConfig::default(),
-                c2_server::ServerIdentity {
-                    server_id: server_id.to_string(),
-                    server_instance_id: format!("{server_id}-instance"),
-                },
-            )
-            .unwrap(),
-        );
-        register_echo_route(&server, "grid").await;
-        let run_server = server.clone();
-        tokio::spawn(async move {
-            let _ = run_server.run().await;
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                let mut client = IpcClient::new(address);
-                if client.connect().await.is_ok() {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
-        server
     }
 
     #[tokio::test]

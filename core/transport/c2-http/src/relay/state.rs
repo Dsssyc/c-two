@@ -412,10 +412,28 @@ mod tests {
         address: &str,
         client: Arc<IpcClient>,
     ) -> RouteEntry {
+        register_local_with_instance(
+            state,
+            name,
+            server_id,
+            &format!("{server_id}-instance"),
+            address,
+            client,
+        )
+    }
+
+    fn register_local_with_instance(
+        state: &RelayState,
+        name: &str,
+        server_id: &str,
+        server_instance_id: &str,
+        address: &str,
+        client: Arc<IpcClient>,
+    ) -> RouteEntry {
         match state.commit_register_upstream(
             name.to_string(),
             server_id.to_string(),
-            format!("{server_id}-instance"),
+            server_instance_id.to_string(),
             address.to_string(),
             String::new(),
             String::new(),
@@ -626,6 +644,7 @@ mod tests {
             RouteAuthority::new(&state).register_local_preflight(
                 "grid",
                 "server-old",
+                "instance-old",
                 "ipc://grid-old",
             ),
             Ok(crate::relay::authority::RegisterPreflight::SameOwner)
@@ -634,6 +653,7 @@ mod tests {
             RouteAuthority::new(&state).register_local_preflight(
                 "grid",
                 "server-new",
+                "instance-new",
                 "ipc://grid-new",
             ),
             Err(ControlError::DuplicateRoute { .. })
@@ -812,7 +832,7 @@ mod tests {
         let result = state.commit_register_upstream(
             "grid".into(),
             "server-grid".into(),
-            "instance-grid".into(),
+            "server-grid-instance".into(),
             "ipc://grid".into(),
             String::new(),
             String::new(),
@@ -824,6 +844,55 @@ mod tests {
         assert!(matches!(
             state.conn_pool.lookup("grid"),
             CachedClient::Evicted { .. }
+        ));
+    }
+
+    #[test]
+    fn same_server_new_instance_refreshes_local_route_and_client() {
+        let state = RelayState::new(test_config(), null_disseminator());
+        let original = Arc::new(IpcClient::new("ipc://grid"));
+        original.force_connected(true);
+        register_local_with_instance(
+            &state,
+            "grid",
+            "server-grid",
+            "instance-old",
+            "ipc://grid",
+            original,
+        );
+
+        assert!(matches!(
+            RouteAuthority::new(&state).register_local_preflight(
+                "grid",
+                "server-grid",
+                "instance-new",
+                "ipc://grid",
+            ),
+            Ok(crate::relay::authority::RegisterPreflight::Available { .. })
+        ));
+
+        let replacement = Arc::new(IpcClient::new("ipc://grid"));
+        replacement.force_connected(true);
+        let result = state.commit_register_upstream(
+            "grid".into(),
+            "server-grid".into(),
+            "instance-new".into(),
+            "ipc://grid".into(),
+            String::new(),
+            String::new(),
+            replacement,
+            None,
+        );
+
+        assert!(matches!(result, RegisterCommitResult::Registered { .. }));
+        let routes = state.resolve("grid");
+        assert_eq!(
+            routes[0].server_instance_id.as_deref(),
+            Some("instance-new")
+        );
+        assert!(matches!(
+            state.conn_pool.lookup("grid"),
+            CachedClient::Ready { .. }
         ));
     }
 
@@ -887,7 +956,7 @@ mod tests {
         let result = state.commit_register_upstream(
             "grid".into(),
             "server-grid".into(),
-            "instance-grid".into(),
+            "server-grid-instance".into(),
             "ipc://grid".into(),
             String::new(),
             String::new(),

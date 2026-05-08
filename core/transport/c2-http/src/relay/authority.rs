@@ -150,10 +150,12 @@ impl<'a> RouteAuthority<'a> {
         &self,
         name: &str,
         server_id: &str,
+        server_instance_id: &str,
         address: &str,
     ) -> Result<RegisterPreflight, ControlError> {
         self.validate_route_name(name)?;
         self.validate_server_id(server_id)?;
+        self.validate_server_instance_id(server_instance_id)?;
 
         let existing = self.state.local_route(name);
         let Some(existing) = existing else {
@@ -162,9 +164,13 @@ impl<'a> RouteAuthority<'a> {
 
         let existing_address = existing.ipc_address.clone().unwrap_or_default();
         let existing_server_id = existing.server_id.unwrap_or_default();
+        let existing_server_instance_id = existing.server_instance_id.unwrap_or_default();
         if existing_server_id == server_id {
             if existing_address == address {
-                return Ok(RegisterPreflight::SameOwner);
+                if existing_server_instance_id == server_instance_id {
+                    return Ok(RegisterPreflight::SameOwner);
+                }
+                return Ok(RegisterPreflight::Available { replacement: None });
             }
             return Err(ControlError::AddressMismatch { existing_address });
         }
@@ -198,11 +204,12 @@ impl<'a> RouteAuthority<'a> {
         &self,
         name: &str,
         server_id: &str,
+        server_instance_id: &str,
         address: &str,
     ) -> Result<RegisterPreparation, ControlError> {
         let mut last_stale_owner = None;
         for _ in 0..3 {
-            match self.register_local_preflight(name, server_id, address)? {
+            match self.register_local_preflight(name, server_id, server_instance_id, address)? {
                 RegisterPreflight::Available { replacement: None } => {
                     return Ok(RegisterPreparation::Available { replacement: None });
                 }
@@ -297,19 +304,25 @@ impl<'a> RouteAuthority<'a> {
         if let Some(existing) = route_table.local_route(&name) {
             let existing_address = existing.ipc_address.clone().unwrap_or_default();
             let existing_server_id = existing.server_id.clone().unwrap_or_default();
+            let existing_server_instance_id =
+                existing.server_instance_id.clone().unwrap_or_default();
             if existing_server_id == server_id {
                 if existing_address == address {
-                    return Ok(RouteCommandResult::SameOwner { entry: existing });
-                }
-                return Err(ControlError::AddressMismatch { existing_address });
-            }
-            match replacement {
-                Some(token) if token.existing_address == existing_address => {
-                    if !self.state.can_replace_owner_token(&name, &token.token) {
-                        return Err(ControlError::DuplicateRoute { existing_address });
+                    if existing_server_instance_id == server_instance_id {
+                        return Ok(RouteCommandResult::SameOwner { entry: existing });
                     }
+                } else {
+                    return Err(ControlError::AddressMismatch { existing_address });
                 }
-                _ => return Err(ControlError::DuplicateRoute { existing_address }),
+            } else {
+                match replacement {
+                    Some(token) if token.existing_address == existing_address => {
+                        if !self.state.can_replace_owner_token(&name, &token.token) {
+                            return Err(ControlError::DuplicateRoute { existing_address });
+                        }
+                    }
+                    _ => return Err(ControlError::DuplicateRoute { existing_address }),
+                }
             }
         }
 

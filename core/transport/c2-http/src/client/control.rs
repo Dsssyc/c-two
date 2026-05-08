@@ -305,7 +305,7 @@ mod tests {
     #[test]
     fn resolve_maps_404_status_from_real_relay_router() {
         let (addr, server) = runtime().handle().block_on(async {
-            let state = crate::relay::router::tests::test_state_for_client();
+            let state = crate::relay::test_support::test_state_for_client();
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let app = crate::relay::router::build_router(state);
