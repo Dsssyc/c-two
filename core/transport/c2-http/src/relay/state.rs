@@ -702,6 +702,54 @@ mod tests {
         assert_eq!(state.get_address("grid").as_deref(), Some("ipc://first"));
     }
 
+    #[tokio::test]
+    async fn candidate_preparation_does_not_grant_registration_right_after_race() {
+        let state = RelayState::new(test_config(), null_disseminator());
+        let replacement = RouteAuthority::new(&state)
+            .prepare_candidate_registration("grid", "server-candidate", "ipc://candidate")
+            .await
+            .unwrap();
+        assert!(replacement.is_none());
+
+        let racer = Arc::new(IpcClient::new("ipc://racer"));
+        racer.force_connected(true);
+        let racer_result = state.commit_register_upstream(
+            "grid".into(),
+            "server-racer".into(),
+            "instance-racer".into(),
+            "ipc://racer".into(),
+            String::new(),
+            String::new(),
+            racer,
+            None,
+        );
+        assert!(matches!(
+            racer_result,
+            RegisterCommitResult::Registered { .. }
+        ));
+
+        let candidate = Arc::new(IpcClient::new("ipc://candidate"));
+        candidate.force_connected(true);
+        let candidate_result = state.commit_register_upstream(
+            "grid".into(),
+            "server-candidate".into(),
+            "instance-candidate".into(),
+            "ipc://candidate".into(),
+            String::new(),
+            String::new(),
+            candidate,
+            None,
+        );
+
+        assert!(matches!(
+            candidate_result,
+            RegisterCommitResult::Duplicate {
+                existing_address
+            } if existing_address == "ipc://racer"
+        ));
+        assert_eq!(state.get_address("grid").as_deref(), Some("ipc://racer"));
+    }
+
     #[test]
     fn replacement_token_can_replace_same_slot_only_while_still_evicted() {
         let state = RelayState::new(test_config(), null_disseminator());

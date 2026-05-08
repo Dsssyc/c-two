@@ -175,29 +175,65 @@ impl<'a> RouteAuthority<'a> {
             return Err(ControlError::AddressMismatch { existing_address });
         }
 
-        match self.state.connection_lookup(name) {
-            CachedClient::Ready {
-                address: existing_address,
-                ..
-            } => Err(ControlError::DuplicateRoute { existing_address }),
-            CachedClient::Evicted {
-                address: existing_address,
+        let replacement = self.different_owner_replacement(name, existing_address)?;
+        Ok(RegisterPreflight::Available {
+            replacement: Some(replacement),
+        })
+    }
+
+    pub(crate) async fn prepare_candidate_registration(
+        &self,
+        name: &str,
+        server_id: &str,
+        address: &str,
+    ) -> Result<Option<OwnerReplacement>, ControlError> {
+        let mut last_stale_owner = None;
+        for _ in 0..3 {
+            self.validate_route_name(name)?;
+            self.validate_server_id(server_id)?;
+
+            let existing = self.state.local_route(name);
+            let Some(existing) = existing else {
+                return Ok(None);
+            };
+
+            let existing_address = existing.ipc_address.clone().unwrap_or_default();
+            let existing_server_id = existing.server_id.unwrap_or_default();
+            if existing_server_id == server_id {
+                if existing_address == address {
+                    return Ok(None);
+                }
+                return Err(ControlError::AddressMismatch { existing_address });
             }
-            | CachedClient::Disconnected {
-                address: existing_address,
-            } => {
-                let Some(token) = self.state.owner_token(name) else {
+
+            let replacement = match self.different_owner_replacement(name, existing_address.clone())
+            {
+                Ok(replacement) => replacement,
+                Err(ControlError::DuplicateRoute { existing_address }) => {
                     return Err(ControlError::DuplicateRoute { existing_address });
-                };
-                Ok(RegisterPreflight::Available {
-                    replacement: Some(OwnerReplacement {
-                        existing_address,
-                        token,
-                    }),
-                })
+                }
+                Err(err) => return Err(err),
+            };
+
+            match self
+                .probe_owner(name, &replacement.existing_address, &replacement.token)
+                .await
+            {
+                OwnerProbe::Alive => {
+                    return Err(ControlError::DuplicateRoute {
+                        existing_address: replacement.existing_address,
+                    });
+                }
+                OwnerProbe::RouteMissing | OwnerProbe::Dead => return Ok(Some(replacement)),
+                OwnerProbe::Stale => {
+                    last_stale_owner = Some(replacement.existing_address);
+                }
             }
-            CachedClient::Missing => Err(ControlError::DuplicateRoute { existing_address }),
         }
+
+        Err(ControlError::DuplicateRoute {
+            existing_address: last_stale_owner.unwrap_or_else(|| "<unknown>".to_string()),
+        })
     }
 
     pub(crate) async fn prepare_register(
@@ -344,6 +380,30 @@ impl<'a> RouteAuthority<'a> {
         self.state.insert_connection(name, address, client);
         drop(route_table);
         Ok(RouteCommandResult::Registered { entry })
+    }
+
+    fn different_owner_replacement(
+        &self,
+        name: &str,
+        existing_address: String,
+    ) -> Result<OwnerReplacement, ControlError> {
+        match self.state.connection_lookup(name) {
+            CachedClient::Ready { address, .. } => Err(ControlError::DuplicateRoute {
+                existing_address: address,
+            }),
+            CachedClient::Evicted { address } | CachedClient::Disconnected { address } => {
+                let Some(token) = self.state.owner_token(name) else {
+                    return Err(ControlError::DuplicateRoute {
+                        existing_address: address,
+                    });
+                };
+                Ok(OwnerReplacement {
+                    existing_address: address,
+                    token,
+                })
+            }
+            CachedClient::Missing => Err(ControlError::DuplicateRoute { existing_address }),
+        }
     }
 
     fn unregister_local(

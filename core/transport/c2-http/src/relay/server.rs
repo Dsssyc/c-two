@@ -16,7 +16,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::relay::authority::{ControlError, RegisterPreparation, RouteAuthority};
+use crate::relay::authority::{ControlError, RouteAuthority};
 use crate::relay::background::spawn_background_tasks;
 use crate::relay::gossip::{broadcast_route_announce, broadcast_route_withdraw};
 use crate::relay::peer::{PeerEnvelope, PeerMessage};
@@ -404,6 +404,32 @@ impl RelayServer {
                         let _ = reply.send(Err(err));
                         continue;
                     }
+                    let replacement = match RouteAuthority::new(&state)
+                        .prepare_candidate_registration(&name, &server_id, &address)
+                        .await
+                    {
+                        Ok(replacement) => {
+                            replacement.map(|r| crate::relay::state::OwnerReplacementToken {
+                                existing_address: r.existing_address,
+                                token: r.token,
+                            })
+                        }
+                        Err(ControlError::AddressMismatch { .. })
+                        | Err(ControlError::DuplicateRoute { .. }) => {
+                            let _ = reply.send(Err(RelayControlError::DuplicateRoute { name }));
+                            continue;
+                        }
+                        Err(ControlError::InvalidName { reason })
+                        | Err(ControlError::InvalidServerId { reason })
+                        | Err(ControlError::InvalidServerInstanceId { reason }) => {
+                            let _ = reply.send(Err(RelayControlError::Other(reason)));
+                            continue;
+                        }
+                        Err(ControlError::OwnerMismatch) | Err(ControlError::NotFound) => {
+                            let _ = reply.send(Err(RelayControlError::DuplicateRoute { name }));
+                            continue;
+                        }
+                    };
                     let result = {
                         let mut client = IpcClient::new(&address);
                         let connect_result = if state.config().skip_ipc_validation {
@@ -424,10 +450,28 @@ impl RelayServer {
                                     ))));
                                     continue;
                                 }
-                                let server_instance_id = client
-                                    .server_instance_id()
-                                    .map(ToOwned::to_owned)
-                                    .unwrap_or_else(|| format!("{server_id}-instance"));
+                                let server_instance_id = if state.config().skip_ipc_validation {
+                                    format!("{server_id}-instance")
+                                } else {
+                                    let Some(server_instance_id) =
+                                        client.server_instance_id().map(ToOwned::to_owned)
+                                    else {
+                                        close_client(client);
+                                        let _ = reply.send(Err(RelayControlError::Other(format!(
+                                            "IPC server identity mismatch for upstream '{name}'"
+                                        ))));
+                                        continue;
+                                    };
+                                    if let Err(ControlError::InvalidServerInstanceId { reason }) =
+                                        RouteAuthority::new(&state)
+                                            .validate_server_instance_id(&server_instance_id)
+                                    {
+                                        close_client(client);
+                                        let _ = reply.send(Err(RelayControlError::Other(reason)));
+                                        continue;
+                                    }
+                                    server_instance_id
+                                };
                                 if !state.config().skip_ipc_validation && !client.has_route(&name) {
                                     close_client(client);
                                     let _ = reply.send(Err(RelayControlError::Other(format!(
@@ -435,61 +479,6 @@ impl RelayServer {
                                     ))));
                                     continue;
                                 }
-                                let replacement = match RouteAuthority::new(&state)
-                                    .prepare_register(
-                                        &name,
-                                        &server_id,
-                                        &server_instance_id,
-                                        &address,
-                                    )
-                                    .await
-                                {
-                                    Ok(RegisterPreparation::Available { replacement }) => {
-                                        replacement.map(|r| {
-                                            crate::relay::state::OwnerReplacementToken {
-                                                existing_address: r.existing_address,
-                                                token: r.token,
-                                            }
-                                        })
-                                    }
-                                    Ok(RegisterPreparation::SameOwner) => {
-                                        if !state.config().skip_ipc_validation {
-                                            close_client(client);
-                                        }
-                                        let _ = reply.send(Ok(()));
-                                        continue;
-                                    }
-                                    Ok(RegisterPreparation::DuplicateAlive { .. })
-                                    | Err(ControlError::AddressMismatch { .. })
-                                    | Err(ControlError::DuplicateRoute { .. }) => {
-                                        if !state.config().skip_ipc_validation {
-                                            close_client(client);
-                                        }
-                                        let _ = reply
-                                            .send(Err(RelayControlError::DuplicateRoute { name }));
-                                        continue;
-                                    }
-                                    Err(ControlError::InvalidName { reason })
-                                    | Err(ControlError::InvalidServerId { reason })
-                                    | Err(ControlError::InvalidServerInstanceId { reason }) => {
-                                        if !state.config().skip_ipc_validation {
-                                            close_client(client);
-                                        }
-                                        let _ = reply.send(Err(RelayControlError::Other(
-                                            reason.to_string(),
-                                        )));
-                                        continue;
-                                    }
-                                    Err(ControlError::OwnerMismatch)
-                                    | Err(ControlError::NotFound) => {
-                                        if !state.config().skip_ipc_validation {
-                                            close_client(client);
-                                        }
-                                        let _ = reply
-                                            .send(Err(RelayControlError::DuplicateRoute { name }));
-                                        continue;
-                                    }
-                                };
                                 let client = Arc::new(client);
                                 match state.commit_register_upstream(
                                     name.clone(),
@@ -790,6 +779,109 @@ mod tests {
         drop(tx);
         task.await.unwrap();
         server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn command_register_duplicate_live_owner_rejects_before_candidate_connect() {
+        let (state, disseminator, tx, task) = command_loop_state_with_config(RelayConfig {
+            relay_id: "relay-a".into(),
+            advertise_url: "http://relay-a:8080".into(),
+            skip_ipc_validation: false,
+            ..RelayConfig::default()
+        });
+        let old_address = unique_ipc_address("duplicate_live_old");
+        let old_server = start_live_server_with_routes(&old_address, "server-old", &["grid"]).await;
+        let (first_reply, first_result) = oneshot::channel();
+
+        tx.send(Command::RegisterUpstream {
+            name: "grid".into(),
+            server_id: "server-old".into(),
+            address: old_address.clone(),
+            reply: first_reply,
+        })
+        .await
+        .unwrap();
+        first_result.await.unwrap().unwrap();
+
+        let bad_candidate_address = unique_ipc_address("duplicate_live_bad_candidate");
+        let (second_reply, second_result) = oneshot::channel();
+        tx.send(Command::RegisterUpstream {
+            name: "grid".into(),
+            server_id: "server-new".into(),
+            address: bad_candidate_address,
+            reply: second_reply,
+        })
+        .await
+        .unwrap();
+
+        let err = second_result.await.unwrap().unwrap_err();
+        assert!(matches!(
+            err,
+            RelayControlError::DuplicateRoute { name } if name == "grid"
+        ));
+        let routes = state.resolve("grid");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].server_id.as_deref(), Some("server-old"));
+        assert_eq!(routes[0].ipc_address.as_deref(), Some(old_address.as_str()));
+        assert_eq!(
+            disseminator.envelopes().len(),
+            1,
+            "duplicate command registrations must not broadcast route announce"
+        );
+
+        drop(tx);
+        task.await.unwrap();
+        old_server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn command_register_replaces_dead_evicted_owner_after_candidate_attestation() {
+        let (state, disseminator, tx, task) = command_loop_state_with_config(RelayConfig {
+            relay_id: "relay-a".into(),
+            advertise_url: "http://relay-a:8080".into(),
+            skip_ipc_validation: false,
+            ..RelayConfig::default()
+        });
+        let old_address = unique_ipc_address("dead_evicted_old");
+        let old_server = start_live_server_with_routes(&old_address, "server-old", &["grid"]).await;
+        let (first_reply, first_result) = oneshot::channel();
+
+        tx.send(Command::RegisterUpstream {
+            name: "grid".into(),
+            server_id: "server-old".into(),
+            address: old_address,
+            reply: first_reply,
+        })
+        .await
+        .unwrap();
+        first_result.await.unwrap().unwrap();
+        if let Some(client) = state.evict_connection("grid") {
+            client.close_shared().await;
+        }
+        old_server.shutdown();
+
+        let new_address = unique_ipc_address("dead_evicted_new");
+        let new_server = start_live_server_with_routes(&new_address, "server-new", &["grid"]).await;
+        let (second_reply, second_result) = oneshot::channel();
+        tx.send(Command::RegisterUpstream {
+            name: "grid".into(),
+            server_id: "server-new".into(),
+            address: new_address.clone(),
+            reply: second_reply,
+        })
+        .await
+        .unwrap();
+
+        second_result.await.unwrap().unwrap();
+        let routes = state.resolve("grid");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].server_id.as_deref(), Some("server-new"));
+        assert_eq!(routes[0].ipc_address.as_deref(), Some(new_address.as_str()));
+        assert_eq!(disseminator.envelopes().len(), 2);
+
+        drop(tx);
+        task.await.unwrap();
+        new_server.shutdown();
     }
 
     #[tokio::test]

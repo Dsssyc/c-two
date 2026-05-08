@@ -198,5 +198,10 @@ benchmarks/results/*
 .worktrees/
 .bin/
 
+# Agent-local planning notes. Keep durable project issues under docs/issues/.
+/findings.md
+/progress.md
+/task_plan.md
+
 # Specific Python versions
 .python-version
