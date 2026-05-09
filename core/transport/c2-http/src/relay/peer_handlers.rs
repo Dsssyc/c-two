@@ -57,6 +57,14 @@ fn known_peer(state: &RelayState, sender_relay_id: &str) -> bool {
     sender_relay_id != state.relay_id() && state.has_peer(sender_relay_id)
 }
 
+fn valid_peer_relay_id(relay_id: &str) -> bool {
+    c2_config::validate_relay_id(relay_id).is_ok()
+}
+
+fn valid_peer_relay_url(url: &str) -> bool {
+    crate::relay::route_table::valid_relay_url(url)
+}
+
 /// POST /_peer/announce — receive RouteAnnounce or RouteWithdraw
 pub async fn handle_peer_announce(
     State(state): State<Arc<RelayState>>,
@@ -140,11 +148,25 @@ pub async fn handle_peer_join(
             )
                 .into_response();
         }
+        if !valid_peer_relay_id(&relay_id) || !valid_peer_relay_url(&url) {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "ignored"})),
+            )
+                .into_response();
+        }
         if relay_id == state.relay_id() {
             return (StatusCode::OK, Json(serde_json::json!({"status": "self"}))).into_response();
         }
-        state.with_route_table_mut(|rt| rt.record_peer_join(relay_id, url));
-        Json(canonical_peer_snapshot(&state)).into_response()
+        if state.with_route_table_mut(|rt| rt.record_peer_join(relay_id, url)) {
+            Json(canonical_peer_snapshot(&state)).into_response()
+        } else {
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"status": "ignored"})),
+            )
+                .into_response()
+        }
     } else {
         StatusCode::BAD_REQUEST.into_response()
     }
@@ -169,7 +191,11 @@ pub async fn handle_peer_heartbeat(
         route_count,
     } = envelope.message
     {
-        if sender_relay_id != relay_id || !known_peer(&state, &sender_relay_id) {
+        if !valid_peer_relay_id(&sender_relay_id)
+            || !valid_peer_relay_id(&relay_id)
+            || sender_relay_id != relay_id
+            || !known_peer(&state, &sender_relay_id)
+        {
             return StatusCode::OK;
         }
         state.with_route_table_mut(|rt| {
@@ -195,7 +221,11 @@ pub async fn handle_peer_leave(
     }
     let sender_relay_id = envelope.sender_relay_id.clone();
     if let PeerMessage::RelayLeave { relay_id } = envelope.message {
-        if sender_relay_id != relay_id || !trusted_peer(&state, &sender_relay_id) {
+        if !valid_peer_relay_id(&sender_relay_id)
+            || !valid_peer_relay_id(&relay_id)
+            || sender_relay_id != relay_id
+            || !trusted_peer(&state, &sender_relay_id)
+        {
             return StatusCode::OK;
         }
         let _ = RouteAuthority::new(&state).execute(RouteCommand::RemovePeerRoutes {
@@ -215,7 +245,7 @@ pub async fn handle_peer_digest(
         return StatusCode::OK.into_response();
     }
     let sender_relay_id = envelope.sender_relay_id.clone();
-    if !trusted_peer(&state, &sender_relay_id) {
+    if !valid_peer_relay_id(&sender_relay_id) || !trusted_peer(&state, &sender_relay_id) {
         return StatusCode::OK.into_response();
     }
     match envelope.message {
@@ -709,6 +739,40 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert!(!state.has_peer("relay-c"));
+    }
+
+    #[tokio::test]
+    async fn join_rejects_invalid_relay_id_or_url_without_mutating_peer_table() {
+        for (sender, relay_id, url) in [
+            ("bad/relay", "bad/relay", "http://bad-relay:8080"),
+            ("relay-b", "relay-b", "not a url"),
+        ] {
+            let state = test_state();
+            let envelope = PeerEnvelope::new(
+                sender,
+                PeerMessage::RelayJoin {
+                    relay_id: relay_id.into(),
+                    url: url.into(),
+                },
+            );
+
+            let response = handle_peer_join(State(state.clone()), Json(envelope))
+                .await
+                .into_response();
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                body.get("status").and_then(serde_json::Value::as_str),
+                Some("ignored")
+            );
+            assert!(
+                !state.has_peer(relay_id),
+                "invalid join mutated peer {relay_id}"
+            );
+        }
     }
 
     #[tokio::test]

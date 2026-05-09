@@ -165,10 +165,7 @@ impl<'a> RouteAuthority<'a> {
     }
 
     pub(crate) fn validate_relay_id(&self, relay_id: &str) -> Result<(), ControlError> {
-        if relay_id.trim().is_empty() {
-            return Err(ControlError::OwnerMismatch);
-        }
-        Ok(())
+        c2_config::validate_relay_id(relay_id).map_err(|_| ControlError::OwnerMismatch)
     }
 
     pub(crate) fn validate_server_id(&self, server_id: &str) -> Result<(), ControlError> {
@@ -614,4 +611,80 @@ enum OwnerProbe {
     RouteMissing,
     Dead,
     Stale,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    use c2_config::RelayConfig;
+
+    use crate::relay::peer::PeerEnvelope;
+    use crate::relay::types::{PeerInfo, PeerSnapshot, PeerStatus};
+
+    struct NullDisseminator;
+
+    impl crate::relay::disseminator::Disseminator for NullDisseminator {
+        fn broadcast(
+            &self,
+            _envelope: PeerEnvelope,
+            _peers: &[PeerSnapshot],
+        ) -> Option<tokio::task::JoinHandle<()>> {
+            None
+        }
+    }
+
+    fn test_state() -> RelayState {
+        RelayState::new(
+            Arc::new(RelayConfig {
+                relay_id: "relay-a".into(),
+                advertise_url: "http://relay-a:8080".into(),
+                ..Default::default()
+            }),
+            Arc::new(NullDisseminator),
+        )
+    }
+
+    fn peer_route(name: &str, relay_id: &str) -> RouteEntry {
+        RouteEntry {
+            name: name.into(),
+            relay_id: relay_id.into(),
+            relay_url: format!("http://{relay_id}:8080"),
+            server_id: None,
+            server_instance_id: None,
+            ipc_address: None,
+            crm_ns: "test.ns".into(),
+            crm_name: "Grid".into(),
+            crm_ver: "0.1.0".into(),
+            locality: Locality::Peer,
+            registered_at: 1000.0,
+        }
+    }
+
+    #[test]
+    fn authority_rejects_invalid_relay_id_before_peer_route_mutation() {
+        let state = test_state();
+        state.register_peer(PeerInfo {
+            relay_id: "bad/relay".into(),
+            url: "http://bad-relay:8080".into(),
+            route_count: 0,
+            last_heartbeat: Instant::now(),
+            status: PeerStatus::Alive,
+        });
+
+        let result = RouteAuthority::new(&state).execute(RouteCommand::AnnouncePeer {
+            sender_relay_id: "bad/relay".into(),
+            entry: peer_route("grid", "bad/relay"),
+        });
+
+        match result {
+            Err(ControlError::OwnerMismatch) => {}
+            other => panic!(
+                "expected invalid relay id to be rejected before mutation, got {:?}",
+                other.err()
+            ),
+        }
+        assert!(state.resolve("grid").is_empty());
+    }
 }

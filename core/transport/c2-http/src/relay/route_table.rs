@@ -361,9 +361,9 @@ impl RouteTable {
         self.sync_peer_route_urls(&relay_id, &url);
     }
 
-    pub fn record_peer_join(&mut self, relay_id: String, url: String) {
+    pub fn record_peer_join(&mut self, relay_id: String, url: String) -> bool {
         if !valid_relay_id(&relay_id) || relay_id == self.relay_id || !valid_relay_url(&url) {
-            return;
+            return false;
         }
         let now = Instant::now();
         match self.peers.get_mut(&relay_id) {
@@ -386,6 +386,7 @@ impl RouteTable {
             }
         }
         self.sync_peer_route_urls(&relay_id, &url);
+        true
     }
 
     pub fn unregister_peer(&mut self, relay_id: &str) -> Option<PeerInfo> {
@@ -680,7 +681,7 @@ pub(crate) fn valid_route_name(name: &str) -> bool {
 }
 
 fn valid_relay_id(relay_id: &str) -> bool {
-    !relay_id.trim().is_empty()
+    c2_config::validate_relay_id(relay_id).is_ok()
 }
 
 pub(crate) fn valid_crm_tag(crm_ns: &str, crm_name: &str, crm_ver: &str) -> bool {
@@ -1236,6 +1237,17 @@ mod tests {
     }
 
     #[test]
+    fn register_route_rejects_invalid_relay_id_without_mutation() {
+        let mut rt = RouteTable::new("relay-a".into());
+
+        let invalid_peer = peer_entry("grid", "bad/relay", 1000.0);
+
+        assert!(!rt.register_route(invalid_peer));
+        assert!(rt.resolve("grid").is_empty());
+        assert!(rt.list_routes().is_empty());
+    }
+
+    #[test]
     fn apply_tombstone_rejects_non_finite_timestamp() {
         let mut rt = RouteTable::new("relay-b".into());
         register_alive_peer(&mut rt, "relay-a");
@@ -1288,6 +1300,24 @@ mod tests {
     }
 
     #[test]
+    fn apply_tombstone_rejects_path_like_relay_id_without_mutation() {
+        let mut rt = RouteTable::new("relay-b".into());
+        register_alive_peer(&mut rt, "relay-a");
+        assert!(rt.register_route(peer_entry("grid", "relay-a", 1000.0)));
+
+        assert!(!rt.apply_tombstone(RouteTombstone {
+            name: "grid".into(),
+            relay_id: "bad/relay".into(),
+            removed_at: 2000.0,
+            server_id: None,
+            observed_at: Instant::now(),
+        }));
+
+        assert_eq!(rt.resolve("grid").len(), 1);
+        assert!(rt.list_tombstones().is_empty());
+    }
+
+    #[test]
     fn unregister_route_rejects_non_finite_tombstone_without_removing_route() {
         let mut rt = RouteTable::new("relay-b".into());
         register_alive_peer(&mut rt, "relay-a");
@@ -1326,6 +1356,15 @@ mod tests {
         ] {
             assert!(!valid_relay_url(url), "{url}");
         }
+    }
+
+    #[test]
+    fn record_peer_join_rejects_invalid_relay_id_without_peer_mutation() {
+        let mut rt = RouteTable::new("relay-a".into());
+
+        assert!(!rt.record_peer_join("bad/relay".into(), "http://bad-relay:8080".into()));
+        assert!(!rt.has_peer("bad/relay"));
+        assert!(rt.list_peers().is_empty());
     }
 
     #[test]
@@ -1714,6 +1753,35 @@ mod tests {
                     status: PeerStatus::Alive,
                 },
             ],
+        });
+
+        assert_eq!(rt.resolve("existing").len(), 1);
+        assert!(rt.resolve("grid").is_empty());
+        assert!(rt.list_tombstones().is_empty());
+        assert!(rt.get_peer("relay-c").is_none());
+    }
+
+    #[test]
+    fn merge_snapshot_rejects_invalid_peer_url_without_partial_mutation() {
+        let mut rt = RouteTable::new("relay-b".into());
+        register_alive_peer(&mut rt, "relay-a");
+        rt.register_route(peer_entry("existing", "relay-a", 1000.0));
+
+        rt.merge_snapshot(FullSync {
+            routes: vec![peer_entry("grid", "relay-c", 1000.0)],
+            tombstones: vec![RouteTombstone {
+                name: "existing".into(),
+                relay_id: "relay-a".into(),
+                removed_at: 2000.0,
+                server_id: None,
+                observed_at: Instant::now(),
+            }],
+            peers: vec![PeerSnapshot {
+                relay_id: "relay-c".into(),
+                url: "not a url".into(),
+                route_count: 1,
+                status: PeerStatus::Alive,
+            }],
         });
 
         assert_eq!(rt.resolve("existing").len(), 1);

@@ -53,6 +53,7 @@ impl Default for RelayConfig {
 
 impl RelayConfig {
     pub fn validate(&self) -> Result<(), String> {
+        crate::validate_relay_id(&self.relay_id)?;
         if self.idle_timeout_secs != 0 && self.idle_timeout_secs.checked_mul(1000).is_none() {
             return Err("idle_timeout_secs must fit in milliseconds".into());
         }
@@ -63,7 +64,57 @@ impl RelayConfig {
         let host = gethostname::gethostname().to_string_lossy().to_string();
         let pid = std::process::id();
         let uuid = uuid::Uuid::new_v4();
-        format!("{host}_{pid}_{}", &uuid.to_string()[..8])
+        Self::build_generated_relay_id(&host, pid, &uuid.to_string()[..8])
+    }
+
+    fn build_generated_relay_id(host: &str, pid: u32, suffix: &str) -> String {
+        let suffix = suffix
+            .trim()
+            .chars()
+            .map(|ch| {
+                if ch.is_control() || ch == '/' || ch == '\\' {
+                    '_'
+                } else {
+                    ch
+                }
+            })
+            .collect::<String>();
+        let suffix = if suffix.is_empty() || suffix == "." || suffix == ".." {
+            "00000000".to_string()
+        } else {
+            suffix
+        };
+        let tail = format!("_{pid}_{suffix}");
+
+        let mut host = host
+            .trim()
+            .chars()
+            .map(|ch| {
+                if ch.is_control() || ch == '/' || ch == '\\' {
+                    '_'
+                } else {
+                    ch
+                }
+            })
+            .collect::<String>();
+        if host.is_empty() || host == "." || host == ".." {
+            host = "relay".to_string();
+        }
+
+        let max_host_bytes = 255usize.saturating_sub(tail.len()).max(1);
+        if host.as_bytes().len() > max_host_bytes {
+            let mut end = max_host_bytes;
+            while !host.is_char_boundary(end) {
+                end -= 1;
+            }
+            host.truncate(end);
+            host = host.trim().to_string();
+            if host.is_empty() || host == "." || host == ".." {
+                host = "relay".to_string();
+            }
+        }
+
+        format!("{host}{tail}")
     }
 
     /// Derive advertise_url from bind if not explicitly set.
@@ -100,5 +151,36 @@ mod tests {
 
         assert!(err.contains("idle_timeout_secs"));
         assert!(err.contains("milliseconds"));
+    }
+
+    #[test]
+    fn relay_config_rejects_invalid_relay_id() {
+        let mut config = RelayConfig::default();
+        config.relay_id = "bad\nrelay".to_string();
+
+        let err = config
+            .validate()
+            .expect_err("relay config should reject invalid relay_id");
+
+        assert!(err.contains("relay_id"));
+    }
+
+    #[test]
+    fn generated_relay_id_truncates_long_hostname_to_valid_id() {
+        let host = "h".repeat(300);
+        let relay_id = RelayConfig::build_generated_relay_id(&host, 1234, "abcd1234");
+
+        assert!(relay_id.ends_with("_1234_abcd1234"));
+        assert!(relay_id.as_bytes().len() <= 255);
+        crate::validate_relay_id(&relay_id).unwrap();
+    }
+
+    #[test]
+    fn generated_relay_id_sanitizes_invalid_hostname_characters() {
+        let relay_id = RelayConfig::build_generated_relay_id("bad/host\n", 1234, "abcd1234");
+
+        assert!(!relay_id.contains('/'));
+        assert!(!relay_id.contains('\n'));
+        crate::validate_relay_id(&relay_id).unwrap();
     }
 }

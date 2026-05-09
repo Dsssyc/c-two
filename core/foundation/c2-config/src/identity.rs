@@ -6,6 +6,14 @@ pub fn validate_server_id(server_id: &str) -> Result<(), String> {
     validate_id("server_id", server_id)
 }
 
+pub fn validate_relay_id(relay_id: &str) -> Result<(), String> {
+    validate_id("relay_id", relay_id)?;
+    if relay_id.as_bytes().len() > 255 {
+        return Err("relay_id cannot exceed 255 bytes".to_string());
+    }
+    Ok(())
+}
+
 fn validate_id(label: &str, value: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err(format!("{label} cannot be empty"));
@@ -66,6 +74,34 @@ mod tests {
                 "server_id should be rejected: {value:?}"
             );
         }
+    }
+
+    #[test]
+    fn relay_id_rejects_path_like_or_control_values() {
+        for value in [
+            "",
+            "../escape",
+            "bad/name",
+            "bad\\name",
+            ".",
+            "..",
+            " leading",
+            "trailing ",
+            "bad\nrelay",
+        ] {
+            assert!(
+                validate_relay_id(value).is_err(),
+                "relay_id should be rejected: {value:?}"
+            );
+        }
+        let too_long = "x".repeat(256);
+        assert!(validate_relay_id(&too_long).is_err());
+    }
+
+    #[test]
+    fn relay_id_accepts_generated_style_values() {
+        validate_relay_id("host_1234_abcd1234").unwrap();
+        validate_relay_id("relay-a").unwrap();
     }
 
     #[test]

@@ -9,7 +9,7 @@ mod pool;
 mod relay;
 mod resolver;
 
-pub use identity::{validate_ipc_region_id, validate_server_id};
+pub use identity::{validate_ipc_region_id, validate_relay_id, validate_server_id};
 pub use ipc::{
     BASE_IPC_OVERRIDE_KEYS, BaseIpcConfig, CLIENT_IPC_OVERRIDE_KEYS, ClientIpcConfig,
     FORBIDDEN_IPC_OVERRIDE_KEYS, SERVER_IPC_OVERRIDE_KEYS, ServerIpcConfig,
