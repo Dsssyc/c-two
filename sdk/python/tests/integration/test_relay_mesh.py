@@ -130,6 +130,26 @@ class TestSingleRelay:
         peers = _http_get_json(f"{relay.url}/_peers")
         assert peers == []
 
+    def test_skip_validation_register_rejects_incomplete_crm_tag(self, start_c3_relay):
+        relay = start_c3_relay(skip_ipc_validation=True)
+        req = _http_post(
+            f"{relay.url}/_register",
+            {
+                "name": "grid",
+                "server_id": "grid-a",
+                "server_instance_id": "grid-a-instance",
+                "address": "ipc://grid_a",
+                "crm_ns": "test.mesh",
+                "crm_name": "",
+                "crm_ver": "0.1.0",
+            },
+        )
+
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(req, timeout=5)
+
+        assert exc.value.code == 400
+
 
 class TestTwoRelayMesh:
     """Tests with two relays in a mesh."""

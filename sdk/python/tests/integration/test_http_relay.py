@@ -255,6 +255,22 @@ class TestCcConnectHttp:
         with pytest.raises(RuntimeError, match='CRM contract mismatch'):
             cc.connect(Counter, name='hello', address=relay_url)
 
+    def test_relay_call_rejects_invalid_expected_crm_header(self, start_c3_relay):
+        relay = start_c3_relay(skip_ipc_validation=True)
+        with httpx.Client(trust_env=False, timeout=5.0) as http:
+            resp = http.post(
+                f"{relay.url}/grid/get",
+                content=b"",
+                headers={
+                    "x-c2-expected-crm-ns": "test/grid",
+                    "x-c2-expected-crm-name": "Grid",
+                    "x-c2-expected-crm-ver": "0.1.0",
+                },
+            )
+
+        assert resp.status_code == 400
+        assert resp.json()["error"] == "InvalidCrmTag"
+
     def test_connect_http_close_closes_relay_aware_client(self, relay_stack):
         """cc.close closes the relay-aware explicit HTTP client."""
         relay_url, _ = relay_stack

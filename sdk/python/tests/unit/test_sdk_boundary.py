@@ -270,3 +270,58 @@ def test_python_ipc_config_facade_does_not_validate_override_keys():
         if needle in ipc_source or needle in registry_source
     ]
     assert offenders == []
+
+
+def test_relay_does_not_keep_second_crm_tag_validator():
+    root = Path(__file__).resolve().parents[4]
+    route_table = root / "core" / "transport" / "c2-http" / "src" / "relay" / "route_table.rs"
+    source = route_table.read_text(encoding="utf-8")
+
+    assert "fn valid_crm_tag_field" not in source
+    assert "c2_wire::handshake::validate_crm_tag" in source
+
+
+def test_route_authority_uses_canonical_relay_id_validator():
+    root = Path(__file__).resolve().parents[4]
+    authority = root / "core" / "transport" / "c2-http" / "src" / "relay" / "authority.rs"
+    source = authority.read_text(encoding="utf-8")
+
+    assert "c2_config::validate_relay_id" in source
+    assert "relay_id.trim().is_empty()" not in source
+
+
+def test_route_authority_reports_invalid_ipc_address_as_validation_error():
+    root = Path(__file__).resolve().parents[4]
+    authority = root / "core" / "transport" / "c2-http" / "src" / "relay" / "authority.rs"
+    state = root / "core" / "transport" / "c2-http" / "src" / "relay" / "state.rs"
+    authority_source = authority.read_text(encoding="utf-8")
+    state_source = state.read_text(encoding="utf-8")
+
+    assert "InvalidAddress { reason: String }" in authority_source
+    assert "socket_path_from_ipc_address(address)" in authority_source
+    assert "ControlError::InvalidAddress { reason }" in state_source
+
+
+def test_python_crm_metadata_is_not_parsed_from_slash_tag():
+    root = Path(__file__).resolve().parents[2] / "src" / "c_two" / "transport" / "server" / "native.py"
+    source = root.read_text(encoding="utf-8")
+
+    assert "tag.split('/')" not in source
+
+
+def test_route_table_direct_mutations_validate_tombstones_and_private_identity():
+    root = Path(__file__).resolve().parents[4]
+    route_table = root / "core" / "transport" / "c2-http" / "src" / "relay" / "route_table.rs"
+    source = route_table.read_text(encoding="utf-8")
+
+    assert "fn valid_tombstone" in source
+    assert "self.valid_tombstone(&tombstone)" in source
+    assert "fn valid_server_instance_id" in source
+    assert "fn valid_relay_url" in source
+    assert "valid_relay_url(&entry.relay_url)" in source
+    assert "valid_relay_url(&url)" in source
+    assert "let removed = self.routes.get(&key).cloned();" in source
+    assert "if !self.apply_tombstone(tombstone)" in source
+    assert "c2_ipc::socket_path_from_ipc_address" in source
+    assert 'starts_with("ipc://")' not in source
+    assert "valid_nonempty_identity" not in source
