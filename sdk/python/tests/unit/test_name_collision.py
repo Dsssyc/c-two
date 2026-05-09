@@ -12,6 +12,7 @@ import uuid
 
 import pytest
 
+import c_two as cc
 from c_two.config import settings
 from c_two.transport import Server, ConcurrencyConfig, ConcurrencyMode
 from c_two.transport.registry import _ProcessRegistry
@@ -379,6 +380,7 @@ class TestServerNameCollision:
             def is_running(self) -> bool:
                 return True
 
+        @cc.crm(namespace='unit.name_collision', version='0.1.0')
         class FakeCRM:
             pass
 
@@ -410,7 +412,7 @@ class TestServerNameCollision:
         with pytest.raises(RuntimeError, match='boom'):
             bridge.register_crm(FakeCRM, FakeCRM(), name='grid')
 
-        assert events == ['rust_register:read_parallel:None:1::FakeCRM:']
+        assert events == ['rust_register:read_parallel:None:1:unit.name_collision:FakeCRM:0.1.0']
         assert bridge.names == []
 
 

@@ -28,7 +28,10 @@ def route_info(name: str, methods: list[MethodEntry]) -> RouteInfo:
 
 def test_route_info_requires_explicit_crm_tag():
     with pytest.raises(TypeError):
-        RouteInfo(name='grid', methods=[MethodEntry(name='get', index=0)])
+        RouteInfo(
+            name='grid',
+            methods=[MethodEntry(name='get', index=0)],
+        )
 
 
 def test_route_info_rejects_invalid_crm_tag():
