@@ -72,6 +72,9 @@ class TestHandshake:
         cap = CAP_CALL | CAP_METHOD_IDX
         route = RouteInfo(
             name="hello",
+            crm_ns="test.hello",
+            crm_name="Hello",
+            crm_ver="1.2.3",
             methods=[
                 MethodEntry(name="add", index=0),
                 MethodEntry(name="greeting", index=1),
@@ -93,6 +96,9 @@ class TestHandshake:
         assert len(hs.routes) == 1
         r = hs.routes[0]
         assert r.name == "hello"
+        assert r.crm_ns == "test.hello"
+        assert r.crm_name == "Hello"
+        assert r.crm_ver == "1.2.3"
         assert len(r.methods) == 2
         assert r.method_by_name("add") == 0
         assert r.method_by_name("greeting") == 1

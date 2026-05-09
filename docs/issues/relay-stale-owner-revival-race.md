@@ -6,6 +6,13 @@
 
 ## Summary
 
+This document was extracted from the interrupted review session
+`019dec60-8de6-7492-9152-9ad8b61ebe49`. That session found a real relay command-loop
+registration ordering bug: `RegisterUpstream` could dial a new candidate IPC
+endpoint before rejecting a duplicate live owner. That ordering bug has been
+handled by splitting command-loop registration into candidate eligibility,
+candidate IPC attestation, and final commit.
+
 Relay route replacement now fences relay-local time-of-check/time-of-use races with
 `OwnerToken` before committing a candidate upstream registration. This prevents an
 old relay slot or route table entry from being silently overwritten after another
@@ -16,6 +23,20 @@ upstream owner can be probed as dead or route-missing, then become healthy again
 before the candidate replacement commits, without any fresh relay-visible owner
 generation change. In that case the relay can still complete the candidate
 replacement because the relay-local slot remains replaceable.
+
+## Settled Context From The Bad Session
+
+- Command-loop `RegisterUpstream` now rejects duplicate live owners before
+  dialing the candidate IPC address.
+- Non-skip IPC validation now requires a real `server_instance_id` from the
+  candidate handshake; only skip-validation tests synthesize an instance.
+- HTTP `/_register` still follows its original safer ordering: prepare with
+  known identity, attest candidate IPC, then commit.
+- Final replacement commit remains authoritative and rechecks current relay
+  route state plus the captured `OwnerToken`.
+- Regression coverage exists for duplicate live-owner rejection before
+  candidate connect, stale-owner replacement after candidate attestation, and
+  stale candidate preparation losing a final commit race.
 
 ## Current Behavior
 

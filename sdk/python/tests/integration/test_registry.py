@@ -26,6 +26,18 @@ from tests.fixtures.hello import HelloImpl
 from tests.fixtures.counter import Counter, CounterImpl
 
 
+@cc.crm(namespace='test.other_hello', version='0.1.0')
+class OtherHello:
+    def greeting(self, name: str) -> str:
+        ...
+
+
+@cc.crm(namespace='test.hello', version='0.1.0')
+class RenamedHello:
+    def greeting(self, name: str) -> str:
+        ...
+
+
 @pytest.fixture(autouse=True)
 def _clean_registry():
     """Ensure a clean registry for every test."""
@@ -65,6 +77,18 @@ class TestRegisterConnect:
         finally:
             cc.close(crm)
 
+    def test_connect_thread_local_rejects_crm_contract_mismatch(self):
+        cc.register(Hello, HelloImpl(), name='hello')
+
+        with pytest.raises(TypeError, match='CRM contract mismatch'):
+            cc.connect(OtherHello, name='hello')
+
+    def test_connect_thread_local_rejects_crm_name_mismatch(self):
+        cc.register(Hello, HelloImpl(), name='hello')
+
+        with pytest.raises(TypeError, match='CRM contract mismatch'):
+            cc.connect(RenamedHello, name='hello')
+
     def test_connect_ipc(self):
         """IPC connect via explicit address returns ipc-mode proxy."""
         cc.register(Hello, HelloImpl(), name='hello')
@@ -79,6 +103,22 @@ class TestRegisterConnect:
             assert result == 'Hello, IPC!'
         finally:
             cc.close(crm)
+
+    def test_connect_ipc_rejects_crm_contract_mismatch(self):
+        cc.register(Hello, HelloImpl(), name='hello')
+        addr = cc.server_address()
+        assert addr is not None
+
+        with pytest.raises(RuntimeError, match='CRM contract mismatch'):
+            cc.connect(OtherHello, name='hello', address=addr)
+
+    def test_connect_ipc_rejects_crm_name_mismatch(self):
+        cc.register(Hello, HelloImpl(), name='hello')
+        addr = cc.server_address()
+        assert addr is not None
+
+        with pytest.raises(RuntimeError, match='CRM contract mismatch'):
+            cc.connect(RenamedHello, name='hello', address=addr)
 
     def test_close_terminates_proxy(self):
         cc.register(Hello, HelloImpl(), name='hello')

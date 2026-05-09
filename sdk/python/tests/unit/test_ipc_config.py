@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import inspect
+from collections import UserDict
 from pathlib import Path
 from typing import get_type_hints
 
@@ -151,25 +152,25 @@ def test_client_ipc_overrides_beat_env(monkeypatch):
 
 
 @pytest.mark.parametrize('key', ['shm_threshold'])
-def test_forbidden_server_ipc_override_fields_are_rejected(key):
-    with pytest.raises((TypeError, ValueError), match=key):
+def test_forbidden_server_ipc_override_fields_are_rejected_by_native(key):
+    with pytest.raises(ValueError, match='shm_threshold is a global transport policy'):
         Server(bind_address='ipc://unit_bad_server_override', ipc_overrides={key: 1})
 
 
 @pytest.mark.parametrize('key', ['shm_threshold'])
-def test_forbidden_client_ipc_override_fields_are_rejected(key):
-    with pytest.raises((TypeError, ValueError), match=key):
+def test_forbidden_client_ipc_override_fields_are_rejected_by_native(key):
+    with pytest.raises(ValueError, match='shm_threshold is a global transport policy'):
         cc.set_client(ipc_overrides={key: 1})
 
 
-def test_removed_max_pool_memory_override_is_unknown():
-    with pytest.raises(TypeError, match='unknown IPC override'):
+def test_removed_max_pool_memory_override_is_rejected_by_native():
+    with pytest.raises(ValueError, match='unknown IPC override option: max_pool_memory'):
         Server(
             bind_address='ipc://unit_removed_max_pool_memory',
             ipc_overrides={'max_pool_memory': 1024},
         )
 
-    with pytest.raises(TypeError, match='unknown IPC override'):
+    with pytest.raises(ValueError, match='unknown IPC override option: max_pool_memory'):
         cc.set_client(ipc_overrides={'max_pool_memory': 1024})
 
 
@@ -183,15 +184,49 @@ def test_native_resolver_treats_max_pool_memory_as_unknown_override():
         native.resolve_client_ipc_config({'max_pool_memory': 1024}, None)
 
 
-def test_unknown_ipc_override_field_is_rejected():
-    with pytest.raises(TypeError, match='unknown IPC override'):
+def test_native_resolver_accepts_mapping_subclasses():
+    native = ipc_config._native_resolver()  # noqa: SLF001
+    overrides = UserDict({'pool_segment_size': 2 * 1024 * 1024})
+
+    server_cfg = native.resolve_server_ipc_config(overrides, None)
+    client_cfg = native.resolve_client_ipc_config(overrides, None)
+
+    assert server_cfg['pool_segment_size'] == 2 * 1024 * 1024
+    assert client_cfg['pool_segment_size'] == 2 * 1024 * 1024
+
+
+def test_unknown_ipc_override_field_is_rejected_by_native():
+    with pytest.raises(ValueError, match='unknown IPC override option: not_real'):
         Server(bind_address='ipc://unit_unknown_override', ipc_overrides={'not_real': 1})
 
-    with pytest.raises(TypeError, match='unknown IPC override'):
+    with pytest.raises(ValueError, match='unknown IPC override option: not_real'):
         cc.set_server(ipc_overrides={'not_real': 1})
 
-    with pytest.raises(TypeError, match='unknown IPC override'):
+    with pytest.raises(ValueError, match='unknown IPC override option: not_real'):
         cc.set_client(ipc_overrides={'not_real': 1})
+
+
+def test_ipc_overrides_must_be_mapping_native_error():
+    with pytest.raises(TypeError, match='ipc_overrides must be a mapping'):
+        cc.set_server(ipc_overrides=object())  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match='ipc_overrides must be a mapping'):
+        cc.set_client(ipc_overrides=object())  # type: ignore[arg-type]
+
+
+def test_ipc_override_keys_must_be_strings_native_error():
+    with pytest.raises(TypeError, match='IPC override option names must be strings'):
+        cc.set_client(ipc_overrides={1: 4096})  # type: ignore[dict-item]
+
+
+def test_ipc_override_non_string_keys_are_shape_errors_before_semantic_errors():
+    with pytest.raises(TypeError, match='IPC override option names must be strings'):
+        cc.set_client(
+            ipc_overrides={  # type: ignore[dict-item]
+                1: 4096,
+                'shm_threshold': 1,
+            },
+        )
 
 
 def test_high_level_ipc_overrides_are_copied_when_set():
@@ -203,6 +238,32 @@ def test_high_level_ipc_overrides_are_copied_when_set():
     assert registry._runtime_session.server_ipc_overrides == {
         'pool_segment_size': 2 * 1024 * 1024,
     }  # noqa: SLF001
+
+
+def test_ipc_override_mapping_is_snapshotted_by_native():
+    overrides = UserDict({
+        'pool_segment_size': 2 * 1024 * 1024,
+        'chunk_size': None,
+    })
+
+    cc.set_server(ipc_overrides=overrides)  # type: ignore[arg-type]
+    overrides['pool_segment_size'] = 4 * 1024 * 1024
+
+    registry = _ProcessRegistry.get()
+    assert registry._runtime_session.server_ipc_overrides == {
+        'pool_segment_size': 2 * 1024 * 1024,
+    }  # noqa: SLF001
+
+
+def test_low_level_server_accepts_mapping_subclass_ipc_overrides():
+    server = Server(
+        bind_address='ipc://unit_server_mapping_subclass',
+        ipc_overrides=UserDict({'pool_segment_size': 2 * 1024 * 1024}),
+    )
+    try:
+        assert server._config['pool_segment_size'] == 2 * 1024 * 1024  # noqa: SLF001
+    finally:
+        server.shutdown()
 
 
 def test_server_id_override_drives_auto_address():
@@ -253,8 +314,20 @@ def test_relay_resolved_connect_delegates_route_validation_to_runtime_session(mo
         def set_relay_anchor_address(self, relay_address):  # noqa: ANN001
             self.relay_anchor_address_override = relay_address
 
-        def connect_via_relay(self, route_name: str):
-            calls.append((self.relay_anchor_address_override, route_name))
+        def connect_via_relay(
+            self,
+            route_name: str,
+            expected_crm_ns: str,
+            expected_crm_name: str,
+            expected_crm_ver: str,
+        ):
+            calls.append((
+                self.relay_anchor_address_override,
+                route_name,
+                expected_crm_ns,
+                expected_crm_name,
+                expected_crm_ver,
+            ))
             return FakeRelayAwareClient()
 
         def lease_tracker(self):
@@ -269,7 +342,9 @@ def test_relay_resolved_connect_delegates_route_validation_to_runtime_session(mo
     crm = registry.connect(IUnitConfigCRM, name='unit-route')
 
     assert 'RustClientPool.instance()' not in inspect.getsource(type(registry))
-    assert calls == [('http://registry-relay.test', 'unit-route')]
+    assert calls == [
+        ('http://registry-relay.test', 'unit-route', 'unit.config', 'IUnitConfigCRM', '0.1.0'),
+    ]
     assert crm.client._client.__class__ is FakeRelayAwareClient  # noqa: SLF001
 
 
@@ -313,7 +388,13 @@ def test_relay_resolved_connect_maps_native_404_to_resource_not_found(monkeypatc
         def set_relay_anchor_address(self, relay_address):  # noqa: ANN001
             pass
 
-        def connect_via_relay(self, route_name: str):  # noqa: ARG002
+        def connect_via_relay(
+            self,
+            route_name: str,
+            expected_crm_ns: str,
+            expected_crm_name: str,
+            expected_crm_ver: str,
+        ):  # noqa: ARG002
             err = RuntimeError('HTTP 404')
             err.status_code = 404
             raise err

@@ -10,8 +10,8 @@ Three modes:
   directly via ``call_direct(method_name, args)`` — zero serialization.
 - **ipc**: ``supports_direct_call = False``.  Delegates to a Rust IPC
   client with routing-name-based ``call()``.
-- **http**: ``supports_direct_call = False``.  Delegates to a Rust HTTP
-  client for cross-node access via an HTTP relay.
+- **http**: ``supports_direct_call = False``.  Delegates to a Rust-native HTTP
+  call surface for cross-node access via an HTTP relay.
 
 Usage::
 
@@ -27,7 +27,7 @@ Usage::
     crm.client = proxy
     crm.greeting('World')       # → rust_client.call('hello', 'greeting', ...)
 
-    # HTTP (cross-node via RustHttpClient):
+    # HTTP (cross-node via a Rust-native HTTP or relay-aware client):
     proxy = CRMProxy.http(http_client, 'hello')
     crm = Hello()
     crm.client = proxy

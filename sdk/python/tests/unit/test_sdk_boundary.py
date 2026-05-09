@@ -217,3 +217,26 @@ def test_native_server_response_parser_does_not_accept_shm_coordinate_tuples():
     ]
     offenders = [needle for needle in forbidden if needle in parser_source]
     assert offenders == []
+
+
+def test_python_ipc_config_facade_does_not_validate_override_keys():
+    root = Path(__file__).resolve().parents[2] / "src" / "c_two"
+    ipc_source = (root / "config" / "ipc.py").read_text(encoding="utf-8")
+    registry_source = (root / "transport" / "registry.py").read_text(encoding="utf-8")
+
+    forbidden = [
+        "_SERVER_KEYS",
+        "_CLIENT_KEYS",
+        "_FORBIDDEN_IPC_KEYS",
+        "_clean_ipc_overrides",
+        "_normalize_server_ipc_overrides",
+        "_normalize_client_ipc_overrides",
+        "unknown IPC override",
+        "shm_threshold is a global transport policy",
+    ]
+    offenders = [
+        needle
+        for needle in forbidden
+        if needle in ipc_source or needle in registry_source
+    ]
+    assert offenders == []

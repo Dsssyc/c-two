@@ -115,6 +115,9 @@ class TestServerNameCollision:
                 name='grid',
                 crm_instance=FakeCRM(),
                 direct_instance=FakeResource(),
+                crm_ns='test.grid',
+                crm_name='Grid',
+                crm_ver='0.1.0',
                 method_table=MethodTable(),
                 scheduler=FakeScheduler(),
                 methods=[],
@@ -168,6 +171,9 @@ class TestServerNameCollision:
                 name='grid',
                 crm_instance=FakeCRM(),
                 direct_instance=FakeResource(),
+                crm_ns='test.grid',
+                crm_name='Grid',
+                crm_ver='0.1.0',
                 method_table=MethodTable(),
                 scheduler=FakeScheduler(),
                 methods=[],
@@ -226,6 +232,9 @@ class TestServerNameCollision:
                 name='grid',
                 crm_instance=FakeCRM(),
                 direct_instance=FakeResource(),
+                crm_ns='test.grid',
+                crm_name='Grid',
+                crm_ver='0.1.0',
                 method_table=MethodTable(),
                 scheduler=FakeScheduler(),
                 methods=[],
@@ -289,6 +298,9 @@ class TestServerNameCollision:
                 name='grid',
                 crm_instance=FakeCRM(),
                 direct_instance=FakeResource(),
+                crm_ns='test.grid',
+                crm_name='Grid',
+                crm_ver='0.1.0',
                 method_table=MethodTable(),
                 scheduler=FakeScheduler(),
                 methods=[],
@@ -350,9 +362,12 @@ class TestServerNameCollision:
                 concurrency_mode,
                 max_pending,
                 max_workers,
+                crm_ns,
+                crm_name,
+                crm_ver,
             ):  # noqa: ARG002
                 events.append(
-                    f'rust_register:{concurrency_mode}:{max_pending}:{max_workers}'
+                    f'rust_register:{concurrency_mode}:{max_pending}:{max_workers}:{crm_ns}:{crm_name}:{crm_ver}'
                 )
                 raise RuntimeError('boom')
 
@@ -395,7 +410,7 @@ class TestServerNameCollision:
         with pytest.raises(RuntimeError, match='boom'):
             bridge.register_crm(FakeCRM, FakeCRM(), name='grid')
 
-        assert events == ['rust_register:read_parallel:None:1']
+        assert events == ['rust_register:read_parallel:None:1::FakeCRM:']
         assert bridge.names == []
 
 

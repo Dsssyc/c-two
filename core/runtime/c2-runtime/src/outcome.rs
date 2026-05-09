@@ -6,6 +6,7 @@ use c2_server::scheduler::{AccessLevel, ConcurrencyMode};
 pub struct RuntimeRouteSpec {
     pub name: String,
     pub crm_ns: String,
+    pub crm_name: String,
     pub crm_ver: String,
     pub method_names: Vec<String>,
     pub access_map: HashMap<u16, AccessLevel>,

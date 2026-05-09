@@ -1,6 +1,6 @@
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyAny, PyDict, PyMapping};
 
 use c2_config::{
     ClientIpcConfig, ClientIpcConfigOverrides, ConfigResolver, ConfigSources,
@@ -32,7 +32,7 @@ fn resolve_shm_threshold(global_overrides: Option<&Bound<'_, PyDict>>) -> PyResu
 #[pyo3(signature = (overrides=None, global_overrides=None))]
 fn resolve_server_ipc_config(
     py: Python<'_>,
-    overrides: Option<&Bound<'_, PyDict>>,
+    overrides: Option<&Bound<'_, PyAny>>,
     global_overrides: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
     let mut runtime = RuntimeConfigOverrides::default();
@@ -51,11 +51,11 @@ fn resolve_server_ipc_config(
 #[pyo3(signature = (overrides=None, global_overrides=None))]
 fn resolve_client_ipc_config(
     py: Python<'_>,
-    overrides: Option<&Bound<'_, PyDict>>,
+    overrides: Option<&Bound<'_, PyAny>>,
     global_overrides: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
     let mut runtime = RuntimeConfigOverrides::default();
-    let client_overrides = client_overrides(overrides)?;
+    let client_overrides = parse_client_ipc_overrides(overrides)?;
     apply_shm_overrides(&mut runtime, global_overrides)?;
     let resolved = ConfigResolver::resolve_client_ipc(
         client_overrides,
@@ -88,13 +88,18 @@ fn apply_shm_overrides(
 }
 
 pub(crate) fn parse_server_ipc_overrides(
-    dict: Option<&Bound<'_, PyDict>>,
+    overrides: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<ServerIpcConfigOverrides> {
-    let Some(dict) = dict else {
+    let Some(dict) = copy_ipc_overrides(overrides)? else {
         return Ok(ServerIpcConfigOverrides::default());
     };
+    parse_server_ipc_overrides_dict(&dict)
+}
+
+fn parse_server_ipc_overrides_dict(dict: &Bound<'_, PyDict>) -> PyResult<ServerIpcConfigOverrides> {
+    validate_ipc_override_key_names(dict)?;
     reject_forbidden_ipc_fields(dict)?;
-    reject_unknown_ipc_fields(dict, SERVER_IPC_KEYS)?;
+    reject_unknown_ipc_fields(dict, c2_config::SERVER_IPC_OVERRIDE_KEYS)?;
     Ok(ServerIpcConfigOverrides {
         pool_enabled: get_opt(dict, "pool_enabled")?,
         pool_segment_size: get_opt(dict, "pool_segment_size")?,
@@ -118,9 +123,9 @@ pub(crate) fn parse_server_ipc_overrides(
 }
 
 pub(crate) fn parse_client_ipc_overrides(
-    dict: Option<&Bound<'_, PyDict>>,
+    overrides: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<ClientIpcConfigOverrides> {
-    client_overrides(dict)
+    client_overrides(overrides)
 }
 
 pub(crate) fn server_ipc_overrides_to_dict<'py>(
@@ -289,69 +294,53 @@ pub(crate) fn client_ipc_overrides_to_dict<'py>(
     Ok(dict)
 }
 
-fn client_overrides(dict: Option<&Bound<'_, PyDict>>) -> PyResult<ClientIpcConfigOverrides> {
-    let Some(dict) = dict else {
+fn copy_ipc_overrides<'py>(
+    overrides: Option<&Bound<'py, PyAny>>,
+) -> PyResult<Option<Bound<'py, PyDict>>> {
+    let Some(overrides) = overrides else {
+        return Ok(None);
+    };
+    if overrides.is_none() {
+        return Ok(None);
+    }
+    let mapping = overrides
+        .cast::<PyMapping>()
+        .map_err(|_| PyTypeError::new_err("ipc_overrides must be a mapping"))?;
+    let copied = PyDict::new(overrides.py());
+    copied.update(mapping)?;
+    Ok(Some(copied))
+}
+
+fn client_overrides(overrides: Option<&Bound<'_, PyAny>>) -> PyResult<ClientIpcConfigOverrides> {
+    let Some(dict) = copy_ipc_overrides(overrides)? else {
         return Ok(ClientIpcConfigOverrides::default());
     };
-    reject_forbidden_ipc_fields(dict)?;
-    reject_unknown_ipc_fields(dict, CLIENT_IPC_KEYS)?;
+    validate_ipc_override_key_names(&dict)?;
+    reject_forbidden_ipc_fields(&dict)?;
+    reject_unknown_ipc_fields(&dict, c2_config::CLIENT_IPC_OVERRIDE_KEYS)?;
     Ok(ClientIpcConfigOverrides {
-        pool_enabled: get_opt(dict, "pool_enabled")?,
-        pool_segment_size: get_opt(dict, "pool_segment_size")?,
-        max_pool_segments: get_opt(dict, "max_pool_segments")?,
-        reassembly_segment_size: get_opt(dict, "reassembly_segment_size")?,
-        reassembly_max_segments: get_opt(dict, "reassembly_max_segments")?,
-        max_total_chunks: get_opt(dict, "max_total_chunks")?,
-        chunk_gc_interval_secs: get_opt(dict, "chunk_gc_interval")?,
-        chunk_threshold_ratio: get_opt(dict, "chunk_threshold_ratio")?,
-        chunk_assembler_timeout_secs: get_opt(dict, "chunk_assembler_timeout")?,
-        max_reassembly_bytes: get_opt(dict, "max_reassembly_bytes")?,
-        chunk_size: get_opt(dict, "chunk_size")?,
+        pool_enabled: get_opt(&dict, "pool_enabled")?,
+        pool_segment_size: get_opt(&dict, "pool_segment_size")?,
+        max_pool_segments: get_opt(&dict, "max_pool_segments")?,
+        reassembly_segment_size: get_opt(&dict, "reassembly_segment_size")?,
+        reassembly_max_segments: get_opt(&dict, "reassembly_max_segments")?,
+        max_total_chunks: get_opt(&dict, "max_total_chunks")?,
+        chunk_gc_interval_secs: get_opt(&dict, "chunk_gc_interval")?,
+        chunk_threshold_ratio: get_opt(&dict, "chunk_threshold_ratio")?,
+        chunk_assembler_timeout_secs: get_opt(&dict, "chunk_assembler_timeout")?,
+        max_reassembly_bytes: get_opt(&dict, "max_reassembly_bytes")?,
+        chunk_size: get_opt(&dict, "chunk_size")?,
         ..Default::default()
     })
 }
 
-const BASE_IPC_KEYS: &[&str] = &[
-    "pool_enabled",
-    "pool_segment_size",
-    "max_pool_segments",
-    "reassembly_segment_size",
-    "reassembly_max_segments",
-    "max_total_chunks",
-    "chunk_gc_interval",
-    "chunk_threshold_ratio",
-    "chunk_assembler_timeout",
-    "max_reassembly_bytes",
-    "chunk_size",
-];
-
-const SERVER_IPC_KEYS: &[&str] = &[
-    "pool_enabled",
-    "pool_segment_size",
-    "max_pool_segments",
-    "reassembly_segment_size",
-    "reassembly_max_segments",
-    "max_total_chunks",
-    "chunk_gc_interval",
-    "chunk_threshold_ratio",
-    "chunk_assembler_timeout",
-    "max_reassembly_bytes",
-    "chunk_size",
-    "max_frame_size",
-    "max_payload_size",
-    "max_pending_requests",
-    "pool_decay_seconds",
-    "heartbeat_interval",
-    "heartbeat_timeout",
-];
-
-const CLIENT_IPC_KEYS: &[&str] = BASE_IPC_KEYS;
-
 fn reject_forbidden_ipc_fields(dict: &Bound<'_, PyDict>) -> PyResult<()> {
-    if dict.contains("shm_threshold")? {
-        return Err(PyValueError::new_err(
-            "shm_threshold is a global transport policy; use set_transport_policy(shm_threshold=...)",
-        ));
+    for key in c2_config::FORBIDDEN_IPC_OVERRIDE_KEYS {
+        if dict.contains(*key)? {
+            return Err(PyValueError::new_err(
+                "shm_threshold is a global transport policy; use set_transport_policy(shm_threshold=...)",
+            ));
+        }
     }
     Ok(())
 }
@@ -364,6 +353,14 @@ fn reject_unknown_ipc_fields(dict: &Bound<'_, PyDict>, allowed: &[&str]) -> PyRe
                 "unknown IPC override option: {key}"
             )));
         }
+    }
+    Ok(())
+}
+
+fn validate_ipc_override_key_names(dict: &Bound<'_, PyDict>) -> PyResult<()> {
+    for item in dict.keys().iter() {
+        item.extract::<String>()
+            .map_err(|_| PyTypeError::new_err("IPC override option names must be strings"))?;
     }
     Ok(())
 }

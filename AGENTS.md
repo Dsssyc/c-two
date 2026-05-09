@@ -154,6 +154,10 @@ Rust `c3 relay` runtime.
 | `settings.py` | `C2Settings` facade for SDK code overrides such as `cc.set_relay_anchor()` and process transport policy |
 | `ipc.py` | Typed override schemas: `BaseIPCOverrides`, `ServerIPCOverrides`, `ClientIPCOverrides`; Rust owns defaults and validation |
 
+IPC override key validation belongs to Rust/native config parsing. Python
+`ipc.py` may expose typed override schemas and forward mappings, but it must not
+keep allowed-key or forbidden-key validation tables.
+
 Config priority chain:
 
 ```text
@@ -177,8 +181,9 @@ Runtime-session config follows the same ownership rule. Rust
 `ipc://` address derivation, server IPC override storage/projection, direct IPC
 client acquire/release, client IPC config projection/freeze, route registration
 transactions, unregister/shutdown transaction outcomes, relay projection,
-relay-backed name resolution, and explicit HTTP client pool projection. Python
-may expose typed override facades and forward them into the native session, but
+relay-backed name resolution, explicit HTTP relay contract validation, and
+low-level HTTP client pool projection. Python may expose typed override facades
+and forward them into the native session, but
 must not keep separate `_server_ipc_overrides`, `_client_config`,
 `_client_ipc_overrides`, `_pool_config_applied`, server-id, server-address,
 direct `RustClientPool` or `RustHttpClientPool` authority, `_http_pool`,
@@ -215,8 +220,8 @@ frame or chunk metadata.
 
 `registry.py` asks native `RuntimeSession.ensure_server_bridge()` for the
 server bridge, `RuntimeSession.acquire_ipc_client()` for direct IPC clients,
-`RuntimeSession.acquire_http_client()` for explicit HTTP clients, and
-`RuntimeSession.connect_via_relay()` for relay name resolution. It consumes
+`RuntimeSession.connect_explicit_relay_http()` for explicit HTTP relay clients,
+and `RuntimeSession.connect_via_relay()` for relay name resolution. It consumes
 native unregister/shutdown outcomes before mutating Python local bindings. Do
 not reintroduce `_relay_control_client`, `_relay_control_address`,
 `_relay_control_client_for()`, `_http_pool`, direct

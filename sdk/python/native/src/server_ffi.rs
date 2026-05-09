@@ -144,6 +144,9 @@ impl PyServer {
         concurrency_mode: &str,
         max_pending: Option<usize>,
         max_workers: Option<usize>,
+        crm_ns: &str,
+        crm_name: &str,
+        crm_ver: &str,
     ) -> PyResult<BuiltRoute> {
         let mode = parse_concurrency_mode(concurrency_mode)?;
         let limits = SchedulerLimits::try_from_usize(max_pending, max_workers)
@@ -176,6 +179,9 @@ impl PyServer {
 
         let route = CrmRoute {
             name: name.to_string(),
+            crm_ns: crm_ns.to_string(),
+            crm_name: crm_name.to_string(),
+            crm_ver: crm_ver.to_string(),
             scheduler: Arc::new(scheduler),
             callback,
             method_names,
@@ -410,7 +416,7 @@ impl PyServer {
     ///
     /// `method_names` lists the CRM method names indexed by method_idx.
     /// `access_map` maps method_idx → "read" or "write".
-    #[pyo3(signature = (name, dispatcher, method_names, access_map, concurrency_mode, max_pending=None, max_workers=None))]
+    #[pyo3(signature = (name, dispatcher, method_names, access_map, concurrency_mode, max_pending=None, max_workers=None, crm_ns="", crm_name="", crm_ver=""))]
     fn register_route(
         &self,
         py: Python<'_>,
@@ -421,6 +427,9 @@ impl PyServer {
         concurrency_mode: &str,
         max_pending: Option<usize>,
         max_workers: Option<usize>,
+        crm_ns: &str,
+        crm_name: &str,
+        crm_ver: &str,
     ) -> PyResult<PyRouteConcurrency> {
         let built = self.build_route(
             py,
@@ -431,6 +440,9 @@ impl PyServer {
             concurrency_mode,
             max_pending,
             max_workers,
+            crm_ns,
+            crm_name,
+            crm_ver,
         )?;
         let route_handle = built.route_handle.clone();
         self.register_built_route(py, built.route)?;

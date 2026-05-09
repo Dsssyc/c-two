@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use c2_wire::control::MAX_CALL_ROUTE_NAME_BYTES;
+use c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES;
 
 use crate::relay::types::*;
 
@@ -105,19 +106,17 @@ impl RouteTable {
         (removed, removed_at)
     }
 
-    pub fn unregister_local_route_if_address_matches(
+    pub fn unregister_local_route_if_matches(
         &mut self,
-        name: &str,
-        address: &str,
+        expected: &RouteEntry,
     ) -> (Option<RouteEntry>, f64) {
         let relay_id = self.relay_id.clone();
-        let key = (name.to_string(), relay_id.clone());
-        let matches_address = self
+        let key = (expected.name.clone(), relay_id.clone());
+        let matches_expected = self
             .routes
             .get(&key)
-            .and_then(|entry| entry.ipc_address.as_deref())
-            .is_some_and(|stored| stored == address);
-        if !matches_address {
+            .is_some_and(|entry| local_route_matches(entry, expected));
+        if !matches_expected {
             return (None, self.next_local_timestamp());
         }
         let removed_at = self.next_local_timestamp();
@@ -127,7 +126,7 @@ impl RouteTable {
         };
         let server_id = removed.as_ref().and_then(|entry| entry.server_id.clone());
         self.apply_tombstone(RouteTombstone {
-            name: name.to_string(),
+            name: expected.name.clone(),
             relay_id,
             removed_at,
             server_id,
@@ -186,12 +185,36 @@ impl RouteTable {
     /// Resolve a name → ordered list of RouteInfo.
     /// LOCAL first, then PEER sorted by (registered_at, relay_id).
     pub fn resolve(&self, name: &str) -> Vec<RouteInfo> {
+        self.resolve_filtered(name, None)
+    }
+
+    pub fn resolve_matching(
+        &self,
+        name: &str,
+        crm_ns: &str,
+        crm_name: &str,
+        crm_ver: &str,
+    ) -> Vec<RouteInfo> {
+        self.resolve_filtered(name, Some((crm_ns, crm_name, crm_ver)))
+    }
+
+    fn resolve_filtered(
+        &self,
+        name: &str,
+        expected_crm: Option<(&str, &str, &str)>,
+    ) -> Vec<RouteInfo> {
         let mut local = Vec::new();
         let mut peers = Vec::new();
 
         for ((n, _), entry) in &self.routes {
             if n != name {
                 continue;
+            }
+            if let Some((crm_ns, crm_name, crm_ver)) = expected_crm {
+                if entry.crm_ns != crm_ns || entry.crm_name != crm_name || entry.crm_ver != crm_ver
+                {
+                    continue;
+                }
             }
             match entry.locality {
                 Locality::Local => local.push(entry.to_route_info()),
@@ -406,6 +429,11 @@ impl RouteTable {
             if !valid_route_name(&entry.name) || !valid_relay_id(&entry.relay_id) {
                 return;
             }
+            if !entry.registered_at.is_finite()
+                || !valid_crm_tag(&entry.crm_ns, &entry.crm_name, &entry.crm_ver)
+            {
+                return;
+            }
             let Some(peer) = peer_snapshots.get(&entry.relay_id) else {
                 return;
             };
@@ -503,6 +531,7 @@ impl RouteTable {
                 entry.registered_at.to_bits().hash(&mut hasher);
                 entry.relay_url.hash(&mut hasher);
                 entry.crm_ns.hash(&mut hasher);
+                entry.crm_name.hash(&mut hasher);
                 entry.crm_ver.hash(&mut hasher);
                 ((key.0.clone(), key.1.clone(), false), hasher.finish())
             })
@@ -538,6 +567,7 @@ impl RouteTable {
                 relay_id: entry.relay_id.clone(),
                 relay_url: entry.relay_url.clone(),
                 crm_ns: entry.crm_ns.clone(),
+                crm_name: entry.crm_name.clone(),
                 crm_ver: entry.crm_ver.clone(),
                 registered_at: entry.registered_at,
             })
@@ -571,12 +601,26 @@ impl RouteTable {
     }
 }
 
-fn valid_route_name(name: &str) -> bool {
-    !name.trim().is_empty() && name.as_bytes().len() <= MAX_CALL_ROUTE_NAME_BYTES
+pub(crate) fn valid_route_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.trim() == name
+        && name.as_bytes().len() <= MAX_CALL_ROUTE_NAME_BYTES
+        && !name.chars().any(char::is_control)
 }
 
 fn valid_relay_id(relay_id: &str) -> bool {
     !relay_id.trim().is_empty()
+}
+
+pub(crate) fn valid_crm_tag(crm_ns: &str, crm_name: &str, crm_ver: &str) -> bool {
+    valid_crm_tag_field(crm_ns) && valid_crm_tag_field(crm_name) && valid_crm_tag_field(crm_ver)
+}
+
+fn valid_crm_tag_field(value: &str) -> bool {
+    !value.is_empty()
+        && value.trim() == value
+        && value.as_bytes().len() <= MAX_HANDSHAKE_NAME_BYTES
+        && !value.chars().any(char::is_control)
 }
 
 fn current_epoch_millis() -> u64 {
@@ -601,6 +645,7 @@ mod tests {
             server_instance_id: Some(format!("inst-{name}-{relay_id}")),
             ipc_address: Some(format!("ipc://{name}_{relay_id}")),
             crm_ns: "test.ns".into(),
+            crm_name: "Grid".into(),
             crm_ver: "0.1.0".into(),
             locality: Locality::Local,
             registered_at: 1000.0,
@@ -616,6 +661,7 @@ mod tests {
             server_instance_id: None,
             ipc_address: None,
             crm_ns: "test.ns".into(),
+            crm_name: "Grid".into(),
             crm_ver: "0.1.0".into(),
             locality: Locality::Peer,
             registered_at,
@@ -630,6 +676,33 @@ mod tests {
             last_heartbeat: Instant::now(),
             status: PeerStatus::Alive,
         });
+    }
+
+    #[test]
+    fn route_name_validator_rejects_control_characters() {
+        assert!(!valid_route_name("grid\0hidden"));
+        assert!(!valid_route_name("grid\nhidden"));
+        assert!(valid_route_name("grid-visible.name_1"));
+    }
+
+    #[test]
+    fn route_digest_includes_crm_name() {
+        let mut left = RouteTable::new("relay-a".into());
+        let mut right = RouteTable::new("relay-a".into());
+        let left_entry = local_entry("grid", "relay-a");
+        let mut right_entry = left_entry.clone();
+        right_entry.crm_name = "OtherGrid".into();
+
+        left.register_route(left_entry);
+        right.register_route(right_entry);
+
+        assert_ne!(
+            left.route_digest()
+                .get(&("grid".into(), "relay-a".into(), false)),
+            right
+                .route_digest()
+                .get(&("grid".into(), "relay-a".into(), false)),
+        );
     }
 
     #[test]
@@ -931,6 +1004,22 @@ mod tests {
         let resolved = rt.resolve("grid");
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].relay_url, "http://relay-a:8080");
+    }
+
+    #[test]
+    fn resolve_matching_filters_by_full_crm_tag() {
+        let mut rt = RouteTable::new("relay-a".into());
+        rt.register_route(local_entry("grid", "relay-a"));
+
+        assert_eq!(
+            rt.resolve_matching("grid", "test.ns", "Grid", "0.1.0")
+                .len(),
+            1,
+        );
+        assert!(
+            rt.resolve_matching("grid", "test.ns", "OtherGrid", "0.1.0")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1288,6 +1377,38 @@ mod tests {
         });
 
         assert!(rt.list_routes().is_empty());
+    }
+
+    #[test]
+    fn merge_snapshot_rejects_invalid_crm_tag_without_partial_mutation() {
+        let mut rt = RouteTable::new("relay-b".into());
+        register_alive_peer(&mut rt, "relay-a");
+        rt.register_route(peer_entry("existing", "relay-a", 1000.0));
+
+        let mut invalid = peer_entry("invalid", "relay-a", 2000.0);
+        invalid.crm_name = "Grid\0Injected".into();
+
+        rt.merge_snapshot(FullSync {
+            routes: vec![peer_entry("new", "relay-a", 2001.0), invalid],
+            tombstones: vec![RouteTombstone {
+                name: "existing".into(),
+                relay_id: "relay-a".into(),
+                removed_at: 3000.0,
+                server_id: None,
+                observed_at: Instant::now(),
+            }],
+            peers: vec![PeerSnapshot {
+                relay_id: "relay-a".into(),
+                url: "http://relay-a:8080".into(),
+                route_count: 2,
+                status: PeerStatus::Alive,
+            }],
+        });
+
+        assert_eq!(rt.resolve("existing").len(), 1);
+        assert!(rt.resolve("new").is_empty());
+        assert!(rt.resolve("invalid").is_empty());
+        assert!(rt.list_tombstones().is_empty());
     }
 
     #[test]

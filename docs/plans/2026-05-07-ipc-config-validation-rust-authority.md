@@ -4,6 +4,8 @@
 
 **Goal:** Remove Python-owned IPC override key validation so Rust/native config parsing is the single validation authority while preserving typed Python override facades and clear user-facing errors.
 
+**Status:** Implemented on `dev-feature`; final verification is tracked below.
+
 **Architecture:** Python keeps `TypedDict` schemas and forwards override mappings without checking allowed or forbidden keys. `c2-config` owns the canonical IPC override field catalog, and the PyO3 native layer accepts any Python mapping, snapshots it into an owned dict, validates keys and forbidden fields, then builds Rust override structs. Runtime-session storage remains Rust-owned, so Python never keeps a second IPC config validation state.
 
 **Tech Stack:** Rust `c2-config`, PyO3 0.28 native bindings, Python `TypedDict` facades, `uv`/`maturin`, pytest, Cargo workspace tests.
@@ -39,7 +41,7 @@
 - Modify: `sdk/python/tests/unit/test_ipc_config.py`
 - Modify: `sdk/python/tests/unit/test_sdk_boundary.py`
 
-- [ ] **Step 1: Add behavior tests that require native validation**
+- [x] **Step 1: Add behavior tests that require native validation**
 
 Replace the existing unknown/forbidden-key assertions in `sdk/python/tests/unit/test_ipc_config.py` with tests that expect native `ValueError` wording and add mapping-shape coverage:
 
@@ -92,7 +94,7 @@ def test_ipc_override_keys_must_be_strings_native_error():
         cc.set_client(ipc_overrides={1: 4096})  # type: ignore[dict-item]
 ```
 
-- [ ] **Step 2: Add mapping-subclass and copy/freeze coverage**
+- [x] **Step 2: Add mapping-subclass and copy/freeze coverage**
 
 Add this test to the same file so the native parser must accept mappings, snapshot values once, and keep `None` semantics:
 
@@ -110,7 +112,7 @@ def test_ipc_override_mapping_is_snapshotted_by_native():
     }
 ```
 
-- [ ] **Step 3: Add a source boundary guard**
+- [x] **Step 3: Add a source boundary guard**
 
 Append this test to `sdk/python/tests/unit/test_sdk_boundary.py`:
 
@@ -134,7 +136,7 @@ def test_python_ipc_config_facade_does_not_validate_override_keys():
     assert offenders == []
 ```
 
-- [ ] **Step 4: Run the focused tests and verify they fail for the intended reason**
+- [x] **Step 4: Run the focused tests and verify they fail for the intended reason**
 
 Run:
 
@@ -151,7 +153,7 @@ Expected before implementation: failures showing Python still raises `TypeError`
 - Modify: `core/foundation/c2-config/src/lib.rs`
 - Modify: `sdk/python/native/src/config_ffi.rs`
 
-- [ ] **Step 1: Add canonical override key catalogs in Rust core**
+- [x] **Step 1: Add canonical override key catalogs in Rust core**
 
 Add the public constants near the IPC struct definitions in `core/foundation/c2-config/src/ipc.rs`:
 
@@ -197,7 +199,7 @@ pub const FORBIDDEN_IPC_OVERRIDE_KEYS: &[&str] = &[
 ];
 ```
 
-- [ ] **Step 2: Export the catalogs from `c2-config`**
+- [x] **Step 2: Export the catalogs from `c2-config`**
 
 Change the export list in `core/foundation/c2-config/src/lib.rs`:
 
@@ -208,7 +210,7 @@ pub use ipc::{
 };
 ```
 
-- [ ] **Step 3: Replace PyO3-local key constants**
+- [x] **Step 3: Replace PyO3-local key constants**
 
 In `sdk/python/native/src/config_ffi.rs`, remove `BASE_IPC_KEYS`, `SERVER_IPC_KEYS`, and `CLIENT_IPC_KEYS`, then call the exported constants:
 
@@ -232,7 +234,7 @@ fn reject_forbidden_ipc_fields(dict: &Bound<'_, PyDict>) -> PyResult<()> {
 }
 ```
 
-- [ ] **Step 4: Verify Rust core still compiles**
+- [x] **Step 4: Verify Rust core still compiles**
 
 Run:
 
@@ -248,7 +250,7 @@ Expected: all `c2-config` tests pass.
 - Modify: `sdk/python/native/src/config_ffi.rs`
 - Modify: `sdk/python/native/src/runtime_session_ffi.rs`
 
-- [ ] **Step 1: Import mapping and type-error support**
+- [x] **Step 1: Import mapping and type-error support**
 
 In `sdk/python/native/src/config_ffi.rs`, update imports:
 
@@ -258,7 +260,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyMapping};
 ```
 
-- [ ] **Step 2: Snapshot arbitrary Python mappings inside native**
+- [x] **Step 2: Snapshot arbitrary Python mappings inside native**
 
 Add this helper before `parse_server_ipc_overrides`:
 
@@ -281,7 +283,7 @@ fn copy_ipc_overrides<'py>(
 }
 ```
 
-- [ ] **Step 3: Split public mapping parsers from dict parsers**
+- [x] **Step 3: Split public mapping parsers from dict parsers**
 
 Refactor server parsing so public callers pass `PyAny` and internal dict parsing remains simple:
 
@@ -357,7 +359,7 @@ fn client_overrides(
 }
 ```
 
-- [ ] **Step 4: Make non-string keys fail clearly in native**
+- [x] **Step 4: Make non-string keys fail clearly in native**
 
 Replace `reject_unknown_ipc_fields` with:
 
@@ -377,7 +379,7 @@ fn reject_unknown_ipc_fields(dict: &Bound<'_, PyDict>, allowed: &[&str]) -> PyRe
 }
 ```
 
-- [ ] **Step 5: Change exported native functions to accept mappings**
+- [x] **Step 5: Change exported native functions to accept mappings**
 
 Update the `resolve_server_ipc_config` and `resolve_client_ipc_config` signatures in `sdk/python/native/src/config_ffi.rs`:
 
@@ -397,7 +399,7 @@ fn resolve_client_ipc_config(
 ) -> PyResult<Py<PyAny>> {
 ```
 
-- [ ] **Step 6: Change `RuntimeSession` PyO3 input signatures to mappings**
+- [x] **Step 6: Change `RuntimeSession` PyO3 input signatures to mappings**
 
 In `sdk/python/native/src/runtime_session_ffi.rs`, update the constructor and setters from `Option<&Bound<'_, PyDict>>` to `Option<&Bound<'_, PyAny>>`:
 
@@ -416,7 +418,7 @@ fn set_client_ipc_overrides(&self, overrides: Option<&Bound<'_, PyAny>>) -> PyRe
 
 When an existing call site has a `Bound<'_, PyDict>`, pass `Some(overrides.as_any())` into the parser.
 
-- [ ] **Step 7: Verify native bindings compile**
+- [x] **Step 7: Verify native bindings compile**
 
 Run:
 
@@ -432,7 +434,7 @@ Expected: command exits successfully. If PyO3 reports a cast or update API misma
 - Modify: `sdk/python/src/c_two/config/ipc.py`
 - Modify: `sdk/python/src/c_two/transport/registry.py`
 
-- [ ] **Step 1: Thin `config/ipc.py` to types plus native forwarding**
+- [x] **Step 1: Thin `config/ipc.py` to types plus native forwarding**
 
 Remove `_SERVER_KEYS`, `_CLIENT_KEYS`, `_FORBIDDEN_IPC_KEYS`, `_normalize_server_ipc_overrides`, `_normalize_client_ipc_overrides`, and `_clean_ipc_overrides`. Keep only the `TypedDict` classes, `_resolve_*` resolver calls, `_native_resolver`, and `_shm_overrides`:
 
@@ -461,7 +463,7 @@ def _resolve_client_ipc_config(
     ))
 ```
 
-- [ ] **Step 2: Stop normalizing overrides in `registry.py`**
+- [x] **Step 2: Stop normalizing overrides in `registry.py`**
 
 Replace the IPC config import with:
 
@@ -481,7 +483,7 @@ Change `set_client()` to pass directly:
 if not self._runtime_session.set_client_ipc_overrides(ipc_overrides):
 ```
 
-- [ ] **Step 3: Verify no Python validation helpers remain**
+- [x] **Step 3: Verify no Python validation helpers remain**
 
 Run:
 
@@ -497,7 +499,7 @@ Expected: no matches in Python SDK source. Matches in `sdk/python/native/src/con
 - Modify: `AGENTS.md`
 - Modify: `docs/plans/2026-05-04-thin-sdk-rust-core-boundary.md`
 
-- [ ] **Step 1: Update `AGENTS.md` config guidance**
+- [x] **Step 1: Update `AGENTS.md` config guidance**
 
 In the Config Layer section, add this sentence after the IPC override schema paragraph:
 
@@ -507,11 +509,11 @@ may expose typed override schemas and forward mappings, but it must not keep
 allowed-key or forbidden-key validation tables.
 ```
 
-- [ ] **Step 2: Mark issue8 implemented in the thin-sdk boundary document**
+- [x] **Step 2: Mark issue8 implemented in the thin-sdk boundary document**
 
 After code and tests pass, change the issue8 ledger row to `Implemented` and point to this plan. Replace the issue8 section with an implemented-ownership summary that says Python `ipc.py` is type facade plus native forwarding, `c2-config` owns the key catalog, and PyO3 snapshots Python mappings before validation.
 
-- [ ] **Step 3: Run docs whitespace verification**
+- [x] **Step 3: Run docs whitespace verification**
 
 Run:
 
@@ -526,7 +528,7 @@ Expected: no whitespace errors.
 **Files:**
 - Verify: Rust workspace, native extension, focused Python tests, full Python suite.
 
-- [ ] **Step 1: Run Rust config and native checks**
+- [x] **Step 1: Run Rust config and native checks**
 
 Run:
 
@@ -537,7 +539,7 @@ cargo check --manifest-path sdk/python/native/Cargo.toml -q
 
 Expected: both commands pass.
 
-- [ ] **Step 2: Rebuild the Python native extension**
+- [x] **Step 2: Rebuild the Python native extension**
 
 Run:
 
@@ -547,7 +549,7 @@ uv sync --reinstall-package c-two
 
 Expected: maturin rebuild succeeds.
 
-- [ ] **Step 3: Run focused Python tests**
+- [x] **Step 3: Run focused Python tests**
 
 Run:
 
@@ -557,7 +559,7 @@ C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_ipc_config.py 
 
 Expected: all selected tests pass; no skipped tests in these unit files are caused by relay availability.
 
-- [ ] **Step 4: Run full Python suite**
+- [x] **Step 4: Run full Python suite**
 
 Run:
 
@@ -567,7 +569,7 @@ C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30 -rs
 
 Expected: full suite passes. Relay-dependent tests may skip only if the local `c3` relay binary is not built; build it with `python tools/dev/c3_tool.py --build --link` before treating relay coverage as complete.
 
-- [ ] **Step 5: Run source-level zombie-code audit**
+- [x] **Step 5: Run source-level zombie-code audit**
 
 Run:
 
@@ -578,7 +580,7 @@ rg -n "unknown IPC override|shm_threshold is a global transport policy" sdk/pyth
 
 Expected: first command has no matches outside this implementation plan if docs are included intentionally; second command has no matches in Python source. Native Rust matches are expected and are the new authority.
 
-- [ ] **Step 6: Review for regressions before commit**
+- [x] **Step 6: Review for regressions before handoff**
 
 Check these invariants manually in the diff:
 
@@ -589,7 +591,7 @@ Check these invariants manually in the diff:
 - Unknown and forbidden keys are rejected before value extraction.
 - Direct IPC code paths, relay projection, response allocation, and buffer lease tracking are untouched except for config parsing inputs.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 7: Commit (optional; not run unless explicitly requested)**
 
 Run:
 

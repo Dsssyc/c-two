@@ -145,6 +145,9 @@ class TestHandshakeBoundsChecking:
         buf += struct.pack('<H', 1)     # route_count=1
         buf.append(2)                   # route_name_len=2
         buf += b'r1'                    # route_name
+        buf.append(0)                   # crm_ns_len=0
+        buf.append(0)                   # crm_name_len=0
+        buf.append(0)                   # crm_ver_len=0
         buf += struct.pack('<H', _MAX_HANDSHAKE_METHODS + 1)  # method count
         with pytest.raises(ValueError, match='invalid value|exceeds'):
             decode_handshake(bytes(buf))

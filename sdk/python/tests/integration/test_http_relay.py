@@ -2,7 +2,8 @@
 
 Tests the full pipeline: RustHttpClient -> standalone c3 relay -> RustClient -> Server -> CRM
 
-Also tests ``cc.connect(address='http://...')`` end-to-end.
+Also tests ``cc.connect(address='http://...')`` end-to-end through the native
+relay-aware explicit HTTP projection.
 """
 from __future__ import annotations
 
@@ -248,15 +249,25 @@ class TestCcConnectHttp:
             cc.close(hello)
             cc.close(counter)
 
-    def test_connect_http_close_releases_pool(self, relay_stack):
-        """cc.close releases the HTTP pool reference."""
+    def test_connect_http_rejects_crm_contract_mismatch_before_call(self, relay_stack):
+        relay_url, _ = relay_stack
+
+        with pytest.raises(RuntimeError, match='CRM contract mismatch'):
+            cc.connect(Counter, name='hello', address=relay_url)
+
+    def test_connect_http_close_closes_relay_aware_client(self, relay_stack):
+        """cc.close closes the relay-aware explicit HTTP client."""
         relay_url, _ = relay_stack
         registry = _ProcessRegistry.get()
 
         crm = cc.connect(Hello, name='hello', address=relay_url)
-        assert registry._runtime_session.http_client_refcount(relay_url) == 1
+        native_client = crm.client._client  # noqa: SLF001
+        assert native_client.mode == 'http'
+        assert registry._runtime_session.http_client_refcount(relay_url) == 0
 
         cc.close(crm)
+        with pytest.raises(RuntimeError, match='closed'):
+            native_client.call('hello', 'greeting', b'')
         assert registry._runtime_session.http_client_refcount(relay_url) == 0
 
     def test_connect_http_with_slash_in_name(self, start_c3_relay):
@@ -364,6 +375,45 @@ class TestCcConnectHttp:
         finally:
             if crm is not None:
                 resolver.close(crm)
+            resolver.shutdown()
+            settings.relay_anchor_address = previous_relay
+            registrar.shutdown()
+            settings.relay_anchor_address = previous_relay
+
+    def test_relay_local_ipc_contract_mismatch_does_not_fallback_to_http(self, start_c3_relay):
+        name = 'identity/local-ipc-contract-mismatch'
+        relay = start_c3_relay(skip_ipc_validation=True)
+        relay_url = relay.url
+        previous_relay = settings.relay_anchor_address
+        registrar = _ProcessRegistry()
+        resolver = _ProcessRegistry()
+        try:
+            registrar.register(Hello, HelloImpl(), name=name)
+            ipc_addr = registrar.get_server_address()
+            server_id = registrar.get_server_id()
+            assert ipc_addr is not None
+            assert server_id is not None
+            server_instance_id = _server_instance_id_for(registrar, ipc_addr)
+
+            with httpx.Client(trust_env=False, timeout=5.0) as http:
+                resp = http.post(
+                    f'{relay_url}/_register',
+                    json={
+                        'name': name,
+                        'server_id': server_id,
+                        'server_instance_id': server_instance_id,
+                        'address': ipc_addr,
+                        'crm_ns': 'test.counter',
+                        'crm_name': 'Counter',
+                        'crm_ver': '0.1.0',
+                    },
+                )
+                assert resp.status_code == 201
+
+            resolver.set_relay_anchor(relay_url)
+            with pytest.raises(RuntimeError, match='CRM contract mismatch'):
+                resolver.connect(Counter, name=name)
+        finally:
             resolver.shutdown()
             settings.relay_anchor_address = previous_relay
             registrar.shutdown()

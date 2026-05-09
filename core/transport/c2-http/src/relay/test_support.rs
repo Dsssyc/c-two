@@ -52,9 +52,22 @@ pub(crate) fn test_state_for_client() -> Arc<RelayState> {
 }
 
 pub(crate) async fn register_echo_route(server: &Arc<Server>, name: &str) {
+    register_echo_route_with_contract(server, name, "test.echo", "Echo", "0.1.0").await;
+}
+
+pub(crate) async fn register_echo_route_with_contract(
+    server: &Arc<Server>,
+    name: &str,
+    crm_ns: &str,
+    crm_name: &str,
+    crm_ver: &str,
+) {
     server
         .register_route(CrmRoute {
             name: name.into(),
+            crm_ns: crm_ns.into(),
+            crm_name: crm_name.into(),
+            crm_ver: crm_ver.into(),
             scheduler: Arc::new(Scheduler::new(
                 ConcurrencyMode::ReadParallel,
                 HashMap::new(),
@@ -71,19 +84,38 @@ pub(crate) async fn start_live_server_with_routes(
     server_id: &str,
     routes: &[&str],
 ) -> Arc<Server> {
+    let route_contracts = routes
+        .iter()
+        .map(|route| (*route, "test.echo", "Echo", "0.1.0"))
+        .collect::<Vec<_>>();
+    start_live_server_with_identity_and_contracts(
+        address,
+        server_id,
+        &format!("{server_id}-instance"),
+        &route_contracts,
+    )
+    .await
+}
+
+pub(crate) async fn start_live_server_with_identity_and_contracts(
+    address: &str,
+    server_id: &str,
+    server_instance_id: &str,
+    routes: &[(&str, &str, &str, &str)],
+) -> Arc<Server> {
     let server = Arc::new(
         Server::new_with_identity(
             address,
             ServerIpcConfig::default(),
             c2_server::ServerIdentity {
                 server_id: server_id.to_string(),
-                server_instance_id: format!("{server_id}-instance"),
+                server_instance_id: server_instance_id.to_string(),
             },
         )
         .unwrap(),
     );
-    for route in routes {
-        register_echo_route(&server, route).await;
+    for (route, crm_ns, crm_name, crm_ver) in routes {
+        register_echo_route_with_contract(&server, route, crm_ns, crm_name, crm_ver).await;
     }
     let run_server = server.clone();
     tokio::spawn(async move {

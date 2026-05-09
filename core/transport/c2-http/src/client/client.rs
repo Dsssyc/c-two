@@ -14,6 +14,9 @@ const PATH_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'.')
     .remove(b'_')
     .remove(b'~');
+const EXPECTED_CRM_NS_HEADER: &str = "x-c2-expected-crm-ns";
+const EXPECTED_CRM_NAME_HEADER: &str = "x-c2-expected-crm-name";
+const EXPECTED_CRM_VER_HEADER: &str = "x-c2-expected-crm-ver";
 
 fn encode_segment(s: &str) -> String {
     utf8_percent_encode(s, PATH_SEGMENT).to_string()
@@ -107,17 +110,30 @@ impl HttpClient {
         method_name: &str,
         data: &[u8],
     ) -> Result<Vec<u8>, HttpError> {
+        self.call_with_expected_crm_async(route_name, method_name, data, None)
+            .await
+    }
+
+    pub(crate) async fn call_with_expected_crm_async(
+        &self,
+        route_name: &str,
+        method_name: &str,
+        data: &[u8],
+        expected_crm: Option<(&str, &str, &str)>,
+    ) -> Result<Vec<u8>, HttpError> {
         let url = format!(
             "{}/{}/{}",
             self.base_url,
             encode_segment(route_name),
             encode_segment(method_name),
         );
-        let resp = self
+        let mut request = self
             .client
             .post(&url)
             .header("Content-Type", "application/octet-stream")
-            .body(data.to_vec())
+            .body(data.to_vec());
+        request = add_expected_crm_headers(request, expected_crm);
+        let resp = request
             .send()
             .await
             .map_err(|e| HttpError::Transport(e.to_string()))?;
@@ -164,10 +180,18 @@ impl HttpClient {
 
     /// Async route probe — GET /_probe/{route_name}.
     pub async fn probe_route_async(&self, route_name: &str) -> Result<(), HttpError> {
+        self.probe_route_with_expected_crm_async(route_name, None)
+            .await
+    }
+
+    pub(crate) async fn probe_route_with_expected_crm_async(
+        &self,
+        route_name: &str,
+        expected_crm: Option<(&str, &str, &str)>,
+    ) -> Result<(), HttpError> {
         let url = format!("{}/_probe/{}", self.base_url, encode_segment(route_name));
-        let resp = self
-            .client
-            .get(&url)
+        let request = add_expected_crm_headers(self.client.get(&url), expected_crm);
+        let resp = request
             .send()
             .await
             .map_err(|e| HttpError::Transport(e.to_string()))?;
@@ -184,6 +208,19 @@ impl HttpClient {
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
+}
+
+fn add_expected_crm_headers(
+    mut request: reqwest::RequestBuilder,
+    expected_crm: Option<(&str, &str, &str)>,
+) -> reqwest::RequestBuilder {
+    if let Some((crm_ns, crm_name, crm_ver)) = expected_crm {
+        request = request
+            .header(EXPECTED_CRM_NS_HEADER, crm_ns)
+            .header(EXPECTED_CRM_NAME_HEADER, crm_name)
+            .header(EXPECTED_CRM_VER_HEADER, crm_ver);
+    }
+    request
 }
 
 #[cfg(test)]

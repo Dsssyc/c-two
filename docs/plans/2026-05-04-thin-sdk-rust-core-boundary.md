@@ -92,8 +92,65 @@ code, not merely planned in a separate implementation document.
 | 5 | SDK-visible buffer lease lifecycle | Implemented | See `docs/plans/2026-05-06-unified-buffer-lease-rust-authority.md`; `c2-mem` owns retained buffer lease accounting and Python exposes only hold/result facades. |
 | 6 | Server route slot lifecycle and readiness | Implemented | See `docs/plans/2026-05-07-server-readiness-rust-authority.md`; `c2-server` owns readiness, lifecycle transitions, socket unlink authority, and shutdown barriers. |
 | 7 | Response allocation decision | Implemented | See `docs/plans/2026-05-07-response-allocation-rust-authority.md`; Python response-pool allocation was removed and low-copy response buffer preparation now lives in Rust native/core. |
-| 8 | IPC config validation duplication | Planned | See `docs/plans/2026-05-07-ipc-config-validation-rust-authority.md`; next work removes Python allowed/forbidden-key checks and makes Rust/native config parsing the single validation authority. |
-| 9 | Native method table facade | Backlog / low priority | Method discovery remains language-specific enough that this should only proceed if it removes real duplicated wire authority. |
+| 8 | IPC config validation duplication | Implemented | See `docs/plans/2026-05-07-ipc-config-validation-rust-authority.md`; Python now forwards IPC override mappings and Rust/native config parsing owns allowed-key, forbidden-key, and shape validation. |
+| 9 | CRM contract descriptor and route validation | In progress | Reframed from a narrow native method-table facade after cross-language SDK review. See `docs/plans/2026-05-08-crm-contract-rust-authority.md`; SDKs extract CRM descriptors, while Rust should own language-neutral CRM identity matching, route metadata projection, and method-index validity checks. |
+
+### 2026-05-08 Post-Review Addendum
+
+Session `019dec60-8de6-7492-9152-9ad8b61ebe49` was interrupted during a strict
+review of relay registration behavior. The durable conclusion belongs in this
+boundary reference because it reinforces the same rule: language SDKs must not
+own generic runtime, relay, IPC, wire, or chunk lifecycle correctness.
+
+Settled findings from that session:
+
+- The relay command-loop / `c3 relay --upstream` registration path had a real
+  ordering bug: it could dial a new candidate IPC endpoint before rejecting a
+  duplicate live owner.
+- That specific bug is now handled in Rust `c2-http`: command-loop registration
+  is split into candidate eligibility, candidate IPC attestation, and final
+  commit. Duplicate live owners are rejected before candidate connect.
+- Non-skip IPC validation now requires the candidate handshake to provide a real
+  `server_instance_id`; only skip-validation tests may synthesize an instance.
+- Final relay route replacement remains a Rust authority decision guarded by
+  relay-local route state and `OwnerToken`.
+- The remaining relay robustness gap is not a Python SDK issue. It is a future
+  Rust relay/IPC owner-freshness problem: an old upstream owner can be probed as
+  dead or route-missing, recover externally before candidate commit, and still
+  be replaced if no relay-visible owner epoch/lease/fence changed. The follow-up
+  is tracked in `docs/issues/relay-stale-owner-revival-race.md`.
+
+This relay robustness note is not a downshift-ledger candidate. Treat it as a
+separate Rust relay/IPC hardening concern unless it becomes release-blocking.
+
+### 2026-05-08 Issue 8 Verification And Issue 9 Decision
+
+Issue 8 is implemented and re-reviewed. Verification from the strict review
+pass:
+
+- `uv sync --reinstall-package c-two`
+- `cargo test --manifest-path core/Cargo.toml -p c2-config`
+- `cargo check --manifest-path sdk/python/native/Cargo.toml -q`
+- `C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_ipc_config.py sdk/python/tests/unit/test_runtime_session.py sdk/python/tests/unit/test_sdk_boundary.py -q --timeout=30 -rs`
+- `cargo test --manifest-path core/Cargo.toml --workspace`
+- `C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30 -rs`
+- `C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_python_examples_syntax.py::test_python_examples_compile_on_minimum_supported_python -q --timeout=30 -rs`
+- direct native `RuntimeSession(UserDict(...))` mapping snapshot probe
+- `git diff --check`
+
+All passed, with the full Python suite reporting `741 passed, 2 skipped`; the
+skips are examples-dependency skips, not IPC config failures.
+
+Issue 9 was initially reviewed too narrowly as a native method-table facade.
+That conclusion is superseded by the cross-language CRM review: Python should
+still discover Python CRM methods and map `method_idx -> Python method` inside
+the callback, but CRM namespace/version identity, route metadata projection,
+client-side CRM matching, and method-index validity are language-neutral
+runtime contract concerns. They should live in Rust core so future Rust, Go,
+Fortran, and C++ SDKs do not each reimplement the same checks.
+
+The active repair is tracked in
+`docs/plans/2026-05-08-crm-contract-rust-authority.md`.
 
 ### P1. Remote IPC scheduler config and execution semantics
 
@@ -255,8 +312,9 @@ Rust-owned pieces include:
 - client config freeze after first connection acquisition;
 - direct IPC client acquire/release/refcount/shutdown through the native
   session pool;
-- explicit HTTP client acquire/release/refcount/shutdown through the native
-  session projection;
+- low-level HTTP client acquire/release/refcount/shutdown through the native
+  session projection, while explicit SOTA HTTP connects use the native
+  relay-aware contract-validation path;
 - lazy server bridge creation through `ensure_server_bridge()`;
 - route registration transactions through `register_route()`;
 - local unregister and shutdown transaction outcomes;
@@ -515,26 +573,26 @@ data-size, and chunk-count limits.
 
 ### P2. IPC config validation duplication
 
-**Planned ownership**
+**Implemented ownership**
 
-Status: implementation plan drafted in
+Status: implemented on `dev-feature` by
 `docs/plans/2026-05-07-ipc-config-validation-rust-authority.md`.
 
-Python `sdk/python/src/c_two/config/ipc.py` still keeps allowed-key and
-forbidden-key checks that duplicate native resolver checks in
-`sdk/python/native/src/config_ffi.rs`. The planned repair keeps Python
-`TypedDict` schemas as SDK type hints, removes Python `_normalize_*` and
-`_clean_ipc_overrides` validation helpers, passes override mappings directly
-into native config parsing, and makes Rust/native validation produce the
-canonical user-facing errors.
+Python `sdk/python/src/c_two/config/ipc.py` now keeps only `TypedDict` schemas,
+native resolver forwarding, and global SHM override projection. It no longer
+keeps `_normalize_*`, `_clean_ipc_overrides`, allowed-key tables, forbidden-key
+tables, or user-facing IPC override key error text. `registry.py` passes caller
+override mappings directly into native `RuntimeSession` parsing.
 
-The implementation plan also moves the IPC override key catalog into
-`core/foundation/c2-config` so PyO3 bindings consume Rust-core field lists
-instead of maintaining SDK-side allowed-key tables. PyO3 snapshots arbitrary
-Python mappings before parsing, preserving copy/freeze semantics without
-letting Python own validation state.
+The canonical IPC override key catalog now lives in `core/foundation/c2-config`
+and is exported to PyO3 bindings. `sdk/python/native/src/config_ffi.rs` accepts
+arbitrary Python mappings, snapshots them into an owned native `dict`, validates
+key names, rejects global-only fields such as `shm_threshold`, rejects unknown
+fields such as derived `max_pool_memory`, and then builds Rust override structs.
+Runtime-session storage remains Rust-owned, so mutating a caller mapping after
+`cc.set_server()` or `cc.set_client()` cannot mutate stored overrides.
 
-**Required coverage**
+**Verified coverage**
 
 - Unknown server/client IPC override errors still point to the offending key
   and come from native validation.
@@ -543,27 +601,34 @@ letting Python own validation state.
 - Mapping subclasses are accepted and snapshotted by native parsing.
 - Non-mapping override inputs and non-string override keys fail with precise
   native `TypeError` messages.
+- Non-string key shape errors take precedence over semantic forbidden-field
+  errors.
 - Boundary tests prevent Python allowed-key, forbidden-key, and `_normalize_*`
   validation helpers from being reintroduced.
 
-### P3. Native method table facade
+### P3. CRM contract descriptor and route validation
 
-**Current Python ownership**
+**Planned ownership**
 
-`sdk/python/src/c_two/transport/wire.py` retains a Python `MethodTable` for
-server dispatch mapping.
+`sdk/python/src/c_two/transport/wire.py` may retain a Python `MethodTable` only
+as a Python callback projection. It must not be the language-neutral contract
+authority for route metadata, method-index validity, or client CRM matching.
 
-**Why low priority**
+**Implementation direction**
 
-Method discovery is language-specific, and the Python table is small. Rust
-already owns client handshake method tables. Moving this is mostly cleanup, not
-a major cross-language risk.
+Do not move Python method discovery into Rust. Instead:
 
-**Implementation sketch**
+- SDKs extract `crm_ns`, `crm_ver`, method names, and access metadata from the
+  language-native CRM definition.
+- Rust stores that descriptor as route contract metadata.
+- Direct IPC handshakes project CRM identity next to route method entries.
+- Rust clients validate expected CRM identity before binding a proxy to a route.
+- Relay-aware route selection filters candidates by expected CRM identity before
+  choosing local IPC or HTTP targets.
+- Rust server dispatch rejects invalid method indexes before scheduler
+  acquisition and before invoking any SDK callback.
 
-Expose a native method table type only if it simplifies route registration or
-removes duplicated wire limits. Do not prioritize this ahead of scheduler,
-runtime/session, IPC control helpers, and error/config canonicalization.
+Transferable ABI hashes and full signature compatibility remain future work.
 
 ## Suggested Execution Order
 
@@ -575,7 +640,8 @@ runtime/session, IPC control helpers, and error/config canonicalization.
 5. Hold lease tracking and server readiness cleanup.
 6. Response allocation decision without payload-copy regression.
 7. Config validation deduplication.
-8. Native method table cleanup only if still useful.
+8. CRM contract descriptor and route validation, without moving
+   language-specific method discovery into Rust.
 
 ## Regression Matrix For Future Work
 
@@ -596,6 +662,12 @@ Every implementation spawned from this reference should preserve:
 - SHM-backed remote IPC requests arrive as `ShmBuffer`/`memoryview`.
 - Large result replies keep using Rust transport selection and avoid avoidable
   copies.
+- Chunked request/response lifecycle cleanup remains Rust-owned: no client or
+  server chunk assembly should rely on Python SDK cleanup, receive-loop natural
+  exit, or process teardown as the only release path.
+- Relay stale-owner replacement remains Rust-owned and identity-attested:
+  future fixes must add owner freshness/fencing in relay/IPC state, not
+  route-name trust or SDK-side retry/replay behavior.
 
 ## Notes For Future SDK Authors
 

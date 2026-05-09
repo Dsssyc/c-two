@@ -135,12 +135,29 @@ pub trait CrmCallback: Send + Sync + 'static {
 pub struct CrmRoute {
     /// Route name (e.g., "grid", "solver")
     pub name: String,
+    /// CRM namespace from the language-neutral contract descriptor.
+    pub crm_ns: String,
+    /// CRM contract class/model name from the language-neutral contract descriptor.
+    pub crm_name: String,
+    /// CRM semantic version from the language-neutral contract descriptor.
+    pub crm_ver: String,
     /// Concurrency scheduler for this CRM
     pub scheduler: Arc<Scheduler>,
     /// Callback to invoke CRM methods
     pub callback: Arc<dyn CrmCallback>,
     /// Method names indexed by method_idx
     pub method_names: Vec<String>,
+}
+
+impl CrmRoute {
+    /// Return true when `method_idx` points at a registered CRM method.
+    ///
+    /// This is intentionally an O(1) bounds check for the remote dispatch hot
+    /// path. Full method-name and contract validation happens at registration
+    /// and client binding time.
+    pub fn has_method_index(&self, method_idx: u16) -> bool {
+        (method_idx as usize) < self.method_names.len()
+    }
 }
 
 /// Route dispatcher — resolves (route_name, method_idx) to CrmRoute.
@@ -233,6 +250,9 @@ mod tests {
     fn make_route(name: &str) -> CrmRoute {
         CrmRoute {
             name: name.to_string(),
+            crm_ns: "test.grid".to_string(),
+            crm_name: "Grid".to_string(),
+            crm_ver: "0.1.0".to_string(),
             scheduler: Arc::new(Scheduler::new(
                 ConcurrencyMode::ReadParallel,
                 HashMap::new(),
@@ -265,6 +285,19 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(result, ResponseMeta::Inline(ref v) if v == b"echo"));
+    }
+
+    #[test]
+    fn route_contract_metadata_and_method_index_bounds_are_available() {
+        let route = make_route("grid");
+
+        assert_eq!(route.crm_ns, "test.grid");
+        assert_eq!(route.crm_name, "Grid");
+        assert_eq!(route.crm_ver, "0.1.0");
+        assert!(route.has_method_index(0));
+        assert!(route.has_method_index(1));
+        assert!(!route.has_method_index(2));
+        assert!(!route.has_method_index(u16::MAX));
     }
 
     #[test]

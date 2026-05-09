@@ -13,6 +13,7 @@ import inspect
 import logging
 import math
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -46,6 +47,9 @@ class CRMSlot:
     name: str
     crm_instance: object
     direct_instance: object
+    crm_ns: str
+    crm_name: str
+    crm_ver: str
     method_table: MethodTable
     scheduler: Scheduler
     methods: list[str]
@@ -91,7 +95,7 @@ class NativeServerBridge:
         crm_instance: object | None = None,
         concurrency: ConcurrencyConfig | None = None,
         *,
-        ipc_overrides: ServerIPCOverrides | None = None,
+        ipc_overrides: ServerIPCOverrides | Mapping[str, object] | None = None,
         name: str | None = None,
         server_id: str | None = None,
         server_instance_id: str | None = None,
@@ -182,6 +186,9 @@ class NativeServerBridge:
             name=routing_name,
             crm_instance=instance,
             direct_instance=crm_instance,
+            crm_ns=getattr(crm_class, '__cc_namespace__', ''),
+            crm_name=getattr(crm_class, '__cc_name__', crm_class.__name__),
+            crm_ver=getattr(crm_class, '__cc_version__', ''),
             method_table=method_table,
             scheduler=None,  # type: ignore[arg-type]
             methods=methods,
@@ -219,6 +226,7 @@ class NativeServerBridge:
                         cc_config.max_pending,
                         cc_config.max_workers,
                         getattr(crm_class, '__cc_namespace__', ''),
+                        getattr(crm_class, '__cc_name__', crm_class.__name__),
                         getattr(crm_class, '__cc_version__', ''),
                         relay_anchor_address,
                     )
@@ -242,6 +250,9 @@ class NativeServerBridge:
                     cc_config.mode.value,
                     cc_config.max_pending,
                     cc_config.max_workers,
+                    slot.crm_ns,
+                    slot.crm_name,
+                    slot.crm_ver,
                 )
             slot.scheduler = Scheduler(native_concurrency, method_index)
             self._slots[routing_name] = slot
@@ -289,13 +300,13 @@ class NativeServerBridge:
             raise KeyError(f'Name not registered: {name!r}')
         return slot.scheduler
 
-    def get_local_slot_info(self, name: str) -> tuple[object, Scheduler] | None:
+    def get_local_slot_info(self, name: str) -> tuple[object, Scheduler, str, str, str] | None:
         """Return Python dispatch glue for same-process fast-path calls."""
         with self._slots_lock:
             slot = self._slots.get(name)
         if slot is None:
             return None
-        return slot.direct_instance, slot.scheduler
+        return slot.direct_instance, slot.scheduler, slot.crm_ns, slot.crm_name, slot.crm_ver
 
     @property
     def names(self) -> list[str]:

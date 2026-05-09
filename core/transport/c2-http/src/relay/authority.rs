@@ -9,6 +9,7 @@ use c2_ipc::IpcClient;
 use c2_wire::control::MAX_CALL_ROUTE_NAME_BYTES;
 
 use crate::relay::conn_pool::{CachedClient, OwnerToken};
+use crate::relay::route_table::{valid_crm_tag, valid_route_name};
 use crate::relay::state::RelayState;
 use crate::relay::types::{Locality, RouteEntry};
 
@@ -17,10 +18,50 @@ pub(crate) enum ControlError {
     InvalidName { reason: String },
     InvalidServerId { reason: String },
     InvalidServerInstanceId { reason: String },
+    ContractMismatch { reason: String },
     AddressMismatch { existing_address: String },
     DuplicateRoute { existing_address: String },
     OwnerMismatch,
     NotFound,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AttestedRouteContract {
+    pub crm_ns: String,
+    pub crm_name: String,
+    pub crm_ver: String,
+}
+
+pub(crate) fn attest_ipc_route_contract(
+    client: &IpcClient,
+    route_name: &str,
+    claimed_crm_ns: &str,
+    claimed_crm_name: &str,
+    claimed_crm_ver: &str,
+) -> Result<AttestedRouteContract, ControlError> {
+    let Some((crm_ns, crm_name, crm_ver)) = client.route_contract(route_name) else {
+        return Err(ControlError::NotFound);
+    };
+    if crm_ns.is_empty() || crm_name.is_empty() || crm_ver.is_empty() {
+        return Err(ControlError::ContractMismatch {
+            reason: format!("IPC upstream route '{route_name}' did not advertise a CRM contract"),
+        });
+    }
+    if (!claimed_crm_ns.is_empty() && claimed_crm_ns != crm_ns)
+        || (!claimed_crm_name.is_empty() && claimed_crm_name != crm_name)
+        || (!claimed_crm_ver.is_empty() && claimed_crm_ver != crm_ver)
+    {
+        return Err(ControlError::ContractMismatch {
+            reason: format!(
+                "IPC upstream route '{route_name}' CRM contract mismatch: claimed {claimed_crm_ns}/{claimed_crm_name}/{claimed_crm_ver}, got {crm_ns}/{crm_name}/{crm_ver}",
+            ),
+        });
+    }
+    Ok(AttestedRouteContract {
+        crm_ns: crm_ns.to_string(),
+        crm_name: crm_name.to_string(),
+        crm_ver: crm_ver.to_string(),
+    })
 }
 
 #[derive(Clone)]
@@ -54,6 +95,7 @@ pub(crate) enum RouteCommand {
         server_instance_id: String,
         address: String,
         crm_ns: String,
+        crm_name: String,
         crm_ver: String,
         client: Arc<IpcClient>,
         replacement: Option<OwnerReplacement>,
@@ -104,14 +146,11 @@ impl<'a> RouteAuthority<'a> {
     }
 
     pub(crate) fn validate_route_name(&self, name: &str) -> Result<(), ControlError> {
-        if name.trim().is_empty() {
+        if !valid_route_name(name) {
             return Err(ControlError::InvalidName {
-                reason: "name cannot be empty".to_string(),
-            });
-        }
-        if name.as_bytes().len() > MAX_CALL_ROUTE_NAME_BYTES {
-            return Err(ControlError::InvalidName {
-                reason: "name exceeds wire route-name limit".to_string(),
+                reason: format!(
+                    "name must be non-empty, control-character-free, and no more than {MAX_CALL_ROUTE_NAME_BYTES} bytes"
+                ),
             });
         }
         Ok(())
@@ -144,6 +183,21 @@ impl<'a> RouteAuthority<'a> {
     ) -> Result<(), ControlError> {
         validate_server_instance_id(server_instance_id)
             .map_err(|reason| ControlError::InvalidServerInstanceId { reason })
+    }
+
+    pub(crate) fn validate_crm_tag(
+        &self,
+        crm_ns: &str,
+        crm_name: &str,
+        crm_ver: &str,
+    ) -> Result<(), ControlError> {
+        if valid_crm_tag(crm_ns, crm_name, crm_ver) {
+            Ok(())
+        } else {
+            Err(ControlError::ContractMismatch {
+                reason: "CRM tag fields must be non-empty, control-character-free, and fit the IPC handshake field limit".to_string(),
+            })
+        }
     }
 
     pub(crate) fn register_local_preflight(
@@ -288,6 +342,7 @@ impl<'a> RouteAuthority<'a> {
                 server_instance_id,
                 address,
                 crm_ns,
+                crm_name,
                 crm_ver,
                 client,
                 replacement,
@@ -297,6 +352,7 @@ impl<'a> RouteAuthority<'a> {
                 server_instance_id,
                 address,
                 crm_ns,
+                crm_name,
                 crm_ver,
                 client,
                 replacement,
@@ -328,6 +384,7 @@ impl<'a> RouteAuthority<'a> {
         server_instance_id: String,
         address: String,
         crm_ns: String,
+        crm_name: String,
         crm_ver: String,
         client: Arc<IpcClient>,
         replacement: Option<OwnerReplacement>,
@@ -370,6 +427,7 @@ impl<'a> RouteAuthority<'a> {
             server_instance_id: Some(server_instance_id),
             ipc_address: Some(address.clone()),
             crm_ns,
+            crm_name,
             crm_ver,
             locality: Locality::Local,
             registered_at: route_table.next_local_timestamp(),
@@ -448,6 +506,12 @@ impl<'a> RouteAuthority<'a> {
         self.validate_route_name(&entry.name)?;
         self.validate_relay_id(&sender_relay_id)?;
         self.validate_relay_id(&entry.relay_id)?;
+        self.validate_crm_tag(&entry.crm_ns, &entry.crm_name, &entry.crm_ver)?;
+        if !entry.registered_at.is_finite() {
+            return Err(ControlError::ContractMismatch {
+                reason: "route registered_at must be finite".to_string(),
+            });
+        }
         if !self.trusted_peer_owner(&sender_relay_id, &entry.relay_id) {
             return Err(ControlError::OwnerMismatch);
         }

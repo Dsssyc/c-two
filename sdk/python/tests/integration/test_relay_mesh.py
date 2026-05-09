@@ -31,6 +31,9 @@ def _register_body(name: str, server_id: str, address: str) -> dict[str, str]:
         "server_id": server_id,
         "server_instance_id": f"{server_id}-instance",
         "address": address,
+        "crm_ns": "test.mesh",
+        "crm_name": "MeshResource",
+        "crm_ver": "0.1.0",
     }
 
 

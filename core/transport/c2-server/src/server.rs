@@ -537,6 +537,12 @@ fn validate_route_for_wire(route: &CrmRoute) -> Result<(), ServerError> {
         validate_name_len("method name", method_name)
             .map_err(|e| ServerError::Protocol(e.to_string()))?;
     }
+    validate_name_len("crm namespace", &route.crm_ns)
+        .map_err(|e| ServerError::Protocol(e.to_string()))?;
+    validate_name_len("crm name", &route.crm_name)
+        .map_err(|e| ServerError::Protocol(e.to_string()))?;
+    validate_name_len("crm version", &route.crm_ver)
+        .map_err(|e| ServerError::Protocol(e.to_string()))?;
     Ok(())
 }
 
@@ -786,6 +792,9 @@ async fn handle_handshake(
         .iter()
         .map(|r| RouteInfo {
             name: r.name.clone(),
+            crm_ns: r.crm_ns.clone(),
+            crm_name: r.crm_name.clone(),
+            crm_ver: r.crm_ver.clone(),
             methods: r
                 .method_names
                 .iter()
@@ -943,6 +952,21 @@ async fn send_route_execution_result(
     }
 }
 
+async fn write_unknown_method_index(
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    request_id: u64,
+    route_name: &str,
+    method_idx: u16,
+) {
+    let message = format!("unknown method index {method_idx} for route {route_name}");
+    write_reply(
+        writer,
+        request_id,
+        &ReplyControl::Error(error_wire(ErrorCode::ResourceFunctionExecuting, message)),
+    )
+    .await;
+}
+
 // ---------------------------------------------------------------------------
 // CRM call dispatch (inline, non-buddy, non-chunked)
 // ---------------------------------------------------------------------------
@@ -980,9 +1004,15 @@ async fn dispatch_call(
         }
     };
 
+    let idx = ctrl.method_idx;
+    if !route.has_method_index(idx) {
+        write_unknown_method_index(writer, request_id, &route.name, idx).await;
+        conn.flight_dec();
+        return;
+    }
+
     let callback = Arc::clone(&route.callback);
     let name = ctrl.route_name;
-    let idx = ctrl.method_idx;
     let args = payload[consumed..].to_vec();
     let resp_pool = Arc::clone(&server.response_pool);
 
@@ -1122,9 +1152,16 @@ async fn dispatch_buddy_call(
         }
     };
 
+    let idx = ctrl.method_idx;
+    if !route.has_method_index(idx) {
+        cleanup_request(request);
+        write_unknown_method_index(writer, request_id, &route.name, idx).await;
+        conn.flight_dec();
+        return;
+    }
+
     let callback = Arc::clone(&route.callback);
     let name = ctrl.route_name;
-    let idx = ctrl.method_idx;
     let resp_pool = Arc::clone(&server.response_pool);
 
     let scheduler = route.scheduler.as_ref().clone();
@@ -1296,9 +1333,15 @@ async fn dispatch_chunked_call(
             }
         };
 
+        let idx = method_idx;
+        if !route.has_method_index(idx) {
+            cleanup_request(request);
+            write_unknown_method_index(writer, request_id, &route.name, idx).await;
+            return;
+        }
+
         let callback = Arc::clone(&route.callback);
         let name = route_name;
-        let idx = method_idx;
         let resp_pool = Arc::clone(&server.response_pool);
 
         let scheduler = route.scheduler.as_ref().clone();
@@ -2149,6 +2192,9 @@ mod tests {
     fn make_route(name: &str) -> CrmRoute {
         CrmRoute {
             name: name.into(),
+            crm_ns: "test.grid".into(),
+            crm_name: "Grid".into(),
+            crm_ver: "0.1.0".into(),
             scheduler: Arc::new(Scheduler::new(
                 ConcurrencyMode::ReadParallel,
                 HashMap::new(),
@@ -2282,6 +2328,67 @@ mod tests {
 
         assert!(err.to_string().contains("route count"));
         assert!(s.dispatcher.read().await.resolve("overflow").is_none());
+    }
+
+    #[tokio::test]
+    async fn inline_dispatch_rejects_unknown_method_index_before_callback() {
+        use c2_wire::control::{decode_reply_control, encode_call_control};
+        use c2_wire::frame::decode_frame;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingCallback {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl CrmCallback for CountingCallback {
+            fn invoke(
+                &self,
+                _: &str,
+                _: u16,
+                _request: RequestData,
+                _response_pool: Arc<parking_lot::RwLock<MemPool>>,
+            ) -> Result<ResponseMeta, CrmError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(ResponseMeta::Inline(b"should-not-run".to_vec()))
+            }
+        }
+
+        let server =
+            Arc::new(Server::new("ipc://unknown_method_idx", ServerIpcConfig::default()).unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut route = make_route("grid");
+        route.callback = Arc::new(CountingCallback {
+            calls: Arc::clone(&calls),
+        });
+        server.register_route(route).await.unwrap();
+
+        let conn = Connection::new(1);
+        let (mut client_stream, server_stream) = UnixStream::pair().unwrap();
+        let (_read_half, write_half) = server_stream.into_split();
+        let writer = Arc::new(Mutex::new(write_half));
+        let payload = encode_call_control("grid", 99).unwrap();
+
+        dispatch_call(&server, &conn, 42, &payload, &writer).await;
+
+        let mut total_len_buf = [0u8; 4];
+        client_stream.read_exact(&mut total_len_buf).await.unwrap();
+        let total_len = u32::from_le_bytes(total_len_buf);
+        let mut body = vec![0u8; total_len as usize];
+        client_stream.read_exact(&mut body).await.unwrap();
+        let mut frame = Vec::with_capacity(4 + body.len());
+        frame.extend_from_slice(&total_len_buf);
+        frame.extend_from_slice(&body);
+        let (header, reply_payload) = decode_frame(&frame).unwrap();
+
+        assert_eq!(header.request_id, 42);
+        match decode_reply_control(reply_payload, 0).unwrap().0 {
+            ReplyControl::Error(err) => {
+                let message = String::from_utf8_lossy(&err);
+                assert!(message.contains("unknown method index 99"));
+            }
+            other => panic!("expected method-index error reply, got {other:?}"),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     // -- shutdown --

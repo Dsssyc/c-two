@@ -539,6 +539,19 @@ impl PyRustClient {
             .collect()
     }
 
+    /// CRM tag advertised for a route by the IPC handshake.
+    fn route_contract(&self, route_name: &str) -> Option<(String, String, String)> {
+        self.inner
+            .route_contract(route_name)
+            .map(|(crm_ns, crm_name, crm_ver)| {
+                (
+                    crm_ns.to_string(),
+                    crm_name.to_string(),
+                    crm_ver.to_string(),
+                )
+            })
+    }
+
     /// Stable logical server identity advertised by the IPC handshake.
     #[getter]
     fn server_id(&self) -> Option<String> {

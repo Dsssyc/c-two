@@ -284,6 +284,20 @@ impl RuntimeSession {
                 "route/spec method_names mismatch for {route_name}"
             )));
         }
+        if route.crm_ns != spec.crm_ns
+            || route.crm_name != spec.crm_name
+            || route.crm_ver != spec.crm_ver
+        {
+            return Err(RuntimeSessionError::Server(format!(
+                "route/spec crm contract mismatch for {route_name}: route={}/{}/{} spec={}/{}/{}",
+                route.crm_ns,
+                route.crm_name,
+                route.crm_ver,
+                spec.crm_ns,
+                spec.crm_name,
+                spec.crm_ver,
+            )));
+        }
         let scheduler_snapshot = route.scheduler.snapshot();
         if scheduler_snapshot.mode != spec.concurrency_mode
             || scheduler_snapshot.max_pending != spec.max_pending
@@ -319,6 +333,7 @@ impl RuntimeSession {
                 &identity.server_instance_id,
                 &identity.ipc_address,
                 &spec.crm_ns,
+                &spec.crm_name,
                 &spec.crm_ver,
             ) {
                 let _ = rt.block_on(server.unregister_route(&route_name));
@@ -460,6 +475,9 @@ impl RuntimeSession {
         relay_use_proxy: bool,
         max_attempts: usize,
         call_timeout_secs: f64,
+        expected_crm_ns: &str,
+        expected_crm_name: &str,
+        expected_crm_ver: &str,
     ) -> Result<RelayResolvedConnection, RuntimeSessionError> {
         let projection = self.relay_projection(relay_use_proxy)?;
         let client = RelayAwareHttpClient::new_with_control(
@@ -470,7 +488,8 @@ impl RuntimeSession {
                 max_attempts,
                 call_timeout_secs,
             },
-        );
+        )
+        .with_expected_crm(expected_crm_ns, expected_crm_name, expected_crm_ver);
         match client.resolve_target().map_err(runtime_http_error)? {
             RelayResolvedTarget::Ipc { candidate } => Ok(RelayResolvedConnection::Ipc {
                 address: candidate.address,
@@ -489,6 +508,9 @@ impl RuntimeSession {
         relay_use_proxy: bool,
         max_attempts: usize,
         call_timeout_secs: f64,
+        expected_crm_ns: &str,
+        expected_crm_name: &str,
+        expected_crm_ver: &str,
     ) -> Result<(RelayAwareHttpClient, String), RuntimeSessionError> {
         let projection = self.relay_projection(relay_use_proxy)?;
         let client = RelayAwareHttpClient::new_with_control(
@@ -499,7 +521,36 @@ impl RuntimeSession {
                 max_attempts,
                 call_timeout_secs,
             },
-        );
+        )
+        .with_expected_crm(expected_crm_ns, expected_crm_name, expected_crm_ver);
+        match client.resolve_http_target().map_err(runtime_http_error)? {
+            RelayResolvedTarget::Http { relay_url } => Ok((client, relay_url)),
+            RelayResolvedTarget::Ipc { .. } => unreachable!("HTTP relay connect returned IPC"),
+        }
+    }
+
+    pub fn connect_explicit_relay_http_client(
+        &self,
+        relay_url: &str,
+        route_name: &str,
+        relay_use_proxy: bool,
+        max_attempts: usize,
+        call_timeout_secs: f64,
+        expected_crm_ns: &str,
+        expected_crm_name: &str,
+        expected_crm_ver: &str,
+    ) -> Result<(RelayAwareHttpClient, String), RuntimeSessionError> {
+        let client = RelayAwareHttpClient::new(
+            relay_url,
+            route_name,
+            relay_use_proxy,
+            RelayAwareClientConfig {
+                max_attempts,
+                call_timeout_secs,
+            },
+        )
+        .map_err(runtime_http_error)?
+        .with_expected_crm(expected_crm_ns, expected_crm_name, expected_crm_ver);
         match client.resolve_http_target().map_err(runtime_http_error)? {
             RelayResolvedTarget::Http { relay_url } => Ok((client, relay_url)),
             RelayResolvedTarget::Ipc { .. } => unreachable!("HTTP relay connect returned IPC"),
@@ -665,6 +716,9 @@ mod tests {
     fn dummy_route(name: &str) -> CrmRoute {
         CrmRoute {
             name: name.to_string(),
+            crm_ns: "test.runtime".to_string(),
+            crm_name: "Runtime".to_string(),
+            crm_ver: "0.1.0".to_string(),
             scheduler: Arc::new(Scheduler::new(
                 ConcurrencyMode::ReadParallel,
                 HashMap::new(),
@@ -835,6 +889,37 @@ mod tests {
             .unregister_route(&server, "absent", None, false)
             .expect_err("missing route should error");
         assert_eq!(err, RuntimeSessionError::MissingRoute("absent".to_string()));
+    }
+
+    #[test]
+    fn register_route_rejects_crm_contract_mismatch() {
+        let route_name = unique_route_name("crm-contract-mismatch");
+        let session = RuntimeSession::new(RuntimeSessionOptions {
+            server_id: Some(unique_route_name("crm-contract-session")),
+            ..Default::default()
+        })
+        .expect("session");
+        let server = test_server("crm-contract-server");
+        let route = dummy_route(&route_name);
+        let spec = RuntimeRouteSpec {
+            name: route_name.clone(),
+            crm_ns: "different.ns".to_string(),
+            crm_name: route.crm_name.clone(),
+            crm_ver: "0.1.0".to_string(),
+            method_names: vec!["ping".to_string()],
+            access_map: HashMap::new(),
+            concurrency_mode: ConcurrencyMode::ReadParallel,
+            max_pending: None,
+            max_workers: None,
+        };
+
+        let err = session
+            .register_route(&server, route, spec, None, false)
+            .expect_err("CRM contract mismatch should be rejected before registration");
+        assert!(
+            err.to_string().contains("crm contract mismatch"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

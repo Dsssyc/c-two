@@ -170,6 +170,27 @@ impl SyncClient {
         self.inner.route_names()
     }
 
+    /// Validate the connected route against an expected CRM contract.
+    pub fn validate_route_contract(
+        &self,
+        route_name: &str,
+        expected_crm_ns: &str,
+        expected_crm_name: &str,
+        expected_crm_ver: &str,
+    ) -> Result<(), IpcError> {
+        self.inner.validate_route_contract(
+            route_name,
+            expected_crm_ns,
+            expected_crm_name,
+            expected_crm_ver,
+        )
+    }
+
+    /// CRM tag advertised by a route, if present.
+    pub fn route_contract(&self, route_name: &str) -> Option<(&str, &str, &str)> {
+        self.inner.route_contract(route_name)
+    }
+
     /// Identity announced by the connected IPC server handshake.
     pub fn server_identity(&self) -> Option<&c2_wire::handshake::ServerIdentity> {
         self.inner.server_identity()

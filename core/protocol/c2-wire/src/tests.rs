@@ -286,6 +286,9 @@ mod handshake_tests {
     fn server_handshake_roundtrip_includes_server_identity() {
         let routes = vec![RouteInfo {
             name: "grid".to_string(),
+            crm_ns: "test.grid".to_string(),
+            crm_name: "Grid".to_string(),
+            crm_ver: "1.2.3".to_string(),
             methods: vec![MethodEntry {
                 name: "ping".to_string(),
                 index: 0,
@@ -308,6 +311,9 @@ mod handshake_tests {
 
         assert_eq!(decoded.server_identity.as_ref(), Some(&identity));
         assert_eq!(decoded.routes, routes);
+        assert_eq!(decoded.routes[0].crm_ns, "test.grid");
+        assert_eq!(decoded.routes[0].crm_name, "Grid");
+        assert_eq!(decoded.routes[0].crm_ver, "1.2.3");
     }
 
     #[test]
@@ -342,6 +348,9 @@ mod handshake_tests {
         let routes = vec![
             RouteInfo {
                 name: "grid".into(),
+                crm_ns: "test.grid".into(),
+                crm_name: "Grid".into(),
+                crm_ver: "0.1.0".into(),
                 methods: vec![
                     MethodEntry {
                         name: "hello".into(),
@@ -359,6 +368,9 @@ mod handshake_tests {
             },
             RouteInfo {
                 name: "counter".into(),
+                crm_ns: "test.counter".into(),
+                crm_name: "Counter".into(),
+                crm_ver: "0.1.0".into(),
                 methods: vec![
                     MethodEntry {
                         name: "get".into(),
@@ -398,6 +410,9 @@ mod handshake_tests {
     fn server_handshake_rejects_overlong_route_name() {
         let routes = vec![RouteInfo {
             name: "x".repeat(MAX_HANDSHAKE_NAME_BYTES + 1),
+            crm_ns: "test.overlong".into(),
+            crm_name: "Overlong".into(),
+            crm_ver: "0.1.0".into(),
             methods: vec![],
         }];
 
@@ -407,9 +422,51 @@ mod handshake_tests {
     }
 
     #[test]
+    fn server_handshake_rejects_overlong_crm_metadata() {
+        let routes = vec![RouteInfo {
+            name: "grid".into(),
+            crm_ns: "x".repeat(MAX_HANDSHAKE_NAME_BYTES + 1),
+            crm_name: "Grid".into(),
+            crm_ver: "0.1.0".into(),
+            methods: vec![],
+        }];
+
+        let err =
+            encode_server_handshake(&[], CAP_CALL_V2, &routes, "", &test_identity()).unwrap_err();
+        assert!(err.to_string().contains("crm namespace"));
+
+        let routes = vec![RouteInfo {
+            name: "grid".into(),
+            crm_ns: "test.grid".into(),
+            crm_name: "x".repeat(MAX_HANDSHAKE_NAME_BYTES + 1),
+            crm_ver: "0.1.0".into(),
+            methods: vec![],
+        }];
+
+        let err =
+            encode_server_handshake(&[], CAP_CALL_V2, &routes, "", &test_identity()).unwrap_err();
+        assert!(err.to_string().contains("crm name"));
+
+        let routes = vec![RouteInfo {
+            name: "grid".into(),
+            crm_ns: "test.grid".into(),
+            crm_name: "Grid".into(),
+            crm_ver: "x".repeat(MAX_HANDSHAKE_NAME_BYTES + 1),
+            methods: vec![],
+        }];
+
+        let err =
+            encode_server_handshake(&[], CAP_CALL_V2, &routes, "", &test_identity()).unwrap_err();
+        assert!(err.to_string().contains("crm version"));
+    }
+
+    #[test]
     fn server_handshake_rejects_too_many_methods() {
         let routes = vec![RouteInfo {
             name: "grid".into(),
+            crm_ns: "test.grid".into(),
+            crm_name: "Grid".into(),
+            crm_ver: "0.1.0".into(),
             methods: (0..=MAX_METHODS)
                 .map(|i| MethodEntry {
                     name: format!("m{i}"),
@@ -432,8 +489,8 @@ mod handshake_tests {
 
     #[test]
     fn empty_handshake() {
-        // Version 7, prefix_len=0, 0 segments, cap_flags=0
-        let buf = [7, 0, 0, 0, 0, 0];
+        // Version 9, prefix_len=0, 0 segments, cap_flags=0
+        let buf = [9, 0, 0, 0, 0, 0];
         let decoded = decode_handshake(&buf).unwrap();
         assert_eq!(decoded.prefix, "");
         assert!(decoded.segments.is_empty());
@@ -520,8 +577,8 @@ mod cross_lang_tests {
 
     #[test]
     fn canonical_client_handshake_fixture_decodes() {
-        // v7: [07][00 prefix_len][01 00 seg_count][00 00 00 10 size][04 seg0][03 00 caps]
-        let bytes = hex_to_bytes("070001000000001004736567300300");
+        // v9: [09][00 prefix_len][01 00 seg_count][00 00 00 10 size][04 seg0][03 00 caps]
+        let bytes = hex_to_bytes("090001000000001004736567300300");
         let hs = decode_handshake(&bytes).unwrap();
         assert_eq!(hs.prefix, "");
         assert_eq!(hs.segments.len(), 1);
@@ -534,9 +591,10 @@ mod cross_lang_tests {
 
     #[test]
     fn canonical_server_handshake_fixture_decodes() {
-        // v7: client handshake prefix, server identity, then route table.
+        // v9: client handshake prefix, server identity, then route table
+        // with per-route full CRM tag.
         let bytes = hex_to_bytes(
-            "0700010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696402000568656c6c6f0000036164640100",
+            "0900010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696409746573742e67726964044772696405302e312e3002000568656c6c6f0000036164640100",
         );
         let hs = decode_handshake(&bytes).unwrap();
         assert_eq!(hs.prefix, "");
@@ -553,6 +611,9 @@ mod cross_lang_tests {
         );
         assert_eq!(hs.routes.len(), 1);
         assert_eq!(hs.routes[0].name, "grid");
+        assert_eq!(hs.routes[0].crm_ns, "test.grid");
+        assert_eq!(hs.routes[0].crm_name, "Grid");
+        assert_eq!(hs.routes[0].crm_ver, "0.1.0");
         assert_eq!(hs.routes[0].methods.len(), 2);
         assert_eq!(hs.routes[0].methods[0].name, "hello");
         assert_eq!(hs.routes[0].methods[0].index, 0);
@@ -598,8 +659,8 @@ mod cross_lang_tests {
     fn rust_encode_matches_canonical_client_handshake_fixture() {
         let segments = vec![("seg0".into(), 268_435_456u32)];
         let encoded = encode_client_handshake(&segments, CAP_CALL_V2 | CAP_METHOD_IDX, "").unwrap();
-        // v7: [07][00 prefix_len][01 00 seg_count][00 00 00 10 size][04 name_len][seg0][03 00 caps]
-        let expected = hex_to_bytes("070001000000001004736567300300");
+        // v9: [09][00 prefix_len][01 00 seg_count][00 00 00 10 size][04 name_len][seg0][03 00 caps]
+        let expected = hex_to_bytes("090001000000001004736567300300");
         assert_eq!(encoded, expected);
     }
 
@@ -608,6 +669,9 @@ mod cross_lang_tests {
         let segments = vec![("srv0".into(), 134_217_728u32)];
         let routes = vec![RouteInfo {
             name: "grid".into(),
+            crm_ns: "test.grid".into(),
+            crm_name: "Grid".into(),
+            crm_ver: "0.1.0".into(),
             methods: vec![
                 MethodEntry {
                     name: "hello".into(),
@@ -631,9 +695,10 @@ mod cross_lang_tests {
             &identity,
         )
         .unwrap();
-        // v7: [07][00 prefix_len] then segments/caps, identity, and route table.
+        // v9: [09][00 prefix_len] then segments/caps, identity, and route table
+        // with per-route full CRM tag metadata.
         let expected = hex_to_bytes(
-            "0700010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696402000568656c6c6f0000036164640100",
+            "0900010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696409746573742e67726964044772696405302e312e3002000568656c6c6f0000036164640100",
         );
         assert_eq!(encoded, expected);
     }

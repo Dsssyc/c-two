@@ -3,7 +3,7 @@
 //! ## Client → Server
 //!
 //! ```text
-//! [1B version=7]
+//! [1B version=9]
 //! [1B prefix_len][prefix UTF-8]
 //! [2B seg_count LE]
 //! [per-segment: [4B size LE][1B name_len][name UTF-8]]
@@ -20,6 +20,9 @@
 //! [2B route_count LE]
 //! [per-route:
 //!     [1B name_len][route_name UTF-8]
+//!     [1B crm_ns_len][crm_ns UTF-8]
+//!     [1B crm_name_len][crm_name UTF-8]
+//!     [1B crm_ver_len][crm_ver UTF-8]
 //!     [2B method_count LE]
 //!     [per-method: [1B name_len][method_name UTF-8][2B method_idx LE]]
 //! ]
@@ -29,7 +32,7 @@ use crate::control::EncodeError;
 use crate::frame::DecodeError;
 
 /// Handshake version number.
-pub const HANDSHAKE_VERSION: u8 = 7;
+pub const HANDSHAKE_VERSION: u8 = 9;
 
 // ── Capability flags (2 bytes) ───────────────────────────────────────────
 
@@ -62,6 +65,9 @@ pub struct MethodEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteInfo {
     pub name: String,
+    pub crm_ns: String,
+    pub crm_name: String,
+    pub crm_ver: String,
     pub methods: Vec<MethodEntry>,
 }
 
@@ -151,6 +157,9 @@ pub fn encode_server_handshake(
     buf.extend_from_slice(&(routes.len() as u16).to_le_bytes());
     for route in routes {
         validate_name_len("route name", &route.name)?;
+        validate_name_len("crm namespace", &route.crm_ns)?;
+        validate_name_len("crm name", &route.crm_name)?;
+        validate_name_len("crm version", &route.crm_ver)?;
         if route.methods.len() > MAX_METHODS {
             return Err(EncodeError::FieldTooLong {
                 field: "method count",
@@ -161,6 +170,15 @@ pub fn encode_server_handshake(
         let name_b = route.name.as_bytes();
         buf.push(name_b.len() as u8);
         buf.extend_from_slice(name_b);
+        let crm_ns_b = route.crm_ns.as_bytes();
+        buf.push(crm_ns_b.len() as u8);
+        buf.extend_from_slice(crm_ns_b);
+        let crm_name_b = route.crm_name.as_bytes();
+        buf.push(crm_name_b.len() as u8);
+        buf.extend_from_slice(crm_name_b);
+        let crm_ver_b = route.crm_ver.as_bytes();
+        buf.push(crm_ver_b.len() as u8);
+        buf.extend_from_slice(crm_ver_b);
         buf.extend_from_slice(&(route.methods.len() as u16).to_le_bytes());
         for m in &route.methods {
             validate_name_len("method name", &m.name)?;
@@ -288,6 +306,27 @@ pub fn decode_handshake(buf: &[u8]) -> Result<Handshake, DecodeError> {
         let r_name = read_str(buf, off, r_len)?;
         off += r_len;
 
+        check_remaining(buf, off, 1, "crm namespace length")?;
+        let crm_ns_len = buf[off] as usize;
+        off += 1;
+        check_remaining(buf, off, crm_ns_len, "crm namespace")?;
+        let crm_ns = read_str(buf, off, crm_ns_len)?;
+        off += crm_ns_len;
+
+        check_remaining(buf, off, 1, "crm name length")?;
+        let crm_name_len = buf[off] as usize;
+        off += 1;
+        check_remaining(buf, off, crm_name_len, "crm name")?;
+        let crm_name = read_str(buf, off, crm_name_len)?;
+        off += crm_name_len;
+
+        check_remaining(buf, off, 1, "crm version length")?;
+        let crm_ver_len = buf[off] as usize;
+        off += 1;
+        check_remaining(buf, off, crm_ver_len, "crm version")?;
+        let crm_ver = read_str(buf, off, crm_ver_len)?;
+        off += crm_ver_len;
+
         check_remaining(buf, off, 2, "method count")?;
         let m_count = read_u16(buf, off) as usize;
         off += 2;
@@ -315,6 +354,9 @@ pub fn decode_handshake(buf: &[u8]) -> Result<Handshake, DecodeError> {
         }
         routes.push(RouteInfo {
             name: r_name,
+            crm_ns,
+            crm_name,
+            crm_ver,
             methods,
         });
     }

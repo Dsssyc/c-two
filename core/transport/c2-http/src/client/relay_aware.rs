@@ -61,6 +61,7 @@ pub struct RelayAwareHttpClient {
     config: RelayAwareClientConfig,
     current: Mutex<Option<String>>,
     anchor_allows_local_ipc: bool,
+    expected_crm: Option<(String, String, String)>,
 }
 
 impl RelayAwareHttpClient {
@@ -90,7 +91,27 @@ impl RelayAwareHttpClient {
             use_proxy,
             config,
             current: Mutex::new(None),
+            expected_crm: None,
         }
+    }
+
+    pub fn with_expected_crm(mut self, crm_ns: &str, crm_name: &str, crm_ver: &str) -> Self {
+        if !crm_ns.is_empty() || !crm_name.is_empty() || !crm_ver.is_empty() {
+            self.expected_crm = Some((
+                crm_ns.to_string(),
+                crm_name.to_string(),
+                crm_ver.to_string(),
+            ));
+        }
+        self
+    }
+
+    fn expected_crm_tuple(&self) -> Option<(&str, &str, &str)> {
+        self.expected_crm
+            .as_ref()
+            .map(|(crm_ns, crm_name, crm_ver)| {
+                (crm_ns.as_str(), crm_name.as_str(), crm_ver.as_str())
+            })
     }
 
     pub fn call(&self, method_name: &str, data: &[u8]) -> Result<Vec<u8>, HttpError> {
@@ -192,7 +213,14 @@ impl RelayAwareHttpClient {
                     }
                 };
 
-                match client.client.probe_route_async(&self.route_name).await {
+                match client
+                    .client
+                    .probe_route_with_expected_crm_async(
+                        &self.route_name,
+                        self.expected_crm_tuple(),
+                    )
+                    .await
+                {
                     Ok(()) => {
                         *self.current.lock() = Some(relay_url.clone());
                         return Ok(RelayResolvedTarget::Http { relay_url });
@@ -273,7 +301,12 @@ impl RelayAwareHttpClient {
 
                 match client
                     .client
-                    .call_async(&self.route_name, method_name, data)
+                    .call_with_expected_crm_async(
+                        &self.route_name,
+                        method_name,
+                        data,
+                        self.expected_crm_tuple(),
+                    )
                     .await
                 {
                     Ok(bytes) => {
@@ -307,7 +340,44 @@ impl RelayAwareHttpClient {
         if force_refresh {
             self.control.invalidate(&self.route_name);
         }
-        self.control.resolve_async(&self.route_name).await
+        let expected_crm = self.expected_crm_tuple();
+        let routes = match expected_crm {
+            Some((crm_ns, crm_name, crm_ver)) => {
+                self.control
+                    .resolve_matching_async(&self.route_name, crm_ns, crm_name, crm_ver)
+                    .await?
+            }
+            None => self.control.resolve_async(&self.route_name).await?,
+        };
+        let raw_routes_non_empty = !routes.is_empty();
+        let filtered = filter_routes_by_expected_crm(routes, expected_crm);
+        if !force_refresh && expected_crm.is_some() && raw_routes_non_empty && filtered.is_empty() {
+            self.control.invalidate(&self.route_name);
+            let refreshed = match expected_crm {
+                Some((crm_ns, crm_name, crm_ver)) => {
+                    self.control
+                        .resolve_matching_async(&self.route_name, crm_ns, crm_name, crm_ver)
+                        .await?
+                }
+                None => self.control.resolve_async(&self.route_name).await?,
+            };
+            let refreshed_routes_non_empty = !refreshed.is_empty();
+            let refreshed_filtered = filter_routes_by_expected_crm(refreshed, expected_crm);
+            if refreshed_routes_non_empty && refreshed_filtered.is_empty() {
+                return Err(HttpError::ServerError(
+                    409,
+                    crm_contract_mismatch_body(&self.route_name),
+                ));
+            }
+            return Ok(refreshed_filtered);
+        }
+        if force_refresh && expected_crm.is_some() && raw_routes_non_empty && filtered.is_empty() {
+            return Err(HttpError::ServerError(
+                409,
+                crm_contract_mismatch_body(&self.route_name),
+            ));
+        }
+        Ok(filtered)
     }
 
     fn order_routes(
@@ -369,6 +439,15 @@ fn relay_error_body(error: &str, route_name: &str) -> String {
     .to_string()
 }
 
+fn crm_contract_mismatch_body(route_name: &str) -> String {
+    json!({
+        "error": "CRMContractMismatch",
+        "route": route_name,
+        "message": format!("CRM contract mismatch for route {route_name}"),
+    })
+    .to_string()
+}
+
 fn resolve_retryable(err: &HttpError) -> bool {
     matches!(
         err,
@@ -393,6 +472,23 @@ fn select_local_ipc_candidate(
     })
 }
 
+fn filter_routes_by_expected_crm(
+    routes: Vec<RelayRouteInfo>,
+    expected: Option<(&str, &str, &str)>,
+) -> Vec<RelayRouteInfo> {
+    let Some((expected_ns, expected_name, expected_ver)) = expected else {
+        return routes;
+    };
+    routes
+        .into_iter()
+        .filter(|route| {
+            route.crm_ns == expected_ns
+                && route.crm_name == expected_name
+                && route.crm_ver == expected_ver
+        })
+        .collect()
+}
+
 fn relay_anchor_allows_local_ipc(anchor_url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(anchor_url) else {
         return false;
@@ -415,7 +511,7 @@ mod tests {
         Json, Router,
         body::Bytes,
         extract::{Path, State},
-        http::StatusCode,
+        http::{HeaderMap, StatusCode},
         response::{IntoResponse, Response},
         routing::{get, post},
     };
@@ -442,6 +538,7 @@ mod tests {
                 server_id: None,
                 server_instance_id: None,
                 crm_ns: String::new(),
+                crm_name: String::new(),
                 crm_ver: String::new(),
             },
             RelayRouteInfo {
@@ -451,6 +548,7 @@ mod tests {
                 server_id: None,
                 server_instance_id: None,
                 crm_ns: String::new(),
+                crm_name: String::new(),
                 crm_ver: String::new(),
             },
         ])
@@ -496,6 +594,7 @@ mod tests {
             server_id: None,
             server_instance_id: None,
             crm_ns: String::new(),
+            crm_name: String::new(),
             crm_ver: String::new(),
         }])
         .into_response()
@@ -540,6 +639,7 @@ mod tests {
                 server_id: None,
                 server_instance_id: None,
                 crm_ns: String::new(),
+                crm_name: String::new(),
                 crm_ver: String::new(),
             },
             RelayRouteInfo {
@@ -549,10 +649,100 @@ mod tests {
                 server_id: Some("local-grid".to_string()),
                 server_instance_id: Some("inst-local-grid".to_string()),
                 crm_ns: String::new(),
+                crm_name: String::new(),
                 crm_ver: String::new(),
             },
         ])
         .into_response()
+    }
+
+    async fn registry_resolve_contract_changes(
+        State(state): State<RegistryState>,
+        Path(name): Path<String>,
+    ) -> Response {
+        let count = state.resolve_count.fetch_add(1, Ordering::SeqCst);
+        let (crm_ns, crm_ver) = if count == 0 {
+            ("other.grid", "0.1.0")
+        } else {
+            ("test.grid", "0.1.0")
+        };
+        Json(vec![RelayRouteInfo {
+            name,
+            relay_url: state.live_url.clone(),
+            ipc_address: None,
+            server_id: None,
+            server_instance_id: None,
+            crm_ns: crm_ns.to_string(),
+            crm_name: "Grid".to_string(),
+            crm_ver: crm_ver.to_string(),
+        }])
+        .into_response()
+    }
+
+    async fn registry_resolve_expected_contract(
+        State(state): State<RegistryState>,
+        Path(name): Path<String>,
+    ) -> Response {
+        state.resolve_count.fetch_add(1, Ordering::SeqCst);
+        Json(vec![RelayRouteInfo {
+            name,
+            relay_url: state.live_url.clone(),
+            ipc_address: None,
+            server_id: None,
+            server_instance_id: None,
+            crm_ns: "test.grid".to_string(),
+            crm_name: "Grid".to_string(),
+            crm_ver: "0.1.0".to_string(),
+        }])
+        .into_response()
+    }
+
+    fn expected_crm_headers_match(headers: &HeaderMap) -> bool {
+        headers
+            .get("x-c2-expected-crm-ns")
+            .is_some_and(|v| v == "test.grid")
+            && headers
+                .get("x-c2-expected-crm-name")
+                .is_some_and(|v| v == "Grid")
+            && headers
+                .get("x-c2-expected-crm-ver")
+                .is_some_and(|v| v == "0.1.0")
+    }
+
+    async fn probe_requires_expected_crm_headers(headers: HeaderMap) -> Response {
+        if expected_crm_headers_match(&headers) {
+            StatusCode::OK.into_response()
+        } else {
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "CRMContractMismatch",
+                    "message": "CRM contract mismatch for route grid",
+                })),
+            )
+                .into_response()
+        }
+    }
+
+    async fn call_requires_expected_crm_headers(
+        headers: HeaderMap,
+        Path((_route, _method)): Path<(String, String)>,
+        body: Bytes,
+    ) -> Response {
+        if expected_crm_headers_match(&headers) {
+            let mut out = b"ok:".to_vec();
+            out.extend_from_slice(&body);
+            (StatusCode::OK, out).into_response()
+        } else {
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "CRMContractMismatch",
+                    "message": "CRM contract mismatch for route grid",
+                })),
+            )
+                .into_response()
+        }
     }
 
     async fn spawn_app(app: Router) -> (String, tokio::task::JoinHandle<()>) {
@@ -685,6 +875,91 @@ mod tests {
         registry_handle.abort();
     }
 
+    #[tokio::test]
+    async fn cached_wrong_contract_routes_force_fresh_resolve_before_404() {
+        let (live_url, live_handle) =
+            spawn_app(Router::new().route("/_probe/{route}", get(|| async { StatusCode::OK })))
+                .await;
+        let resolve_count = Arc::new(AtomicUsize::new(0));
+        let registry_state = RegistryState {
+            stale_url: String::new(),
+            live_url: live_url.clone(),
+            resolve_count: resolve_count.clone(),
+        };
+        let (registry_url, registry_handle) = spawn_app(
+            Router::new()
+                .route("/_resolve/{name}", get(registry_resolve_contract_changes))
+                .with_state(registry_state),
+        )
+        .await;
+
+        let client = RelayAwareHttpClient::new(
+            &registry_url,
+            "grid",
+            false,
+            RelayAwareClientConfig {
+                max_attempts: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .with_expected_crm("test.grid", "Grid", "0.1.0");
+
+        client.connect_async().await.unwrap();
+        assert_eq!(
+            resolve_count.load(Ordering::SeqCst),
+            2,
+            "CRM-filtered cached routes should force one fresh resolve before reporting no compatible route"
+        );
+
+        registry_handle.abort();
+        live_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn expected_crm_headers_are_sent_on_probe_and_call() {
+        let (live_url, live_handle) = spawn_app(
+            Router::new()
+                .route("/_probe/{route}", get(probe_requires_expected_crm_headers))
+                .route(
+                    "/{route}/{method}",
+                    post(call_requires_expected_crm_headers),
+                ),
+        )
+        .await;
+        let resolve_count = Arc::new(AtomicUsize::new(0));
+        let registry_state = RegistryState {
+            stale_url: String::new(),
+            live_url,
+            resolve_count,
+        };
+        let (registry_url, registry_handle) = spawn_app(
+            Router::new()
+                .route("/_resolve/{name}", get(registry_resolve_expected_contract))
+                .with_state(registry_state),
+        )
+        .await;
+
+        let client = RelayAwareHttpClient::new(
+            &registry_url,
+            "grid",
+            false,
+            RelayAwareClientConfig {
+                max_attempts: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .with_expected_crm("test.grid", "Grid", "0.1.0");
+
+        client.connect_async().await.unwrap();
+        let bytes = client.call_async("step", b"payload").await.unwrap();
+        assert_eq!(bytes, b"ok:payload");
+
+        registry_handle.abort();
+        live_handle.abort();
+    }
+
     #[test]
     fn local_ipc_selection_requires_loopback_anchor() {
         let routes = vec![RelayRouteInfo {
@@ -694,6 +969,7 @@ mod tests {
             server_id: Some("local-grid".to_string()),
             server_instance_id: Some("inst-local-grid".to_string()),
             crm_ns: String::new(),
+            crm_name: String::new(),
             crm_ver: String::new(),
         }];
 
@@ -720,6 +996,7 @@ mod tests {
             server_id: Some("grid-server".to_string()),
             server_instance_id: Some("inst-a".to_string()),
             crm_ns: String::new(),
+            crm_name: String::new(),
             crm_ver: String::new(),
         };
         let missing_instance = RelayRouteInfo {
@@ -758,6 +1035,7 @@ mod tests {
             server_id: Some("grid-server".to_string()),
             server_instance_id: Some("inst-a".to_string()),
             crm_ns: String::new(),
+            crm_name: String::new(),
             crm_ver: String::new(),
         };
 
@@ -765,6 +1043,49 @@ mod tests {
         assert_eq!(candidate.address, "ipc://grid-server");
         assert_eq!(candidate.server_id, "grid-server");
         assert_eq!(candidate.server_instance_id, "inst-a");
+    }
+
+    #[test]
+    fn crm_contract_filter_runs_before_local_ipc_selection() {
+        let mismatched_local = RelayRouteInfo {
+            name: "grid".to_string(),
+            relay_url: "http://127.0.0.1:8080".to_string(),
+            ipc_address: Some("ipc://wrong-grid".to_string()),
+            server_id: Some("wrong-grid".to_string()),
+            server_instance_id: Some("inst-wrong".to_string()),
+            crm_ns: "other.grid".to_string(),
+            crm_name: "Grid".to_string(),
+            crm_ver: "0.1.0".to_string(),
+        };
+        let mismatched_crm_name = RelayRouteInfo {
+            name: "grid".to_string(),
+            relay_url: "http://127.0.0.1:8082".to_string(),
+            ipc_address: Some("ipc://wrong-model".to_string()),
+            server_id: Some("wrong-model".to_string()),
+            server_instance_id: Some("inst-wrong-model".to_string()),
+            crm_ns: "test.grid".to_string(),
+            crm_name: "OtherGrid".to_string(),
+            crm_ver: "0.1.0".to_string(),
+        };
+        let matched_http = RelayRouteInfo {
+            name: "grid".to_string(),
+            relay_url: "http://127.0.0.1:8081".to_string(),
+            ipc_address: None,
+            server_id: None,
+            server_instance_id: None,
+            crm_ns: "test.grid".to_string(),
+            crm_name: "Grid".to_string(),
+            crm_ver: "0.1.0".to_string(),
+        };
+
+        let filtered = filter_routes_by_expected_crm(
+            vec![mismatched_local, mismatched_crm_name, matched_http.clone()],
+            Some(("test.grid", "Grid", "0.1.0")),
+        );
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].relay_url, matched_http.relay_url);
+        assert_eq!(select_local_ipc_candidate(true, true, &filtered), None);
     }
 
     #[tokio::test]

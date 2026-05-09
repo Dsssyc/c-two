@@ -187,7 +187,7 @@ impl PyRustRelayControlClient {
         })
     }
 
-    #[pyo3(signature = (name, server_id, server_instance_id, ipc_address, crm_ns="", crm_ver=""))]
+    #[pyo3(signature = (name, server_id, server_instance_id, ipc_address, crm_ns="", crm_name="", crm_ver=""))]
     fn register(
         &self,
         py: Python<'_>,
@@ -196,6 +196,7 @@ impl PyRustRelayControlClient {
         server_instance_id: &str,
         ipc_address: &str,
         crm_ns: &str,
+        crm_name: &str,
         crm_ver: &str,
     ) -> PyResult<()> {
         let inner = Arc::clone(&self.inner);
@@ -204,6 +205,7 @@ impl PyRustRelayControlClient {
         let server_instance_id = server_instance_id.to_string();
         let ipc_address = ipc_address.to_string();
         let crm_ns = crm_ns.to_string();
+        let crm_name = crm_name.to_string();
         let crm_ver = crm_ver.to_string();
         py.detach(move || {
             inner.register(
@@ -212,6 +214,7 @@ impl PyRustRelayControlClient {
                 &server_instance_id,
                 &ipc_address,
                 &crm_ns,
+                &crm_name,
                 &crm_ver,
             )
         })
@@ -253,6 +256,7 @@ fn routes_to_py(py: Python<'_>, routes: Vec<RelayRouteInfo>) -> PyResult<Vec<Py<
             dict.set_item("relay_url", route.relay_url)?;
             dict.set_item("ipc_address", route.ipc_address)?;
             dict.set_item("crm_ns", route.crm_ns)?;
+            dict.set_item("crm_name", route.crm_name)?;
             dict.set_item("crm_ver", route.crm_ver)?;
             Ok(dict.into_any().unbind())
         })

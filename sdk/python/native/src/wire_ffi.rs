@@ -47,14 +47,33 @@ pub struct PyRouteInfo {
     #[pyo3(get)]
     name: String,
     #[pyo3(get)]
+    crm_ns: String,
+    #[pyo3(get)]
+    crm_name: String,
+    #[pyo3(get)]
+    crm_ver: String,
+    #[pyo3(get)]
     methods: Vec<Py<PyMethodEntry>>,
 }
 
 #[pymethods]
 impl PyRouteInfo {
     #[new]
-    fn new(name: String, methods: Vec<Py<PyMethodEntry>>) -> Self {
-        Self { name, methods }
+    #[pyo3(signature = (name, methods, crm_ns="", crm_name="", crm_ver=""))]
+    fn new(
+        name: String,
+        methods: Vec<Py<PyMethodEntry>>,
+        crm_ns: &str,
+        crm_name: &str,
+        crm_ver: &str,
+    ) -> Self {
+        Self {
+            name,
+            crm_ns: crm_ns.to_string(),
+            crm_name: crm_name.to_string(),
+            crm_ver: crm_ver.to_string(),
+            methods,
+        }
     }
 
     /// Look up method index by name, or `None` if not found.
@@ -83,8 +102,11 @@ impl PyRouteInfo {
 
     fn __repr__(&self) -> String {
         format!(
-            "RouteInfo(name='{}', methods=[{}])",
+            "RouteInfo(name='{}', crm_ns='{}', crm_name='{}', crm_ver='{}', methods=[{}])",
             self.name,
+            self.crm_ns,
+            self.crm_name,
+            self.crm_ver,
             self.methods
                 .iter()
                 .map(|m| {
@@ -353,6 +375,9 @@ fn encode_server_handshake(
                 .collect();
             c2_wire::handshake::RouteInfo {
                 name: r_ref.name.clone(),
+                crm_ns: r_ref.crm_ns.clone(),
+                crm_name: r_ref.crm_name.clone(),
+                crm_ver: r_ref.crm_ver.clone(),
                 methods,
             }
         })
@@ -395,6 +420,9 @@ fn decode_handshake(py: Python<'_>, payload: &[u8]) -> PyResult<PyHandshake> {
             py,
             PyRouteInfo {
                 name: route.name,
+                crm_ns: route.crm_ns,
+                crm_name: route.crm_name,
+                crm_ver: route.crm_ver,
                 methods: py_methods?,
             },
         )?);

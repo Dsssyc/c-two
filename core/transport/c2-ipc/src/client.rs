@@ -23,7 +23,7 @@ use c2_wire::control::{ReplyControl, decode_reply_control, encode_call_control};
 use c2_wire::flags;
 use c2_wire::frame::{self, DecodeError, FrameHeader, HEADER_SIZE};
 use c2_wire::handshake::{
-    CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX, Handshake, MethodEntry, decode_handshake,
+    CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX, Handshake, MethodEntry, RouteInfo, decode_handshake,
     encode_client_handshake,
 };
 
@@ -187,16 +187,38 @@ impl From<c2_wire::control::EncodeError> for IpcError {
 /// Per-route method table (name ↔ index).
 #[derive(Debug, Clone)]
 pub struct MethodTable {
+    crm_ns: String,
+    crm_name: String,
+    crm_ver: String,
     name_to_idx: HashMap<String, u16>,
 }
 
 impl MethodTable {
-    fn from_entries(entries: &[MethodEntry]) -> Self {
+    fn from_route(route: &RouteInfo) -> Self {
+        Self::from_entries(
+            &route.methods,
+            route.crm_ns.clone(),
+            route.crm_name.clone(),
+            route.crm_ver.clone(),
+        )
+    }
+
+    fn from_entries(
+        entries: &[MethodEntry],
+        crm_ns: String,
+        crm_name: String,
+        crm_ver: String,
+    ) -> Self {
         let mut name_to_idx = HashMap::with_capacity(entries.len());
         for e in entries {
             name_to_idx.insert(e.name.clone(), e.index);
         }
-        Self { name_to_idx }
+        Self {
+            crm_ns,
+            crm_name,
+            crm_ver,
+            name_to_idx,
+        }
     }
 
     /// Look up method index by name.
@@ -207,6 +229,21 @@ impl MethodTable {
     /// Get all method names.
     pub fn method_names(&self) -> Vec<&str> {
         self.name_to_idx.keys().map(|s| s.as_str()).collect()
+    }
+
+    /// CRM namespace advertised for this route in the IPC handshake.
+    pub fn crm_ns(&self) -> &str {
+        &self.crm_ns
+    }
+
+    /// CRM contract class/model name advertised for this route in the IPC handshake.
+    pub fn crm_name(&self) -> &str {
+        &self.crm_name
+    }
+
+    /// CRM version advertised for this route in the IPC handshake.
+    pub fn crm_ver(&self) -> &str {
+        &self.crm_ver
     }
 }
 
@@ -364,7 +401,7 @@ impl IpcClient {
 
         // Store method tables from the handshake response.
         for route in &hs.routes {
-            let table = MethodTable::from_entries(&route.methods);
+            let table = MethodTable::from_route(route);
             self.route_tables.insert(route.name.clone(), table);
         }
         self.server_segments = hs.segments.clone();
@@ -901,6 +938,47 @@ impl IpcClient {
         self.route_tables.contains_key(name)
     }
 
+    /// Validate that the connected route matches the expected CRM contract.
+    ///
+    /// Empty expected namespace and version mean "no CRM contract expectation",
+    /// which keeps low-level transport probes usable without inventing dummy CRM
+    /// identities.
+    pub fn validate_route_contract(
+        &self,
+        route_name: &str,
+        expected_crm_ns: &str,
+        expected_crm_name: &str,
+        expected_crm_ver: &str,
+    ) -> Result<(), IpcError> {
+        if expected_crm_ns.is_empty() && expected_crm_name.is_empty() && expected_crm_ver.is_empty()
+        {
+            return Ok(());
+        }
+        let table = self
+            .route_tables
+            .get(route_name)
+            .ok_or_else(|| IpcError::RouteNotFound(route_name.to_string()))?;
+        if table.crm_ns() == expected_crm_ns
+            && table.crm_name() == expected_crm_name
+            && table.crm_ver() == expected_crm_ver
+        {
+            return Ok(());
+        }
+        Err(IpcError::Handshake(format!(
+            "CRM contract mismatch for route {route_name}: expected {expected_crm_ns}/{expected_crm_name}/{expected_crm_ver}, got {}/{}/{}",
+            table.crm_ns(),
+            table.crm_name(),
+            table.crm_ver(),
+        )))
+    }
+
+    /// CRM tag advertised by a route, if present.
+    pub fn route_contract(&self, route_name: &str) -> Option<(&str, &str, &str)> {
+        self.route_tables
+            .get(route_name)
+            .map(|table| (table.crm_ns(), table.crm_name(), table.crm_ver()))
+    }
+
     /// Get all route names.
     pub fn route_names(&self) -> Vec<&str> {
         self.route_tables.keys().map(|s| s.as_str()).collect()
@@ -1194,6 +1272,34 @@ mod tests {
         assert_eq!(client.server_identity(), Some(&identity));
         assert_eq!(client.server_id(), Some("identity-server"));
         assert_eq!(client.server_instance_id(), Some("identity-instance"));
+    }
+
+    #[test]
+    fn client_validates_route_crm_contract_from_handshake_metadata() {
+        let mut client = IpcClient::new("ipc://contract_projection");
+        let mut methods = HashMap::new();
+        methods.insert("ping".to_string(), 0);
+        client.route_tables.insert(
+            "grid".to_string(),
+            MethodTable {
+                crm_ns: "test.grid".to_string(),
+                crm_name: "Grid".to_string(),
+                crm_ver: "0.1.0".to_string(),
+                name_to_idx: methods,
+            },
+        );
+
+        client
+            .validate_route_contract("grid", "test.grid", "Grid", "0.1.0")
+            .expect("matching CRM contract should be accepted");
+
+        let err = client
+            .validate_route_contract("grid", "test.grid", "OtherGrid", "0.1.0")
+            .expect_err("mismatched CRM name should be rejected");
+        assert!(
+            err.to_string().contains("CRM contract mismatch"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
