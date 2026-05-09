@@ -157,9 +157,12 @@ pub fn encode_server_handshake(
     buf.extend_from_slice(&(routes.len() as u16).to_le_bytes());
     for route in routes {
         validate_name_len("route name", &route.name)?;
-        validate_name_len("crm namespace", &route.crm_ns)?;
-        validate_name_len("crm name", &route.crm_name)?;
-        validate_name_len("crm version", &route.crm_ver)?;
+        validate_crm_tag(&route.crm_ns, &route.crm_name, &route.crm_ver).map_err(|reason| {
+            EncodeError::InvalidText {
+                field: "crm tag",
+                reason,
+            }
+        })?;
         if route.methods.len() > MAX_METHODS {
             return Err(EncodeError::FieldTooLong {
                 field: "method count",
@@ -199,6 +202,36 @@ pub fn validate_name_len(field: &'static str, value: &str) -> Result<(), EncodeE
             max: MAX_HANDSHAKE_NAME_BYTES,
             actual,
         });
+    }
+    Ok(())
+}
+
+pub fn validate_crm_tag(crm_ns: &str, crm_name: &str, crm_ver: &str) -> Result<(), String> {
+    validate_crm_tag_field("crm namespace", crm_ns)?;
+    validate_crm_tag_field("crm name", crm_name)?;
+    validate_crm_tag_field("crm version", crm_ver)?;
+    Ok(())
+}
+
+pub fn validate_crm_tag_field(label: &'static str, value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{label} cannot be empty"));
+    }
+    if value.as_bytes().len() > MAX_HANDSHAKE_NAME_BYTES {
+        return Err(format!(
+            "{label} cannot exceed {MAX_HANDSHAKE_NAME_BYTES} bytes"
+        ));
+    }
+    if value.trim() != value {
+        return Err(format!(
+            "{label} cannot contain leading or trailing whitespace"
+        ));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(format!("{label} cannot contain control characters"));
+    }
+    if value.contains('/') || value.contains('\\') {
+        return Err(format!("{label} cannot contain path or tag separators"));
     }
     Ok(())
 }
@@ -326,6 +359,12 @@ pub fn decode_handshake(buf: &[u8]) -> Result<Handshake, DecodeError> {
         check_remaining(buf, off, crm_ver_len, "crm version")?;
         let crm_ver = read_str(buf, off, crm_ver_len)?;
         off += crm_ver_len;
+        validate_crm_tag(&crm_ns, &crm_name, &crm_ver).map_err(|reason| {
+            DecodeError::InvalidText {
+                field: "crm tag",
+                reason,
+            }
+        })?;
 
         check_remaining(buf, off, 2, "method count")?;
         let m_count = read_u16(buf, off) as usize;

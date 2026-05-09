@@ -1,4 +1,5 @@
 import enum
+import unicodedata
 from inspect import isfunction
 from typing import TypeVar, Type, Callable
 from .transferable import auto_transfer
@@ -7,6 +8,7 @@ _F = TypeVar('_F', bound=Callable)
 CRM = TypeVar('CRM')
 _METHOD_ACCESS_ATTR = '__cc_method_access__'
 _SHUTDOWN_ATTR = '__cc_on_shutdown__'
+_CRM_TAG_MAX_BYTES = 255
 
 @enum.unique
 class MethodAccess(enum.Enum):
@@ -71,6 +73,25 @@ def get_shutdown_method(cls: type) -> str | None:
         found = name
     return found
 
+
+def _validate_crm_tag_field(label: str, value: str) -> None:
+    if not isinstance(value, str):
+        raise ValueError(f'{label} of CRM must be a string.')
+    if not value:
+        raise ValueError(f'{label} of CRM cannot be empty.')
+    if len(value.encode('utf-8')) > _CRM_TAG_MAX_BYTES:
+        raise ValueError(
+            f'{label} of CRM cannot exceed {_CRM_TAG_MAX_BYTES} bytes.',
+        )
+    if value.strip() != value:
+        raise ValueError(
+            f'{label} of CRM cannot contain leading or trailing whitespace.',
+        )
+    if any(unicodedata.category(ch) == 'Cc' for ch in value):
+        raise ValueError(f'{label} of CRM cannot contain control characters.')
+    if '/' in value or '\\' in value:
+        raise ValueError(f'{label} of CRM cannot contain path or tag separators.')
+
 class CRMMeta(type):
     """Metaclass for CRM (Core Resource Model) contract classes.
 
@@ -114,12 +135,10 @@ def crm(*, namespace: str = 'cc', version: str = '0.1.0'):
     ``with`` statement.
     """
     def crm_wrapper(cls: Type[CRM]) -> Type[CRM]:
-        # Validate namespace and version
-        if not namespace:
-            raise ValueError('Namespace of CRM cannot be empty.')
-        if not version:
-            raise ValueError('Version of CRM cannot be empty (version example: "1.0.0").')
-        if not isinstance(version, str) or not version.count('.') == 2:
+        _validate_crm_tag_field('Namespace', namespace)
+        _validate_crm_tag_field('CRM name', cls.__name__)
+        _validate_crm_tag_field('Version', version)
+        if version.count('.') != 2:
             raise ValueError('Version must be a string in the format "major.minor.patch".')
 
         decorated_methods = {}

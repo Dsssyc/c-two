@@ -65,10 +65,18 @@ def _is_crm_contract_mismatch(exc: BaseException) -> bool:
 
 
 def _crm_contract_identity(crm_class: type) -> tuple[str, str, str]:
+    crm_ns = getattr(crm_class, '__cc_namespace__', '')
+    crm_name = getattr(crm_class, '__cc_name__', '')
+    crm_ver = getattr(crm_class, '__cc_version__', '')
+    if not crm_ns or not crm_name or not crm_ver:
+        raise ValueError(
+            f'{crm_class.__name__} is not a valid CRM contract class '
+            '(decorate it with @cc.crm).',
+        )
     return (
-        getattr(crm_class, '__cc_namespace__', ''),
-        getattr(crm_class, '__cc_name__', crm_class.__name__),
-        getattr(crm_class, '__cc_version__', ''),
+        crm_ns,
+        crm_name,
+        crm_ver,
     )
 
 
@@ -257,6 +265,7 @@ class _ProcessRegistry:
         str
             The *name* string (echoed back for convenience).
         """
+        _crm_contract_identity(crm_class)
         with self._lock:
             created_server = False
             try:

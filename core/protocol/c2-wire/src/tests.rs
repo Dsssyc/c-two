@@ -264,6 +264,91 @@ mod handshake_tests {
         }
     }
 
+    fn route(name: &str, methods: &[&str]) -> RouteInfo {
+        RouteInfo {
+            name: name.into(),
+            crm_ns: "test.grid".into(),
+            crm_name: "Grid".into(),
+            crm_ver: "0.1.0".into(),
+            methods: methods
+                .iter()
+                .enumerate()
+                .map(|(index, method)| MethodEntry {
+                    name: (*method).into(),
+                    index: index as u16,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn crm_tag_validator_accepts_normal_contract_identity() {
+        validate_crm_tag("test.grid", "Grid", "0.1.0").unwrap();
+    }
+
+    #[test]
+    fn crm_tag_validator_rejects_malformed_fields() {
+        let too_long = "x".repeat(MAX_HANDSHAKE_NAME_BYTES + 1);
+        for (crm_ns, crm_name, crm_ver, needle) in [
+            ("", "Grid", "0.1.0", "cannot be empty"),
+            ("test.grid", "", "0.1.0", "cannot be empty"),
+            ("test.grid", "Grid", "", "cannot be empty"),
+            (
+                " test.grid",
+                "Grid",
+                "0.1.0",
+                "leading or trailing whitespace",
+            ),
+            ("test.grid", "Grid\nInjected", "0.1.0", "control characters"),
+            ("test/grid", "Grid", "0.1.0", "path or tag separators"),
+            ("test.grid", "Bad\\Grid", "0.1.0", "path or tag separators"),
+            ("test.grid", too_long.as_str(), "0.1.0", "cannot exceed"),
+        ] {
+            let err = validate_crm_tag(crm_ns, crm_name, crm_ver)
+                .expect_err("malformed CrmTag field must fail");
+            assert!(err.contains(needle), "expected {needle:?}, got {err:?}");
+        }
+    }
+
+    #[test]
+    fn server_handshake_encode_rejects_invalid_crm_tag_fields() {
+        let mut route = route("grid", &["get"]);
+        route.crm_name = "Grid\0Injected".into();
+
+        let err = encode_server_handshake(&[], CAP_CALL_V2, &[route], "", &test_identity())
+            .expect_err("invalid CrmTag must fail during encode");
+
+        assert!(err.to_string().contains("crm name"));
+        assert!(err.to_string().contains("control characters"));
+    }
+
+    #[test]
+    fn server_handshake_decode_rejects_invalid_crm_tag_fields() {
+        let route = RouteInfo {
+            name: "grid".into(),
+            crm_ns: "test.grid".into(),
+            crm_name: "Grid".into(),
+            crm_ver: "0.1.0".into(),
+            methods: vec![MethodEntry {
+                name: "get".into(),
+                index: 0,
+            }],
+        };
+        let identity = test_identity();
+        let mut encoded = encode_server_handshake(&[], CAP_CALL_V2, &[route], "", &identity)
+            .expect("valid handshake encodes before byte-level mutation");
+
+        let grid_pos = encoded
+            .windows("Grid".len())
+            .position(|window| window == b"Grid")
+            .expect("encoded CRM name should be present");
+        encoded[grid_pos + 1] = b'\n';
+
+        let err = decode_handshake(&encoded).expect_err("decode must reject malformed CrmTag");
+        assert!(err.to_string().contains("crm name"));
+        assert!(err.to_string().contains("control characters"));
+    }
+
     #[test]
     fn client_handshake_roundtrip() {
         let segments = vec![

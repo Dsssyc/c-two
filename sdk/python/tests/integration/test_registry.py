@@ -38,6 +38,11 @@ class RenamedHello:
         ...
 
 
+class UndecoratedHello:
+    def greeting(self, name: str) -> str:
+        ...
+
+
 @pytest.fixture(autouse=True)
 def _clean_registry():
     """Ensure a clean registry for every test."""
@@ -56,6 +61,12 @@ class TestRegisterConnect:
     def test_register_returns_name(self):
         n = cc.register(Hello, HelloImpl(), name='hello')
         assert n == 'hello'
+
+    def test_register_rejects_undecorated_contract_before_server_creation(self):
+        with pytest.raises(ValueError, match='decorate it with @cc.crm'):
+            cc.register(UndecoratedHello, HelloImpl(), name='hello')
+
+        assert cc.server_address() is None
 
     def test_connect_thread_local(self):
         """Same-process connect returns thread-local proxy (zero serde)."""
@@ -88,6 +99,12 @@ class TestRegisterConnect:
 
         with pytest.raises(TypeError, match='CRM contract mismatch'):
             cc.connect(RenamedHello, name='hello')
+
+    def test_connect_rejects_undecorated_contract_before_transport(self):
+        cc.register(Hello, HelloImpl(), name='hello')
+
+        with pytest.raises(ValueError, match='decorate it with @cc.crm'):
+            cc.connect(UndecoratedHello, name='hello')
 
     def test_connect_ipc(self):
         """IPC connect via explicit address returns ipc-mode proxy."""

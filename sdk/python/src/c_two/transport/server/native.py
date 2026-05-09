@@ -170,9 +170,8 @@ class NativeServerBridge:
         runtime_session: object | None = None,
         relay_anchor_address: str | None = None,
     ) -> str:
-        routing_name = (
-            name if name is not None else self._extract_namespace(crm_class)
-        )
+        crm_ns, crm_name, crm_ver = self._extract_contract_identity(crm_class)
+        routing_name = name if name is not None else crm_ns
         instance = self._create_crm_instance(crm_class, crm_instance)
         methods = self._discover_methods(crm_class)
         cc_config = concurrency or self._default_concurrency or ConcurrencyConfig()
@@ -186,9 +185,9 @@ class NativeServerBridge:
             name=routing_name,
             crm_instance=instance,
             direct_instance=crm_instance,
-            crm_ns=getattr(crm_class, '__cc_namespace__', ''),
-            crm_name=getattr(crm_class, '__cc_name__', crm_class.__name__),
-            crm_ver=getattr(crm_class, '__cc_version__', ''),
+            crm_ns=crm_ns,
+            crm_name=crm_name,
+            crm_ver=crm_ver,
             method_table=method_table,
             scheduler=None,  # type: ignore[arg-type]
             methods=methods,
@@ -225,9 +224,9 @@ class NativeServerBridge:
                         cc_config.mode.value,
                         cc_config.max_pending,
                         cc_config.max_workers,
-                        getattr(crm_class, '__cc_namespace__', ''),
-                        getattr(crm_class, '__cc_name__', crm_class.__name__),
-                        getattr(crm_class, '__cc_version__', ''),
+                        crm_ns,
+                        crm_name,
+                        crm_ver,
                         relay_anchor_address,
                     )
                 except Exception as exc:
@@ -389,8 +388,19 @@ class NativeServerBridge:
 
     @staticmethod
     def _extract_namespace(crm_class: type) -> str:
-        tag = getattr(crm_class, '__tag__', '')
-        return tag.split('/')[0] if tag else ''
+        return NativeServerBridge._extract_contract_identity(crm_class)[0]
+
+    @staticmethod
+    def _extract_contract_identity(crm_class: type) -> tuple[str, str, str]:
+        crm_ns = getattr(crm_class, '__cc_namespace__', '')
+        crm_name = getattr(crm_class, '__cc_name__', '')
+        crm_ver = getattr(crm_class, '__cc_version__', '')
+        if crm_ns and crm_name and crm_ver:
+            return crm_ns, crm_name, crm_ver
+        raise ValueError(
+            f'{crm_class.__name__} is not a valid CRM contract class '
+            '(decorate it with @cc.crm).',
+        )
 
     # ------------------------------------------------------------------
     # Shutdown callback

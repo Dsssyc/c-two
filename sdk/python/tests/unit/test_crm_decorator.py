@@ -100,6 +100,36 @@ class TestIcrmValidation:
             class Svc:
                 pass
 
+    def test_namespace_rejects_path_separator(self):
+        with pytest.raises(ValueError, match="separators"):
+            @cc.crm(namespace="bad/ns", version="1.0.0")
+            class Svc:
+                pass
+
+    def test_class_name_rejects_control_characters(self):
+        Bad = type("Bad\nName", (), {"__module__": __name__})
+
+        with pytest.raises(ValueError, match="control characters"):
+            cc.crm(namespace="ns", version="1.0.0")(Bad)
+
+    def test_class_name_rejects_unicode_control_characters(self):
+        Bad = type("Bad\u0085Name", (), {"__module__": __name__})
+
+        with pytest.raises(ValueError, match="control characters"):
+            cc.crm(namespace="ns", version="1.0.0")(Bad)
+
+    def test_class_name_rejects_path_separator(self):
+        Bad = type("Bad/Name", (), {"__module__": __name__})
+
+        with pytest.raises(ValueError, match="separators"):
+            cc.crm(namespace="ns", version="1.0.0")(Bad)
+
+    def test_version_rejects_overlong_wire_field(self):
+        with pytest.raises(ValueError, match="255 bytes"):
+            @cc.crm(namespace="ns", version=f"1.0.{'x' * 256}")
+            class Svc:
+                pass
+
 
 class TestHelloFixture:
     """Tests using the Hello fixture from tests/fixtures."""

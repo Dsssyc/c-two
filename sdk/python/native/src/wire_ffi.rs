@@ -59,21 +59,24 @@ pub struct PyRouteInfo {
 #[pymethods]
 impl PyRouteInfo {
     #[new]
-    #[pyo3(signature = (name, methods, crm_ns="", crm_name="", crm_ver=""))]
+    #[pyo3(signature = (name, methods, crm_ns, crm_name, crm_ver))]
     fn new(
         name: String,
         methods: Vec<Py<PyMethodEntry>>,
         crm_ns: &str,
         crm_name: &str,
         crm_ver: &str,
-    ) -> Self {
-        Self {
+    ) -> PyResult<Self> {
+        c2_wire::handshake::validate_crm_tag(crm_ns, crm_name, crm_ver)
+            .map_err(PyValueError::new_err)?;
+
+        Ok(Self {
             name,
             crm_ns: crm_ns.to_string(),
             crm_name: crm_name.to_string(),
             crm_ver: crm_ver.to_string(),
             methods,
-        }
+        })
     }
 
     /// Look up method index by name, or `None` if not found.

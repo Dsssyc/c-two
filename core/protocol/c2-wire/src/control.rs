@@ -32,6 +32,10 @@ pub enum EncodeError {
         max: usize,
         actual: usize,
     },
+    InvalidText {
+        field: &'static str,
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for EncodeError {
@@ -39,6 +43,9 @@ impl std::fmt::Display for EncodeError {
         match self {
             Self::FieldTooLong { field, max, actual } => {
                 write!(f, "{field} is too long: {actual} bytes > {max}")
+            }
+            Self::InvalidText { field, reason } => {
+                write!(f, "{field} is invalid: {reason}")
             }
         }
     }

@@ -16,6 +16,32 @@ from c_two.transport.protocol import (
 from c_two.transport.wire import MethodTable
 
 
+def route_info(name: str, methods: list[MethodEntry]) -> RouteInfo:
+    return RouteInfo(
+        name=name,
+        methods=methods,
+        crm_ns='test.wire',
+        crm_name='WireRoute',
+        crm_ver='0.1.0',
+    )
+
+
+def test_route_info_requires_explicit_crm_tag():
+    with pytest.raises(TypeError):
+        RouteInfo(name='grid', methods=[MethodEntry(name='get', index=0)])
+
+
+def test_route_info_rejects_invalid_crm_tag():
+    with pytest.raises(ValueError, match='control characters'):
+        RouteInfo(
+            name='grid',
+            methods=[MethodEntry(name='get', index=0)],
+            crm_ns='test.wire',
+            crm_name='Bad\nRoute',
+            crm_ver='0.1.0',
+        )
+
+
 # ---------------------------------------------------------------------------
 # MethodTable
 # ---------------------------------------------------------------------------
@@ -106,8 +132,8 @@ class TestHandshake:
 
     def test_multi_segment_multi_route(self):
         segs = [("s1", 100), ("s2", 200)]
-        r1 = RouteInfo("route_a", [MethodEntry("m1", 0)])
-        r2 = RouteInfo("route_b", [MethodEntry("m2", 0), MethodEntry("m3", 1)])
+        r1 = route_info("route_a", [MethodEntry("m1", 0)])
+        r2 = route_info("route_b", [MethodEntry("m2", 0), MethodEntry("m3", 1)])
         encoded = encode_server_handshake(
             segs,
             CAP_CALL,
@@ -153,7 +179,7 @@ class TestHandshakePrefixExchange:
     def test_server_handshake_with_prefix(self):
         segments = [("/cc3bABCD0000_b0000", 262144)]
         prefix = "/cc3bABCD0000"
-        routes = [RouteInfo(name="grid", methods=[MethodEntry(name="get", index=0)])]
+        routes = [route_info("grid", [MethodEntry(name="get", index=0)])]
         encoded = encode_server_handshake(
             segments,
             CAP_CALL,
