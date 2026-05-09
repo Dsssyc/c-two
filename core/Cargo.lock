@@ -151,15 +151,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "c2-runtime"
+version = "0.1.0"
+dependencies = [
+ "c2-config",
+ "c2-http",
+ "c2-mem",
+ "c2-server",
+ "parking_lot",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "c2-server"
 version = "0.1.0"
 dependencies = [
  "c2-config",
+ "c2-error",
  "c2-mem",
  "c2-wire",
  "parking_lot",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

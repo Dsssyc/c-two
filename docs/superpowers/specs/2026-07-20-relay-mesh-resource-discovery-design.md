@@ -383,13 +383,13 @@ Clients need to know their local relay address for name resolution. Two mechanis
 
 ```python
 # Option 1: Environment variable (recommended for deployments)
-# C2_RELAY_ADDRESS=http://localhost:8080
+# C2_RELAY_ANCHOR_ADDRESS=http://localhost:8080
 
 # Option 2: Programmatic
-cc.set_relay('http://localhost:8080')
+cc.set_relay_anchor('http://localhost:8080')
 ```
 
-`C2_RELAY_ADDRESS` semantics remain unchanged: it points to the relay this process should use for remote access. The relay now also serves as the name resolution endpoint.
+`C2_RELAY_ANCHOR_ADDRESS` semantics remain unchanged: it points to the relay this process should use for remote access. The relay now also serves as the name resolution endpoint.
 
 For same-node scenarios where only IPC is needed (no relay), name resolution falls back to local-only (priorities 1–2 in the resolution chain). The relay is only needed for cross-node discovery.
 
@@ -455,9 +455,9 @@ def connect(icrm_class, name, address=None):
         return ICRMProxy.thread_local(...)
 
     # Priority 2: resolve via relay HTTP endpoint (with cache)
-    relay_address = _get_relay_address()
-    if relay_address:
-        routes = _resolve_with_cache(relay_address, name)
+    relay_anchor_address = _get_relay_anchor_address()
+    if relay_anchor_address:
+        routes = _resolve_with_cache(relay_anchor_address, name)
         for route_info in routes:
             try:
                 if route_info['relay_url'] == relay_address:
@@ -671,7 +671,7 @@ C-Two is at 0.x.x — no backward compatibility guarantees.
 
 ### Unchanged APIs
 
-- `C2_RELAY_ADDRESS` — points to local relay (now also the name resolution endpoint).
+- `C2_RELAY_ANCHOR_ADDRESS` — points to local relay (now also the name resolution endpoint).
 - `cc.register()` — no new required parameters. New optional: `consistency`, `stale_policy`, `refresh_strategy`.
 - `cc.connect()` — `name` parameter is the primary locator. `address=` is retained as escape hatch (bypasses relay resolution when provided).
 - Single-node deployments without relay continue to work (local-only resolution).

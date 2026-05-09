@@ -51,6 +51,7 @@ jobs:
               - '.github/scripts/**'
               - '.github/dependabot.yml'
               - 'tools/dev/**'
+              - 'tests/repo/**'
 
   core:
     needs: changes
@@ -116,12 +117,12 @@ jobs:
           --with pytest-timeout
           --with packaging
           pytest
-          --confcutdir=sdk/python/tests/unit
-          sdk/python/tests/unit/test_cli_release_workflow.py
-          sdk/python/tests/unit/test_python_package_release_workflow.py
-          sdk/python/tests/unit/test_check_version.py::TestCheckVersion
-          sdk/python/tests/unit/test_check_cli_release.py
-          sdk/python/tests/unit/test_c3_tool.py
+          --confcutdir=tests/repo
+          tests/repo/test_cli_release_workflow.py
+          tests/repo/test_python_package_release_workflow.py
+          tests/repo/test_check_version.py::TestCheckVersion
+          tests/repo/test_check_cli_release.py
+          tests/repo/test_c3_tool.py
           -q --timeout=30
 
   test:
@@ -167,4 +168,4 @@ jobs:
         if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
         run: uv run pytest sdk/python/tests -q --timeout=30
         env:
-          C2_RELAY_ADDRESS: ""
+          C2_RELAY_ANCHOR_ADDRESS: ""

@@ -369,14 +369,17 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
 
     def com_to_crm(*args, _c2_buffer=None):
         input_transferable = input.serialize if input else None
-        # Output deserializer: from_buffer when hold mode and available
+        # Output construction hook: from_buffer when hold mode and available
         if output is not None:
             if _c2_buffer == 'hold' and hasattr(output, 'from_buffer') and callable(output.from_buffer):
                 output_fn = output.from_buffer
+                output_hook = 'from_buffer'
             else:
                 output_fn = output.deserialize
+                output_hook = 'deserialize'
         else:
             output_fn = None
+            output_hook = None
 
         try:
             if len(args) < 1:
@@ -410,7 +413,28 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
             if hasattr(response, 'release'):
                 mv = memoryview(response)
                 if _c2_buffer == 'hold':
-                    result = output_fn(mv)
+                    try:
+                        result = output_fn(mv)
+                        if hasattr(response, 'track_retained'):
+                            tracker = getattr(client, 'lease_tracker', None)
+                            if tracker is not None:
+                                route_name = getattr(client, 'route_name', '')
+                                response.track_retained(
+                                    tracker,
+                                    route_name,
+                                    method_name,
+                                    'client_response',
+                                )
+                    except Exception as exc:
+                        mv.release()
+                        try:
+                            response.release()
+                        except Exception:
+                            pass
+                        if output_hook == 'from_buffer':
+                            raise error.ClientOutputFromBuffer(str(exc)) from exc
+                        raise
+
                     def release_cb():
                         mv.release()
                         try:
@@ -441,18 +465,23 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
                 raise error.ClientSerializeInput(str(e)) from e
             elif stage == 'call_crm':
                 raise error.ClientCallResource(str(e)) from e
+            elif output_hook == 'from_buffer':
+                raise error.ClientOutputFromBuffer(str(e)) from e
             else:
                 raise error.ClientDeserializeOutput(str(e)) from e
 
     def crm_to_com(*args, _release_fn=None):
-        # Select input deserializer based on buffer mode
+        # Select input construction hook based on buffer mode.
         if input is not None:
             if buffer == 'hold' and hasattr(input, 'from_buffer') and callable(input.from_buffer):
                 input_fn = input.from_buffer
+                input_hook = 'from_buffer'
             else:
                 input_fn = input.deserialize
+                input_hook = 'deserialize'
         else:
             input_fn = None
+            input_hook = None
         output_transferable = output.serialize if output else None
         input_buffer_mode = buffer
 
@@ -495,25 +524,38 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
 
         except Exception as e:
             result = None
-            if _release_fn is not None:
+            should_release_input = (
+                _release_fn is not None
+                and (input_buffer_mode == 'view' or stage == 'deserialize_input')
+            )
+            if should_release_input:
                 try:
                     _release_fn()
+                    _release_fn = None
                 except Exception:
                     pass
             if stage == 'deserialize_input':
-                err = error.ResourceDeserializeInput(str(e))
+                if input_hook == 'from_buffer':
+                    err = error.ResourceInputFromBuffer(str(e))
+                else:
+                    err = error.ResourceDeserializeInput(str(e))
             elif stage == 'execute_function':
                 err = error.ResourceExecuteFunction(str(e))
             else:
                 err = error.ResourceSerializeOutput(str(e))
 
-        serialized_error = error.CCError.serialize(err)
         serialized_result = b''
-        if output_transferable is not None and result is not None:
-            serialized_result = (
-                output_transferable(*result) if isinstance(result, tuple)
-                else output_transferable(result)
-            )
+        if err is None and output_transferable is not None and result is not None:
+            try:
+                serialized_result = (
+                    output_transferable(*result) if isinstance(result, tuple)
+                    else output_transferable(result)
+                )
+            except Exception as e:
+                err = error.ResourceSerializeOutput(str(e))
+                serialized_result = b''
+
+        serialized_error = error.CCError.serialize(err)
         return (serialized_error, serialized_result)
 
     @wraps(func)

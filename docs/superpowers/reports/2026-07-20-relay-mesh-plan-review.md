@@ -174,11 +174,11 @@ rubber-duck review that the initial pass missed.
   `register_upstream(upstream)` immediately
 - **Fix:** Make `--upstream` optional. When absent, start in mesh-only mode using seeds.
 
-### M-5: No `cc.set_relay()` API
+### M-5: No `cc.set_relay_anchor()` API
 
-- **Spec:** lines 384-390 — `cc.set_relay(address)` as programmatic alternative to env var
+- **Spec:** lines 384-390 — `cc.set_relay_anchor(address)` as programmatic alternative to env var
 - **Plan:** Not mentioned in any task
-- **Fix:** Add `set_relay()` to registry.py + export from `__init__.py`. It should set
+- **Fix:** Add `set_relay_anchor()` to registry.py + export from `__init__.py`. It should set
   the relay address used by `cc.register()` and `cc.connect()` route lookups.
 
 ### M-6: Protocol version check only in handle_peer_announce
@@ -314,7 +314,7 @@ Re-verified all 20 findings against the revised plan. Results below.
 |----|-------|------------|
 | M-3 | Missing ANTI_ENTROPY_INTERVAL | `relay_anti_entropy_interval: float = 60.0` added (line 2522) |
 | M-4 | CLI --upstream required | `required=False, default=None` (line 2875) |
-| M-5 | No set_relay() API | `set_relay()` added to registry.py + __init__.py (Task 12) |
+| M-5 | No set_relay_anchor() API | `set_relay_anchor()` added to registry.py + __init__.py (Task 12) |
 | M-6 | Version check only in announce | `check_protocol_version(&envelope)` in all 5 peer handlers (lines 1696, 1731, 1766, 1789, 1804) |
 | M-7 | No RelayLeave on shutdown | Broadcasts `RelayLeave` before cancelling tasks (lines 2275-2283) |
 

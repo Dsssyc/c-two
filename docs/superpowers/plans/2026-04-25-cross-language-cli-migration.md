@@ -962,7 +962,7 @@ from .transport.registry import (
     set_config,
     set_server,
     set_client,
-    set_relay,
+    set_relay_anchor,
     register,
     connect,
     close,
@@ -1316,7 +1316,7 @@ Expected: PASS.
 Run:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest \
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest \
   sdk/python/tests/unit/test_python_package_release_workflow.py \
   sdk/python/tests/unit/test_c3_tool.py \
   sdk/python/tests/unit/test_relay_graceful_shutdown.py \

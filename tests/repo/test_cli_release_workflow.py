@@ -22,6 +22,19 @@ def _workflow_text() -> str:
     )
 
 
+def _filter_lines(ci_text: str, filter_name: str) -> list[str]:
+    lines = ci_text.splitlines()
+    header = f"            {filter_name}:"
+    start = lines.index(header) + 1
+    result: list[str] = []
+    for line in lines[start:]:
+        if line.startswith("            ") and not line.startswith("              - "):
+            break
+        if line.startswith("              - "):
+            result.append(line.removeprefix("              - ").strip("'"))
+    return result
+
+
 def test_cli_release_builds_canonical_platform_artifacts():
     text = _workflow_text()
 
@@ -82,6 +95,7 @@ def test_ci_routes_tests_by_changed_domain():
     assert "cli/**" in ci_text
     assert "tools/dev/**" in ci_text
     assert ".github/dependabot.yml" in ci_text
+    assert "tests/repo/**" in _filter_lines(ci_text, "workflow_policy")
     assert ".github/workflows/cli-release.yml" in ci_text
     assert "github.event_name == 'merge_group'" in ci_text
     assert "needs.changes.outputs.sdk == 'true'" in ci_text
@@ -98,12 +112,20 @@ def test_ci_keeps_workflow_policy_tests_lightweight():
     )
 
     assert "workflow-policy:" in ci_text
-    assert "sdk/python/tests/unit/test_cli_release_workflow.py" in ci_text
+    assert "tests/repo/test_cli_release_workflow.py" in ci_text
+    assert "sdk/python/tests/unit/test_cli_release_workflow.py" not in ci_text
     assert "uv run --no-project" in ci_text
     assert "--with pytest" in ci_text
-    assert "--confcutdir=sdk/python/tests/unit" in ci_text
-    assert "sdk/python/tests/unit/test_check_version.py::TestCheckVersion" in ci_text
-    assert "sdk/python/tests/unit/test_check_cli_release.py" in ci_text
+    assert "--confcutdir=tests/repo" in ci_text
+    assert "--confcutdir=sdk/python/tests/unit" not in ci_text
+    assert "tests/repo/test_check_version.py::TestCheckVersion" in ci_text
+    assert "sdk/python/tests/unit/test_check_version.py::TestCheckVersion" not in ci_text
+    assert "tests/repo/test_check_cli_release.py" in ci_text
+    assert "sdk/python/tests/unit/test_check_cli_release.py" not in ci_text
+    assert "tests/repo/test_c3_tool.py" in ci_text
+    assert "sdk/python/tests/unit/test_c3_tool.py" not in ci_text
+    assert "tests/repo/test_python_package_release_workflow.py" in ci_text
+    assert "sdk/python/tests/unit/test_python_package_release_workflow.py" not in ci_text
     assert "uv run pytest sdk/python/tests -q --timeout=30" in ci_text
 
 

@@ -16,7 +16,7 @@ use crate::relay::authority::{
     ControlError, OwnerReplacement, RouteAuthority, RouteCommand, RouteCommandResult,
 };
 use crate::relay::conn_pool::{
-    AcquireError, CachedClient, ConnectionPool, OwnerToken, UpstreamLease,
+    AcquireError as PoolAcquireError, CachedClient, ConnectionPool, OwnerToken, UpstreamLease,
 };
 use crate::relay::route_table::RouteTable;
 use crate::relay::types::*;
@@ -52,6 +52,15 @@ pub enum UnregisterResult {
     OwnerMismatch,
 }
 
+pub enum UpstreamAcquireError {
+    NotFound,
+    Unreachable {
+        route: RouteEntry,
+        address: String,
+        error: c2_ipc::IpcError,
+    },
+}
+
 impl RelayState {
     pub fn new(
         config: Arc<RelayConfig>,
@@ -82,8 +91,10 @@ impl RelayState {
         &self,
         name: String,
         server_id: String,
+        server_instance_id: String,
         address: String,
         crm_ns: String,
+        crm_name: String,
         crm_ver: String,
         client: Arc<IpcClient>,
         replacement: Option<OwnerReplacementToken>,
@@ -95,8 +106,10 @@ impl RelayState {
         match RouteAuthority::new(self).execute(RouteCommand::RegisterLocal {
             name,
             server_id,
+            server_instance_id,
             address,
             crm_ns,
+            crm_name,
             crm_ver,
             client,
             replacement,
@@ -114,6 +127,12 @@ impl RelayState {
                 RegisterCommitResult::Duplicate { existing_address }
             }
             Err(ControlError::InvalidServerId { .. }) | Err(ControlError::InvalidName { .. }) => {
+                RegisterCommitResult::ConflictingOwner {
+                    existing_address: "<invalid>".to_string(),
+                }
+            }
+            Err(ControlError::InvalidServerInstanceId { .. })
+            | Err(ControlError::ContractMismatch { .. }) => {
                 RegisterCommitResult::ConflictingOwner {
                     existing_address: "<invalid>".to_string(),
                 }
@@ -157,22 +176,22 @@ impl RelayState {
             Err(ControlError::OwnerMismatch)
             | Err(ControlError::AddressMismatch { .. })
             | Err(ControlError::InvalidName { .. })
-            | Err(ControlError::InvalidServerId { .. }) => UnregisterResult::OwnerMismatch,
+            | Err(ControlError::InvalidServerId { .. })
+            | Err(ControlError::InvalidServerInstanceId { .. })
+            | Err(ControlError::ContractMismatch { .. }) => UnregisterResult::OwnerMismatch,
             Err(ControlError::DuplicateRoute { .. }) => UnregisterResult::OwnerMismatch,
         }
     }
 
-    pub fn remove_unreachable_local_upstream(
+    pub fn remove_unreachable_local_upstream_if_matches(
         &self,
-        name: &str,
-        address: &str,
+        expected: &RouteEntry,
     ) -> Option<(RouteEntry, f64, Option<Arc<IpcClient>>)> {
         let (entry, removed_at, client) = {
             let mut route_table = self.route_table.write();
-            let (entry, removed_at) =
-                route_table.unregister_local_route_if_address_matches(name, address);
+            let (entry, removed_at) = route_table.unregister_local_route_if_matches(expected);
             let client = if entry.is_some() {
-                self.conn_pool.remove(name)
+                self.conn_pool.remove(&expected.name)
             } else {
                 None
             };
@@ -185,6 +204,18 @@ impl RelayState {
 
     pub fn resolve(&self, name: &str) -> Vec<RouteInfo> {
         self.route_table.read().resolve(name)
+    }
+
+    pub fn resolve_matching(
+        &self,
+        name: &str,
+        crm_ns: &str,
+        crm_name: &str,
+        crm_ver: &str,
+    ) -> Vec<RouteInfo> {
+        self.route_table
+            .read()
+            .resolve_matching(name, crm_ns, crm_name, crm_ver)
     }
 
     pub fn route_names(&self) -> Vec<String> {
@@ -201,34 +232,91 @@ impl RelayState {
 
     // -- Connection-only operations --
 
-    pub async fn acquire_upstream(&self, name: &str) -> Result<UpstreamLease, AcquireError> {
-        let lease = self
-            .conn_pool
-            .acquire_with(name, |address| async move {
-                let mut client = IpcClient::new(&address);
-                client.connect().await?;
-                if !client.has_route(name) {
-                    client.close().await;
-                    return Err(c2_ipc::IpcError::RouteNotFound(name.to_string()));
-                }
-                Ok(Arc::new(client))
-            })
-            .await?;
+    pub async fn acquire_upstream(
+        &self,
+        name: &str,
+    ) -> Result<(UpstreamLease, RouteEntry), UpstreamAcquireError> {
+        let expected = self
+            .route_table
+            .read()
+            .local_route(name)
+            .ok_or(UpstreamAcquireError::NotFound)?;
+        let route_name = name.to_string();
+        let expected_for_connect = expected.clone();
 
+        let lease = match self
+            .conn_pool
+            .acquire_with(name, move |address| {
+                let expected = expected_for_connect.clone();
+                let route_name = route_name.clone();
+                async move {
+                    if expected.ipc_address.as_deref() != Some(address.as_str()) {
+                        return Err(c2_ipc::IpcError::Handshake(format!(
+                            "relay upstream address mismatch for route {route_name}: expected {:?}, got {address}",
+                            expected.ipc_address
+                        )));
+                    }
+                    let mut client = IpcClient::new(&address);
+                    client.connect().await?;
+                    if client.server_id() != expected.server_id.as_deref()
+                        || client.server_instance_id() != expected.server_instance_id.as_deref()
+                    {
+                        let got_server_id = client.server_id().unwrap_or("").to_string();
+                        let got_server_instance_id =
+                            client.server_instance_id().unwrap_or("").to_string();
+                        client.close().await;
+                        return Err(c2_ipc::IpcError::Handshake(format!(
+                            "relay upstream identity mismatch for route {route_name}: expected {}/{}, got {got_server_id}/{got_server_instance_id}",
+                            expected.server_id.as_deref().unwrap_or(""),
+                            expected.server_instance_id.as_deref().unwrap_or(""),
+                        )));
+                    }
+                    if let Err(err) = client.validate_route_contract(
+                        &route_name,
+                        &expected.crm_ns,
+                        &expected.crm_name,
+                        &expected.crm_ver,
+                    ) {
+                        client.close().await;
+                        return Err(err);
+                    }
+                    if !client.has_route(&route_name) {
+                        client.close().await;
+                        return Err(c2_ipc::IpcError::RouteNotFound(route_name));
+                    }
+                    Ok(Arc::new(client))
+                }
+            })
+            .await
+        {
+            Ok(lease) => lease,
+            Err(PoolAcquireError::NotFound) => return Err(UpstreamAcquireError::NotFound),
+            Err(PoolAcquireError::Unreachable { address, error }) => {
+                return Err(UpstreamAcquireError::Unreachable {
+                    route: expected,
+                    address,
+                    error,
+                });
+            }
+        };
+
+        let lease_address = lease.address();
         let route_matches_lease = self
             .route_table
             .read()
             .local_route(name)
-            .and_then(|entry| entry.ipc_address)
-            .is_some_and(|address| address == lease.address());
+            .is_some_and(|entry| {
+                local_route_matches(&entry, &expected)
+                    && entry.ipc_address.as_deref() == Some(lease_address.as_str())
+            });
 
         if route_matches_lease {
-            Ok(lease)
+            Ok((lease, expected))
         } else {
             let client = lease.client();
             drop(lease);
             client.close_shared().await;
-            Err(AcquireError::NotFound)
+            Err(UpstreamAcquireError::NotFound)
         }
     }
 
@@ -404,12 +492,56 @@ mod tests {
         address: &str,
         client: Arc<IpcClient>,
     ) -> RouteEntry {
+        register_local_with_instance(
+            state,
+            name,
+            server_id,
+            &format!("{server_id}-instance"),
+            address,
+            client,
+        )
+    }
+
+    fn register_local_with_instance(
+        state: &RelayState,
+        name: &str,
+        server_id: &str,
+        server_instance_id: &str,
+        address: &str,
+        client: Arc<IpcClient>,
+    ) -> RouteEntry {
+        register_local_with_contract(
+            state,
+            name,
+            server_id,
+            server_instance_id,
+            address,
+            "test.echo",
+            "Echo",
+            "0.1.0",
+            client,
+        )
+    }
+
+    fn register_local_with_contract(
+        state: &RelayState,
+        name: &str,
+        server_id: &str,
+        server_instance_id: &str,
+        address: &str,
+        crm_ns: &str,
+        crm_name: &str,
+        crm_ver: &str,
+        client: Arc<IpcClient>,
+    ) -> RouteEntry {
         match state.commit_register_upstream(
             name.to_string(),
             server_id.to_string(),
+            server_instance_id.to_string(),
             address.to_string(),
-            String::new(),
-            String::new(),
+            crm_ns.to_string(),
+            crm_name.to_string(),
+            crm_ver.to_string(),
             client,
             None,
         ) {
@@ -513,8 +645,10 @@ mod tests {
                 relay_id: "peer-1".into(),
                 relay_url: "http://peer-1:8080".into(),
                 server_id: None,
+                server_instance_id: None,
                 ipc_address: None,
                 crm_ns: "ns".into(),
+                crm_name: "Grid".into(),
                 crm_ver: "0.1.0".into(),
                 locality: Locality::Peer,
                 registered_at: 1000.0,
@@ -543,8 +677,10 @@ mod tests {
                 relay_id: "test-relay".into(),
                 relay_url: "http://elsewhere:8080".into(),
                 server_id: None,
+                server_instance_id: None,
                 ipc_address: None,
                 crm_ns: "test.ns".into(),
+                crm_name: "Grid".into(),
                 crm_ver: "0.1.0".into(),
                 locality: Locality::Peer,
                 registered_at: 1000.0,
@@ -602,8 +738,10 @@ mod tests {
                 relay_id: "test-relay".into(),
                 relay_url: "http://localhost:9999".into(),
                 server_id: Some("server-old".into()),
+                server_instance_id: Some("instance-old".into()),
                 ipc_address: Some("ipc://grid-old".into()),
                 crm_ns: String::new(),
+                crm_name: String::new(),
                 crm_ver: String::new(),
                 locality: Locality::Local,
                 registered_at: 1000.0,
@@ -614,6 +752,7 @@ mod tests {
             RouteAuthority::new(&state).register_local_preflight(
                 "grid",
                 "server-old",
+                "instance-old",
                 "ipc://grid-old",
             ),
             Ok(crate::relay::authority::RegisterPreflight::SameOwner)
@@ -622,6 +761,7 @@ mod tests {
             RouteAuthority::new(&state).register_local_preflight(
                 "grid",
                 "server-new",
+                "instance-new",
                 "ipc://grid-new",
             ),
             Err(ControlError::DuplicateRoute { .. })
@@ -639,7 +779,9 @@ mod tests {
         let first_result = state.commit_register_upstream(
             "grid".into(),
             "server-first".into(),
+            "instance-first".into(),
             "ipc://first".into(),
+            String::new(),
             String::new(),
             String::new(),
             first,
@@ -653,7 +795,9 @@ mod tests {
         let second_result = state.commit_register_upstream(
             "grid".into(),
             "server-second".into(),
+            "instance-second".into(),
             "ipc://second".into(),
+            String::new(),
             String::new(),
             String::new(),
             second,
@@ -666,6 +810,56 @@ mod tests {
             } if existing_address == "ipc://first"
         ));
         assert_eq!(state.get_address("grid").as_deref(), Some("ipc://first"));
+    }
+
+    #[tokio::test]
+    async fn candidate_preparation_does_not_grant_registration_right_after_race() {
+        let state = RelayState::new(test_config(), null_disseminator());
+        let replacement = RouteAuthority::new(&state)
+            .prepare_candidate_registration("grid", "server-candidate", "ipc://candidate")
+            .await
+            .unwrap();
+        assert!(replacement.is_none());
+
+        let racer = Arc::new(IpcClient::new("ipc://racer"));
+        racer.force_connected(true);
+        let racer_result = state.commit_register_upstream(
+            "grid".into(),
+            "server-racer".into(),
+            "instance-racer".into(),
+            "ipc://racer".into(),
+            String::new(),
+            String::new(),
+            String::new(),
+            racer,
+            None,
+        );
+        assert!(matches!(
+            racer_result,
+            RegisterCommitResult::Registered { .. }
+        ));
+
+        let candidate = Arc::new(IpcClient::new("ipc://candidate"));
+        candidate.force_connected(true);
+        let candidate_result = state.commit_register_upstream(
+            "grid".into(),
+            "server-candidate".into(),
+            "instance-candidate".into(),
+            "ipc://candidate".into(),
+            String::new(),
+            String::new(),
+            String::new(),
+            candidate,
+            None,
+        );
+
+        assert!(matches!(
+            candidate_result,
+            RegisterCommitResult::Duplicate {
+                existing_address
+            } if existing_address == "ipc://racer"
+        ));
+        assert_eq!(state.get_address("grid").as_deref(), Some("ipc://racer"));
     }
 
     #[test]
@@ -682,7 +876,9 @@ mod tests {
         let result = state.commit_register_upstream(
             "grid".into(),
             "server-new".into(),
+            "instance-new".into(),
             "ipc://new".into(),
+            String::new(),
             String::new(),
             String::new(),
             replacement,
@@ -723,7 +919,9 @@ mod tests {
         let result = state.commit_register_upstream(
             "grid".into(),
             "server-racer".into(),
+            "instance-racer".into(),
             "ipc://replacement".into(),
+            String::new(),
             String::new(),
             String::new(),
             stale_replacement,
@@ -740,6 +938,66 @@ mod tests {
             } if existing_address == "ipc://same"
         ));
         assert_eq!(state.get_address("grid").as_deref(), Some("ipc://same"));
+    }
+
+    #[test]
+    fn stale_unreachable_removal_does_not_delete_new_same_address_owner_with_different_tag() {
+        let state = RelayState::new(test_config(), null_disseminator());
+        let old = Arc::new(IpcClient::new("ipc://same"));
+        old.force_connected(true);
+        register_local_with_contract(
+            &state,
+            "grid",
+            "server-old",
+            "instance-old",
+            "ipc://same",
+            "test.old",
+            "OldGrid",
+            "0.1.0",
+            old,
+        );
+        state.evict_connection("grid");
+        assert!(matches!(
+            state.unregister_upstream("grid", "server-old"),
+            UnregisterResult::Removed { .. }
+        ));
+
+        let new_same_address = Arc::new(IpcClient::new("ipc://same"));
+        new_same_address.force_connected(true);
+        register_local_with_contract(
+            &state,
+            "grid",
+            "server-new",
+            "instance-new",
+            "ipc://same",
+            "test.new",
+            "NewGrid",
+            "0.1.0",
+            new_same_address,
+        );
+
+        let stale_snapshot = RouteEntry {
+            name: "grid".into(),
+            relay_id: "test-relay".into(),
+            relay_url: "http://localhost:9999".into(),
+            server_id: Some("server-old".into()),
+            server_instance_id: Some("instance-old".into()),
+            ipc_address: Some("ipc://same".into()),
+            crm_ns: "test.old".into(),
+            crm_name: "OldGrid".into(),
+            crm_ver: "0.1.0".into(),
+            locality: Locality::Local,
+            registered_at: 0.0,
+        };
+        assert!(
+            state
+                .remove_unreachable_local_upstream_if_matches(&stale_snapshot)
+                .is_none(),
+            "stale failure for the old owner must not remove a new same-address owner"
+        );
+        let current = state.local_route("grid").expect("new route should remain");
+        assert_eq!(current.server_id.as_deref(), Some("server-new"));
+        assert_eq!(current.crm_name, "NewGrid");
     }
 
     #[test]
@@ -760,7 +1018,9 @@ mod tests {
         let result = state.commit_register_upstream(
             "grid".into(),
             "server-new".into(),
+            "instance-new".into(),
             "ipc://replacement".into(),
+            String::new(),
             String::new(),
             String::new(),
             replacement,
@@ -795,7 +1055,9 @@ mod tests {
         let result = state.commit_register_upstream(
             "grid".into(),
             "server-grid".into(),
+            "server-grid-instance".into(),
             "ipc://grid".into(),
+            String::new(),
             String::new(),
             String::new(),
             ignored,
@@ -806,6 +1068,56 @@ mod tests {
         assert!(matches!(
             state.conn_pool.lookup("grid"),
             CachedClient::Evicted { .. }
+        ));
+    }
+
+    #[test]
+    fn same_server_new_instance_refreshes_local_route_and_client() {
+        let state = RelayState::new(test_config(), null_disseminator());
+        let original = Arc::new(IpcClient::new("ipc://grid"));
+        original.force_connected(true);
+        register_local_with_instance(
+            &state,
+            "grid",
+            "server-grid",
+            "instance-old",
+            "ipc://grid",
+            original,
+        );
+
+        assert!(matches!(
+            RouteAuthority::new(&state).register_local_preflight(
+                "grid",
+                "server-grid",
+                "instance-new",
+                "ipc://grid",
+            ),
+            Ok(crate::relay::authority::RegisterPreflight::Available { .. })
+        ));
+
+        let replacement = Arc::new(IpcClient::new("ipc://grid"));
+        replacement.force_connected(true);
+        let result = state.commit_register_upstream(
+            "grid".into(),
+            "server-grid".into(),
+            "instance-new".into(),
+            "ipc://grid".into(),
+            String::new(),
+            String::new(),
+            String::new(),
+            replacement,
+            None,
+        );
+
+        assert!(matches!(result, RegisterCommitResult::Registered { .. }));
+        let routes = state.resolve("grid");
+        assert_eq!(
+            routes[0].server_instance_id.as_deref(),
+            Some("instance-new")
+        );
+        assert!(matches!(
+            state.conn_pool.lookup("grid"),
+            CachedClient::Ready { .. }
         ));
     }
 
@@ -821,7 +1133,9 @@ mod tests {
         let result = state.commit_register_upstream(
             "grid".into(),
             "server-grid".into(),
+            "instance-grid".into(),
             "ipc://new".into(),
+            String::new(),
             String::new(),
             String::new(),
             moved,
@@ -851,7 +1165,7 @@ mod tests {
 
         assert!(matches!(
             state.acquire_upstream("grid").await,
-            Err(AcquireError::NotFound)
+            Err(UpstreamAcquireError::NotFound)
         ));
     }
 
@@ -868,7 +1182,9 @@ mod tests {
         let result = state.commit_register_upstream(
             "grid".into(),
             "server-grid".into(),
+            "server-grid-instance".into(),
             "ipc://grid".into(),
+            String::new(),
             String::new(),
             String::new(),
             replacement,
@@ -878,7 +1194,7 @@ mod tests {
         assert!(matches!(result, RegisterCommitResult::SameOwner { .. }));
         assert!(matches!(
             state.acquire_upstream("grid").await,
-            Err(AcquireError::Unreachable { .. })
+            Err(UpstreamAcquireError::Unreachable { .. })
         ));
     }
 }

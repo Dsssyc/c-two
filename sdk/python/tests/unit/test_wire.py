@@ -72,19 +72,33 @@ class TestHandshake:
         cap = CAP_CALL | CAP_METHOD_IDX
         route = RouteInfo(
             name="hello",
+            crm_ns="test.hello",
+            crm_name="Hello",
+            crm_ver="1.2.3",
             methods=[
                 MethodEntry(name="add", index=0),
                 MethodEntry(name="greeting", index=1),
             ],
         )
-        encoded = encode_server_handshake(segments, cap, [route])
+        encoded = encode_server_handshake(
+            segments,
+            cap,
+            [route],
+            server_id='wire-server',
+            server_instance_id='wire-instance',
+        )
         assert encoded[0] == HANDSHAKE_VERSION
         hs = decode_handshake(encoded)
         assert hs.segments == segments
         assert hs.capability_flags == cap
+        assert hs.server_identity.server_id == 'wire-server'
+        assert hs.server_identity.server_instance_id == 'wire-instance'
         assert len(hs.routes) == 1
         r = hs.routes[0]
         assert r.name == "hello"
+        assert r.crm_ns == "test.hello"
+        assert r.crm_name == "Hello"
+        assert r.crm_ver == "1.2.3"
         assert len(r.methods) == 2
         assert r.method_by_name("add") == 0
         assert r.method_by_name("greeting") == 1
@@ -94,7 +108,13 @@ class TestHandshake:
         segs = [("s1", 100), ("s2", 200)]
         r1 = RouteInfo("route_a", [MethodEntry("m1", 0)])
         r2 = RouteInfo("route_b", [MethodEntry("m2", 0), MethodEntry("m3", 1)])
-        encoded = encode_server_handshake(segs, CAP_CALL, [r1, r2])
+        encoded = encode_server_handshake(
+            segs,
+            CAP_CALL,
+            [r1, r2],
+            server_id='multi-server',
+            server_instance_id='multi-instance',
+        )
         hs = decode_handshake(encoded)
         assert len(hs.segments) == 2
         assert len(hs.routes) == 2
@@ -114,11 +134,11 @@ class TestHandshake:
 
     def test_truncated_raises(self):
         with pytest.raises(ValueError):
-            decode_handshake(b"\x06")
+            decode_handshake(bytes([HANDSHAKE_VERSION]))
 
 
 class TestHandshakePrefixExchange:
-    """Handshake v6: prefix field."""
+    """Handshake v7: prefix and server identity fields."""
 
     def test_client_handshake_with_prefix(self):
         segments = [("/cc3b00001234_b0000", 262144)]
@@ -134,9 +154,18 @@ class TestHandshakePrefixExchange:
         segments = [("/cc3bABCD0000_b0000", 262144)]
         prefix = "/cc3bABCD0000"
         routes = [RouteInfo(name="grid", methods=[MethodEntry(name="get", index=0)])]
-        encoded = encode_server_handshake(segments, CAP_CALL, routes, prefix=prefix)
+        encoded = encode_server_handshake(
+            segments,
+            CAP_CALL,
+            routes,
+            prefix=prefix,
+            server_id='prefix-server',
+            server_instance_id='prefix-instance',
+        )
         hs = decode_handshake(encoded)
         assert hs.prefix == prefix
+        assert hs.server_identity.server_id == 'prefix-server'
+        assert hs.server_identity.server_instance_id == 'prefix-instance'
         assert len(hs.routes) == 1
         assert hs.routes[0].name == "grid"
 

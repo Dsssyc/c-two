@@ -4,7 +4,7 @@ Compares buddy vs dedicated allocation paths for payloads 64B–1GB.
 Tests both bytes (identity fast path) and dict (pickle serialization).
 
 Usage:
-    C2_RELAY_ADDRESS= uv run python sdk/python/benchmarks/segment_size_benchmark.py
+    C2_RELAY_ANCHOR_ADDRESS= uv run python sdk/python/benchmarks/segment_size_benchmark.py
 """
 from __future__ import annotations
 

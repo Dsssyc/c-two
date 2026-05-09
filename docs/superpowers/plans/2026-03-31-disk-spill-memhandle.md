@@ -1351,7 +1351,7 @@ Expected: Prints `OK`
 
 - [x] **Step 4: Run existing test suite**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30`
 Expected: All existing tests pass
 
 - [x] **Step 5: Commit**
@@ -1604,7 +1604,7 @@ self._buddy_pool_py = buddy_pool  # The PyMemPool instance
 
 - [x] **Step 6: Run tests**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30`
 Expected: All tests pass
 
 - [x] **Step 7: Commit**
@@ -1749,7 +1749,7 @@ reply_assemblers: dict[int, tuple[RustChunkAssembler, float]] = {}
 
 - [x] **Step 5: Run tests**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30`
 Expected: All tests pass
 
 - [x] **Step 6: Commit**
@@ -1833,7 +1833,7 @@ FLAG_DISK_SPILL = 1 << 5     # Reserved for Phase 2 disk spillover
 
 - [x] **Step 4: Run tests**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30`
 Expected: All tests pass
 
 - [x] **Step 5: Commit**
@@ -1860,7 +1860,7 @@ Expected: All tests pass (spill, handle, pool handle, assembler)
 
 - [x] **Step 2: Run Python tests**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30`
 Expected: All tests pass (should be same count as baseline ± tests removed with chunk.py)
 
 - [x] **Step 3: Run integration examples**

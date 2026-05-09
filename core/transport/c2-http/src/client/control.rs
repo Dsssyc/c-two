@@ -22,6 +22,43 @@ fn encode_segment(s: &str) -> String {
     utf8_percent_encode(s, CONTROL_SEGMENT).to_string()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ResolveCacheKey {
+    Name(String),
+    Typed {
+        name: String,
+        crm_ns: String,
+        crm_name: String,
+        crm_ver: String,
+    },
+}
+
+impl ResolveCacheKey {
+    fn route_name(&self) -> &str {
+        match self {
+            Self::Name(name)
+            | Self::Typed {
+                name,
+                crm_ns: _,
+                crm_name: _,
+                crm_ver: _,
+            } => name,
+        }
+    }
+}
+
+fn resolve_cache_key(name: &str, expected_crm: Option<(&str, &str, &str)>) -> ResolveCacheKey {
+    match expected_crm {
+        Some((crm_ns, crm_name, crm_ver)) => ResolveCacheKey::Typed {
+            name: name.to_string(),
+            crm_ns: crm_ns.to_string(),
+            crm_name: crm_name.to_string(),
+            crm_ver: crm_ver.to_string(),
+        },
+        None => ResolveCacheKey::Name(name.to_string()),
+    }
+}
+
 fn canonical_base_url(base_url: &str) -> String {
     base_url.trim().trim_end_matches('/').to_owned()
 }
@@ -30,8 +67,10 @@ fn canonical_base_url(base_url: &str) -> String {
 struct RegisterRequest<'a> {
     name: &'a str,
     server_id: &'a str,
+    server_instance_id: &'a str,
     address: &'a str,
     crm_ns: &'a str,
+    crm_name: &'a str,
     crm_ver: &'a str,
 }
 
@@ -46,7 +85,10 @@ pub struct RelayRouteInfo {
     pub name: String,
     pub relay_url: String,
     pub ipc_address: Option<String>,
+    pub server_id: Option<String>,
+    pub server_instance_id: Option<String>,
     pub crm_ns: String,
+    pub crm_name: String,
     pub crm_ver: String,
 }
 
@@ -79,7 +121,7 @@ pub struct RelayControlClient {
     client: reqwest::Client,
     base_url: String,
     config: RelayControlClientConfig,
-    cache: Mutex<HashMap<String, CacheEntry>>,
+    cache: Mutex<HashMap<ResolveCacheKey, CacheEntry>>,
 }
 
 impl RelayControlClient {
@@ -108,15 +150,19 @@ impl RelayControlClient {
         &self,
         name: &str,
         server_id: &str,
+        server_instance_id: &str,
         address: &str,
         crm_ns: &str,
+        crm_name: &str,
         crm_ver: &str,
     ) -> Result<(), HttpError> {
         let request = RegisterRequest {
             name,
             server_id,
+            server_instance_id,
             address,
             crm_ns,
+            crm_name,
             crm_ver,
         };
         runtime().handle().block_on(self.post_json_with_retry(
@@ -144,11 +190,40 @@ impl RelayControlClient {
     }
 
     pub async fn resolve_async(&self, name: &str) -> Result<Vec<RelayRouteInfo>, HttpError> {
-        if let Some(routes) = self.cached(name) {
+        self.resolve_with_query_async(name, None).await
+    }
+
+    pub async fn resolve_matching_async(
+        &self,
+        route_name: &str,
+        crm_ns: &str,
+        crm_name: &str,
+        crm_ver: &str,
+    ) -> Result<Vec<RelayRouteInfo>, HttpError> {
+        self.resolve_with_query_async(route_name, Some((crm_ns, crm_name, crm_ver)))
+            .await
+    }
+
+    async fn resolve_with_query_async(
+        &self,
+        name: &str,
+        expected_crm: Option<(&str, &str, &str)>,
+    ) -> Result<Vec<RelayRouteInfo>, HttpError> {
+        let cache_key = resolve_cache_key(name, expected_crm);
+        if let Some(routes) = self.cached(&cache_key) {
             return Ok(routes);
         }
 
-        let path = format!("/_resolve/{}", encode_segment(name));
+        let path = match expected_crm {
+            Some((crm_ns, crm_name, crm_ver)) => format!(
+                "/_resolve/{}?crm_ns={}&crm_name={}&crm_ver={}",
+                encode_segment(name),
+                encode_segment(crm_ns),
+                encode_segment(crm_name),
+                encode_segment(crm_ver),
+            ),
+            None => format!("/_resolve/{}", encode_segment(name)),
+        };
         let resp = self
             .client
             .get(format!("{}{}", self.base_url, path))
@@ -172,7 +247,7 @@ impl RelayControlClient {
         };
 
         self.cache.lock().insert(
-            name.to_string(),
+            cache_key,
             CacheEntry {
                 routes: routes.clone(),
                 inserted_at: Instant::now(),
@@ -186,7 +261,7 @@ impl RelayControlClient {
     }
 
     pub fn invalidate(&self, name: &str) {
-        self.cache.lock().remove(name);
+        self.cache.lock().retain(|key, _| key.route_name() != name);
     }
 
     pub fn base_url(&self) -> &str {
@@ -248,11 +323,11 @@ impl RelayControlClient {
         Err(HttpError::ServerError(status, text))
     }
 
-    fn cached(&self, name: &str) -> Option<Vec<RelayRouteInfo>> {
+    fn cached(&self, key: &ResolveCacheKey) -> Option<Vec<RelayRouteInfo>> {
         let mut cache = self.cache.lock();
-        let entry = cache.get(name)?;
+        let entry = cache.get(key)?;
         if entry.inserted_at.elapsed() >= self.config.cache_ttl {
-            cache.remove(name);
+            cache.remove(key);
             return None;
         }
         Some(entry.routes.clone())
@@ -270,16 +345,27 @@ mod tests {
     }
 
     #[test]
+    fn route_cache_key_distinguishes_name_only_from_typed_identity_with_delimiters() {
+        assert_ne!(
+            resolve_cache_key("grid\0test.ns\0Grid\00.1.0", None),
+            resolve_cache_key("grid", Some(("test.ns", "Grid", "0.1.0"))),
+        );
+    }
+
+    #[test]
     fn route_cache_can_be_invalidated() {
         let client = RelayControlClient::new("http://relay.test", false).unwrap();
         client.cache.lock().insert(
-            "grid".into(),
+            resolve_cache_key("grid", None),
             CacheEntry {
                 routes: vec![RelayRouteInfo {
                     name: "grid".into(),
                     relay_url: "http://relay-a.test".into(),
                     ipc_address: None,
+                    server_id: None,
+                    server_instance_id: None,
                     crm_ns: "".into(),
+                    crm_name: "".into(),
                     crm_ver: "".into(),
                 }],
                 inserted_at: Instant::now(),
@@ -287,23 +373,28 @@ mod tests {
         );
 
         assert_eq!(
-            client.cached("grid").unwrap()[0].relay_url,
+            client.cached(&resolve_cache_key("grid", None)).unwrap()[0].relay_url,
             "http://relay-a.test"
         );
         client.invalidate("grid");
-        assert!(client.cached("grid").is_none());
+        assert!(client.cached(&resolve_cache_key("grid", None)).is_none());
     }
 
     #[cfg(feature = "relay")]
     #[test]
     fn resolve_maps_404_status_from_real_relay_router() {
         let (addr, server) = runtime().handle().block_on(async {
-            let state = crate::relay::router::tests::test_state_for_client();
+            let state = crate::relay::test_support::test_state_for_client();
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let app = crate::relay::router::build_router(state);
             let server = tokio::spawn(async move {
-                axum::serve(listener, app).await.unwrap();
+                axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .await
+                .unwrap();
             });
             (addr, server)
         });

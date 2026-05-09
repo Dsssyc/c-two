@@ -13,6 +13,7 @@ fn scrub_peer_snapshot(mut snapshot: FullSync) -> FullSync {
     for entry in snapshot.routes.iter_mut() {
         entry.ipc_address = None;
         entry.server_id = None;
+        entry.server_instance_id = None;
     }
     snapshot
         .tombstones
@@ -71,6 +72,7 @@ pub async fn handle_peer_announce(
             relay_id,
             relay_url,
             crm_ns,
+            crm_name,
             crm_ver,
             registered_at,
         } => {
@@ -83,8 +85,10 @@ pub async fn handle_peer_announce(
                     relay_id,
                     relay_url,
                     server_id: None,
+                    server_instance_id: None,
                     ipc_address: None,
                     crm_ns,
+                    crm_name,
                     crm_ver,
                     locality: Locality::Peer,
                     registered_at,
@@ -371,6 +375,7 @@ mod tests {
                 relay_id: "relay-b".into(),
                 relay_url: "http://relay-b:8080".into(),
                 crm_ns: "test.ns".into(),
+                crm_name: "Grid".into(),
                 crm_ver: "0.1.0".into(),
                 registered_at: 1000.0,
             },
@@ -395,6 +400,7 @@ mod tests {
                 relay_id: "relay-c".into(),
                 relay_url: "http://relay-c:8080".into(),
                 crm_ns: "test.ns".into(),
+                crm_name: "Grid".into(),
                 crm_ver: "0.1.0".into(),
                 registered_at: 1000.0,
             },
@@ -420,6 +426,7 @@ mod tests {
                 relay_id: "relay-b".into(),
                 relay_url: "http://relay-b:8080".into(),
                 crm_ns: "test.ns".into(),
+                crm_name: "Grid".into(),
                 crm_ver: "0.1.0".into(),
                 registered_at: 1000.0,
             },
@@ -434,6 +441,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn announce_rejects_invalid_crm_tag_fields() {
+        let state = test_state();
+        known_peer(&state, "relay-b");
+        let too_long = "x".repeat(c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES + 1);
+
+        for (idx, (crm_ns, crm_name, crm_ver)) in [
+            ("", "Grid", "0.1.0"),
+            ("test.ns", "", "0.1.0"),
+            ("test.ns", "Grid", ""),
+            ("test.ns", "Bad\0Grid", "0.1.0"),
+            ("test.ns", too_long.as_str(), "0.1.0"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let route_name = format!("grid-invalid-crm-{idx}");
+            let envelope = PeerEnvelope::new(
+                "relay-b",
+                PeerMessage::RouteAnnounce {
+                    name: route_name.clone(),
+                    relay_id: "relay-b".into(),
+                    relay_url: "http://relay-b:8080".into(),
+                    crm_ns: crm_ns.into(),
+                    crm_name: crm_name.into(),
+                    crm_ver: crm_ver.into(),
+                    registered_at: 1000.0,
+                },
+            );
+
+            let response = handle_peer_announce(State(state.clone()), Json(envelope))
+                .await
+                .into_response();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                state.resolve(&route_name).is_empty(),
+                "invalid CRM tag should not be stored for {route_name}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn announce_uses_known_peer_url_instead_of_message_url() {
         let state = test_state();
         known_peer(&state, "relay-b");
@@ -444,6 +493,7 @@ mod tests {
                 relay_id: "relay-b".into(),
                 relay_url: "http://spoofed:8080".into(),
                 crm_ns: "test.ns".into(),
+                crm_name: "Grid".into(),
                 crm_ver: "0.1.0".into(),
                 registered_at: 1000.0,
             },
@@ -470,6 +520,7 @@ mod tests {
                 relay_id: "relay-b".into(),
                 relay_url: "http://relay-b:8080".into(),
                 crm_ns: "test.ns".into(),
+                crm_name: "Grid".into(),
                 crm_ver: "0.1.0".into(),
                 registered_at: 1000.0,
             },
@@ -523,8 +574,10 @@ mod tests {
                 relay_id: "relay-b".into(),
                 relay_url: "http://spoofed:8080".into(),
                 server_id: None,
+                server_instance_id: None,
                 ipc_address: None,
                 crm_ns: "test.ns".into(),
+                crm_name: "Grid".into(),
                 crm_ver: "0.1.0".into(),
                 locality: Locality::Peer,
                 registered_at: 1000.0,
@@ -613,8 +666,10 @@ mod tests {
                 relay_id: "relay-a".into(),
                 relay_url: "http://relay-a:8080".into(),
                 server_id: Some("server-secret".into()),
+                server_instance_id: Some("instance-secret".into()),
                 ipc_address: Some("ipc://secret".into()),
                 crm_ns: "test.ns".into(),
+                crm_name: "Grid".into(),
                 crm_ver: "0.1.0".into(),
                 locality: Locality::Local,
                 registered_at: 1000.0,
@@ -668,6 +723,34 @@ mod tests {
                     relay_id: "relay-c".into(),
                     relay_url: "http://relay-c:8080".into(),
                     crm_ns: "test.ns".into(),
+                    crm_name: "Grid".into(),
+                    crm_ver: "0.1.0".into(),
+                    registered_at: 1000.0,
+                }],
+            },
+        );
+
+        let response = handle_peer_digest(State(state.clone()), Json(envelope))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(state.resolve("grid").is_empty());
+    }
+
+    #[tokio::test]
+    async fn digest_diff_rejects_invalid_crm_tag_fields() {
+        let state = test_state();
+        known_peer(&state, "relay-b");
+        let envelope = PeerEnvelope::new(
+            "relay-b",
+            PeerMessage::DigestDiff {
+                entries: vec![crate::relay::peer::DigestDiffEntry::Active {
+                    name: "grid".into(),
+                    relay_id: "relay-b".into(),
+                    relay_url: "http://relay-b:8080".into(),
+                    crm_ns: "test.ns".into(),
+                    crm_name: "Grid\nInjected".into(),
                     crm_ver: "0.1.0".into(),
                     registered_at: 1000.0,
                 }],
@@ -694,6 +777,7 @@ mod tests {
                     relay_id: "relay-b".into(),
                     relay_url: "http://spoofed:8080".into(),
                     crm_ns: "test.ns".into(),
+                    crm_name: "Grid".into(),
                     crm_ver: "0.1.0".into(),
                     registered_at: 1000.0,
                 }],
@@ -722,6 +806,7 @@ mod tests {
                     relay_id: "relay-b".into(),
                     relay_url: "http://relay-b:8080".into(),
                     crm_ns: "test.ns".into(),
+                    crm_name: "Grid".into(),
                     crm_ver: "0.1.0".into(),
                     registered_at: 1000.0,
                 }],
@@ -748,8 +833,10 @@ mod tests {
                 relay_id: "relay-a".into(),
                 relay_url: "http://relay-a:8080".into(),
                 server_id: Some("server-local".into()),
+                server_instance_id: Some("instance-local".into()),
                 ipc_address: Some("ipc://local".into()),
                 crm_ns: "test.ns".into(),
+                crm_name: "Local".into(),
                 crm_ver: "0.1.0".into(),
                 locality: Locality::Local,
                 registered_at: 1000.0,
@@ -762,8 +849,10 @@ mod tests {
                 relay_id: "relay-c".into(),
                 relay_url: "http://spoofed:8080".into(),
                 server_id: None,
+                server_instance_id: None,
                 ipc_address: None,
                 crm_ns: "test.ns".into(),
+                crm_name: "Remote".into(),
                 crm_ver: "0.1.0".into(),
                 locality: Locality::Peer,
                 registered_at: 1001.0,
@@ -866,8 +955,10 @@ mod tests {
                 relay_id: "relay-b".into(),
                 relay_url: "http://relay-b:8080".into(),
                 server_id: None,
+                server_instance_id: None,
                 ipc_address: None,
                 crm_ns: "test.ns".into(),
+                crm_name: "Grid".into(),
                 crm_ver: "0.1.0".into(),
                 locality: Locality::Peer,
                 registered_at: 1000.0,
@@ -902,8 +993,10 @@ mod tests {
                 relay_id: "relay-a".into(),
                 relay_url: "http://relay-a:8080".into(),
                 server_id: Some("server-secret".into()),
+                server_instance_id: Some("instance-secret".into()),
                 ipc_address: Some("ipc://secret".into()),
                 crm_ns: "test.ns".into(),
+                crm_name: "Grid".into(),
                 crm_ver: "0.1.0".into(),
                 locality: Locality::Local,
                 registered_at: 1000.0,
@@ -928,8 +1021,10 @@ mod tests {
                 relay_id: "relay-a".into(),
                 relay_url: "http://relay-a:8080".into(),
                 server_id: Some("server-grid".into()),
+                server_instance_id: Some("instance-grid".into()),
                 ipc_address: Some("ipc://grid".into()),
                 crm_ns: "test.ns".into(),
+                crm_name: "Grid".into(),
                 crm_ver: "0.1.0".into(),
                 locality: Locality::Local,
                 registered_at: 1000.0,

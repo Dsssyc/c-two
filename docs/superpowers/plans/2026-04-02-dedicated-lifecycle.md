@@ -728,7 +728,7 @@ Expected: maturin rebuilds successfully.
 
 - [ ] **Step 4: Run Python test suite**
 
-Run: `cd /Users/soku/Desktop/codespace/WorldInProgress/c-two && C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30 2>&1 | tail -20`
+Run: `cd /Users/soku/Desktop/codespace/WorldInProgress/c-two && C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30 2>&1 | tail -20`
 
 Expected: all tests pass.
 

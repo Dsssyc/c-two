@@ -15,8 +15,10 @@ pub struct RouteEntry {
     pub relay_id: String,
     pub relay_url: String,
     pub server_id: Option<String>,
+    pub server_instance_id: Option<String>,
     pub ipc_address: Option<String>,
     pub crm_ns: String,
+    pub crm_name: String,
     pub crm_ver: String,
     pub locality: Locality,
     pub registered_at: f64,
@@ -45,7 +47,10 @@ pub struct RouteInfo {
     pub name: String,
     pub relay_url: String,
     pub ipc_address: Option<String>,
+    pub server_id: Option<String>,
+    pub server_instance_id: Option<String>,
     pub crm_ns: String,
+    pub crm_name: String,
     pub crm_ver: String,
 }
 
@@ -53,18 +58,42 @@ impl RouteEntry {
     pub fn to_route_info(&self) -> RouteInfo {
         // `ipc_address` is private to the owning relay's filesystem; only
         // expose it for LOCAL routes. PEER routes go through `relay_url`.
-        let ipc_address = match self.locality {
-            Locality::Local => self.ipc_address.clone(),
-            Locality::Peer => None,
+        let local = self.locality == Locality::Local;
+        let ipc_address = if local {
+            self.ipc_address.clone()
+        } else {
+            None
+        };
+        let server_id = if local { self.server_id.clone() } else { None };
+        let server_instance_id = if local {
+            self.server_instance_id.clone()
+        } else {
+            None
         };
         RouteInfo {
             name: self.name.clone(),
             relay_url: self.relay_url.clone(),
             ipc_address,
+            server_id,
+            server_instance_id,
             crm_ns: self.crm_ns.clone(),
+            crm_name: self.crm_name.clone(),
             crm_ver: self.crm_ver.clone(),
         }
     }
+}
+
+pub(crate) fn local_route_matches(entry: &RouteEntry, expected: &RouteEntry) -> bool {
+    entry.name == expected.name
+        && entry.relay_id == expected.relay_id
+        && entry.server_id == expected.server_id
+        && entry.server_instance_id == expected.server_instance_id
+        && entry.ipc_address == expected.ipc_address
+        && entry.crm_ns == expected.crm_ns
+        && entry.crm_name == expected.crm_name
+        && entry.crm_ver == expected.crm_ver
+        && entry.locality == Locality::Local
+        && expected.locality == Locality::Local
 }
 
 /// Peer relay status.
@@ -114,6 +143,7 @@ impl TryFrom<crate::relay::peer::DigestDiffEntry> for RouteEntry {
                 relay_id,
                 relay_url,
                 crm_ns,
+                crm_name,
                 crm_ver,
                 registered_at,
             } => Ok(Self {
@@ -121,8 +151,10 @@ impl TryFrom<crate::relay::peer::DigestDiffEntry> for RouteEntry {
                 relay_id,
                 relay_url,
                 server_id: None,
+                server_instance_id: None,
                 ipc_address: None,
                 crm_ns,
+                crm_name,
                 crm_ver,
                 locality: Locality::Peer,
                 registered_at,

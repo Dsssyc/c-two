@@ -5,7 +5,7 @@
 <h1 align="center">C-Two</h1>
 
 <p align="center">
-  A resource-oriented RPC framework for Python — turn stateful classes into location-transparent distributed resources.
+  A resource-oriented RPC runtime — turn stateful classes into location-transparent distributed resources.
 </p>
 
 <p align="center">
@@ -24,13 +24,13 @@
 
 ## Basic Idea
 
-- **Resources, not services** — C-Two doesn't expose RPC endpoints. It makes Python classes remotely accessible while preserving their stateful, object-oriented nature.
+- **Resources, not services** — C-Two does not expose RPC endpoints. It exposes stateful resource objects through language SDKs. The Python SDK makes Python classes remotely accessible while preserving their object-oriented nature.
 
 - **Zero-copy from process to data** — Same-process calls skip serialization entirely. Cross-process IPC can hold shared-memory buffers alive, letting you read columnar data (NumPy, Arrow, …) directly from SHM — no deserialization, no copies.
 
-- **Built for scientific Python** — Native support for Apache Arrow, NumPy arrays, and large payloads (chunked streaming for data beyond 256 MB). Designed for computational workloads, not microservices.
+- **Built for scientific workloads** — The Python SDK has native support for Apache Arrow, NumPy arrays, and large payloads (chunked streaming for data beyond 256 MB). Designed for computational workloads, not microservices.
 
-- **Rust-powered transport** — The IPC layer uses a Rust buddy allocator for shared memory and a Rust HTTP relay for high-throughput networking.
+- **Rust-powered core** — Shared transport, memory, wire codec, relay, and configuration live in Rust so future SDKs reuse one runtime contract.
 
 ---
 
@@ -112,11 +112,11 @@ cc.close(counter)
 
 ```python
 # Server process
-cc.set_relay('http://relay-host:8080')
+cc.set_relay_anchor('http://relay-host:8080')
 cc.register(Counter, CounterImpl(), name='counter')
 
 # Client process (separate terminal)
-cc.set_relay('http://relay-host:8080')
+cc.set_relay_anchor('http://relay-host:8080')
 counter = cc.connect(Counter, name='counter')
 counter.increment(5)     # works identically
 cc.close(counter)
@@ -200,12 +200,17 @@ The `c3` command is C-Two's cross-language native CLI. From a source checkout,
 build and link a local development binary with
 `python tools/dev/c3_tool.py --build --link`.
 The Python SDK does not embed or start the relay server; start `c3 relay`,
-Docker Compose, or your orchestrator separately, then point Python code at it
-with `C2_RELAY_ADDRESS` or `cc.set_relay()`.
+Docker Compose, or your orchestrator separately, then point Python code at its
+relay anchor with `C2_RELAY_ANCHOR_ADDRESS` or `cc.set_relay_anchor()`.
+The anchor is the control-plane registration/name-resolution endpoint. Remote
+HTTP calls still go directly to the resolved route's `relay_url`; local direct
+IPC is used only when the anchor endpoint is loopback/local.
 Relay-aware clients preflight routes before the first call and re-resolve
 structured stale-route responses; set `C2_RELAY_ROUTE_MAX_ATTEMPTS` to tune the
 maximum route acquisition attempts (default `3`, valid range `1..=32`, `0` is
-treated as `1`). Ambiguous data-plane failures are not replayed.
+treated as `1`). Set `C2_RELAY_CALL_TIMEOUT` to tune CRM call timeout seconds
+(default `300`; `0` disables the reqwest total timeout). Ambiguous data-plane
+failures are not replayed.
 
 ```bash
 # Start a relay anywhere reachable on your network
@@ -219,12 +224,12 @@ Kubernetes NetworkPolicy, service mesh policy, or ingress authentication.
 
 ```python
 # Server side — announce resources to the relay
-cc.set_relay('http://relay-host:8080')
+cc.set_relay_anchor('http://relay-host:8080')
 cc.register(MeshStore, MeshStoreImpl(), name='mesh')
 cc.serve()
 
 # Client side — resolve by name, no address needed
-cc.set_relay('http://relay-host:8080')
+cc.set_relay_anchor('http://relay-host:8080')
 mesh = cc.connect(MeshStore, name='mesh')
 ```
 
@@ -446,7 +451,7 @@ An HTTP relay bridges network requests to CRM processes running on IPC. CRM proc
 ```python
 import c_two as cc
 
-cc.set_relay('http://relay-host:8080')
+cc.set_relay_anchor('http://relay-host:8080')
 cc.register(MeshStore, MeshStore(), name='mesh')
 cc.serve()  # blocks until Ctrl-C
 ```
@@ -465,7 +470,7 @@ reachability.
 ```python
 import c_two as cc
 
-cc.set_relay('http://relay-host:8080')
+cc.set_relay_anchor('http://relay-host:8080')
 mesh = cc.connect(MeshStore, name='mesh')  # relay resolves the name
 mesh.get_mesh()
 cc.close(mesh)
@@ -549,7 +554,7 @@ The IPC transport uses a **control-plane / data-plane separation**: method routi
 
 ### Rust Native Layer
 
-Performance-critical components are implemented in Rust and compiled as a Python extension via [PyO3](https://pyo3.rs) + [maturin](https://www.maturin.rs):
+The core runtime is language-neutral Rust; SDKs bind to the same core contracts rather than reimplement transport behavior. Performance-critical components are implemented in Rust and exposed to Python through a native extension built with [PyO3](https://pyo3.rs) + [maturin](https://www.maturin.rs):
 
 The Rust workspace contains 7 crates organized in 4 layers (foundation → protocol → transport → bridge):
 
@@ -591,6 +596,11 @@ uv sync                            # install dependencies + compile Rust extensi
 uv sync --group examples           # install examples dependencies (pandas, pyarrow)
 python tools/dev/c3_tool.py --build --link  # build and link native c3 for source checkouts
 uv run pytest                      # run the test suite
+
+# Python 3.10 compatibility check. C-Two keeps 3.10 support for downstream
+# stacks such as Taichi that are still pinned to that runtime.
+uv python install 3.10
+uv run pytest sdk/python/tests/unit/test_python_examples_syntax.py::test_python_examples_compile_on_minimum_supported_python -q --timeout=30 -rs
 ```
 
 > Requires [uv](https://github.com/astral-sh/uv) and a Rust toolchain.
@@ -626,4 +636,4 @@ See the [full roadmap](docs/plans/c-two-rpc-v2-roadmap.md) for details.
 
 ---
 
-<p align="center">Built for scientific Python. Powered by Rust.</p>
+<p align="center">Built for resource-oriented computation. Powered by Rust.</p>

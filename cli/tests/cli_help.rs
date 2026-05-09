@@ -33,6 +33,8 @@ fn c3_help_includes_embedded_banner() {
 fn c3_help_can_render_banner_with_legacy_color() {
     let mut cmd = Command::cargo_bin("c3").unwrap();
     cmd.arg("--help")
+        .env_remove("NO_COLOR")
+        .env_remove("CLICOLOR")
         .env("CLICOLOR_FORCE", "1")
         .assert()
         .success()

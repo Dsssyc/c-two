@@ -30,7 +30,7 @@ logging.basicConfig(
 # ── Main ────────────────────────────────────────────────────────────
 
 def main():
-    cc.set_relay(RELAY_URL)
+    cc.set_relay_anchor(RELAY_URL)
 
     grid = NestedGrid(
         epsg=2326,

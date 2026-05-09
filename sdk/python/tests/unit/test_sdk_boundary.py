@@ -21,6 +21,7 @@ def test_registry_does_not_own_relay_control_plane_mechanisms():
     forbidden_classes: list[str] = []
     forbidden_names: list[str] = []
     forbidden_route_fields: list[str] = []
+    forbidden_pool_names: list[str] = []
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -36,6 +37,12 @@ def test_registry_does_not_own_relay_control_plane_mechanisms():
         elif isinstance(node, ast.FunctionDef):
             if node.name == "_is_local_relay_url":
                 forbidden_names.append(node.name)
+        elif isinstance(node, ast.Name):
+            if node.id in {"RustHttpClientPool", "_http_pool"}:
+                forbidden_pool_names.append(node.id)
+        elif isinstance(node, ast.Attribute):
+            if node.attr == "_http_pool":
+                forbidden_pool_names.append(node.attr)
         elif isinstance(node, ast.Call):
             func = node.func
             if isinstance(func, ast.Attribute):
@@ -63,6 +70,7 @@ def test_registry_does_not_own_relay_control_plane_mechanisms():
     assert forbidden_names == []
     assert forbidden_calls == []
     assert forbidden_route_fields == []
+    assert forbidden_pool_names == []
 
 
 def _attribute_name(node: ast.Attribute) -> str:
@@ -89,3 +97,146 @@ def _literal_slice(node: ast.Subscript) -> object | None:
     if isinstance(node.slice, ast.Constant):
         return node.slice.value
     return None
+
+
+def test_import_does_not_expose_logo_banner():
+    import c_two
+
+    assert not hasattr(c_two, "LOGO" + "_UNICODE")
+
+
+def test_error_facade_does_not_reimplement_wire_codec():
+    source_path = Path(__file__).resolve().parents[2] / "src" / "c_two" / "error.py"
+    source = source_path.read_text(encoding="utf-8")
+
+    legacy = "legacy"
+    forbidden = [
+        ".tobytes()",
+        ".decode('utf-8')",
+        '.decode("utf-8")',
+        ".split(':', 1)",
+        '.split(":", 1)',
+        "int(code_raw)",
+        "Unknown error code {code_value}",
+        "invalid UTF-8",
+        "missing ':' separator",
+        "invalid code",
+        f"encode_error_{legacy}",
+        f"decode_error_{legacy}",
+        f"to_{legacy}_bytes",
+        f"from_{legacy}_bytes",
+    ]
+
+    offenders = [needle for needle in forbidden if needle in source]
+    assert offenders == []
+    assert "_native.error_registry" in source
+    assert "_native.encode_error_wire" in source
+    assert "_native.decode_error_wire_parts" in source
+
+
+def test_python_does_not_own_buffer_lease_accounting():
+    root = Path(__file__).resolve().parents[2] / "src" / "c_two"
+    offenders = []
+    forbidden = [
+        "class " + "Hold" + "Registry",
+        "weakref." + "ref(request_buf",
+        "_hold" + "_registry",
+        "_entr" + "ies",
+        "total_held_bytes " + "+=",
+    ]
+    for path in root.rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        for needle in forbidden:
+            if needle in text:
+                offenders.append(f"{path.relative_to(root)}:{needle}")
+    assert offenders == []
+
+
+def test_python_server_bridge_does_not_own_readiness_polling():
+    import inspect
+    from c_two.transport.server.native import NativeServerBridge
+
+    source = inspect.getsource(NativeServerBridge)
+    forbidden = [
+        "os.path.exists",
+        "while not os.path",
+        "self._started",
+        "_started =",
+    ]
+    offenders = [needle for needle in forbidden if needle in source]
+    assert offenders == []
+
+    start_source = inspect.getsource(NativeServerBridge.start)
+    assert "start_and_wait" in start_source
+
+    shutdown_source = inspect.getsource(NativeServerBridge.shutdown)
+    assert "if self.is_started()" not in shutdown_source
+
+
+def test_runtime_session_does_not_infer_started_from_socket_file():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[4]
+    session_rs = root / "core" / "runtime" / "c2-runtime" / "src" / "session.rs"
+    source = session_rs.read_text(encoding="utf-8")
+    assert "socket_path().exists()" not in source
+
+
+def test_python_server_dispatcher_does_not_own_response_allocation():
+    import inspect
+    from c_two.transport.server.native import NativeServerBridge
+
+    source = inspect.getsource(NativeServerBridge._make_dispatcher)
+    forbidden = [
+        "response_pool",
+        "len(res_part) >",
+        "write_from_buffer",
+        "bytes(res_part)",
+        "seg_idx",
+        "is_dedicated",
+    ]
+    offenders = [needle for needle in forbidden if needle in source]
+    assert offenders == []
+
+
+def test_native_server_response_parser_does_not_accept_shm_coordinate_tuples():
+    root = Path(__file__).resolve().parents[4]
+    server_ffi = root / "sdk" / "python" / "native" / "src" / "server_ffi.rs"
+    source = server_ffi.read_text(encoding="utf-8")
+    start = source.index("fn parse_response_meta")
+    end = source.index("// ---------------------------------------------------------------------------", start)
+    parser_source = source[start:end]
+
+    forbidden = [
+        "PyTuple",
+        "seg_idx: int",
+        "offset: int",
+        "data_size: int",
+        "is_dedicated: bool",
+        "seg_idx, offset, data_size",
+    ]
+    offenders = [needle for needle in forbidden if needle in parser_source]
+    assert offenders == []
+
+
+def test_python_ipc_config_facade_does_not_validate_override_keys():
+    root = Path(__file__).resolve().parents[2] / "src" / "c_two"
+    ipc_source = (root / "config" / "ipc.py").read_text(encoding="utf-8")
+    registry_source = (root / "transport" / "registry.py").read_text(encoding="utf-8")
+
+    forbidden = [
+        "_SERVER_KEYS",
+        "_CLIENT_KEYS",
+        "_FORBIDDEN_IPC_KEYS",
+        "_clean_ipc_overrides",
+        "_normalize_server_ipc_overrides",
+        "_normalize_client_ipc_overrides",
+        "unknown IPC override",
+        "shm_threshold is a global transport policy",
+    ]
+    offenders = [
+        needle
+        for needle in forbidden
+        if needle in ipc_source or needle in registry_source
+    ]
+    assert offenders == []

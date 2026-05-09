@@ -1,6 +1,9 @@
 """Unit tests for the Python IPC override facade."""
 from __future__ import annotations
 
+import inspect
+from collections import UserDict
+from pathlib import Path
 from typing import get_type_hints
 
 import pytest
@@ -29,14 +32,14 @@ class UnitConfigCRM:
 def _reset_registry_and_settings(monkeypatch):
     cc.shutdown()
     _ProcessRegistry.reset()
-    settings.relay_address = None
+    settings.relay_anchor_address = None
     settings.shm_threshold = None
     monkeypatch.setenv('C2_ENV_FILE', '')
     for key in (
         'C2_SHM_THRESHOLD',
         'C2_IPC_POOL_SEGMENT_SIZE',
         'C2_IPC_REASSEMBLY_SEGMENT_SIZE',
-        'C2_RELAY_ADDRESS',
+        'C2_RELAY_ANCHOR_ADDRESS',
         'C2_RELAY_USE_PROXY',
         'C2_RELAY_ROUTE_MAX_ATTEMPTS',
     ):
@@ -44,7 +47,7 @@ def _reset_registry_and_settings(monkeypatch):
     yield
     cc.shutdown()
     _ProcessRegistry.reset()
-    settings.relay_address = None
+    settings.relay_anchor_address = None
     settings.shm_threshold = None
 
 
@@ -104,7 +107,6 @@ def test_low_level_server_uses_env_for_global_transport_policy(monkeypatch):
 
     server = Server(bind_address='ipc://unit_env_threshold')
     try:
-        assert server._shm_threshold == 8192  # noqa: SLF001
         assert server._config['shm_threshold'] == 8192  # noqa: SLF001
     finally:
         server.shutdown()
@@ -117,7 +119,6 @@ def test_transport_policy_override_beats_env(monkeypatch):
 
     server = Server(bind_address='ipc://unit_policy_override')
     try:
-        assert server._shm_threshold == 16384  # noqa: SLF001
         assert server._config['shm_threshold'] == 16384  # noqa: SLF001
     finally:
         server.shutdown()
@@ -146,34 +147,31 @@ def test_client_ipc_overrides_beat_env(monkeypatch):
 
     cc.set_client(ipc_overrides={'reassembly_segment_size': 16 * 1024 * 1024})
     registry = _ProcessRegistry.get()
-    registry._ensure_pool_config()  # noqa: SLF001
 
-    assert registry._client_config['reassembly_segment_size'] == 16 * 1024 * 1024  # noqa: SLF001
+    assert registry._runtime_session.client_ipc_config['reassembly_segment_size'] == 16 * 1024 * 1024  # noqa: SLF001
 
 
 @pytest.mark.parametrize('key', ['shm_threshold'])
-def test_forbidden_server_ipc_override_fields_are_rejected(key):
-    with pytest.raises((TypeError, ValueError), match=key):
+def test_forbidden_server_ipc_override_fields_are_rejected_by_native(key):
+    with pytest.raises(ValueError, match='shm_threshold is a global transport policy'):
         Server(bind_address='ipc://unit_bad_server_override', ipc_overrides={key: 1})
 
 
 @pytest.mark.parametrize('key', ['shm_threshold'])
-def test_forbidden_client_ipc_override_fields_are_rejected(key):
-    with pytest.raises((TypeError, ValueError), match=key):
+def test_forbidden_client_ipc_override_fields_are_rejected_by_native(key):
+    with pytest.raises(ValueError, match='shm_threshold is a global transport policy'):
         cc.set_client(ipc_overrides={key: 1})
-        _ProcessRegistry.get()._ensure_pool_config()  # noqa: SLF001
 
 
-def test_removed_max_pool_memory_override_is_unknown():
-    with pytest.raises(TypeError, match='unknown IPC override'):
+def test_removed_max_pool_memory_override_is_rejected_by_native():
+    with pytest.raises(ValueError, match='unknown IPC override option: max_pool_memory'):
         Server(
             bind_address='ipc://unit_removed_max_pool_memory',
             ipc_overrides={'max_pool_memory': 1024},
         )
 
-    with pytest.raises(TypeError, match='unknown IPC override'):
+    with pytest.raises(ValueError, match='unknown IPC override option: max_pool_memory'):
         cc.set_client(ipc_overrides={'max_pool_memory': 1024})
-        _ProcessRegistry.get()._ensure_pool_config()  # noqa: SLF001
 
 
 def test_native_resolver_treats_max_pool_memory_as_unknown_override():
@@ -186,15 +184,49 @@ def test_native_resolver_treats_max_pool_memory_as_unknown_override():
         native.resolve_client_ipc_config({'max_pool_memory': 1024}, None)
 
 
-def test_unknown_ipc_override_field_is_rejected():
-    with pytest.raises(TypeError, match='unknown IPC override'):
+def test_native_resolver_accepts_mapping_subclasses():
+    native = ipc_config._native_resolver()  # noqa: SLF001
+    overrides = UserDict({'pool_segment_size': 2 * 1024 * 1024})
+
+    server_cfg = native.resolve_server_ipc_config(overrides, None)
+    client_cfg = native.resolve_client_ipc_config(overrides, None)
+
+    assert server_cfg['pool_segment_size'] == 2 * 1024 * 1024
+    assert client_cfg['pool_segment_size'] == 2 * 1024 * 1024
+
+
+def test_unknown_ipc_override_field_is_rejected_by_native():
+    with pytest.raises(ValueError, match='unknown IPC override option: not_real'):
         Server(bind_address='ipc://unit_unknown_override', ipc_overrides={'not_real': 1})
 
-    with pytest.raises(TypeError, match='unknown IPC override'):
+    with pytest.raises(ValueError, match='unknown IPC override option: not_real'):
         cc.set_server(ipc_overrides={'not_real': 1})
 
-    with pytest.raises(TypeError, match='unknown IPC override'):
+    with pytest.raises(ValueError, match='unknown IPC override option: not_real'):
         cc.set_client(ipc_overrides={'not_real': 1})
+
+
+def test_ipc_overrides_must_be_mapping_native_error():
+    with pytest.raises(TypeError, match='ipc_overrides must be a mapping'):
+        cc.set_server(ipc_overrides=object())  # type: ignore[arg-type]
+
+    with pytest.raises(TypeError, match='ipc_overrides must be a mapping'):
+        cc.set_client(ipc_overrides=object())  # type: ignore[arg-type]
+
+
+def test_ipc_override_keys_must_be_strings_native_error():
+    with pytest.raises(TypeError, match='IPC override option names must be strings'):
+        cc.set_client(ipc_overrides={1: 4096})  # type: ignore[dict-item]
+
+
+def test_ipc_override_non_string_keys_are_shape_errors_before_semantic_errors():
+    with pytest.raises(TypeError, match='IPC override option names must be strings'):
+        cc.set_client(
+            ipc_overrides={  # type: ignore[dict-item]
+                1: 4096,
+                'shm_threshold': 1,
+            },
+        )
 
 
 def test_high_level_ipc_overrides_are_copied_when_set():
@@ -203,7 +235,35 @@ def test_high_level_ipc_overrides_are_copied_when_set():
     overrides['pool_segment_size'] = 4 * 1024 * 1024
 
     registry = _ProcessRegistry.get()
-    assert registry._server_ipc_overrides == {'pool_segment_size': 2 * 1024 * 1024}  # noqa: SLF001
+    assert registry._runtime_session.server_ipc_overrides == {
+        'pool_segment_size': 2 * 1024 * 1024,
+    }  # noqa: SLF001
+
+
+def test_ipc_override_mapping_is_snapshotted_by_native():
+    overrides = UserDict({
+        'pool_segment_size': 2 * 1024 * 1024,
+        'chunk_size': None,
+    })
+
+    cc.set_server(ipc_overrides=overrides)  # type: ignore[arg-type]
+    overrides['pool_segment_size'] = 4 * 1024 * 1024
+
+    registry = _ProcessRegistry.get()
+    assert registry._runtime_session.server_ipc_overrides == {
+        'pool_segment_size': 2 * 1024 * 1024,
+    }  # noqa: SLF001
+
+
+def test_low_level_server_accepts_mapping_subclass_ipc_overrides():
+    server = Server(
+        bind_address='ipc://unit_server_mapping_subclass',
+        ipc_overrides=UserDict({'pool_segment_size': 2 * 1024 * 1024}),
+    )
+    try:
+        assert server._config['pool_segment_size'] == 2 * 1024 * 1024  # noqa: SLF001
+    finally:
+        server.shutdown()
 
 
 def test_server_id_override_drives_auto_address():
@@ -239,64 +299,110 @@ def test_server_id_rejects_empty_or_path_like_values():
         cc.set_server(server_id='bad\nid')
 
 
-def test_relay_resolved_connect_delegates_route_validation_to_rust(monkeypatch):
+def test_relay_resolved_connect_delegates_route_validation_to_runtime_session(monkeypatch):
     registry = _ProcessRegistry.get()
-    settings.relay_address = 'http://registry-relay.test'
+    settings.relay_anchor_address = 'http://registry-relay.test'
     calls = []
 
-    class FakeRelayAwareClient:
-        def __init__(self, relay_url: str, route_name: str):
-            calls.append((relay_url, route_name))
+    class FakeRuntimeSession:
+        client_config_frozen = False
+        server_id = None
+        server_id_override = None
+        server_ipc_overrides = None
+        client_ipc_overrides = None
 
+        def set_relay_anchor_address(self, relay_address):  # noqa: ANN001
+            self.relay_anchor_address_override = relay_address
+
+        def connect_via_relay(
+            self,
+            route_name: str,
+            expected_crm_ns: str,
+            expected_crm_name: str,
+            expected_crm_ver: str,
+        ):
+            calls.append((
+                self.relay_anchor_address_override,
+                route_name,
+                expected_crm_ns,
+                expected_crm_name,
+                expected_crm_ver,
+            ))
+            return FakeRelayAwareClient()
+
+        def lease_tracker(self):
+            return None
+
+    class FakeRelayAwareClient:
         def close(self):
             pass
 
-    import c_two._native as native
-
-    monkeypatch.setattr(native, 'RustRelayAwareHttpClient', FakeRelayAwareClient)
+    registry._runtime_session = FakeRuntimeSession()  # noqa: SLF001
 
     crm = registry.connect(IUnitConfigCRM, name='unit-route')
 
-    assert registry._pool_config_applied is False  # noqa: SLF001
-    assert calls == [('http://registry-relay.test', 'unit-route')]
+    assert 'RustClientPool.instance()' not in inspect.getsource(type(registry))
+    assert calls == [
+        ('http://registry-relay.test', 'unit-route', 'unit.config', 'IUnitConfigCRM', '0.1.0'),
+    ]
     assert crm.client._client.__class__ is FakeRelayAwareClient  # noqa: SLF001
 
 
-def test_relay_resolved_connect_uses_rust_relay_aware_client(monkeypatch):
+def test_relay_resolved_connect_uses_native_session_not_python_relay_client():
     registry = _ProcessRegistry.get()
-    settings.relay_address = 'http://registry-relay.test'
-    calls = []
+    settings.relay_anchor_address = 'http://registry-relay.test'
 
-    class FakeRelayAwareClient:
-        def __init__(self, relay_url: str, route_name: str):
-            calls.append((relay_url, route_name))
+    with pytest.raises(Exception):
+        registry.connect(IUnitConfigCRM, name='unit-route')
 
-        def close(self):
+    source = inspect.getsource(type(registry))
+    assert 'RustRelayAwareHttpClient(' not in source
+    assert '_relay_control_client_for' not in source
+
+
+def test_relay_connected_http_mode_preserves_relay_aware_call_path():
+    repo_root = Path(__file__).resolve().parents[4]
+    source = (
+        repo_root / 'sdk/python/native/src/runtime_session_ffi.rs'
+    ).read_text(encoding='utf-8')
+
+    assert 'client: Arc<RelayAwareHttpClient>' in source
+    assert 'call_relay_aware_http_client(py, client, method_name, data)' in source
+    assert 'resolve_relay_connection(' in source
+    assert 'resolve_relay_target(' not in source
+
+    close_inner = source.split('fn close_inner(&self) {', 1)[1].split(
+        'impl Drop for PyRelayConnectedClient',
+        1,
+    )[0]
+    assert 'release_http_client_from_global_pool' not in close_inner
+
+
+def test_relay_resolved_connect_maps_native_404_to_resource_not_found(monkeypatch):
+    registry = _ProcessRegistry.get()
+    settings.relay_anchor_address = 'http://registry-relay.test'
+
+    class FakeRuntimeSession:
+        client_config_frozen = False
+
+        def set_relay_anchor_address(self, relay_address):  # noqa: ANN001
             pass
 
-    import c_two._native as native
-
-    monkeypatch.setattr(native, 'RustRelayAwareHttpClient', FakeRelayAwareClient)
-
-    crm = registry.connect(IUnitConfigCRM, name='unit-route')
-
-    assert calls == [('http://registry-relay.test', 'unit-route')]
-    assert crm.client._client.__class__ is FakeRelayAwareClient  # noqa: SLF001
-
-
-def test_relay_resolved_connect_maps_preflight_404_to_resource_not_found(monkeypatch):
-    registry = _ProcessRegistry.get()
-    settings.relay_address = 'http://registry-relay.test'
-
-    class FakeRelayAwareClient:
-        def __init__(self, relay_url: str, route_name: str):  # noqa: ARG002
+        def connect_via_relay(
+            self,
+            route_name: str,
+            expected_crm_ns: str,
+            expected_crm_name: str,
+            expected_crm_ver: str,
+        ):  # noqa: ARG002
             err = RuntimeError('HTTP 404')
             err.status_code = 404
             raise err
 
-    import c_two._native as native
+        def lease_tracker(self):
+            return None
 
-    monkeypatch.setattr(native, 'RustRelayAwareHttpClient', FakeRelayAwareClient)
+    registry._runtime_session = FakeRuntimeSession()  # noqa: SLF001
 
     with pytest.raises(ResourceNotFound, match="Resource 'unit-route' not found"):
         registry.connect(IUnitConfigCRM, name='unit-route')
@@ -341,17 +447,17 @@ def test_proxy_policy_does_not_resolve_ipc_env(monkeypatch):
 
 
 def test_relay_settings_do_not_resolve_ipc_env(monkeypatch):
-    monkeypatch.setenv('C2_RELAY_ADDRESS', 'http://127.0.0.1:8080')
+    monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', 'http://127.0.0.1:8080')
     monkeypatch.setenv('C2_IPC_POOL_SEGMENT_SIZE', 'not-a-number')
 
-    assert settings.relay_address == 'http://127.0.0.1:8080'
+    assert settings.relay_anchor_address == 'http://127.0.0.1:8080'
 
 
-def test_relay_address_resolution_ignores_relay_proxy_policy(monkeypatch):
-    monkeypatch.setenv('C2_RELAY_ADDRESS', 'http://127.0.0.1:8080')
+def test_relay_anchor_address_resolution_ignores_relay_proxy_policy(monkeypatch):
+    monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', 'http://127.0.0.1:8080')
     monkeypatch.setenv('C2_RELAY_USE_PROXY', 'not-a-bool')
 
-    assert settings.relay_address == 'http://127.0.0.1:8080'
+    assert settings.relay_anchor_address == 'http://127.0.0.1:8080'
 
 
 def test_shm_threshold_resolution_does_not_parse_ipc_env(monkeypatch):
@@ -359,3 +465,15 @@ def test_shm_threshold_resolution_does_not_parse_ipc_env(monkeypatch):
     monkeypatch.setenv('C2_IPC_POOL_SEGMENT_SIZE', 'not-a-number')
 
     assert settings.shm_threshold == 8192
+
+
+def test_relay_anchor_env_replaces_old_relay_address_env(monkeypatch):
+    monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', 'http://127.0.0.1:8080')
+    monkeypatch.setenv('C2_RELAY_ADDRESS', 'http://old-relay.test:8080')
+
+    assert settings.relay_anchor_address == 'http://127.0.0.1:8080'
+
+
+def test_public_relay_anchor_api_replaces_set_relay():
+    assert hasattr(cc, 'set_relay_anchor')
+    assert not hasattr(cc, 'set_relay')

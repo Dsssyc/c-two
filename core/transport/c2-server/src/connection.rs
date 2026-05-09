@@ -1,8 +1,7 @@
 //! Per-client connection state.
 //!
-//! Mirrors the Python `Connection` dataclass from
-//! `c_two.transport.server.connection` — tracks handshake status,
-//! SHM segments, activity timestamps, and in-flight request counting.
+//! Tracks handshake status, SHM segments, activity timestamps, and
+//! in-flight request counting for one IPC peer.
 
 use parking_lot::{Mutex, RwLock};
 use std::sync::Arc;

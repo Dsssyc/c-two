@@ -1010,7 +1010,7 @@ Note: This is a simplified sketch. The actual memoryview implementation must ens
 - [ ] **Step 4: Run tests**
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30
 ```
 
 - [ ] **Step 5: Commit**
@@ -1127,7 +1127,7 @@ fn parse_response_meta(py: Python<'_>, result: PyObject) -> Result<ResponseMeta,
 ```bash
 cd src/c_two/_native && cargo check -p c2-ffi
 uv sync --reinstall-package c-two
-C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30
 ```
 
 - [ ] **Step 4: Commit**
@@ -1192,8 +1192,8 @@ class TestZeroCopyIPC:
 - [ ] **Step 2: Run tests**
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest tests/integration/test_zero_copy_ipc.py -v --timeout=30
-C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/integration/test_zero_copy_ipc.py -v --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30
 ```
 
 - [ ] **Step 3: Commit**

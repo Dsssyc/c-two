@@ -10,8 +10,8 @@ Three modes:
   directly via ``call_direct(method_name, args)`` — zero serialization.
 - **ipc**: ``supports_direct_call = False``.  Delegates to a Rust IPC
   client with routing-name-based ``call()``.
-- **http**: ``supports_direct_call = False``.  Delegates to a Rust HTTP
-  client for cross-node access via an HTTP relay.
+- **http**: ``supports_direct_call = False``.  Delegates to a Rust-native HTTP
+  call surface for cross-node access via an HTTP relay.
 
 Usage::
 
@@ -27,7 +27,7 @@ Usage::
     crm.client = proxy
     crm.greeting('World')       # → rust_client.call('hello', 'greeting', ...)
 
-    # HTTP (cross-node via RustHttpClient):
+    # HTTP (cross-node via a Rust-native HTTP or relay-aware client):
     proxy = CRMProxy.http(http_client, 'hello')
     crm = Hello()
     crm.client = proxy
@@ -37,8 +37,6 @@ from __future__ import annotations
 
 import threading
 from typing import Any, Callable, TYPE_CHECKING
-
-from ...crm.meta import MethodAccess
 
 if TYPE_CHECKING:
     from ..server.scheduler import Scheduler
@@ -60,7 +58,7 @@ class CRMProxy:
     __slots__ = (
         '_mode', '_crm', '_client', '_name',
         '_closed', '_close_lock', '_on_terminate',
-        '_scheduler', '_access_map',
+        '_scheduler', '_lease_tracker',
     )
 
     # ------------------------------------------------------------------
@@ -73,8 +71,8 @@ class CRMProxy:
         crm_instance: object,
         *,
         scheduler: Scheduler | None = None,
-        access_map: dict[str, MethodAccess] | None = None,
         on_terminate: Callable[[], None] | None = None,
+        lease_tracker: Any = None,
     ) -> CRMProxy:
         """Create a thread-local proxy (same process, no serialization).
 
@@ -87,9 +85,6 @@ class CRMProxy:
             Optional :class:`Scheduler` for read/write concurrency control.
             When provided, ``call_direct`` wraps method execution in
             the scheduler's execution guard.
-        access_map:
-            Mapping from method name → :class:`MethodAccess`.  Required
-            when *scheduler* is provided.
         """
         proxy = object.__new__(cls)
         proxy._mode = 'thread'
@@ -100,7 +95,7 @@ class CRMProxy:
         proxy._closed = False
         proxy._on_terminate = on_terminate
         proxy._scheduler = scheduler
-        proxy._access_map = access_map
+        proxy._lease_tracker = lease_tracker
         return proxy
 
     @classmethod
@@ -110,6 +105,7 @@ class CRMProxy:
         name: str,
         *,
         on_terminate: Callable[[], None] | None = None,
+        lease_tracker: Any = None,
     ) -> CRMProxy:
         """Create an IPC proxy (cross-process via Rust IPC client).
 
@@ -126,7 +122,7 @@ class CRMProxy:
         proxy._closed = False
         proxy._on_terminate = on_terminate
         proxy._scheduler = None
-        proxy._access_map = None
+        proxy._lease_tracker = lease_tracker
         # Auto-discover route name when not provided.
         if not name and hasattr(client, 'route_names'):
             names = client.route_names()
@@ -141,6 +137,7 @@ class CRMProxy:
         name: str,
         *,
         on_terminate: Callable[[], None] | None = None,
+        lease_tracker: Any = None,
     ) -> CRMProxy:
         """Create an HTTP proxy (cross-node via Rust HTTP client + relay).
 
@@ -156,7 +153,7 @@ class CRMProxy:
         proxy._closed = False
         proxy._on_terminate = on_terminate
         proxy._scheduler = None
-        proxy._access_map = None
+        proxy._lease_tracker = lease_tracker
         return proxy
 
     # ------------------------------------------------------------------
@@ -175,6 +172,16 @@ class CRMProxy:
     def supports_direct_call(self) -> bool:
         """``True`` for thread-local proxies (skip serialization)."""
         return self._mode == 'thread'
+
+    @property
+    def route_name(self) -> str:
+        """Routing name associated with this proxy."""
+        return self._name
+
+    @property
+    def lease_tracker(self) -> Any:
+        """Native retained-buffer lease tracker for this process session."""
+        return self._lease_tracker
 
     def call(self, method_name: str, data: bytes | None = None) -> bytes:
         """Send a serialized CRM call (IPC or HTTP mode).
@@ -222,10 +229,10 @@ class CRMProxy:
             raise AttributeError(
                 f'{type(self._crm).__name__} has no method {method_name!r}',
             )
-        if self._scheduler is None:
+        if self._scheduler is None or self._scheduler.is_unconstrained:
             return method(*args)
-        access = self._access_map.get(method_name, MethodAccess.WRITE) if self._access_map else MethodAccess.WRITE
-        with self._scheduler.execution_guard(access):
+        method_idx = self._scheduler.method_idx(method_name)
+        with self._scheduler.execution_guard(method_idx):
             return method(*args)
 
     def relay(self, event_bytes: bytes) -> bytes:

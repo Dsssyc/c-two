@@ -1,29 +1,63 @@
 //! Axum router for the multi-upstream relay server.
 
+use std::convert::Infallible;
+use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, Path, State},
-    http::StatusCode,
+    extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, Path, Query, State},
+    http::request::Parts,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 
-use crate::relay::authority::{ControlError, RegisterPreparation, RouteAuthority};
-use crate::relay::conn_pool::{AcquireError, UpstreamLease};
+use crate::relay::authority::{
+    ControlError, RegisterPreparation, RouteAuthority, attest_ipc_route_contract,
+};
+use crate::relay::conn_pool::UpstreamLease;
 use crate::relay::gossip::{broadcast_route_announce, broadcast_route_withdraw};
 use crate::relay::peer_handlers;
-use crate::relay::state::{RegisterCommitResult, RelayState};
+use crate::relay::route_table::{valid_crm_tag, valid_route_name};
+use crate::relay::state::{RegisterCommitResult, RelayState, UpstreamAcquireError};
+use crate::relay::types::RouteEntry;
 use c2_ipc::IpcClient;
 
 const CONTROL_BODY_LIMIT_BYTES: usize = 64 * 1024;
+const EXPECTED_CRM_NS_HEADER: &str = "x-c2-expected-crm-ns";
+const EXPECTED_CRM_NAME_HEADER: &str = "x-c2-expected-crm-name";
+const EXPECTED_CRM_VER_HEADER: &str = "x-c2-expected-crm-ver";
 
 enum RequestClient {
-    Ready { lease: UpstreamLease },
+    Ready {
+        lease: UpstreamLease,
+        route: RouteEntry,
+    },
     NotFound,
     Unreachable,
+}
+
+struct OptionalConnectInfo(Option<SocketAddr>);
+
+impl<S> FromRequestParts<S> for OptionalConnectInfo
+where
+    S: Send + Sync,
+{
+    type Rejection = Infallible;
+
+    fn from_request_parts(
+        parts: &mut Parts,
+        _state: &S,
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        let remote_addr = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|ConnectInfo(addr)| *addr);
+        std::future::ready(Ok(Self(remote_addr)))
+    }
 }
 
 fn duplicate_route_response(name: &str, existing_address: &str) -> Response {
@@ -36,6 +70,182 @@ fn duplicate_route_response(name: &str, existing_address: &str) -> Response {
         })),
     )
         .into_response()
+}
+
+fn claimed_contract_mismatch_reason(
+    route_name: &str,
+    claimed_crm_ns: &str,
+    claimed_crm_name: &str,
+    claimed_crm_ver: &str,
+    actual_crm_ns: &str,
+    actual_crm_name: &str,
+    actual_crm_ver: &str,
+) -> Option<String> {
+    if (!claimed_crm_ns.is_empty() && claimed_crm_ns != actual_crm_ns)
+        || (!claimed_crm_name.is_empty() && claimed_crm_name != actual_crm_name)
+        || (!claimed_crm_ver.is_empty() && claimed_crm_ver != actual_crm_ver)
+    {
+        return Some(format!(
+            "IPC upstream route '{route_name}' CRM contract mismatch: claimed {claimed_crm_ns}/{claimed_crm_name}/{claimed_crm_ver}, got {actual_crm_ns}/{actual_crm_name}/{actual_crm_ver}",
+        ));
+    }
+    None
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct ResolveQuery {
+    crm_ns: Option<String>,
+    crm_name: Option<String>,
+    crm_ver: Option<String>,
+}
+
+struct ExpectedCrmTag {
+    crm_ns: String,
+    crm_name: String,
+    crm_ver: String,
+}
+
+#[cfg(test)]
+struct DataPlanePrecheckHook {
+    route_name: String,
+    action: Box<dyn FnOnce() + Send + 'static>,
+}
+
+#[cfg(test)]
+static DATA_PLANE_AFTER_PRECHECK_HOOKS: std::sync::Mutex<Vec<DataPlanePrecheckHook>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn set_data_plane_after_precheck_hook(route_name: String, action: impl FnOnce() + Send + 'static) {
+    DATA_PLANE_AFTER_PRECHECK_HOOKS
+        .lock()
+        .unwrap()
+        .push(DataPlanePrecheckHook {
+            route_name,
+            action: Box::new(action),
+        });
+}
+
+#[cfg(test)]
+fn run_data_plane_after_precheck_hook(route_name: &str) {
+    let hook = {
+        let mut guard = DATA_PLANE_AFTER_PRECHECK_HOOKS.lock().unwrap();
+        if let Some(index) = guard.iter().position(|hook| hook.route_name == route_name) {
+            Some(guard.remove(index))
+        } else {
+            None
+        }
+    };
+    if let Some(hook) = hook {
+        (hook.action)();
+    }
+}
+
+fn expected_crm_from_headers(headers: &HeaderMap) -> Result<Option<ExpectedCrmTag>, Response> {
+    let crm_ns = headers
+        .get(EXPECTED_CRM_NS_HEADER)
+        .map(|value| value.to_str().map(str::to_string));
+    let crm_name = headers
+        .get(EXPECTED_CRM_NAME_HEADER)
+        .map(|value| value.to_str().map(str::to_string));
+    let crm_ver = headers
+        .get(EXPECTED_CRM_VER_HEADER)
+        .map(|value| value.to_str().map(str::to_string));
+
+    match (crm_ns, crm_name, crm_ver) {
+        (None, None, None) => Ok(None),
+        (Some(Ok(crm_ns)), Some(Ok(crm_name)), Some(Ok(crm_ver))) => {
+            if !valid_crm_tag(&crm_ns, &crm_name, &crm_ver) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "InvalidCrmTag",
+                        "message": "expected CRM headers must be non-empty, control-character-free, and fit the IPC handshake field limit",
+                    })),
+                )
+                    .into_response());
+            }
+            Ok(Some(ExpectedCrmTag {
+                crm_ns,
+                crm_name,
+                crm_ver,
+            }))
+        }
+        (Some(Err(_)), _, _) | (_, Some(Err(_)), _) | (_, _, Some(Err(_))) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "InvalidCrmTag",
+                "message": "expected CRM headers must be valid UTF-8",
+            })),
+        )
+            .into_response()),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "InvalidCrmTag",
+                "message": "x-c2-expected-crm-ns, x-c2-expected-crm-name, and x-c2-expected-crm-ver must be supplied together",
+            })),
+        )
+            .into_response()),
+    }
+}
+
+fn crm_contract_mismatch_response(route_name: &str) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": "CRMContractMismatch",
+            "route": route_name,
+            "message": format!("CRM contract mismatch for route {route_name}"),
+        })),
+    )
+        .into_response()
+}
+
+fn route_matches_expected_crm(route: &RouteEntry, expected: &ExpectedCrmTag) -> bool {
+    route.crm_ns == expected.crm_ns
+        && route.crm_name == expected.crm_name
+        && route.crm_ver == expected.crm_ver
+}
+
+fn validate_expected_crm_for_route(
+    state: &RelayState,
+    route_name: &str,
+    expected: &Option<ExpectedCrmTag>,
+) -> Result<(), Response> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let Some(route) = state.local_route(route_name) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "ResourceNotFound",
+                "route": route_name,
+            })),
+        )
+            .into_response());
+    };
+    if route_matches_expected_crm(&route, expected) {
+        Ok(())
+    } else {
+        Err(crm_contract_mismatch_response(route_name))
+    }
+}
+
+fn validate_expected_crm_for_acquired_route(
+    route_name: &str,
+    route: &RouteEntry,
+    expected: &Option<ExpectedCrmTag>,
+) -> Result<(), Response> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    if route_matches_expected_crm(route, expected) {
+        Ok(())
+    } else {
+        Err(crm_contract_mismatch_response(route_name))
+    }
 }
 
 /// Build the relay axum router with control-plane and data-plane endpoints.
@@ -74,7 +284,7 @@ pub fn build_router(state: Arc<RelayState>) -> Router {
 
 /// `POST /_register` — register a new upstream CRM.
 ///
-/// Body: `{"name": "grid", "server_id": "...", "address": "ipc://...", "crm_ns": "...", "crm_ver": "..."}`
+/// Body: `{"name": "grid", "server_id": "...", "server_instance_id": "...", "address": "ipc://...", "crm_ns": "...", "crm_name": "...", "crm_ver": "..."}`
 /// Returns: 201 on success, 409 on duplicate, 502 on connection failure.
 async fn handle_register(
     State(state): State<Arc<RelayState>>,
@@ -92,8 +302,19 @@ async fn handle_register(
         Some(id) => id.to_string(),
         None => return (StatusCode::BAD_REQUEST, "Missing \"server_id\"").into_response(),
     };
+    let server_instance_id = match body.get("server_instance_id").and_then(|v| v.as_str()) {
+        Some(id) => id.to_string(),
+        None => {
+            return (StatusCode::BAD_REQUEST, "Missing \"server_instance_id\"").into_response();
+        }
+    };
     let crm_ns = body
         .get("crm_ns")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let crm_name = body
+        .get("crm_name")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
@@ -103,8 +324,14 @@ async fn handle_register(
         .unwrap_or("")
         .to_string();
 
+    if let Err(ControlError::InvalidServerInstanceId { reason }) =
+        RouteAuthority::new(&state).validate_server_instance_id(&server_instance_id)
+    {
+        return (StatusCode::BAD_REQUEST, reason).into_response();
+    }
+
     let replacement = match RouteAuthority::new(&state)
-        .prepare_register(&name, &server_id, &address)
+        .prepare_register(&name, &server_id, &server_instance_id, &address)
         .await
     {
         Ok(RegisterPreparation::Available { replacement }) => {
@@ -114,6 +341,19 @@ async fn handle_register(
             })
         }
         Ok(RegisterPreparation::SameOwner) => {
+            if let Some(existing) = state.local_route(&name) {
+                if let Some(reason) = claimed_contract_mismatch_reason(
+                    &name,
+                    &crm_ns,
+                    &crm_name,
+                    &crm_ver,
+                    &existing.crm_ns,
+                    &existing.crm_name,
+                    &existing.crm_ver,
+                ) {
+                    return (StatusCode::BAD_REQUEST, reason).into_response();
+                }
+            }
             return (
                 StatusCode::OK,
                 Json(serde_json::json!({"registered": name})),
@@ -126,7 +366,9 @@ async fn handle_register(
             return duplicate_route_response(&name, &existing_address);
         }
         Err(ControlError::InvalidName { reason })
-        | Err(ControlError::InvalidServerId { reason }) => {
+        | Err(ControlError::InvalidServerId { reason })
+        | Err(ControlError::InvalidServerInstanceId { reason })
+        | Err(ControlError::ContractMismatch { reason }) => {
             return (StatusCode::BAD_REQUEST, reason).into_response();
         }
         Err(ControlError::OwnerMismatch) | Err(ControlError::NotFound) => {
@@ -135,8 +377,13 @@ async fn handle_register(
     };
 
     // Connect IPC client (or skip if configured for testing)
-    let client = if state.config().skip_ipc_validation {
-        Arc::new(IpcClient::new(&address))
+    let (client, crm_ns, crm_name, crm_ver) = if state.config().skip_ipc_validation {
+        (
+            Arc::new(IpcClient::new(&address)),
+            crm_ns,
+            crm_name,
+            crm_ver,
+        )
     } else {
         let mut c = IpcClient::new(&address);
         if let Err(e) = c.connect().await {
@@ -145,15 +392,66 @@ async fn handle_register(
                 Json(serde_json::json!({"error": format!("Failed to connect upstream '{name}' at {address}: {e}")})),
             ).into_response();
         }
-        Arc::new(c)
+        let identity_matches = c.server_id() == Some(server_id.as_str())
+            && c.server_instance_id() == Some(server_instance_id.as_str());
+        if !identity_matches {
+            close_client(c);
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": format!("IPC server identity mismatch for upstream '{name}' at {address}"),
+                })),
+            )
+                .into_response();
+        }
+        if !c.has_route(&name) {
+            close_client(c);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("IPC upstream at {address} does not export route '{name}'"),
+                })),
+            )
+                .into_response();
+        }
+        let contract = match attest_ipc_route_contract(&c, &name, &crm_ns, &crm_name, &crm_ver) {
+            Ok(contract) => contract,
+            Err(ControlError::ContractMismatch { reason }) => {
+                close_client(c);
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": reason })),
+                )
+                    .into_response();
+            }
+            Err(ControlError::NotFound) => {
+                close_client(c);
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": format!("IPC upstream at {address} does not export route '{name}'"),
+                    })),
+                )
+                    .into_response();
+            }
+            Err(_) => unreachable!("route contract attestation returns only contract errors"),
+        };
+        (
+            Arc::new(c),
+            contract.crm_ns,
+            contract.crm_name,
+            contract.crm_ver,
+        )
     };
 
     let commit_client = client.clone();
     let entry = match state.commit_register_upstream(
         name.clone(),
         server_id,
+        server_instance_id,
         address,
         crm_ns,
+        crm_name,
         crm_ver,
         commit_client,
         replacement,
@@ -181,6 +479,13 @@ async fn handle_register(
 
 fn close_arc_client(arc_client: Arc<IpcClient>) {
     tokio::spawn(async move { arc_client.close_shared().await });
+}
+
+fn close_client(client: IpcClient) {
+    tokio::spawn(async move {
+        let mut client = client;
+        client.close().await;
+    });
 }
 
 /// `POST /_unregister` — remove a CRM upstream.
@@ -265,6 +570,7 @@ async fn handle_list_routes(State(state): State<Arc<RelayState>>) -> impl IntoRe
                     crate::relay::types::Locality::Peer => "peer",
                 },
                 "crm_ns": r.crm_ns,
+                "crm_name": r.crm_name,
                 "crm_ver": r.crm_ver,
             })
         })
@@ -286,10 +592,64 @@ async fn handle_health(State(state): State<Arc<RelayState>>) -> impl IntoRespons
 /// `GET /_resolve/{name}` — resolve a CRM name to available routes.
 async fn handle_resolve(
     Path(name): Path<String>,
+    Query(query): Query<ResolveQuery>,
     State(state): State<Arc<RelayState>>,
+    OptionalConnectInfo(remote_addr): OptionalConnectInfo,
 ) -> impl IntoResponse {
-    let routes = state.resolve(&name);
+    if !valid_route_name(&name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "InvalidRouteName",
+                "message": "route name must be non-empty, control-character-free, and fit the wire route-name limit",
+            })),
+        )
+            .into_response();
+    }
+    let expose_ipc_address = remote_addr.is_some_and(|addr| addr.ip().is_loopback());
+    let expected_crm = match (&query.crm_ns, &query.crm_name, &query.crm_ver) {
+        (Some(crm_ns), Some(crm_name), Some(crm_ver)) => {
+            if !valid_crm_tag(crm_ns, crm_name, crm_ver) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "InvalidCrmTag",
+                        "message": "crm_ns, crm_name, and crm_ver must be non-empty, control-character-free, and fit the IPC handshake field limit",
+                    })),
+                )
+                    .into_response();
+            }
+            Some((crm_ns.as_str(), crm_name.as_str(), crm_ver.as_str()))
+        }
+        (None, None, None) => None,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "InvalidCrmTag",
+                    "message": "crm_ns, crm_name, and crm_ver must be supplied together",
+                })),
+            )
+                .into_response();
+        }
+    };
+    let mut routes = if let Some((crm_ns, crm_name, crm_ver)) = expected_crm {
+        state.resolve_matching(&name, crm_ns, crm_name, crm_ver)
+    } else {
+        state.resolve(&name)
+    };
     if routes.is_empty() {
+        if expected_crm.is_some() && !state.resolve(&name).is_empty() {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "CRMContractMismatch",
+                    "name": name,
+                    "message": format!("CRM contract mismatch for route {name}"),
+                })),
+            )
+                .into_response();
+        }
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
@@ -297,6 +657,13 @@ async fn handle_resolve(
             })),
         )
             .into_response();
+    }
+    if !expose_ipc_address {
+        for route in &mut routes {
+            route.ipc_address = None;
+            route.server_id = None;
+            route.server_instance_id = None;
+        }
     }
     Json(routes).into_response()
 }
@@ -310,9 +677,25 @@ async fn handle_peers(State(state): State<Arc<RelayState>>) -> impl IntoResponse
 async fn handle_probe(
     Path(route_name): Path<String>,
     State(state): State<Arc<RelayState>>,
+    headers: HeaderMap,
 ) -> Response {
+    let expected_crm = match expected_crm_from_headers(&headers) {
+        Ok(expected) => expected,
+        Err(response) => return response,
+    };
+    if let Err(response) = validate_expected_crm_for_route(&state, &route_name, &expected_crm) {
+        return response;
+    }
+    #[cfg(test)]
+    run_data_plane_after_precheck_hook(&route_name);
     match acquire_request_client(state, &route_name).await {
-        RequestClient::Ready { lease } => {
+        RequestClient::Ready { lease, route } => {
+            if let Err(response) =
+                validate_expected_crm_for_acquired_route(&route_name, &route, &expected_crm)
+            {
+                drop(lease);
+                return response;
+            }
             drop(lease);
             StatusCode::OK.into_response()
         }
@@ -342,10 +725,20 @@ async fn handle_probe(
 async fn call_handler(
     State(state): State<Arc<RelayState>>,
     Path((route_name, method_name)): Path<(String, String)>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let lease = match acquire_request_client(state.clone(), &route_name).await {
-        RequestClient::Ready { lease } => lease,
+    let expected_crm = match expected_crm_from_headers(&headers) {
+        Ok(expected) => expected,
+        Err(response) => return response,
+    };
+    if let Err(response) = validate_expected_crm_for_route(&state, &route_name, &expected_crm) {
+        return response;
+    }
+    #[cfg(test)]
+    run_data_plane_after_precheck_hook(&route_name);
+    let (lease, acquired_route) = match acquire_request_client(state.clone(), &route_name).await {
+        RequestClient::Ready { lease, route } => (lease, route),
         RequestClient::NotFound => {
             return (
                 StatusCode::NOT_FOUND,
@@ -367,6 +760,12 @@ async fn call_handler(
                 .into_response();
         }
     };
+    if let Err(response) =
+        validate_expected_crm_for_acquired_route(&route_name, &acquired_route, &expected_crm)
+    {
+        drop(lease);
+        return response;
+    }
     let client = lease.client();
 
     match client.call(&route_name, &method_name, &body).await {
@@ -388,9 +787,8 @@ async fn call_handler(
         )
             .into_response(),
         Err(c2_ipc::IpcError::RouteNotFound(route)) => {
-            let address = lease.address();
             drop(lease);
-            remove_unreachable_route(&state, &route, &address);
+            remove_unreachable_route(&state, &acquired_route);
             (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({
@@ -417,11 +815,15 @@ async fn call_handler(
 
 async fn acquire_request_client(state: Arc<RelayState>, route_name: &str) -> RequestClient {
     match state.acquire_upstream(route_name).await {
-        Ok(lease) => RequestClient::Ready { lease },
-        Err(AcquireError::NotFound) => RequestClient::NotFound,
-        Err(AcquireError::Unreachable { address, error }) => {
-            eprintln!("[relay] Failed to acquire upstream '{route_name}': {error}");
-            remove_unreachable_route(&state, route_name, &address);
+        Ok((lease, route)) => RequestClient::Ready { lease, route },
+        Err(UpstreamAcquireError::NotFound) => RequestClient::NotFound,
+        Err(UpstreamAcquireError::Unreachable {
+            route,
+            address,
+            error,
+        }) => {
+            eprintln!("[relay] Failed to acquire upstream '{route_name}' at {address}: {error}");
+            remove_unreachable_route(&state, &route);
             match error {
                 c2_ipc::IpcError::RouteNotFound(_) => RequestClient::NotFound,
                 _ => RequestClient::Unreachable,
@@ -430,9 +832,9 @@ async fn acquire_request_client(state: Arc<RelayState>, route_name: &str) -> Req
     }
 }
 
-fn remove_unreachable_route(state: &Arc<RelayState>, route_name: &str, address: &str) {
+fn remove_unreachable_route(state: &Arc<RelayState>, route: &RouteEntry) {
     if let Some((entry, removed_at, client)) =
-        state.remove_unreachable_local_upstream(route_name, address)
+        state.remove_unreachable_local_upstream_if_matches(route)
     {
         if let Some(client) = client {
             close_arc_client(client);
@@ -454,59 +856,21 @@ async fn echo_handler(body: Bytes) -> Response {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
     use axum::body::{Body, to_bytes};
+    use axum::extract::ConnectInfo;
     use axum::http::{Request, StatusCode};
-    use c2_config::RelayConfig;
     use c2_ipc::IpcClient;
-    use c2_server::{
-        ConcurrencyMode, CrmCallback, CrmError, CrmRoute, RequestData, ResponseMeta, Scheduler,
-        Server, ServerIpcConfig,
-    };
-    use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
     use tower::ServiceExt;
 
-    use crate::relay::peer::PeerEnvelope;
-
-    struct NoopDisseminator;
-
-    impl crate::relay::disseminator::Disseminator for NoopDisseminator {
-        fn broadcast(
-            &self,
-            _envelope: PeerEnvelope,
-            _peers: &[crate::relay::types::PeerSnapshot],
-        ) -> Option<tokio::task::JoinHandle<()>> {
-            None
-        }
-    }
-
-    struct Echo;
-
-    impl CrmCallback for Echo {
-        fn invoke(
-            &self,
-            _route_name: &str,
-            _method_idx: u16,
-            _request: RequestData,
-            _response_pool: Arc<parking_lot::RwLock<c2_mem::MemPool>>,
-        ) -> Result<ResponseMeta, CrmError> {
-            Ok(ResponseMeta::Inline(b"echo".to_vec()))
-        }
-    }
-
-    pub(crate) fn test_state_for_client() -> Arc<RelayState> {
-        let config = RelayConfig {
-            relay_id: "test-relay".into(),
-            skip_ipc_validation: false,
-            ..RelayConfig::default()
-        };
-        Arc::new(RelayState::new(
-            Arc::new(config),
-            Arc::new(NoopDisseminator),
-        ))
-    }
+    use crate::relay::test_support::{
+        register_echo_route, start_live_server, start_live_server_with_identity_and_contracts,
+        start_live_server_with_routes, test_state_for_client,
+    };
+    use crate::relay::types::RouteInfo;
 
     fn test_state() -> Arc<RelayState> {
         test_state_for_client()
@@ -517,6 +881,7 @@ pub(crate) mod tests {
             serde_json::json!({
                 "name": name,
                 "server_id": server_id,
+                "server_instance_id": format!("{server_id}-instance"),
                 "address": address,
             })
             .to_string(),
@@ -537,6 +902,43 @@ pub(crate) mod tests {
                     .uri("/_register")
                     .header("content-type", "application/json")
                     .body(register_body(name, server_id, address))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        status
+    }
+
+    async fn post_register_with_crm(
+        state: Arc<RelayState>,
+        name: &str,
+        server_id: &str,
+        address: &str,
+        crm_ns: &str,
+        crm_name: &str,
+        crm_ver: &str,
+    ) -> StatusCode {
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": name,
+                            "server_id": server_id,
+                            "server_instance_id": format!("{server_id}-instance"),
+                            "address": address,
+                            "crm_ns": crm_ns,
+                            "crm_name": crm_name,
+                            "crm_ver": crm_ver,
+                        })
+                        .to_string(),
+                    ))
                     .unwrap(),
             )
             .await
@@ -587,6 +989,34 @@ pub(crate) mod tests {
         status
     }
 
+    async fn post_call_with_expected_crm_tag(
+        state: Arc<RelayState>,
+        name: &str,
+        method: &str,
+        crm_ns: &str,
+        crm_name: &str,
+        crm_ver: &str,
+    ) -> StatusCode {
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/{name}/{method}"))
+                    .header("content-type", "application/octet-stream")
+                    .header("x-c2-expected-crm-ns", crm_ns)
+                    .header("x-c2-expected-crm-name", crm_name)
+                    .header("x-c2-expected-crm-ver", crm_ver)
+                    .body(Body::from(Vec::new()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        status
+    }
+
     async fn get_probe(state: Arc<RelayState>, name: &str) -> StatusCode {
         let app = build_router(state);
         let response = app
@@ -604,13 +1034,22 @@ pub(crate) mod tests {
         status
     }
 
-    async fn get_resolve(state: Arc<RelayState>, name: &str) -> StatusCode {
+    async fn get_probe_with_expected_crm_tag(
+        state: Arc<RelayState>,
+        name: &str,
+        crm_ns: &str,
+        crm_name: &str,
+        crm_ver: &str,
+    ) -> StatusCode {
         let app = build_router(state);
         let response = app
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri(format!("/_resolve/{name}"))
+                    .uri(format!("/_probe/{name}"))
+                    .header("x-c2-expected-crm-ns", crm_ns)
+                    .header("x-c2-expected-crm-name", crm_name)
+                    .header("x-c2-expected-crm-ver", crm_ver)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -621,17 +1060,384 @@ pub(crate) mod tests {
         status
     }
 
+    async fn get_resolve(state: Arc<RelayState>, name: &str) -> StatusCode {
+        let app = build_router(state);
+        let mut request = Request::builder()
+            .method("GET")
+            .uri(format!("/_resolve/{name}"))
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            12345,
+        )));
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        status
+    }
+
+    async fn get_resolve_with_crm_tag(
+        state: Arc<RelayState>,
+        name: &str,
+        crm_ns: &str,
+        crm_name: &str,
+        crm_ver: &str,
+    ) -> StatusCode {
+        let app = build_router(state);
+        let mut request = Request::builder()
+            .method("GET")
+            .uri(format!(
+                "/_resolve/{name}?crm_ns={crm_ns}&crm_name={crm_name}&crm_ver={crm_ver}"
+            ))
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            12345,
+        )));
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        status
+    }
+
+    async fn get_resolve_with_query(state: Arc<RelayState>, name: &str, query: &str) -> StatusCode {
+        let app = build_router(state);
+        let mut request = Request::builder()
+            .method("GET")
+            .uri(format!("/_resolve/{name}?{query}"))
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            12345,
+        )));
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        status
+    }
+
+    async fn get_resolve_uri(state: Arc<RelayState>, uri: &str) -> StatusCode {
+        let app = build_router(state);
+        let mut request = Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            12345,
+        )));
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        status
+    }
+
+    #[tokio::test]
+    async fn resolve_rejects_partial_crm_tag_query_instead_of_downgrading_to_name_only() {
+        let state = test_state();
+
+        assert_eq!(
+            get_resolve_with_query(state, "grid", "crm_ns=test.echo&crm_ver=0.1.0").await,
+            StatusCode::BAD_REQUEST,
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_rejects_control_character_route_name() {
+        let state = test_state();
+
+        assert_eq!(
+            get_resolve_uri(state, "/_resolve/grid%00hidden").await,
+            StatusCode::BAD_REQUEST,
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_rejects_control_character_crm_tag_query() {
+        let state = test_state();
+
+        assert_eq!(
+            get_resolve_with_query(
+                state,
+                "grid",
+                "crm_ns=test.echo&crm_name=Echo%00Hidden&crm_ver=0.1.0",
+            )
+            .await,
+            StatusCode::BAD_REQUEST,
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_with_expected_crm_tag_rejects_name_match_with_wrong_crm_name() {
+        let state = test_state();
+        let address = format!(
+            "ipc://relay_resolve_crm_name_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let server = start_live_server(&address, "server-grid").await;
+
+        assert_eq!(
+            post_register(state.clone(), "grid", "server-grid", &address).await,
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            get_resolve_with_crm_tag(state.clone(), "grid", "test.echo", "OtherEcho", "0.1.0",)
+                .await,
+            StatusCode::CONFLICT,
+        );
+        assert_eq!(
+            get_resolve_with_crm_tag(state.clone(), "grid", "test.echo", "Echo", "0.1.0").await,
+            StatusCode::OK,
+        );
+
+        server.shutdown();
+    }
+
+    async fn get_resolve_routes_from(
+        state: Arc<RelayState>,
+        name: &str,
+        remote_addr: SocketAddr,
+    ) -> (StatusCode, Vec<RouteInfo>) {
+        let app = build_router(state);
+        let mut request = Request::builder()
+            .method("GET")
+            .uri(format!("/_resolve/{name}"))
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(remote_addr));
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let routes = if status == StatusCode::OK {
+            serde_json::from_slice(&body).unwrap()
+        } else {
+            Vec::new()
+        };
+        (status, routes)
+    }
+
+    #[tokio::test]
+    async fn resolve_exposes_ipc_address_only_to_loopback_clients() {
+        let state = test_state();
+        state.commit_register_upstream(
+            "grid".into(),
+            "server-grid".into(),
+            "inst-grid".into(),
+            "ipc://grid".into(),
+            String::new(),
+            String::new(),
+            String::new(),
+            Arc::new(IpcClient::new("ipc://grid")),
+            None,
+        );
+
+        let (status, routes) = get_resolve_routes_from(
+            state.clone(),
+            "grid",
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(routes[0].ipc_address.as_deref(), Some("ipc://grid"));
+        assert_eq!(routes[0].server_id.as_deref(), Some("server-grid"));
+        assert_eq!(routes[0].server_instance_id.as_deref(), Some("inst-grid"));
+
+        let (status, routes) = get_resolve_routes_from(
+            state,
+            "grid",
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10)), 12345),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(routes[0].ipc_address, None);
+        assert_eq!(routes[0].server_id, None);
+        assert_eq!(routes[0].server_instance_id, None);
+    }
+
     #[tokio::test]
     async fn register_rejects_invalid_server_id_at_control_boundary() {
         let state = test_state();
+        let too_long = "s".repeat(c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES + 1);
         assert_eq!(
             post_register(state.clone(), "grid", " ", "ipc://grid").await,
             StatusCode::BAD_REQUEST
         );
         assert_eq!(
-            post_register(state, "grid", "bad/path", "ipc://grid").await,
+            post_register(state.clone(), "grid", "bad/path", "ipc://grid").await,
             StatusCode::BAD_REQUEST
         );
+        assert_eq!(
+            post_register(state, "grid", &too_long, "ipc://grid").await,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn register_rejects_invalid_server_instance_id_at_control_boundary() {
+        let state = test_state();
+        let too_long = "a".repeat(c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES + 1);
+        for server_instance_id in ["../bad", too_long.as_str()] {
+            let app = build_router(state.clone());
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/_register")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "name": "grid",
+                                "server_id": "server-grid",
+                                "server_instance_id": server_instance_id,
+                                "address": "ipc://grid",
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(String::from_utf8_lossy(&body).contains("server_instance_id"));
+        }
+    }
+
+    #[tokio::test]
+    async fn register_rejects_ipc_handshake_identity_mismatch() {
+        let state = test_state();
+        let address = format!(
+            "ipc://relay_identity_mismatch_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let server = start_live_server(&address, "server-actual").await;
+
+        assert_eq!(
+            post_register(state, "grid", "server-claimed", &address).await,
+            StatusCode::BAD_GATEWAY
+        );
+
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn register_rejects_upstream_that_does_not_export_route() {
+        let state = test_state();
+        let address = format!(
+            "ipc://relay_missing_route_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let server = start_live_server_with_routes(&address, "server-grid", &["counter"]).await;
+
+        assert_eq!(
+            post_register(state.clone(), "grid", "server-grid", &address).await,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(
+            state.resolve("grid").is_empty(),
+            "relay must not advertise a route that the upstream handshake did not export"
+        );
+
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn register_derives_crm_contract_from_ipc_handshake() {
+        let state = test_state();
+        let address = format!(
+            "ipc://relay_register_contract_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let server = start_live_server(&address, "server-grid").await;
+
+        assert_eq!(
+            post_register(state.clone(), "grid", "server-grid", &address).await,
+            StatusCode::CREATED
+        );
+
+        let routes = state.resolve("grid");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].crm_ns, "test.echo");
+        assert_eq!(routes[0].crm_ver, "0.1.0");
+
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn register_rejects_claimed_crm_contract_mismatch() {
+        let state = test_state();
+        let address = format!(
+            "ipc://relay_register_contract_mismatch_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let server = start_live_server(&address, "server-grid").await;
+
+        assert_eq!(
+            post_register_with_crm(
+                state.clone(),
+                "grid",
+                "server-grid",
+                &address,
+                "wrong.grid",
+                "WrongGrid",
+                "9.9.9",
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(
+            state.resolve("grid").is_empty(),
+            "relay must not advertise a route with caller-claimed CRM metadata that disagrees with the IPC handshake"
+        );
+
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn register_same_owner_rejects_claimed_crm_contract_mismatch() {
+        let state = test_state();
+        let address = format!(
+            "ipc://relay_register_same_owner_contract_mismatch_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let server = start_live_server(&address, "server-grid").await;
+
+        assert_eq!(
+            post_register(state.clone(), "grid", "server-grid", &address).await,
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            post_register_with_crm(
+                state.clone(),
+                "grid",
+                "server-grid",
+                &address,
+                "wrong.grid",
+                "WrongGrid",
+                "9.9.9",
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
+
+        let routes = state.resolve("grid");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].crm_ns, "test.echo");
+        assert_eq!(routes[0].crm_ver, "0.1.0");
+
+        server.shutdown();
     }
 
     #[tokio::test]
@@ -659,7 +1465,9 @@ pub(crate) mod tests {
         state.commit_register_upstream(
             "grid".into(),
             "server-grid".into(),
+            "inst-grid".into(),
             "ipc://missing-grid".into(),
+            String::new(),
             String::new(),
             String::new(),
             stale_client,
@@ -736,40 +1544,201 @@ pub(crate) mod tests {
         assert_eq!(body.len(), payload.len());
     }
 
-    async fn register_echo_route(server: &Arc<Server>, name: &str) {
-        server
-            .register_route(CrmRoute {
-                name: name.into(),
-                scheduler: Arc::new(Scheduler::new(
-                    ConcurrencyMode::ReadParallel,
-                    HashMap::new(),
-                )),
-                callback: Arc::new(Echo),
-                method_names: vec!["ping".into()],
-            })
+    #[tokio::test]
+    async fn call_with_expected_crm_tag_rejects_route_tag_mismatch_before_forwarding() {
+        let state = test_state();
+        let address = format!(
+            "ipc://relay_call_wrong_crm_tag_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let server = start_live_server_with_identity_and_contracts(
+            &address,
+            "server-grid",
+            "server-grid-instance",
+            &[("grid", "test.other", "OtherEcho", "0.1.0")],
+        )
+        .await;
+
+        assert_eq!(
+            post_register(state.clone(), "grid", "server-grid", &address).await,
+            StatusCode::CREATED
+        );
+
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/grid/ping")
+                    .header("content-type", "application/octet-stream")
+                    .header("x-c2-expected-crm-ns", "test.echo")
+                    .header("x-c2-expected-crm-name", "Echo")
+                    .header("x-c2-expected-crm-ver", "0.1.0")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body.contains("CRMContractMismatch"),
+            "unexpected body: {body}"
+        );
+
+        server.shutdown();
     }
 
-    async fn start_live_server(address: &str) -> Arc<Server> {
-        let server = Arc::new(Server::new(address, ServerIpcConfig::default()).unwrap());
-        register_echo_route(&server, "grid").await;
-        let run_server = server.clone();
-        tokio::spawn(async move {
-            let _ = run_server.run().await;
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                let mut client = IpcClient::new(address);
-                if client.connect().await.is_ok() {
-                    break;
+    async fn install_mismatched_route_swap_after_precheck(
+        state: Arc<RelayState>,
+        route_name: &str,
+        new_address: &str,
+    ) {
+        let mut new_client = IpcClient::new(new_address);
+        new_client.connect().await.unwrap();
+        let new_client = Arc::new(new_client);
+        let state_for_hook = state;
+        let route_for_hook = route_name.to_string();
+        let new_address_for_hook = new_address.to_string();
+        set_data_plane_after_precheck_hook(route_name.to_string(), move || {
+            if let crate::relay::state::UnregisterResult::Removed { client, .. } =
+                state_for_hook.unregister_upstream(&route_for_hook, "server-old")
+            {
+                if let Some(client) = client {
+                    tokio::spawn(async move { client.close_shared().await });
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-        })
-        .await
-        .unwrap();
-        server
+            match state_for_hook.commit_register_upstream(
+                route_for_hook.clone(),
+                "server-new".into(),
+                "server-new-instance".into(),
+                new_address_for_hook,
+                "test.other".into(),
+                "OtherEcho".into(),
+                "0.1.0".into(),
+                new_client,
+                None,
+            ) {
+                RegisterCommitResult::Registered { .. }
+                | RegisterCommitResult::SameOwner { .. } => {}
+                RegisterCommitResult::Duplicate { existing_address }
+                | RegisterCommitResult::ConflictingOwner { existing_address } => {
+                    panic!(
+                        "failed to install mismatched route in precheck hook: {existing_address}"
+                    )
+                }
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn call_revalidates_expected_crm_tag_against_acquired_route_snapshot() {
+        let state = test_state();
+        let suffix = unique_suffix();
+        let route_name = format!("grid-toctou-call-{suffix}");
+        let old_address = format!(
+            "ipc://relay_call_toctou_old_{}_{}",
+            std::process::id(),
+            suffix
+        );
+        let new_address = format!(
+            "ipc://relay_call_toctou_new_{}_{}",
+            std::process::id(),
+            suffix
+        );
+        let old_server = start_live_server_with_identity_and_contracts(
+            &old_address,
+            "server-old",
+            "server-old-instance",
+            &[(&route_name, "test.echo", "Echo", "0.1.0")],
+        )
+        .await;
+        let new_server = start_live_server_with_identity_and_contracts(
+            &new_address,
+            "server-new",
+            "server-new-instance",
+            &[(&route_name, "test.other", "OtherEcho", "0.1.0")],
+        )
+        .await;
+
+        assert_eq!(
+            post_register(state.clone(), &route_name, "server-old", &old_address).await,
+            StatusCode::CREATED
+        );
+        install_mismatched_route_swap_after_precheck(state.clone(), &route_name, &new_address)
+            .await;
+
+        assert_eq!(
+            post_call_with_expected_crm_tag(
+                state.clone(),
+                &route_name,
+                "ping",
+                "test.echo",
+                "Echo",
+                "0.1.0",
+            )
+            .await,
+            StatusCode::CONFLICT
+        );
+
+        old_server.shutdown();
+        new_server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn probe_revalidates_expected_crm_tag_against_acquired_route_snapshot() {
+        let state = test_state();
+        let suffix = unique_suffix();
+        let route_name = format!("grid-toctou-probe-{suffix}");
+        let old_address = format!(
+            "ipc://relay_probe_toctou_old_{}_{}",
+            std::process::id(),
+            suffix
+        );
+        let new_address = format!(
+            "ipc://relay_probe_toctou_new_{}_{}",
+            std::process::id(),
+            suffix
+        );
+        let old_server = start_live_server_with_identity_and_contracts(
+            &old_address,
+            "server-old",
+            "server-old-instance",
+            &[(&route_name, "test.echo", "Echo", "0.1.0")],
+        )
+        .await;
+        let new_server = start_live_server_with_identity_and_contracts(
+            &new_address,
+            "server-new",
+            "server-new-instance",
+            &[(&route_name, "test.other", "OtherEcho", "0.1.0")],
+        )
+        .await;
+
+        assert_eq!(
+            post_register(state.clone(), &route_name, "server-old", &old_address).await,
+            StatusCode::CREATED
+        );
+        install_mismatched_route_swap_after_precheck(state.clone(), &route_name, &new_address)
+            .await;
+
+        assert_eq!(
+            get_probe_with_expected_crm_tag(
+                state.clone(),
+                &route_name,
+                "test.echo",
+                "Echo",
+                "0.1.0",
+            )
+            .await,
+            StatusCode::CONFLICT
+        );
+
+        old_server.shutdown();
+        new_server.shutdown();
     }
 
     #[tokio::test]
@@ -785,9 +1754,9 @@ pub(crate) mod tests {
             std::process::id(),
             unique_suffix()
         );
-        let old_server = start_live_server(&old_address).await;
+        let old_server = start_live_server(&old_address, "server-old").await;
         register_echo_route(&old_server, "counter").await;
-        let new_server = start_live_server(&new_address).await;
+        let new_server = start_live_server(&new_address, "server-new").await;
 
         assert_eq!(
             post_register(state.clone(), "grid", "server-old", &old_address).await,
@@ -817,7 +1786,7 @@ pub(crate) mod tests {
             std::process::id(),
             unique_suffix()
         );
-        let stale_server = start_live_server(&stale_address).await;
+        let stale_server = start_live_server(&stale_address, "server-grid").await;
 
         assert_eq!(
             post_register(state.clone(), "grid", "server-grid", &stale_address).await,
@@ -846,7 +1815,7 @@ pub(crate) mod tests {
             std::process::id(),
             unique_suffix()
         );
-        let stale_server = start_live_server(&stale_address).await;
+        let stale_server = start_live_server(&stale_address, "server-grid").await;
 
         assert_eq!(
             post_register(state.clone(), "grid", "server-grid", &stale_address).await,
@@ -869,6 +1838,76 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn probe_reconnect_rejects_same_route_name_with_different_server_instance_id() {
+        let state = test_state();
+        let address = format!(
+            "ipc://relay_probe_wrong_instance_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let old_server = start_live_server(&address, "server-grid").await;
+
+        assert_eq!(
+            post_register(state.clone(), "grid", "server-grid", &address).await,
+            StatusCode::CREATED
+        );
+        state.evict_connection("grid");
+        old_server.shutdown();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let new_server = start_live_server_with_identity_and_contracts(
+            &address,
+            "server-grid",
+            "server-grid-restarted",
+            &[("grid", "test.echo", "Echo", "0.1.0")],
+        )
+        .await;
+
+        assert_eq!(
+            get_probe(state.clone(), "grid").await,
+            StatusCode::BAD_GATEWAY
+        );
+        assert!(state.local_route("grid").is_none());
+
+        new_server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn probe_reconnect_rejects_same_route_name_with_different_crm_tag() {
+        let state = test_state();
+        let address = format!(
+            "ipc://relay_probe_wrong_crm_tag_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let old_server = start_live_server(&address, "server-grid").await;
+
+        assert_eq!(
+            post_register(state.clone(), "grid", "server-grid", &address).await,
+            StatusCode::CREATED
+        );
+        state.evict_connection("grid");
+        old_server.shutdown();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let new_server = start_live_server_with_identity_and_contracts(
+            &address,
+            "server-grid",
+            "server-grid-instance",
+            &[("grid", "test.other", "OtherEcho", "0.1.0")],
+        )
+        .await;
+
+        assert_eq!(
+            get_probe(state.clone(), "grid").await,
+            StatusCode::BAD_GATEWAY
+        );
+        assert!(state.local_route("grid").is_none());
+
+        new_server.shutdown();
+    }
+
+    #[tokio::test]
     async fn call_missing_upstream_route_removes_stale_local_route() {
         let state = test_state();
         let stale_address = format!(
@@ -876,7 +1915,7 @@ pub(crate) mod tests {
             std::process::id(),
             unique_suffix()
         );
-        let stale_server = start_live_server(&stale_address).await;
+        let stale_server = start_live_server(&stale_address, "server-grid").await;
 
         assert_eq!(
             post_register(state.clone(), "grid", "server-grid", &stale_address).await,
@@ -910,8 +1949,8 @@ pub(crate) mod tests {
             std::process::id(),
             unique_suffix()
         );
-        let old_server = start_live_server(&old_address).await;
-        let new_server = start_live_server(&new_address).await;
+        let old_server = start_live_server(&old_address, "server-old").await;
+        let new_server = start_live_server(&new_address, "server-new").await;
 
         assert_eq!(
             post_register(state.clone(), "grid", "server-old", &old_address).await,
@@ -945,8 +1984,8 @@ pub(crate) mod tests {
             std::process::id(),
             unique_suffix()
         );
-        let old_server = start_live_server(&old_address).await;
-        let new_server = start_live_server(&new_address).await;
+        let old_server = start_live_server(&old_address, "server-old").await;
+        let new_server = start_live_server(&new_address, "server-new").await;
 
         assert_eq!(
             post_register(state.clone(), "grid", "server-old", &old_address).await,
@@ -976,7 +2015,7 @@ pub(crate) mod tests {
             std::process::id(),
             unique_suffix()
         );
-        let server = start_live_server(&address).await;
+        let server = start_live_server(&address, "server-grid").await;
 
         assert_eq!(
             post_register(state.clone(), "grid", "server-grid", &address).await,
@@ -1030,8 +2069,8 @@ pub(crate) mod tests {
             std::process::id(),
             unique_suffix()
         );
-        let first_server = start_live_server(&first_address).await;
-        let second_server = start_live_server(&second_address).await;
+        let first_server = start_live_server(&first_address, "server-first").await;
+        let second_server = start_live_server(&second_address, "server-second").await;
 
         let first = {
             let state = state.clone();
@@ -1084,7 +2123,7 @@ pub(crate) mod tests {
             std::process::id(),
             unique_suffix()
         );
-        let server = start_live_server(&address).await;
+        let server = start_live_server(&address, "server-grid").await;
 
         assert_eq!(
             post_register(state.clone(), "grid", "server-grid", &address).await,
@@ -1113,7 +2152,7 @@ pub(crate) mod tests {
             std::process::id(),
             unique_suffix()
         );
-        let server = start_live_server(&address).await;
+        let server = start_live_server(&address, "server-grid").await;
 
         assert_eq!(
             post_register(state.clone(), "grid", "server-grid", &address).await,
@@ -1139,7 +2178,7 @@ pub(crate) mod tests {
             std::process::id(),
             unique_suffix()
         );
-        let server = start_live_server(&address).await;
+        let server = start_live_server(&address, "server-grid").await;
 
         assert_eq!(
             post_register(state.clone(), "grid", "server-grid", &address).await,

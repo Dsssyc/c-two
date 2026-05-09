@@ -28,7 +28,9 @@ impl std::error::Error for CrmError {}
 /// Metadata describing how the CRM callback produced its response.
 ///
 /// Returned by `CrmCallback::invoke()`. The server reads these coordinates
-/// to build the reply frame — no payload data crosses the FFI boundary.
+/// or owned bytes to build the reply frame. For language bindings, large
+/// buffer-like outputs should be prepared through Rust response helpers before
+/// falling back to owned inline bytes.
 #[derive(Debug)]
 pub enum ResponseMeta {
     /// CRM wrote result into response SHM (via pool.alloc + pool.write).
@@ -38,7 +40,10 @@ pub enum ResponseMeta {
         data_size: u32,
         is_dedicated: bool,
     },
-    /// Small result returned as inline bytes (< shm_threshold).
+    /// Owned response bytes awaiting native transport selection.
+    ///
+    /// `send_response_meta()` may still choose buddy SHM or chunked transport
+    /// for this data based on the server IPC config.
     Inline(Vec<u8>),
     /// Method returned None / empty.
     Empty,
@@ -46,8 +51,8 @@ pub enum ResponseMeta {
 
 /// Input data for a CRM method call.
 ///
-/// Pure Rust types — no PyO3 dependency. The `PyCrmCallback` impl in c2-ffi
-/// converts these into Python objects (ShmBuffer/bytes) under GIL.
+/// Pure Rust types with no language-binding dependency. Binding-specific
+/// callback implementations convert these into SDK-visible objects.
 pub enum RequestData {
     /// SHM coordinates from peer (buddy or dedicated).
     /// ShmBuffer.release() frees via pool.free_at().
@@ -111,11 +116,11 @@ impl std::fmt::Debug for RequestData {
 
 /// Trait for calling CRM methods from Rust.
 ///
-/// `invoke()` acquires the GIL internally (in PyCrmCallback impl),
-/// so callers must NOT hold the GIL when calling this.
+/// Implementations may enter language runtimes internally, so callers should
+/// not hold unrelated runtime locks while invoking this callback.
 ///
-/// Uses pure Rust types (RequestData, ResponseMeta) — no PyO3 types
-/// in the trait interface. PyCrmCallback converts to/from Python objects.
+/// Uses pure Rust types (`RequestData`, `ResponseMeta`) in the trait
+/// interface; language bindings handle conversion at the boundary.
 pub trait CrmCallback: Send + Sync + 'static {
     fn invoke(
         &self,
@@ -130,12 +135,29 @@ pub trait CrmCallback: Send + Sync + 'static {
 pub struct CrmRoute {
     /// Route name (e.g., "grid", "solver")
     pub name: String,
+    /// CRM namespace from the language-neutral contract descriptor.
+    pub crm_ns: String,
+    /// CRM contract class/model name from the language-neutral contract descriptor.
+    pub crm_name: String,
+    /// CRM semantic version from the language-neutral contract descriptor.
+    pub crm_ver: String,
     /// Concurrency scheduler for this CRM
     pub scheduler: Arc<Scheduler>,
     /// Callback to invoke CRM methods
     pub callback: Arc<dyn CrmCallback>,
     /// Method names indexed by method_idx
     pub method_names: Vec<String>,
+}
+
+impl CrmRoute {
+    /// Return true when `method_idx` points at a registered CRM method.
+    ///
+    /// This is intentionally an O(1) bounds check for the remote dispatch hot
+    /// path. Full method-name and contract validation happens at registration
+    /// and client binding time.
+    pub fn has_method_index(&self, method_idx: u16) -> bool {
+        (method_idx as usize) < self.method_names.len()
+    }
 }
 
 /// Route dispatcher — resolves (route_name, method_idx) to CrmRoute.
@@ -162,9 +184,9 @@ impl Dispatcher {
         self.routes.insert(name, Arc::new(route));
     }
 
-    /// Remove a CRM route. Returns true if it existed.
-    pub fn unregister(&mut self, name: &str) -> bool {
-        let removed = self.routes.remove(name).is_some();
+    /// Remove a CRM route. Returns the removed route if it existed.
+    pub fn unregister(&mut self, name: &str) -> Option<Arc<CrmRoute>> {
+        let removed = self.routes.remove(name);
         if self.default_route.as_deref() == Some(name) {
             self.default_route = self.routes.keys().next().cloned();
         }
@@ -228,6 +250,9 @@ mod tests {
     fn make_route(name: &str) -> CrmRoute {
         CrmRoute {
             name: name.to_string(),
+            crm_ns: "test.grid".to_string(),
+            crm_name: "Grid".to_string(),
+            crm_ver: "0.1.0".to_string(),
             scheduler: Arc::new(Scheduler::new(
                 ConcurrencyMode::ReadParallel,
                 HashMap::new(),
@@ -263,6 +288,19 @@ mod tests {
     }
 
     #[test]
+    fn route_contract_metadata_and_method_index_bounds_are_available() {
+        let route = make_route("grid");
+
+        assert_eq!(route.crm_ns, "test.grid");
+        assert_eq!(route.crm_name, "Grid");
+        assert_eq!(route.crm_ver, "0.1.0");
+        assert!(route.has_method_index(0));
+        assert!(route.has_method_index(1));
+        assert!(!route.has_method_index(2));
+        assert!(!route.has_method_index(u16::MAX));
+    }
+
+    #[test]
     fn empty_name_resolves_to_default() {
         let mut d = Dispatcher::new();
         d.register(make_route("first"));
@@ -277,7 +315,7 @@ mod tests {
         let mut d = Dispatcher::new();
         d.register(make_route("grid"));
 
-        assert!(d.unregister("grid"));
+        assert!(d.unregister("grid").is_some());
         assert!(d.resolve("grid").is_none());
         assert!(d.is_empty());
     }
@@ -291,7 +329,8 @@ mod tests {
         // default is "alpha" (first registered)
         assert_eq!(d.resolve("").unwrap().name, "alpha");
 
-        d.unregister("alpha");
+        let removed = d.unregister("alpha");
+        assert!(removed.is_some());
 
         // default should now be "beta"
         let route = d.resolve("").expect("should have a new default");
@@ -301,7 +340,7 @@ mod tests {
     #[test]
     fn unregister_nonexistent_returns_false() {
         let mut d = Dispatcher::new();
-        assert!(!d.unregister("nope"));
+        assert!(d.unregister("nope").is_none());
     }
 
     #[test]

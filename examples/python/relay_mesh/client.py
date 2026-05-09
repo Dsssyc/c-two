@@ -23,7 +23,7 @@ RELAY_URL = ensure_http_relay_url(resolved_relay_url('http://127.0.0.1:8300'))
 
 def main():
     # Tell C-Two where the relay is — all name resolution goes through it.
-    cc.set_relay(RELAY_URL)
+    cc.set_relay_anchor(RELAY_URL)
 
     # ── Connect by name ──────────────────────────────────────────────
     # No IPC address needed — the relay resolves 'grid' to the right

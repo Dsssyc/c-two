@@ -9,6 +9,7 @@ use c2_ipc::IpcClient;
 use c2_wire::control::MAX_CALL_ROUTE_NAME_BYTES;
 
 use crate::relay::conn_pool::{CachedClient, OwnerToken};
+use crate::relay::route_table::{valid_crm_tag, valid_route_name};
 use crate::relay::state::RelayState;
 use crate::relay::types::{Locality, RouteEntry};
 
@@ -16,10 +17,51 @@ use crate::relay::types::{Locality, RouteEntry};
 pub(crate) enum ControlError {
     InvalidName { reason: String },
     InvalidServerId { reason: String },
+    InvalidServerInstanceId { reason: String },
+    ContractMismatch { reason: String },
     AddressMismatch { existing_address: String },
     DuplicateRoute { existing_address: String },
     OwnerMismatch,
     NotFound,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AttestedRouteContract {
+    pub crm_ns: String,
+    pub crm_name: String,
+    pub crm_ver: String,
+}
+
+pub(crate) fn attest_ipc_route_contract(
+    client: &IpcClient,
+    route_name: &str,
+    claimed_crm_ns: &str,
+    claimed_crm_name: &str,
+    claimed_crm_ver: &str,
+) -> Result<AttestedRouteContract, ControlError> {
+    let Some((crm_ns, crm_name, crm_ver)) = client.route_contract(route_name) else {
+        return Err(ControlError::NotFound);
+    };
+    if crm_ns.is_empty() || crm_name.is_empty() || crm_ver.is_empty() {
+        return Err(ControlError::ContractMismatch {
+            reason: format!("IPC upstream route '{route_name}' did not advertise a CRM contract"),
+        });
+    }
+    if (!claimed_crm_ns.is_empty() && claimed_crm_ns != crm_ns)
+        || (!claimed_crm_name.is_empty() && claimed_crm_name != crm_name)
+        || (!claimed_crm_ver.is_empty() && claimed_crm_ver != crm_ver)
+    {
+        return Err(ControlError::ContractMismatch {
+            reason: format!(
+                "IPC upstream route '{route_name}' CRM contract mismatch: claimed {claimed_crm_ns}/{claimed_crm_name}/{claimed_crm_ver}, got {crm_ns}/{crm_name}/{crm_ver}",
+            ),
+        });
+    }
+    Ok(AttestedRouteContract {
+        crm_ns: crm_ns.to_string(),
+        crm_name: crm_name.to_string(),
+        crm_ver: crm_ver.to_string(),
+    })
 }
 
 #[derive(Clone)]
@@ -50,8 +92,10 @@ pub(crate) enum RouteCommand {
     RegisterLocal {
         name: String,
         server_id: String,
+        server_instance_id: String,
         address: String,
         crm_ns: String,
+        crm_name: String,
         crm_ver: String,
         client: Arc<IpcClient>,
         replacement: Option<OwnerReplacement>,
@@ -102,14 +146,11 @@ impl<'a> RouteAuthority<'a> {
     }
 
     pub(crate) fn validate_route_name(&self, name: &str) -> Result<(), ControlError> {
-        if name.trim().is_empty() {
+        if !valid_route_name(name) {
             return Err(ControlError::InvalidName {
-                reason: "name cannot be empty".to_string(),
-            });
-        }
-        if name.as_bytes().len() > MAX_CALL_ROUTE_NAME_BYTES {
-            return Err(ControlError::InvalidName {
-                reason: "name exceeds wire route-name limit".to_string(),
+                reason: format!(
+                    "name must be non-empty, control-character-free, and no more than {MAX_CALL_ROUTE_NAME_BYTES} bytes"
+                ),
             });
         }
         Ok(())
@@ -124,17 +165,51 @@ impl<'a> RouteAuthority<'a> {
 
     pub(crate) fn validate_server_id(&self, server_id: &str) -> Result<(), ControlError> {
         c2_config::validate_server_id(server_id)
-            .map_err(|reason| ControlError::InvalidServerId { reason })
+            .map_err(|reason| ControlError::InvalidServerId { reason })?;
+        if server_id.len() > c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES {
+            return Err(ControlError::InvalidServerId {
+                reason: format!(
+                    "server_id cannot exceed {} bytes",
+                    c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_server_instance_id(
+        &self,
+        server_instance_id: &str,
+    ) -> Result<(), ControlError> {
+        validate_server_instance_id(server_instance_id)
+            .map_err(|reason| ControlError::InvalidServerInstanceId { reason })
+    }
+
+    pub(crate) fn validate_crm_tag(
+        &self,
+        crm_ns: &str,
+        crm_name: &str,
+        crm_ver: &str,
+    ) -> Result<(), ControlError> {
+        if valid_crm_tag(crm_ns, crm_name, crm_ver) {
+            Ok(())
+        } else {
+            Err(ControlError::ContractMismatch {
+                reason: "CRM tag fields must be non-empty, control-character-free, and fit the IPC handshake field limit".to_string(),
+            })
+        }
     }
 
     pub(crate) fn register_local_preflight(
         &self,
         name: &str,
         server_id: &str,
+        server_instance_id: &str,
         address: &str,
     ) -> Result<RegisterPreflight, ControlError> {
         self.validate_route_name(name)?;
         self.validate_server_id(server_id)?;
+        self.validate_server_instance_id(server_instance_id)?;
 
         let existing = self.state.local_route(name);
         let Some(existing) = existing else {
@@ -143,47 +218,88 @@ impl<'a> RouteAuthority<'a> {
 
         let existing_address = existing.ipc_address.clone().unwrap_or_default();
         let existing_server_id = existing.server_id.unwrap_or_default();
+        let existing_server_instance_id = existing.server_instance_id.unwrap_or_default();
         if existing_server_id == server_id {
             if existing_address == address {
-                return Ok(RegisterPreflight::SameOwner);
+                if existing_server_instance_id == server_instance_id {
+                    return Ok(RegisterPreflight::SameOwner);
+                }
+                return Ok(RegisterPreflight::Available { replacement: None });
             }
             return Err(ControlError::AddressMismatch { existing_address });
         }
 
-        match self.state.connection_lookup(name) {
-            CachedClient::Ready {
-                address: existing_address,
-                ..
-            } => Err(ControlError::DuplicateRoute { existing_address }),
-            CachedClient::Evicted {
-                address: existing_address,
+        let replacement = self.different_owner_replacement(name, existing_address)?;
+        Ok(RegisterPreflight::Available {
+            replacement: Some(replacement),
+        })
+    }
+
+    pub(crate) async fn prepare_candidate_registration(
+        &self,
+        name: &str,
+        server_id: &str,
+        address: &str,
+    ) -> Result<Option<OwnerReplacement>, ControlError> {
+        let mut last_stale_owner = None;
+        for _ in 0..3 {
+            self.validate_route_name(name)?;
+            self.validate_server_id(server_id)?;
+
+            let existing = self.state.local_route(name);
+            let Some(existing) = existing else {
+                return Ok(None);
+            };
+
+            let existing_address = existing.ipc_address.clone().unwrap_or_default();
+            let existing_server_id = existing.server_id.unwrap_or_default();
+            if existing_server_id == server_id {
+                if existing_address == address {
+                    return Ok(None);
+                }
+                return Err(ControlError::AddressMismatch { existing_address });
             }
-            | CachedClient::Disconnected {
-                address: existing_address,
-            } => {
-                let Some(token) = self.state.owner_token(name) else {
+
+            let replacement = match self.different_owner_replacement(name, existing_address.clone())
+            {
+                Ok(replacement) => replacement,
+                Err(ControlError::DuplicateRoute { existing_address }) => {
                     return Err(ControlError::DuplicateRoute { existing_address });
-                };
-                Ok(RegisterPreflight::Available {
-                    replacement: Some(OwnerReplacement {
-                        existing_address,
-                        token,
-                    }),
-                })
+                }
+                Err(err) => return Err(err),
+            };
+
+            match self
+                .probe_owner(name, &replacement.existing_address, &replacement.token)
+                .await
+            {
+                OwnerProbe::Alive => {
+                    return Err(ControlError::DuplicateRoute {
+                        existing_address: replacement.existing_address,
+                    });
+                }
+                OwnerProbe::RouteMissing | OwnerProbe::Dead => return Ok(Some(replacement)),
+                OwnerProbe::Stale => {
+                    last_stale_owner = Some(replacement.existing_address);
+                }
             }
-            CachedClient::Missing => Err(ControlError::DuplicateRoute { existing_address }),
         }
+
+        Err(ControlError::DuplicateRoute {
+            existing_address: last_stale_owner.unwrap_or_else(|| "<unknown>".to_string()),
+        })
     }
 
     pub(crate) async fn prepare_register(
         &self,
         name: &str,
         server_id: &str,
+        server_instance_id: &str,
         address: &str,
     ) -> Result<RegisterPreparation, ControlError> {
         let mut last_stale_owner = None;
         for _ in 0..3 {
-            match self.register_local_preflight(name, server_id, address)? {
+            match self.register_local_preflight(name, server_id, server_instance_id, address)? {
                 RegisterPreflight::Available { replacement: None } => {
                     return Ok(RegisterPreparation::Available { replacement: None });
                 }
@@ -223,16 +339,20 @@ impl<'a> RouteAuthority<'a> {
             RouteCommand::RegisterLocal {
                 name,
                 server_id,
+                server_instance_id,
                 address,
                 crm_ns,
+                crm_name,
                 crm_ver,
                 client,
                 replacement,
             } => self.register_local(
                 name,
                 server_id,
+                server_instance_id,
                 address,
                 crm_ns,
+                crm_name,
                 crm_ver,
                 client,
                 replacement,
@@ -261,32 +381,41 @@ impl<'a> RouteAuthority<'a> {
         &self,
         name: String,
         server_id: String,
+        server_instance_id: String,
         address: String,
         crm_ns: String,
+        crm_name: String,
         crm_ver: String,
         client: Arc<IpcClient>,
         replacement: Option<OwnerReplacement>,
     ) -> Result<RouteCommandResult, ControlError> {
         self.validate_route_name(&name)?;
         self.validate_server_id(&server_id)?;
+        self.validate_server_instance_id(&server_instance_id)?;
 
         let mut route_table = self.state.route_table_write();
         if let Some(existing) = route_table.local_route(&name) {
             let existing_address = existing.ipc_address.clone().unwrap_or_default();
             let existing_server_id = existing.server_id.clone().unwrap_or_default();
+            let existing_server_instance_id =
+                existing.server_instance_id.clone().unwrap_or_default();
             if existing_server_id == server_id {
                 if existing_address == address {
-                    return Ok(RouteCommandResult::SameOwner { entry: existing });
-                }
-                return Err(ControlError::AddressMismatch { existing_address });
-            }
-            match replacement {
-                Some(token) if token.existing_address == existing_address => {
-                    if !self.state.can_replace_owner_token(&name, &token.token) {
-                        return Err(ControlError::DuplicateRoute { existing_address });
+                    if existing_server_instance_id == server_instance_id {
+                        return Ok(RouteCommandResult::SameOwner { entry: existing });
                     }
+                } else {
+                    return Err(ControlError::AddressMismatch { existing_address });
                 }
-                _ => return Err(ControlError::DuplicateRoute { existing_address }),
+            } else {
+                match replacement {
+                    Some(token) if token.existing_address == existing_address => {
+                        if !self.state.can_replace_owner_token(&name, &token.token) {
+                            return Err(ControlError::DuplicateRoute { existing_address });
+                        }
+                    }
+                    _ => return Err(ControlError::DuplicateRoute { existing_address }),
+                }
             }
         }
 
@@ -295,8 +424,10 @@ impl<'a> RouteAuthority<'a> {
             relay_id: self.state.relay_id().to_string(),
             relay_url: self.state.config().effective_advertise_url(),
             server_id: Some(server_id),
+            server_instance_id: Some(server_instance_id),
             ipc_address: Some(address.clone()),
             crm_ns,
+            crm_name,
             crm_ver,
             locality: Locality::Local,
             registered_at: route_table.next_local_timestamp(),
@@ -307,6 +438,30 @@ impl<'a> RouteAuthority<'a> {
         self.state.insert_connection(name, address, client);
         drop(route_table);
         Ok(RouteCommandResult::Registered { entry })
+    }
+
+    fn different_owner_replacement(
+        &self,
+        name: &str,
+        existing_address: String,
+    ) -> Result<OwnerReplacement, ControlError> {
+        match self.state.connection_lookup(name) {
+            CachedClient::Ready { address, .. } => Err(ControlError::DuplicateRoute {
+                existing_address: address,
+            }),
+            CachedClient::Evicted { address } | CachedClient::Disconnected { address } => {
+                let Some(token) = self.state.owner_token(name) else {
+                    return Err(ControlError::DuplicateRoute {
+                        existing_address: address,
+                    });
+                };
+                Ok(OwnerReplacement {
+                    existing_address: address,
+                    token,
+                })
+            }
+            CachedClient::Missing => Err(ControlError::DuplicateRoute { existing_address }),
+        }
     }
 
     fn unregister_local(
@@ -351,6 +506,12 @@ impl<'a> RouteAuthority<'a> {
         self.validate_route_name(&entry.name)?;
         self.validate_relay_id(&sender_relay_id)?;
         self.validate_relay_id(&entry.relay_id)?;
+        self.validate_crm_tag(&entry.crm_ns, &entry.crm_name, &entry.crm_ver)?;
+        if !entry.registered_at.is_finite() {
+            return Err(ControlError::ContractMismatch {
+                reason: "route registered_at must be finite".to_string(),
+            });
+        }
         if !self.trusted_peer_owner(&sender_relay_id, &entry.relay_id) {
             return Err(ControlError::OwnerMismatch);
         }
@@ -364,6 +525,7 @@ impl<'a> RouteAuthority<'a> {
             .ok_or(ControlError::OwnerMismatch)?;
         entry.relay_url = peer_url;
         entry.server_id = None;
+        entry.server_instance_id = None;
         entry.ipc_address = None;
         entry.locality = Locality::Peer;
         route_table.register_route(entry);
@@ -437,4 +599,31 @@ enum OwnerProbe {
     RouteMissing,
     Dead,
     Stale,
+}
+
+fn validate_server_instance_id(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("invalid server_instance_id: cannot be empty".to_string());
+    }
+    if value.len() > c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES {
+        return Err(format!(
+            "invalid server_instance_id: cannot exceed {} bytes",
+            c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES
+        ));
+    }
+    if value.trim() != value {
+        return Err(
+            "invalid server_instance_id: cannot contain leading or trailing whitespace".to_string(),
+        );
+    }
+    if value == "." || value == ".." || value.contains('/') || value.contains('\\') {
+        return Err("invalid server_instance_id: cannot contain path separators".to_string());
+    }
+    if !value.is_ascii() {
+        return Err("invalid server_instance_id: must be ASCII".to_string());
+    }
+    if value.chars().any(char::is_control) {
+        return Err("invalid server_instance_id: cannot contain control characters".to_string());
+    }
+    Ok(())
 }

@@ -1,7 +1,7 @@
 //! Unit tests for c2-wire codec.
 //!
-//! Tests verify round-trip encoding/decoding and cross-language
-//! compatibility with the Python `c_two.rpc_v2.wire` / `protocol` modules.
+//! Tests verify round-trip encoding/decoding and canonical cross-language
+//! wire compatibility fixtures.
 
 mod frame_tests {
     use crate::flags::*;
@@ -64,8 +64,8 @@ mod frame_tests {
     }
 
     #[test]
-    fn total_len_matches_python_format() {
-        // Python: FRAME_STRUCT = struct.Struct('<IQI')  → 16 bytes
+    fn total_len_matches_canonical_frame_format() {
+        // Canonical frame header layout: `<IQI` → 16 bytes
         // total_len = 12 + payload_len
         // Frame = [4B total_len][8B rid][4B flags][payload]
         let payload = b"test";
@@ -129,8 +129,8 @@ mod buddy_tests {
     }
 
     #[test]
-    fn python_compatible_layout() {
-        // Python: struct.Struct('<HII B') → H(2) + I(4) + I(4) + B(1) = 11
+    fn canonical_buddy_payload_layout() {
+        // Canonical buddy payload layout: `<HII B` → H(2) + I(4) + I(4) + B(1) = 11
         assert_eq!(BUDDY_PAYLOAD_SIZE, 11);
 
         let bp = BuddyPayload {
@@ -237,8 +237,8 @@ mod control_tests {
     }
 
     #[test]
-    fn python_call_control_compat() {
-        // Python: encode_call_control("grid", 5)
+    fn canonical_call_control_fixture_matches() {
+        // Canonical call-control fixture for route `grid`, method index 5
         // = [4] + b"grid" + struct.pack('<H', 5)
         // = [0x04, 0x67, 0x72, 0x69, 0x64, 0x05, 0x00]
         let expected = vec![0x04, 0x67, 0x72, 0x69, 0x64, 0x05, 0x00];
@@ -257,6 +257,13 @@ mod control_tests {
 mod handshake_tests {
     use crate::handshake::*;
 
+    fn test_identity() -> ServerIdentity {
+        ServerIdentity {
+            server_id: "test-server".to_string(),
+            server_instance_id: "test-instance".to_string(),
+        }
+    }
+
     #[test]
     fn client_handshake_roundtrip() {
         let segments = vec![
@@ -271,6 +278,67 @@ mod handshake_tests {
         assert_eq!(decoded.segments[0].0, "seg0");
         assert_eq!(decoded.segments[0].1, 268_435_456);
         assert_eq!(decoded.capability_flags, CAP_CALL_V2 | CAP_METHOD_IDX);
+        assert_eq!(decoded.server_identity, None);
+        assert!(decoded.routes.is_empty());
+    }
+
+    #[test]
+    fn server_handshake_roundtrip_includes_server_identity() {
+        let routes = vec![RouteInfo {
+            name: "grid".to_string(),
+            crm_ns: "test.grid".to_string(),
+            crm_name: "Grid".to_string(),
+            crm_ver: "1.2.3".to_string(),
+            methods: vec![MethodEntry {
+                name: "ping".to_string(),
+                index: 0,
+            }],
+        }];
+        let identity = ServerIdentity {
+            server_id: "grid-server".to_string(),
+            server_instance_id: "inst-001".to_string(),
+        };
+
+        let encoded = encode_server_handshake(
+            &[],
+            CAP_CALL_V2 | CAP_METHOD_IDX,
+            &routes,
+            "/cc3rtest",
+            &identity,
+        )
+        .expect("server handshake encodes");
+        let decoded = decode_handshake(&encoded).expect("server handshake decodes");
+
+        assert_eq!(decoded.server_identity.as_ref(), Some(&identity));
+        assert_eq!(decoded.routes, routes);
+        assert_eq!(decoded.routes[0].crm_ns, "test.grid");
+        assert_eq!(decoded.routes[0].crm_name, "Grid");
+        assert_eq!(decoded.routes[0].crm_ver, "1.2.3");
+    }
+
+    #[test]
+    fn server_handshake_rejects_trailing_bytes() {
+        let mut encoded = encode_server_handshake(
+            &[],
+            CAP_CALL_V2 | CAP_METHOD_IDX,
+            &[],
+            "/cc3rtest",
+            &test_identity(),
+        )
+        .expect("server handshake encodes");
+        encoded.push(0xff);
+
+        let err = decode_handshake(&encoded).expect_err("trailing byte must be rejected");
+        assert!(err.to_string().contains("trailing bytes"));
+    }
+
+    #[test]
+    fn client_handshake_has_no_server_identity() {
+        let encoded = encode_client_handshake(&[], CAP_CALL_V2, "/cc3ctest")
+            .expect("client handshake encodes");
+        let decoded = decode_handshake(&encoded).expect("client handshake decodes");
+
+        assert_eq!(decoded.server_identity, None);
         assert!(decoded.routes.is_empty());
     }
 
@@ -280,6 +348,9 @@ mod handshake_tests {
         let routes = vec![
             RouteInfo {
                 name: "grid".into(),
+                crm_ns: "test.grid".into(),
+                crm_name: "Grid".into(),
+                crm_ver: "0.1.0".into(),
                 methods: vec![
                     MethodEntry {
                         name: "hello".into(),
@@ -297,6 +368,9 @@ mod handshake_tests {
             },
             RouteInfo {
                 name: "counter".into(),
+                crm_ns: "test.counter".into(),
+                crm_name: "Counter".into(),
+                crm_ver: "0.1.0".into(),
                 methods: vec![
                     MethodEntry {
                         name: "get".into(),
@@ -309,11 +383,14 @@ mod handshake_tests {
                 ],
             },
         ];
-        let encoded = encode_server_handshake(&segments, CAP_CALL_V2, &routes, "").unwrap();
+        let identity = test_identity();
+        let encoded =
+            encode_server_handshake(&segments, CAP_CALL_V2, &routes, "", &identity).unwrap();
         let decoded = decode_handshake(&encoded).unwrap();
 
         assert_eq!(decoded.segments.len(), 1);
         assert_eq!(decoded.capability_flags, CAP_CALL_V2);
+        assert_eq!(decoded.server_identity.as_ref(), Some(&identity));
         assert_eq!(decoded.routes.len(), 2);
 
         let grid = &decoded.routes[0];
@@ -333,17 +410,63 @@ mod handshake_tests {
     fn server_handshake_rejects_overlong_route_name() {
         let routes = vec![RouteInfo {
             name: "x".repeat(MAX_HANDSHAKE_NAME_BYTES + 1),
+            crm_ns: "test.overlong".into(),
+            crm_name: "Overlong".into(),
+            crm_ver: "0.1.0".into(),
             methods: vec![],
         }];
 
-        let err = encode_server_handshake(&[], CAP_CALL_V2, &routes, "").unwrap_err();
+        let err =
+            encode_server_handshake(&[], CAP_CALL_V2, &routes, "", &test_identity()).unwrap_err();
         assert!(err.to_string().contains("route name"));
+    }
+
+    #[test]
+    fn server_handshake_rejects_overlong_crm_metadata() {
+        let routes = vec![RouteInfo {
+            name: "grid".into(),
+            crm_ns: "x".repeat(MAX_HANDSHAKE_NAME_BYTES + 1),
+            crm_name: "Grid".into(),
+            crm_ver: "0.1.0".into(),
+            methods: vec![],
+        }];
+
+        let err =
+            encode_server_handshake(&[], CAP_CALL_V2, &routes, "", &test_identity()).unwrap_err();
+        assert!(err.to_string().contains("crm namespace"));
+
+        let routes = vec![RouteInfo {
+            name: "grid".into(),
+            crm_ns: "test.grid".into(),
+            crm_name: "x".repeat(MAX_HANDSHAKE_NAME_BYTES + 1),
+            crm_ver: "0.1.0".into(),
+            methods: vec![],
+        }];
+
+        let err =
+            encode_server_handshake(&[], CAP_CALL_V2, &routes, "", &test_identity()).unwrap_err();
+        assert!(err.to_string().contains("crm name"));
+
+        let routes = vec![RouteInfo {
+            name: "grid".into(),
+            crm_ns: "test.grid".into(),
+            crm_name: "Grid".into(),
+            crm_ver: "x".repeat(MAX_HANDSHAKE_NAME_BYTES + 1),
+            methods: vec![],
+        }];
+
+        let err =
+            encode_server_handshake(&[], CAP_CALL_V2, &routes, "", &test_identity()).unwrap_err();
+        assert!(err.to_string().contains("crm version"));
     }
 
     #[test]
     fn server_handshake_rejects_too_many_methods() {
         let routes = vec![RouteInfo {
             name: "grid".into(),
+            crm_ns: "test.grid".into(),
+            crm_name: "Grid".into(),
+            crm_ver: "0.1.0".into(),
             methods: (0..=MAX_METHODS)
                 .map(|i| MethodEntry {
                     name: format!("m{i}"),
@@ -352,7 +475,8 @@ mod handshake_tests {
                 .collect(),
         }];
 
-        let err = encode_server_handshake(&[], CAP_CALL_V2, &routes, "").unwrap_err();
+        let err =
+            encode_server_handshake(&[], CAP_CALL_V2, &routes, "", &test_identity()).unwrap_err();
         assert!(err.to_string().contains("method count"));
     }
 
@@ -365,18 +489,19 @@ mod handshake_tests {
 
     #[test]
     fn empty_handshake() {
-        // Version 6, prefix_len=0, 0 segments, cap_flags=0
-        let buf = [6, 0, 0, 0, 0, 0];
+        // Version 9, prefix_len=0, 0 segments, cap_flags=0
+        let buf = [9, 0, 0, 0, 0, 0];
         let decoded = decode_handshake(&buf).unwrap();
         assert_eq!(decoded.prefix, "");
         assert!(decoded.segments.is_empty());
         assert_eq!(decoded.capability_flags, 0);
+        assert_eq!(decoded.server_identity, None);
         assert!(decoded.routes.is_empty());
     }
 }
 
 // ── Cross-language compatibility tests ───────────────────────────────────
-// Fixtures generated by Python `c_two.rpc_v2.wire` / `protocol` modules.
+// Canonical wire compatibility fixtures shared by all SDK bindings.
 
 mod cross_lang_tests {
     use crate::buddy::*;
@@ -392,7 +517,7 @@ mod cross_lang_tests {
     }
 
     #[test]
-    fn python_frame_decode() {
+    fn canonical_frame_fixture_decodes() {
         let bytes = hex_to_bytes("180000003930000000000000c2010000746573745f7061796c6f6164");
         let (hdr, payload) = decode_frame(&bytes).unwrap();
         assert_eq!(hdr.request_id, 12345);
@@ -401,7 +526,7 @@ mod cross_lang_tests {
     }
 
     #[test]
-    fn python_call_control_decode() {
+    fn canonical_call_control_fixture_decodes() {
         let bytes = hex_to_bytes("0568656c6c6f0700");
         let (ctrl, consumed) = decode_call_control(&bytes, 0).unwrap();
         assert_eq!(ctrl.route_name, "hello");
@@ -410,7 +535,7 @@ mod cross_lang_tests {
     }
 
     #[test]
-    fn python_call_control_empty_decode() {
+    fn canonical_empty_call_control_fixture_decodes() {
         let bytes = hex_to_bytes("000000");
         let (ctrl, consumed) = decode_call_control(&bytes, 0).unwrap();
         assert_eq!(ctrl.route_name, "");
@@ -419,7 +544,7 @@ mod cross_lang_tests {
     }
 
     #[test]
-    fn python_reply_success_decode() {
+    fn canonical_reply_success_fixture_decodes() {
         let bytes = hex_to_bytes("00");
         let (ctrl, consumed) = decode_reply_control(&bytes, 0).unwrap();
         assert_eq!(ctrl, ReplyControl::Success);
@@ -427,7 +552,7 @@ mod cross_lang_tests {
     }
 
     #[test]
-    fn python_reply_error_decode() {
+    fn canonical_reply_error_fixture_decodes() {
         let bytes = hex_to_bytes("010c000000333a74657374206572726f72");
         let (ctrl, consumed) = decode_reply_control(&bytes, 0).unwrap();
         match ctrl {
@@ -440,7 +565,7 @@ mod cross_lang_tests {
     }
 
     #[test]
-    fn python_buddy_payload_decode() {
+    fn canonical_buddy_payload_fixture_decodes() {
         let bytes = hex_to_bytes("0200001000000002000000");
         let (bp, consumed) = decode_buddy_payload(&bytes).unwrap();
         assert_eq!(bp.seg_idx, 2);
@@ -451,23 +576,25 @@ mod cross_lang_tests {
     }
 
     #[test]
-    fn python_client_handshake_decode() {
-        // v6: [06][00 prefix_len][01 00 seg_count][00 00 00 10 size][04 seg0][03 00 caps]
-        let bytes = hex_to_bytes("060001000000001004736567300300");
+    fn canonical_client_handshake_fixture_decodes() {
+        // v9: [09][00 prefix_len][01 00 seg_count][00 00 00 10 size][04 seg0][03 00 caps]
+        let bytes = hex_to_bytes("090001000000001004736567300300");
         let hs = decode_handshake(&bytes).unwrap();
         assert_eq!(hs.prefix, "");
         assert_eq!(hs.segments.len(), 1);
         assert_eq!(hs.segments[0].0, "seg0");
         assert_eq!(hs.segments[0].1, 268_435_456);
         assert_eq!(hs.capability_flags, CAP_CALL_V2 | CAP_METHOD_IDX);
+        assert_eq!(hs.server_identity, None);
         assert!(hs.routes.is_empty());
     }
 
     #[test]
-    fn python_server_handshake_decode() {
-        // v6: [06][00 prefix_len] then same body
+    fn canonical_server_handshake_fixture_decodes() {
+        // v9: client handshake prefix, server identity, then route table
+        // with per-route full CRM tag.
         let bytes = hex_to_bytes(
-            "0600010000000008047372763003000100046772696402000568656c6c6f0000036164640100",
+            "0900010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696409746573742e67726964044772696405302e312e3002000568656c6c6f0000036164640100",
         );
         let hs = decode_handshake(&bytes).unwrap();
         assert_eq!(hs.prefix, "");
@@ -475,8 +602,18 @@ mod cross_lang_tests {
         assert_eq!(hs.segments[0].0, "srv0");
         assert_eq!(hs.segments[0].1, 134_217_728);
         assert_eq!(hs.capability_flags, CAP_CALL_V2 | CAP_METHOD_IDX);
+        assert_eq!(
+            hs.server_identity.as_ref(),
+            Some(&ServerIdentity {
+                server_id: "server-grid".into(),
+                server_instance_id: "inst-grid".into(),
+            })
+        );
         assert_eq!(hs.routes.len(), 1);
         assert_eq!(hs.routes[0].name, "grid");
+        assert_eq!(hs.routes[0].crm_ns, "test.grid");
+        assert_eq!(hs.routes[0].crm_name, "Grid");
+        assert_eq!(hs.routes[0].crm_ver, "0.1.0");
         assert_eq!(hs.routes[0].methods.len(), 2);
         assert_eq!(hs.routes[0].methods[0].name, "hello");
         assert_eq!(hs.routes[0].methods[0].index, 0);
@@ -485,20 +622,20 @@ mod cross_lang_tests {
     }
 
     #[test]
-    fn rust_encode_matches_python_call_control() {
+    fn rust_encode_matches_canonical_call_control_fixture() {
         let encoded = encode_call_control("hello", 7).unwrap();
         let expected = hex_to_bytes("0568656c6c6f0700");
         assert_eq!(encoded, expected);
     }
 
     #[test]
-    fn rust_encode_matches_python_reply_success() {
+    fn rust_encode_matches_canonical_reply_success_fixture() {
         let encoded = encode_reply_control(&ReplyControl::Success);
         assert_eq!(encoded, hex_to_bytes("00"));
     }
 
     #[test]
-    fn rust_encode_matches_python_reply_error() {
+    fn rust_encode_matches_canonical_reply_error_fixture() {
         let err = b"3:test error".to_vec();
         let encoded = encode_reply_control(&ReplyControl::Error(err));
         let expected = hex_to_bytes("010c000000333a74657374206572726f72");
@@ -506,7 +643,7 @@ mod cross_lang_tests {
     }
 
     #[test]
-    fn rust_encode_matches_python_buddy_payload() {
+    fn rust_encode_matches_canonical_buddy_payload_fixture() {
         let bp = BuddyPayload {
             seg_idx: 2,
             offset: 4096,
@@ -519,19 +656,22 @@ mod cross_lang_tests {
     }
 
     #[test]
-    fn rust_encode_matches_python_client_handshake() {
+    fn rust_encode_matches_canonical_client_handshake_fixture() {
         let segments = vec![("seg0".into(), 268_435_456u32)];
         let encoded = encode_client_handshake(&segments, CAP_CALL_V2 | CAP_METHOD_IDX, "").unwrap();
-        // v6: [06][00 prefix_len][01 00 seg_count][00 00 00 10 size][04 name_len][seg0][03 00 caps]
-        let expected = hex_to_bytes("060001000000001004736567300300");
+        // v9: [09][00 prefix_len][01 00 seg_count][00 00 00 10 size][04 name_len][seg0][03 00 caps]
+        let expected = hex_to_bytes("090001000000001004736567300300");
         assert_eq!(encoded, expected);
     }
 
     #[test]
-    fn rust_encode_matches_python_server_handshake() {
+    fn rust_encode_matches_canonical_server_handshake_fixture() {
         let segments = vec![("srv0".into(), 134_217_728u32)];
         let routes = vec![RouteInfo {
             name: "grid".into(),
+            crm_ns: "test.grid".into(),
+            crm_name: "Grid".into(),
+            crm_ver: "0.1.0".into(),
             methods: vec![
                 MethodEntry {
                     name: "hello".into(),
@@ -543,11 +683,22 @@ mod cross_lang_tests {
                 },
             ],
         }];
-        let encoded =
-            encode_server_handshake(&segments, CAP_CALL_V2 | CAP_METHOD_IDX, &routes, "").unwrap();
-        // v6: [06][00 prefix_len] then same body as v5
+        let identity = ServerIdentity {
+            server_id: "server-grid".into(),
+            server_instance_id: "inst-grid".into(),
+        };
+        let encoded = encode_server_handshake(
+            &segments,
+            CAP_CALL_V2 | CAP_METHOD_IDX,
+            &routes,
+            "",
+            &identity,
+        )
+        .unwrap();
+        // v9: [09][00 prefix_len] then segments/caps, identity, and route table
+        // with per-route full CRM tag metadata.
         let expected = hex_to_bytes(
-            "0600010000000008047372763003000100046772696402000568656c6c6f0000036164640100",
+            "0900010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696409746573742e67726964044772696405302e312e3002000568656c6c6f0000036164640100",
         );
         assert_eq!(encoded, expected);
     }

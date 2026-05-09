@@ -7,8 +7,8 @@ Provides a singleton :class:`_ProcessRegistry` that manages:
 2. **Thread preference** — ``connect()`` returns a zero-serialization
    :class:`CRMProxy.thread_local` when the target CRM lives in the
    same process.
-3. **Client pooling** — remote connections reuse Rust IPC/HTTP clients
-   via :class:`RustClientPool` and :class:`RustHttpClientPool`.
+3. **Client pooling** — remote connections reuse Rust-owned IPC/HTTP client
+   pools through the native runtime session.
 
 Usage::
 
@@ -34,23 +34,15 @@ from __future__ import annotations
 
 import atexit
 import logging
-import os
 import signal
 import sys
 import threading
-import uuid
+from collections.abc import Mapping
 from typing import TypeVar
 
-from c_two.config.ipc import (
-    ClientIPCOverrides,
-    ServerIPCOverrides,
-    _normalize_client_ipc_overrides,
-    _normalize_server_ipc_overrides,
-    _resolve_client_ipc_config,
-)
+from c_two.config.ipc import ClientIPCOverrides, ServerIPCOverrides
 from c_two.config.settings import settings
 from c_two.error import (
-    ResourceAlreadyRegistered,
     ResourceNotFound,
     ResourceUnavailable,
     RegistryUnavailable,
@@ -66,6 +58,55 @@ log = logging.getLogger(__name__)
 def _relay_control_error_status(exc: BaseException) -> int | None:
     value = getattr(exc, "status_code", None)
     return value if isinstance(value, int) else None
+
+
+def _is_crm_contract_mismatch(exc: BaseException) -> bool:
+    return isinstance(exc, RuntimeError) and "CRM contract mismatch" in str(exc)
+
+
+def _crm_contract_identity(crm_class: type) -> tuple[str, str, str]:
+    return (
+        getattr(crm_class, '__cc_namespace__', ''),
+        getattr(crm_class, '__cc_name__', crm_class.__name__),
+        getattr(crm_class, '__cc_version__', ''),
+    )
+
+
+def _ensure_crm_contract_match(
+    *,
+    route_name: str,
+    expected: tuple[str, str, str],
+    actual: tuple[str, str, str],
+) -> None:
+    expected_ns, expected_name, expected_ver = expected
+    actual_ns, actual_name, actual_ver = actual
+    if not expected_ns and not expected_name and not expected_ver:
+        return
+    if (
+        expected_ns == actual_ns
+        and expected_name == actual_name
+        and expected_ver == actual_ver
+    ):
+        return
+    raise TypeError(
+        f'CRM contract mismatch for route {route_name!r}: '
+        f'expected {expected_ns}/{expected_name}/{expected_ver}, '
+        f'got {actual_ns}/{actual_name}/{actual_ver}',
+    )
+
+
+def _relay_cleanup_exception(error: dict[str, object]) -> RuntimeError:
+    route_name = str(error.get('route_name') or '<unknown>')
+    message = str(error.get('message') or 'unknown relay cleanup error')
+    status_code = error.get('status_code')
+    if isinstance(status_code, int):
+        return RuntimeError(
+            f'Relay unregistration failed for {route_name!r}: '
+            f'HTTP {status_code}: {message}',
+        )
+    return RuntimeError(
+        f'Relay unregistration failed for {route_name!r}: {message}',
+    )
 
 
 class _ProcessRegistry:
@@ -98,40 +139,26 @@ class _ProcessRegistry:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        from c_two._native import RuntimeSession
         self._server: Server | None = None
-        self._server_address: str | None = None
-        self._server_id: str | None = None
-        self._server_ipc_overrides: ServerIPCOverrides | None = None
-        self._server_id_override: str | None = None
-        self._client_config: dict[str, object] | None = None
-        self._client_ipc_overrides: ClientIPCOverrides | None = None
-        self._pool_config_applied: bool = False
-        self._relay_control_client: object | None = None
-        self._relay_control_address: str | None = None
-        from c_two._native import RustClientPool, RustHttpClientPool
-        self._pool = RustClientPool.instance()
-        self._http_pool = RustHttpClientPool.instance()
+        self._runtime_session = RuntimeSession(shm_threshold=settings.shm_threshold)
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def set_relay(self, address: str) -> None:
-        """Set the relay address for name resolution.
+    def set_relay_anchor(self, address: str) -> None:
+        """Set the relay anchor address for name resolution.
 
-        Convenience wrapper — equivalent to setting ``C2_RELAY_ADDRESS``.
+        Convenience wrapper — equivalent to setting ``C2_RELAY_ANCHOR_ADDRESS``.
         """
-        previous = settings.relay_address
-        previous_addr = previous.rstrip('/') if previous else None
-        relay_addr = address.rstrip('/')
-        settings.relay_address = address
-        if previous_addr != relay_addr:
-            self._clear_relay_control_client()
+        settings.relay_anchor_address = address
+        self._runtime_session.set_relay_anchor_address(settings._relay_anchor_address)  # noqa: SLF001
 
     def set_transport_policy(self, *, shm_threshold: int | None = None) -> None:
         """Set process transport policy. Must be called before use."""
         with self._lock:
-            if self._server is not None or self._pool_config_applied:
+            if self._server is not None or self._runtime_session.client_config_frozen:
                 import warnings
                 warnings.warn(
                     'Active connections exist, set_transport_policy() ignored. '
@@ -141,13 +168,23 @@ class _ProcessRegistry:
                 )
                 return
             settings.shm_threshold = shm_threshold
-            self._client_config = None
+            runtime_session = self._runtime_session.__class__(
+                server_id=(
+                    self._runtime_session.server_id
+                    or self._runtime_session.server_id_override
+                ),
+                server_ipc_overrides=self._runtime_session.server_ipc_overrides,
+                client_ipc_overrides=self._runtime_session.client_ipc_overrides,
+                shm_threshold=shm_threshold,
+            )
+            runtime_session.set_relay_anchor_address(settings._relay_anchor_address)  # noqa: SLF001
+            self._runtime_session = runtime_session
 
     def set_server(
         self,
         *,
         server_id: str | None = None,
-        ipc_overrides: ServerIPCOverrides | None = None,
+        ipc_overrides: ServerIPCOverrides | Mapping[str, object] | None = None,
     ) -> None:
         """Configure IPC server. Must be called before register()."""
         with self._lock:
@@ -160,13 +197,16 @@ class _ProcessRegistry:
                     stacklevel=3,
                 )
                 return
-            self._server_id_override = self._clean_server_id(server_id)
-            self._server_ipc_overrides = _normalize_server_ipc_overrides(ipc_overrides)
+            self._runtime_session.set_server_options(server_id, ipc_overrides)
 
-    def set_client(self, *, ipc_overrides: ClientIPCOverrides | None = None) -> None:
+    def set_client(
+        self,
+        *,
+        ipc_overrides: ClientIPCOverrides | Mapping[str, object] | None = None,
+    ) -> None:
         """Configure IPC client. Must be called before connect()."""
         with self._lock:
-            if self._pool_config_applied:
+            if self._runtime_session.client_config_frozen:
                 import warnings
                 warnings.warn(
                     'Client connections already exist, set_client() ignored. '
@@ -175,8 +215,14 @@ class _ProcessRegistry:
                     stacklevel=3,
                 )
                 return
-            self._client_ipc_overrides = _normalize_client_ipc_overrides(ipc_overrides)
-            self._client_config = None  # rebuilt lazily
+            if not self._runtime_session.set_client_ipc_overrides(ipc_overrides):
+                import warnings
+                warnings.warn(
+                    'Client connections already exist, set_client() ignored. '
+                    'Call set_client() before connect().',
+                    UserWarning,
+                    stacklevel=3,
+                )
 
     def register(
         self,
@@ -191,7 +237,7 @@ class _ProcessRegistry:
         On the first call, a :class:`Server` is created and started
         automatically (lazy init).
 
-        If ``C2_RELAY_ADDRESS`` is set, the CRM is also registered with
+        If ``C2_RELAY_ANCHOR_ADDRESS`` is set, the CRM is also registered with
         the relay server through the Rust relay control client. A
         connection failure or non-2xx response raises an error.
 
@@ -212,37 +258,49 @@ class _ProcessRegistry:
             The *name* string (echoed back for convenience).
         """
         with self._lock:
-            # Lazy-init server on first registration.
-            if self._server is None:
-                server_id = self._server_id_override or self._auto_server_id()
-                addr = self._address_for_server_id(server_id)
-                self._server = Server(
-                    bind_address=addr,
-                    ipc_overrides=self._server_ipc_overrides,
+            created_server = False
+            try:
+                self._sync_relay_override()
+                # Lazy-init server on first registration. Native identity is
+                # cleared if Python server bridge construction fails, so invalid
+                # server config does not leave a visible server id/address.
+                server = self._server
+                if server is None:
+                    try:
+                        server = self._runtime_session.ensure_server_bridge()
+                    except Exception:
+                        self._runtime_session.clear_server_identity()
+                        raise
+                    self._server = server
+                    created_server = True
+
+                server.register_crm(
+                    crm_class,
+                    crm_instance,
+                    concurrency,
+                    name=name,
+                    runtime_session=self._runtime_session,
+                    relay_anchor_address=None,
                 )
-                self._server_id = server_id
-                self._server_address = addr
-                # Rust pool uses its own defaults; skip Python IPCConfig.
 
-            self._server.register_crm(crm_class, crm_instance, concurrency, name=name)
+                # Start server if not yet running.
+                if not server.is_started():
+                    server.start()
 
-            # Start server if not yet running.
-            if not self._server.is_started():
-                self._server.start()
-
-            server_address = self._server_address
-            server_id = self._server_id
+                server_address = self._runtime_session.server_address
+            except Exception:
+                if created_server:
+                    server = self._server
+                    self._server = None
+                    self._runtime_session.clear_server_identity()
+                    if server is not None:
+                        try:
+                            server.shutdown()
+                        except Exception:
+                            log.warning('Error shutting down Server after failed register', exc_info=True)
+                raise
 
         log.debug('Registered CRM %s at %s', name, server_address)
-
-        # Notify relay (outside lock to avoid deadlocks).
-        crm_ns = getattr(crm_class, '__cc_namespace__', '')
-        crm_ver = getattr(crm_class, '__cc_version__', '')
-        try:
-            self._relay_register(name, server_id, server_address, crm_ns, crm_ver)
-        except Exception:
-            self._rollback_registration(name)
-            raise
 
         return name
 
@@ -275,6 +333,7 @@ class _ProcessRegistry:
             A CRM instance with ``.client`` set to an
             :class:`CRMProxy`.
         """
+        expected_contract = _crm_contract_identity(crm_class)
         with self._lock:
             server = self._server
             local = (
@@ -282,55 +341,91 @@ class _ProcessRegistry:
                 if address is None and server is not None
                 else None
             )
+            lease_tracker = self._runtime_session.lease_tracker()
 
         if address is None and local is not None:
             # Thread preference — same process, no serialization.
-            crm_instance, scheduler, access_map = local
+            crm_instance, scheduler, actual_ns, actual_name, actual_ver = local
+            _ensure_crm_contract_match(
+                route_name=name,
+                expected=expected_contract,
+                actual=(actual_ns, actual_name, actual_ver),
+            )
             proxy = CRMProxy.thread_local(
                 crm_instance,
                 scheduler=scheduler,
-                access_map=access_map,
+                lease_tracker=lease_tracker,
             )
         elif address is not None and address.startswith(('http://', 'https://')):
             # HTTP mode — cross-node via relay server.
-            client = self._http_pool.acquire(address)
+            client = self._runtime_session.connect_explicit_relay_http(
+                address,
+                name,
+                expected_contract[0],
+                expected_contract[1],
+                expected_contract[2],
+            )
             proxy = CRMProxy.http(
                 client,
                 name,
-                on_terminate=lambda addr=address: self._http_pool.release(addr),
+                on_terminate=client.close,
+                lease_tracker=lease_tracker,
             )
         elif address is not None:
             # Remote IPC via pooled RustClient.
-            self._ensure_pool_config()
-            client = self._pool.acquire(address)
+            client = self._runtime_session.acquire_ipc_client(
+                address,
+                name,
+                expected_contract[0],
+                expected_contract[1],
+                expected_contract[2],
+            )
             proxy = CRMProxy.ipc(
                 client,
                 name,
-                on_terminate=lambda addr=address: self._pool.release(addr),
+                on_terminate=lambda addr=address: self._runtime_session.release_ipc_client(addr),
+                lease_tracker=lease_tracker,
             )
         else:
-            relay_addr = settings.relay_address
-            if not relay_addr:
-                raise LookupError(
-                    f'Name {name!r} is not registered locally '
-                    f'and no address was provided',
-                )
-            from c_two._native import RustRelayAwareHttpClient
-
+            self._sync_relay_override()
             try:
-                client = RustRelayAwareHttpClient(relay_addr, name)
+                client = self._runtime_session.connect_via_relay(
+                    name,
+                    expected_contract[0],
+                    expected_contract[1],
+                    expected_contract[2],
+                )
             except Exception as exc:
+                if _is_crm_contract_mismatch(exc):
+                    raise
                 status = _relay_control_error_status(exc)
                 if status == 404:
                     raise ResourceNotFound(f"Resource '{name}' not found") from exc
                 if status is not None:
                     raise ResourceUnavailable(f"Relay error: {status}") from exc
+                if isinstance(exc, LookupError):
+                    raise LookupError(
+                        f'Name {name!r} is not registered locally '
+                        f'and no address was provided',
+                    ) from exc
                 raise RegistryUnavailable(f"Relay unavailable: {exc}") from exc
-            proxy = CRMProxy.http(
-                client,
-                name,
-                on_terminate=lambda: client.close(),
-            )
+            mode = getattr(client, 'mode', 'http')
+            if mode == 'ipc':
+                proxy = CRMProxy.ipc(
+                    client,
+                    name,
+                    on_terminate=lambda: client.close(),
+                    lease_tracker=lease_tracker,
+                )
+            elif mode == 'http':
+                proxy = CRMProxy.http(
+                    client,
+                    name,
+                    on_terminate=lambda: client.close(),
+                    lease_tracker=lease_tracker,
+                )
+            else:
+                raise RegistryUnavailable(f"Unsupported relay target mode: {mode!r}")
 
         crm = crm_class()
         crm.client = proxy
@@ -348,7 +443,7 @@ class _ProcessRegistry:
     def unregister(self, name: str) -> None:
         """Remove a CRM from the registry and server.
 
-        If ``C2_RELAY_ADDRESS`` is set, the CRM is also unregistered
+        If ``C2_RELAY_ANCHOR_ADDRESS`` is set, the CRM is also unregistered
         from the relay through the Rust relay control client.
 
         Parameters
@@ -358,23 +453,26 @@ class _ProcessRegistry:
         """
         with self._lock:
             server = self._server
-            server_id = self._server_id
+            runtime_session = self._runtime_session
         if server is None:
             raise KeyError(f'Name not registered: {name!r}')
 
-        server.unregister_crm(name)
-        # Explicit unregister is part of the control plane. Local state is the
-        # authority; relay cleanup is a remote discovery projection. Surface
-        # relay failures so callers know that remote cleanup is uncertain.
-        self._relay_unregister(name, server_id)
+        outcome = server.unregister_crm(
+            name,
+            runtime_session=runtime_session,
+            relay_anchor_address=None,
+        )
+        relay_error = outcome.get('relay_error')
+        if relay_error is not None:
+            raise _relay_cleanup_exception(dict(relay_error))
 
     def get_server_address(self) -> str | None:
         """IPC address of the auto-created server, or ``None``."""
-        return self._server_address
+        return self._runtime_session.server_address
 
     def get_server_id(self) -> str | None:
         """Server identity of the auto-created server, or ``None``."""
-        return self._server_id
+        return self._runtime_session.server_id
 
     @property
     def names(self) -> list[str]:
@@ -386,44 +484,61 @@ class _ProcessRegistry:
     def shutdown(self) -> None:
         """Full cleanup — shuts down server, terminates pooled clients.
 
-        If ``C2_RELAY_ADDRESS`` is set, all registered CRMs are
+        If ``C2_RELAY_ANCHOR_ADDRESS`` is set, all registered CRMs are
         unregistered from the relay before shutting down.
 
         Called automatically at process exit via :func:`atexit`.
         """
         with self._lock:
             server = self._server
-            names_to_unregister = list(server.names) if server is not None else []
-            server_id = self._server_id
+            runtime_session = self._runtime_session
+            from c_two._native import RuntimeSession
+            self._runtime_session = RuntimeSession(shm_threshold=settings.shm_threshold)
             self._server = None
-            self._server_address = None
-            self._server_id = None
-            self._server_ipc_overrides = None
-            self._server_id_override = None
-            self._client_config = None
-            self._client_ipc_overrides = None
-            self._pool_config_applied = False
 
-        self._clear_relay_control_client()
-
-        # Best-effort relay unregistration (ignore failures during shutdown).
-        for name in names_to_unregister:
-            try:
-                self._relay_unregister(name, server_id)
-            except Exception:
-                log.info(
-                    'Relay unreachable during shutdown unregister of %s — '
-                    'relay may have shut down already.', name,
-                )
+        runtime_session.set_relay_anchor_address(settings._relay_anchor_address)  # noqa: SLF001
 
         if server is not None:
             try:
-                server.shutdown()
+                outcome = server.shutdown(
+                    runtime_session=runtime_session,
+                    relay_anchor_address=None,
+                )
             except Exception:
                 log.warning('Error shutting down Server', exc_info=True)
+                outcome = {'relay_errors': []}
+        else:
+            try:
+                outcome = dict(runtime_session.shutdown(
+                    None,
+                    route_names=[],
+                    relay_anchor_address=None,
+                ))
+            except Exception:
+                log.warning('Error shutting down RuntimeSession', exc_info=True)
+                outcome = {'relay_errors': []}
 
-        self._pool.shutdown_all()
-        self._http_pool.shutdown_all()
+        for relay_error in outcome.get('relay_errors') or []:
+            error = dict(relay_error)
+            name = error.get('route_name')
+            message = error.get('message') or 'unknown relay cleanup error'
+            status = error.get('status_code')
+            if isinstance(status, int):
+                log.info(
+                    'Relay cleanup failed during shutdown unregister of %s: '
+                    'HTTP %s: %s',
+                    name,
+                    status,
+                    message,
+                )
+            else:
+                log.info(
+                    'Relay unreachable during shutdown unregister of %s — %s',
+                    name,
+                    message,
+                )
+
+        self._runtime_session.shutdown_http_clients()
     # ------------------------------------------------------------------
     # Serve (daemon mode)
     # ------------------------------------------------------------------
@@ -458,7 +573,7 @@ class _ProcessRegistry:
         with self._lock:
             server = self._server
             names = list(server.names) if server is not None else []
-            addr = self._server_address
+            addr = self._runtime_session.server_address
 
         if not names:
             log.warning(
@@ -520,162 +635,15 @@ class _ProcessRegistry:
         print('\n'.join(lines))
 
     # ------------------------------------------------------------------
-    # Relay service discovery
-    # ------------------------------------------------------------------
-
-    def _relay_register(self, name: str, server_id: str, ipc_address: str,
-                        crm_ns: str = '', crm_ver: str = ''):
-        """Notify the relay about a new CRM registration."""
-        relay_addr = settings.relay_address
-        if not relay_addr:
-            return  # No relay configured — standalone mode.
-        try:
-            self._relay_control_client_for(relay_addr).register(
-                name,
-                server_id,
-                ipc_address,
-                crm_ns,
-                crm_ver,
-            )
-            log.info('Registered CRM %s with relay at %s', name, relay_addr)
-        except Exception as exc:
-            status = _relay_control_error_status(exc)
-            if status == 409:
-                raise ResourceAlreadyRegistered(
-                    f'Route name already registered with relay: {name!r}',
-                ) from exc
-            if status is not None:
-                raise RuntimeError(
-                    f'Relay registration failed for {name!r}: HTTP {status}',
-                ) from exc
-            raise RuntimeError(
-                f'Relay registration failed for {name!r}: relay unreachable',
-            ) from exc
-
-    def _relay_unregister(
-        self,
-        name: str,
-        server_id: str | None,
-    ) -> None:
-        """Notify the relay about CRM unregistration."""
-        relay_addr = settings.relay_address
-        if not relay_addr:
-            return
-        if not server_id:
-            raise RuntimeError(f'Cannot unregister {name!r} from relay without server_id')
-        try:
-            self._relay_control_client_for(relay_addr).unregister(name, server_id)
-            log.info('Unregistered CRM %s from relay', name)
-        except Exception as exc:
-            status = _relay_control_error_status(exc)
-            if status is not None:
-                raise RuntimeError(
-                    f'Relay unregistration failed for {name!r}: HTTP {status}',
-                ) from exc
-            raise
-
-    def _relay_control_client_for(self, relay_addr: str):
-        relay_addr = relay_addr.rstrip('/')
-        with self._lock:
-            if (
-                self._relay_control_client is not None
-                and self._relay_control_address == relay_addr
-            ):
-                return self._relay_control_client
-            from c_two._native import RustRelayControlClient
-
-            client = RustRelayControlClient(relay_addr)
-            self._relay_control_client = client
-            self._relay_control_address = relay_addr
-            return client
-
-    def _clear_relay_control_client(self) -> None:
-        with self._lock:
-            client = self._relay_control_client
-            self._relay_control_client = None
-            self._relay_control_address = None
-        if client is not None and hasattr(client, "clear_cache"):
-            client.clear_cache()
-
-    # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
 
-    def _build_client_config(self) -> dict[str, object]:
-        if self._client_config is not None:
-            return self._client_config
-        self._client_config = _resolve_client_ipc_config(
-            self._client_ipc_overrides,
-            settings,
-        )
-        return self._client_config
+    def _server_started(self) -> bool:
+        return self._server is not None and self._server.is_started()
 
-    def _ensure_pool_config(self) -> None:
-        """Apply pool default config exactly once (thread-safe)."""
-        with self._lock:
-            if self._pool_config_applied:
-                return
-            cfg = self._build_client_config()
-            self._pool.set_default_config(
-                shm_threshold=cfg['shm_threshold'],
-                pool_enabled=cfg['pool_enabled'],
-                pool_segment_size=cfg['pool_segment_size'],
-                max_pool_segments=cfg['max_pool_segments'],
-                reassembly_segment_size=cfg['reassembly_segment_size'],
-                reassembly_max_segments=cfg['reassembly_max_segments'],
-                max_total_chunks=cfg['max_total_chunks'],
-                chunk_gc_interval=cfg['chunk_gc_interval'],
-                chunk_threshold_ratio=cfg['chunk_threshold_ratio'],
-                chunk_assembler_timeout=cfg['chunk_assembler_timeout'],
-                max_reassembly_bytes=cfg['max_reassembly_bytes'],
-                chunk_size=cfg['chunk_size'],
-            )
-            self._pool_config_applied = True
+    def _sync_relay_override(self) -> None:
+        self._runtime_session.set_relay_anchor_address(settings._relay_anchor_address)  # noqa: SLF001
 
-    def _rollback_registration(self, name: str) -> None:
-        """Undo a local registration after relay registration fails."""
-        with self._lock:
-            server = self._server
-
-        if server is None or name not in server.names:
-            return
-
-        try:
-            server.unregister_crm(name)
-        except Exception:
-            log.warning('Failed to rollback local CRM %s', name, exc_info=True)
-            return
-
-        with self._lock:
-            should_shutdown = self._server is server and not server.names
-
-        if should_shutdown and server is not None:
-            try:
-                server.shutdown()
-            except Exception:
-                log.warning('Failed to shutdown server during rollback', exc_info=True)
-            with self._lock:
-                if self._server is server and not server.names:
-                    self._server = None
-                    self._server_address = None
-                    self._server_id = None
-
-    @staticmethod
-    def _clean_server_id(server_id: str | None) -> str | None:
-        if server_id is None:
-            return None
-        from c_two._native import validate_server_id
-
-        validate_server_id(server_id)
-        return server_id
-
-    @staticmethod
-    def _auto_server_id() -> str:
-        return f'cc{os.getpid():x}{uuid.uuid4().hex}'
-
-    @staticmethod
-    def _address_for_server_id(server_id: str) -> str:
-        return f'ipc://{server_id}'
 
 
 # ------------------------------------------------------------------
@@ -690,20 +658,23 @@ def set_transport_policy(*, shm_threshold: int | None = None) -> None:
 def set_server(
     *,
     server_id: str | None = None,
-    ipc_overrides: ServerIPCOverrides | None = None,
+    ipc_overrides: ServerIPCOverrides | Mapping[str, object] | None = None,
 ) -> None:
     """Configure IPC server. Call before register()."""
     _ProcessRegistry.get().set_server(server_id=server_id, ipc_overrides=ipc_overrides)
 
 
-def set_client(*, ipc_overrides: ClientIPCOverrides | None = None) -> None:
+def set_client(
+    *,
+    ipc_overrides: ClientIPCOverrides | Mapping[str, object] | None = None,
+) -> None:
     """Configure IPC client. Call before connect()."""
     _ProcessRegistry.get().set_client(ipc_overrides=ipc_overrides)
 
 
-def set_relay(address: str) -> None:
-    """Set the relay address for name resolution."""
-    _ProcessRegistry.get().set_relay(address)
+def set_relay_anchor(address: str) -> None:
+    """Set the relay anchor address for name resolution."""
+    _ProcessRegistry.get().set_relay_anchor(address)
 
 
 def register(
@@ -785,18 +756,16 @@ def serve(blocking: bool = True) -> None:
 
 
 def hold_stats() -> dict:
-    """Return hold-mode SHM tracking statistics.
+    """Return retained runtime buffer tracking statistics.
 
     Returns dict with:
-    - active_holds: number of currently held SHM buffers
-    - total_held_bytes: total bytes pinned in SHM
+    - active_holds: number of currently retained runtime buffers
+    - total_held_bytes: total retained runtime buffer bytes
     - oldest_hold_seconds: age of oldest active hold
+    - by_storage: retained counts by inline, SHM, handle, and file-spill storage
     """
-    inst = _ProcessRegistry._instance
-    server = inst._server if inst else None
-    if server is None:
-        return {'active_holds': 0, 'total_held_bytes': 0, 'oldest_hold_seconds': 0}
-    return server.hold_stats()
+    inst = _ProcessRegistry.get()
+    return dict(inst._runtime_session.hold_stats())  # noqa: SLF001
 
 
 # Auto-cleanup on process exit.

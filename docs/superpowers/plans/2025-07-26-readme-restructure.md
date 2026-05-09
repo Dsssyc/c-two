@@ -298,7 +298,7 @@ import c_two as cc
 
 cc.set_address('ipc://grid_server')
 cc.register(IGrid, grid_instance, name='grid')
-# Auto-registers with relay when C2_RELAY_ADDRESS is set
+# Auto-registers with relay when C2_RELAY_ANCHOR_ADDRESS is set
 cc.serve()
 ```
 
@@ -748,7 +748,7 @@ import c_two as cc
 
 cc.set_address('ipc://grid_server')
 cc.register(IGrid, grid_instance, name='grid')
-# 设置 C2_RELAY_ADDRESS 环境变量后自动注册到中继
+# 设置 C2_RELAY_ANCHOR_ADDRESS 环境变量后自动注册到中继
 cc.serve()
 ```
 

@@ -30,8 +30,8 @@ uv sync --reinstall-package c-two
 ## Running Tests
 
 ```bash
-# Full Python test suite (set C2_RELAY_ADDRESS= to avoid env interference)
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30
+# Full Python test suite (set C2_RELAY_ANCHOR_ADDRESS= to avoid env interference)
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30
 
 # Single file / single test
 uv run pytest sdk/python/tests/unit/test_wire.py -q
@@ -42,7 +42,7 @@ cargo test --manifest-path core/Cargo.toml --workspace
 
 # Python SDK native extension and tests
 uv sync --reinstall-package c-two
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests -q --timeout=30
 ```
 
 All new code **must** include tests. Ensure the full suite passes before opening a PR.
@@ -110,7 +110,7 @@ examples/python/
 
 ## Environment Variables
 
-Tests may be affected by `C2_*` environment variables. Always prefix test runs with `C2_RELAY_ADDRESS=` to isolate from your local environment. See `.env.example` for the full reference.
+Tests may be affected by `C2_*` environment variables. Always prefix test runs with `C2_RELAY_ANCHOR_ADDRESS=` to isolate from your local environment. See `.env.example` for the full reference.
 
 ## Questions?
 

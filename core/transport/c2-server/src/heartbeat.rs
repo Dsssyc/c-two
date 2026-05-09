@@ -1,8 +1,7 @@
 //! Heartbeat probing for a single connection.
 //!
-//! Mirrors the Python `run_heartbeat()` from
-//! `c_two.transport.server.heartbeat`.  Periodically checks idle time
-//! and sends a PING signal frame when the connection is quiet.
+//! Periodically checks idle time and sends a PING signal frame when the
+//! connection is quiet.
 
 use std::sync::Arc;
 

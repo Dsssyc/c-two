@@ -117,7 +117,7 @@ class TestHeldResultBasic:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/unit/test_held_result.py -v`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/unit/test_held_result.py -v`
 Expected: FAIL — `ImportError: cannot import name 'HeldResult'`
 
 - [ ] **Step 3: Implement `HeldResult` in `transferable.py`**
@@ -191,12 +191,12 @@ class HeldResult:
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/unit/test_held_result.py -v`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/unit/test_held_result.py -v`
 Expected: All PASS
 
 - [ ] **Step 5: Verify no regressions**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30`
 Expected: 553+ passed
 
 - [ ] **Step 6: Commit**
@@ -269,7 +269,7 @@ class TestHoldFunction:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/unit/test_held_result.py::TestHoldFunction -v`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/unit/test_held_result.py::TestHoldFunction -v`
 Expected: FAIL — `ImportError: cannot import name 'hold'`
 
 - [ ] **Step 3: Implement `hold()` in `transferable.py`**
@@ -305,7 +305,7 @@ def hold(method):
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/unit/test_held_result.py -v`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/unit/test_held_result.py -v`
 Expected: All PASS
 
 - [ ] **Step 5: Commit**
@@ -402,7 +402,7 @@ class TestTransferDecorator:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/unit/test_transfer_decorator.py -v`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/unit/test_transfer_decorator.py -v`
 Expected: FAIL — current `transfer()` returns a wrapping closure, not the original function
 
 - [ ] **Step 3: Rewrite `transfer()` as metadata-only, extract `_build_transfer_wrapper()`**
@@ -613,7 +613,7 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/unit/test_transfer_decorator.py tests/unit/test_held_result.py -v`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/unit/test_transfer_decorator.py tests/unit/test_held_result.py -v`
 Expected: All PASS
 
 - [ ] **Step 5: Update `auto_transfer` to call `_build_transfer_wrapper()` instead of old `transfer()`**
@@ -634,7 +634,7 @@ Also update any direct `transfer()` callsites in tests:
 
 - [ ] **Step 6: Verify no regressions**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30`
 Expected: 553+ passed (auto_transfer now calls _build_transfer_wrapper, existing behavior preserved)
 
 - [ ] **Step 7: Commit**
@@ -692,7 +692,7 @@ class TestAutoTransferWithConfig:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/unit/test_transfer_decorator.py::TestAutoTransferWithConfig -v`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/unit/test_transfer_decorator.py::TestAutoTransferWithConfig -v`
 Expected: FAIL — `auto_transfer` doesn't accept kwargs yet
 
 - [ ] **Step 3: Rewrite `auto_transfer` to accept kwargs (keep Priority 2 for now)**
@@ -780,7 +780,7 @@ Key changes from the old version:
 
 - [ ] **Step 4: Run all tests**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30`
 Expected: All pass (Priority 2 still works, kwargs are additive)
 
 - [ ] **Step 5: Commit**
@@ -876,7 +876,7 @@ class TestIcrmTransferIntegration:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/unit/test_transfer_decorator.py::TestIcrmTransferIntegration -v`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/unit/test_transfer_decorator.py::TestIcrmTransferIntegration -v`
 Expected: FAIL — `icrm()` doesn't detect `__cc_transfer__`
 
 - [ ] **Step 3: Update `icrm()` in `meta.py`**
@@ -898,7 +898,7 @@ Modify the method loop in `icrm()` (L113–118):
 
 - [ ] **Step 4: Run all tests**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30`
 Expected: All pass
 
 - [ ] **Step 5: Commit**
@@ -1049,7 +1049,7 @@ Remove or update tests that reference `_buffer_mode` on the type or `@cc.transfe
 
 - [ ] **Step 8: Run all tests**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30`
 Expected: All pass
 
 - [ ] **Step 9: Commit**
@@ -1151,7 +1151,7 @@ def test_matching_transferable_uses_existing(self):
 
 - [ ] **Step 5: Run all tests**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30`
 Expected: All pass
 
 - [ ] **Step 6: Commit**
@@ -1367,7 +1367,7 @@ class TestIPCHoldMode:
 
 - [ ] **Step 5: Run all tests**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30`
 Expected: All pass
 
 - [ ] **Step 6: Commit**

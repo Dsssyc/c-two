@@ -40,7 +40,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=resolved_relay_url(DEFAULT_RELAY_URL),
         help=(
             'HTTP relay URL used for name registration '
-            f'(default: C2_RELAY_ADDRESS or {DEFAULT_RELAY_URL}).'
+            f'(default: C2_RELAY_ANCHOR_ADDRESS or {DEFAULT_RELAY_URL}).'
         ),
     )
     args = parser.parse_args(argv)
@@ -53,7 +53,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    cc.set_relay(args.relay_url)
+    cc.set_relay_anchor(args.relay_url)
 
     grid = NestedGrid(
         2326,

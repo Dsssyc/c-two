@@ -132,7 +132,7 @@ Key changes:
 - [ ] **Step 2: Run tests**
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30
 ```
 
 Expected: All tests pass. The change is backward-compatible — small responses still return bytes, and the Rust-side `parse_response_meta` already handles both bytes and tuple returns.
@@ -490,7 +490,7 @@ Expected: compiles cleanly.
 ```bash
 cd /Users/soku/Desktop/codespace/WorldInProgress/c-two
 uv sync --reinstall-package c-two
-C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30
 ```
 
 Expected: All tests pass. The logic change is transparent — `call()` still takes the same arguments and returns `PyResponseBuffer`.
@@ -582,7 +582,7 @@ Note: The test fixture `ipc_echo_server` may need to be created or adapted from 
 - [ ] **Step 2: Run tests**
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest tests/integration/test_zero_copy_ipc.py -v --timeout=60
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/integration/test_zero_copy_ipc.py -v --timeout=60
 ```
 
 Expected: All tests pass.
@@ -608,7 +608,7 @@ Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 
 ```bash
 cd /Users/soku/Desktop/codespace/WorldInProgress/c-two
-C2_RELAY_ADDRESS= uv run python benchmarks/three_mode_benchmark.py
+C2_RELAY_ANCHOR_ADDRESS= uv run python benchmarks/three_mode_benchmark.py
 ```
 
 This runs the 3-mode benchmark (Thread/IPC-bytes/IPC-dict) across sizes from 64B to 1GB.

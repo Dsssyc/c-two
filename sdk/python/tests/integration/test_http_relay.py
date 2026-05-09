@@ -2,7 +2,8 @@
 
 Tests the full pipeline: RustHttpClient -> standalone c3 relay -> RustClient -> Server -> CRM
 
-Also tests ``cc.connect(address='http://...')`` end-to-end.
+Also tests ``cc.connect(address='http://...')`` end-to-end through the native
+relay-aware explicit HTTP projection.
 """
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ import httpx
 
 import c_two as cc
 from c_two.config.settings import settings
+from c_two.error import ResourceNotFound
 from c_two._native import RustHttpClientPool
 from c_two.transport.client.proxy import CRMProxy
 from c_two.transport.registry import _ProcessRegistry
@@ -32,6 +34,18 @@ def _acquire_http(url: str):
 def _release_http(url: str):
     """Release a RustHttpClient reference back to the pool."""
     RustHttpClientPool.instance().release(url)
+
+
+def _server_instance_id_for(registry: _ProcessRegistry, address: str) -> str:
+    """Read the IPC server instance identity from the native handshake."""
+    client = registry._runtime_session.acquire_ipc_client(address)  # noqa: SLF001
+    try:
+        instance_id = client.server_instance_id
+        assert isinstance(instance_id, str)
+        assert instance_id
+        return instance_id
+    finally:
+        registry._runtime_session.release_ipc_client(address)  # noqa: SLF001
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +72,7 @@ def relay_stack(start_c3_relay):
     cc.register(Counter, CounterImpl(), name='counter')
     ipc_addr = cc.server_address()
     server_id = cc.server_id()
+    server_instance_id = _server_instance_id_for(_ProcessRegistry.get(), ipc_addr)
 
     relay = start_c3_relay()
     relay_url = relay.url
@@ -66,7 +81,12 @@ def relay_stack(start_c3_relay):
         for name in ('hello', 'counter'):
             resp = http.post(
                 f'{relay_url}/_register',
-                json={'name': name, 'server_id': server_id, 'address': ipc_addr},
+                json={
+                    'name': name,
+                    'server_id': server_id,
+                    'server_instance_id': server_instance_id,
+                    'address': ipc_addr,
+                },
             )
             assert resp.status_code == 201
 
@@ -229,16 +249,26 @@ class TestCcConnectHttp:
             cc.close(hello)
             cc.close(counter)
 
-    def test_connect_http_close_releases_pool(self, relay_stack):
-        """cc.close releases the HTTP pool reference."""
+    def test_connect_http_rejects_crm_contract_mismatch_before_call(self, relay_stack):
+        relay_url, _ = relay_stack
+
+        with pytest.raises(RuntimeError, match='CRM contract mismatch'):
+            cc.connect(Counter, name='hello', address=relay_url)
+
+    def test_connect_http_close_closes_relay_aware_client(self, relay_stack):
+        """cc.close closes the relay-aware explicit HTTP client."""
         relay_url, _ = relay_stack
         registry = _ProcessRegistry.get()
 
         crm = cc.connect(Hello, name='hello', address=relay_url)
-        assert registry._http_pool.refcount(relay_url) == 1
+        native_client = crm.client._client  # noqa: SLF001
+        assert native_client.mode == 'http'
+        assert registry._runtime_session.http_client_refcount(relay_url) == 0
 
         cc.close(crm)
-        assert registry._http_pool.refcount(relay_url) == 0
+        with pytest.raises(RuntimeError, match='closed'):
+            native_client.call('hello', 'greeting', b'')
+        assert registry._runtime_session.http_client_refcount(relay_url) == 0
 
     def test_connect_http_with_slash_in_name(self, start_c3_relay):
         """CRM names containing '/' (toodle-style resource paths) work over HTTP relay.
@@ -252,13 +282,19 @@ class TestCcConnectHttp:
         cc.register(Hello, HelloImpl(), name=slashed_name)
         ipc_addr = cc.server_address()
         server_id = cc.server_id()
+        server_instance_id = _server_instance_id_for(_ProcessRegistry.get(), ipc_addr)
 
         relay = start_c3_relay()
         relay_url = relay.url
         with httpx.Client(trust_env=False, timeout=5.0) as http:
             resp = http.post(
                 f'{relay_url}/_register',
-                json={'name': slashed_name, 'server_id': server_id, 'address': ipc_addr},
+                json={
+                    'name': slashed_name,
+                    'server_id': server_id,
+                    'server_instance_id': server_instance_id,
+                    'address': ipc_addr,
+                },
             )
             assert resp.status_code == 201
 
@@ -268,6 +304,132 @@ class TestCcConnectHttp:
             assert crm.greeting('Slash') == 'Hello, Slash!'
         finally:
             cc.close(crm)
+
+    def test_no_address_connect_uses_env_relay_projection(self, start_c3_relay, monkeypatch):
+        name = 'runtime/session/env-relay-connect'
+        relay = start_c3_relay()
+        relay_url = relay.url
+        previous_relay = settings.relay_anchor_address
+        registrar = _ProcessRegistry()
+        resolver = _ProcessRegistry()
+        crm = None
+        try:
+            monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', relay_url)
+            settings.relay_anchor_address = None
+            registrar.register(Hello, HelloImpl(), name=name)
+            assert registrar.get_server_address() is not None
+
+            crm = resolver.connect(Hello, name=name)
+            assert crm.client._mode == 'ipc'
+            assert crm.greeting('EnvRelay') == 'Hello, EnvRelay!'
+        finally:
+            if crm is not None:
+                resolver.close(crm)
+            resolver.shutdown()
+            settings.relay_anchor_address = previous_relay
+            registrar.shutdown()
+            settings.relay_anchor_address = previous_relay
+
+    def test_no_address_connect_uses_runtime_session_relay_projection(self, start_c3_relay):
+        name = 'runtime/session/relay-connect'
+        relay = start_c3_relay()
+        relay_url = relay.url
+        previous_relay = settings.relay_anchor_address
+        registrar = _ProcessRegistry()
+        resolver = _ProcessRegistry()
+        crm = None
+        try:
+            registrar.set_relay_anchor(relay_url)
+            registrar.register(Hello, HelloImpl(), name=name)
+            assert registrar.get_server_address() is not None
+
+            resolver.set_relay_anchor(relay_url)
+            crm = resolver.connect(Hello, name=name)
+            assert crm.client._mode == 'ipc'
+            assert crm.greeting('RuntimeRelay') == 'Hello, RuntimeRelay!'
+        finally:
+            if crm is not None:
+                resolver.close(crm)
+            resolver.shutdown()
+            settings.relay_anchor_address = previous_relay
+            registrar.shutdown()
+            settings.relay_anchor_address = previous_relay
+
+    def test_name_only_connect_uses_verified_ipc_for_local_anchor(self, start_c3_relay):
+        name = 'identity/verified/local-ipc'
+        relay = start_c3_relay()
+        relay_url = relay.url
+        previous_relay = settings.relay_anchor_address
+        registrar = _ProcessRegistry()
+        resolver = _ProcessRegistry()
+        crm = None
+        try:
+            registrar.set_relay_anchor(relay_url)
+            registrar.register(Hello, HelloImpl(), name=name)
+            resolver.set_relay_anchor(relay_url)
+
+            crm = resolver.connect(Hello, name=name)
+
+            assert crm.client._mode == 'ipc'  # noqa: SLF001
+            assert crm.greeting('Identity') == 'Hello, Identity!'
+        finally:
+            if crm is not None:
+                resolver.close(crm)
+            resolver.shutdown()
+            settings.relay_anchor_address = previous_relay
+            registrar.shutdown()
+            settings.relay_anchor_address = previous_relay
+
+    def test_relay_local_ipc_contract_mismatch_does_not_fallback_to_http(self, start_c3_relay):
+        name = 'identity/local-ipc-contract-mismatch'
+        relay = start_c3_relay(skip_ipc_validation=True)
+        relay_url = relay.url
+        previous_relay = settings.relay_anchor_address
+        registrar = _ProcessRegistry()
+        resolver = _ProcessRegistry()
+        try:
+            registrar.register(Hello, HelloImpl(), name=name)
+            ipc_addr = registrar.get_server_address()
+            server_id = registrar.get_server_id()
+            assert ipc_addr is not None
+            assert server_id is not None
+            server_instance_id = _server_instance_id_for(registrar, ipc_addr)
+
+            with httpx.Client(trust_env=False, timeout=5.0) as http:
+                resp = http.post(
+                    f'{relay_url}/_register',
+                    json={
+                        'name': name,
+                        'server_id': server_id,
+                        'server_instance_id': server_instance_id,
+                        'address': ipc_addr,
+                        'crm_ns': 'test.counter',
+                        'crm_name': 'Counter',
+                        'crm_ver': '0.1.0',
+                    },
+                )
+                assert resp.status_code == 201
+
+            resolver.set_relay_anchor(relay_url)
+            with pytest.raises(RuntimeError, match='CRM contract mismatch'):
+                resolver.connect(Counter, name=name)
+        finally:
+            resolver.shutdown()
+            settings.relay_anchor_address = previous_relay
+            registrar.shutdown()
+            settings.relay_anchor_address = previous_relay
+
+    def test_no_address_relay_connect_maps_missing_route_to_resource_not_found(self, start_c3_relay):
+        relay = start_c3_relay()
+        previous_relay = settings.relay_anchor_address
+        registry = _ProcessRegistry()
+        try:
+            registry.set_relay_anchor(relay.url)
+            with pytest.raises(ResourceNotFound, match="Resource 'missing-route' not found"):
+                registry.connect(Hello, name='missing-route')
+        finally:
+            registry.shutdown()
+            settings.relay_anchor_address = previous_relay
 
     def test_relay_traffic_bypasses_system_proxy(self, monkeypatch, start_c3_relay):
         """All relay HTTP traffic must ignore HTTP_PROXY by default.
@@ -291,15 +453,15 @@ class TestCcConnectHttp:
         name = 'proxy/bypass/test'
         relay = start_c3_relay()
         relay_url = relay.url
-        previous_relay = settings.relay_address
+        previous_relay = settings.relay_anchor_address
         registrar = _ProcessRegistry()
         resolver = _ProcessRegistry()
         crm = None
         try:
-            registrar.set_relay(relay_url)
+            registrar.set_relay_anchor(relay_url)
             # Registration uses the Rust relay control client and must bypass proxies.
             registrar.register(Hello, HelloImpl(), name=name)
-            resolver.set_relay(relay_url)
+            resolver.set_relay_anchor(relay_url)
 
             # No-address connect resolves through the Rust relay control client.
             crm = resolver.connect(Hello, name=name)
@@ -309,9 +471,9 @@ class TestCcConnectHttp:
             if crm is not None:
                 resolver.close(crm)
             resolver.shutdown()
-            settings.relay_address = previous_relay
+            settings.relay_anchor_address = previous_relay
             registrar.shutdown()
-            settings.relay_address = previous_relay
+            settings.relay_anchor_address = previous_relay
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +499,7 @@ class TestRelayControlPlane:
         cc.register(Hello, HelloImpl(), name='hello')
         ipc_addr = cc.server_address()
         server_id = cc.server_id()
+        server_instance_id = _server_instance_id_for(_ProcessRegistry.get(), ipc_addr)
 
         relay = start_c3_relay()
         relay_url = relay.url
@@ -345,7 +508,12 @@ class TestRelayControlPlane:
             # Register via control endpoint.
             resp = http.post(
                 f'{relay_url}/_register',
-                json={'name': 'hello', 'server_id': server_id, 'address': ipc_addr},
+                json={
+                    'name': 'hello',
+                    'server_id': server_id,
+                    'server_instance_id': server_instance_id,
+                    'address': ipc_addr,
+                },
             )
             assert resp.status_code == 201
             assert resp.json()['registered'] == 'hello'
@@ -357,6 +525,7 @@ class TestRelayControlPlane:
             assert any(r['name'] == 'hello' for r in routes)
             route = next(r for r in routes if r['name'] == 'hello')
             assert 'server_id' not in route
+            assert 'server_instance_id' not in route
             assert 'ipc_address' not in route
 
         # Verify data-plane call works.
@@ -373,6 +542,7 @@ class TestRelayControlPlane:
         cc.register(Hello, HelloImpl(), name='hello')
         ipc_addr = cc.server_address()
         server_id = cc.server_id()
+        server_instance_id = _server_instance_id_for(_ProcessRegistry.get(), ipc_addr)
 
         relay = start_c3_relay()
         relay_url = relay.url
@@ -380,14 +550,24 @@ class TestRelayControlPlane:
         with httpx.Client(trust_env=False, timeout=5.0) as http:
             resp = http.post(
                 f'{relay_url}/_register',
-                json={'name': 'hello', 'server_id': server_id, 'address': ipc_addr},
+                json={
+                    'name': 'hello',
+                    'server_id': server_id,
+                    'server_instance_id': server_instance_id,
+                    'address': ipc_addr,
+                },
             )
             assert resp.status_code == 201
 
             # Same-relay duplicate registration uses upsert semantics.
             resp = http.post(
                 f'{relay_url}/_register',
-                json={'name': 'hello', 'server_id': server_id, 'address': ipc_addr},
+                json={
+                    'name': 'hello',
+                    'server_id': server_id,
+                    'server_instance_id': server_instance_id,
+                    'address': ipc_addr,
+                },
             )
             assert resp.status_code == 200
 
@@ -396,6 +576,7 @@ class TestRelayControlPlane:
         cc.register(Hello, HelloImpl(), name='hello')
         ipc_addr = cc.server_address()
         server_id = cc.server_id()
+        server_instance_id = _server_instance_id_for(_ProcessRegistry.get(), ipc_addr)
 
         relay = start_c3_relay()
         relay_url = relay.url
@@ -404,7 +585,12 @@ class TestRelayControlPlane:
             # Register, then unregister.
             http.post(
                 f'{relay_url}/_register',
-                json={'name': 'hello', 'server_id': server_id, 'address': ipc_addr},
+                json={
+                    'name': 'hello',
+                    'server_id': server_id,
+                    'server_instance_id': server_instance_id,
+                    'address': ipc_addr,
+                },
             )
             resp = http.post(
                 f'{relay_url}/_unregister',
@@ -442,6 +628,7 @@ class TestRelayControlPlane:
         cc.register(Counter, CounterImpl(), name='counter')
         ipc_addr = cc.server_address()
         server_id = cc.server_id()
+        server_instance_id = _server_instance_id_for(_ProcessRegistry.get(), ipc_addr)
 
         relay = start_c3_relay()
         relay_url = relay.url
@@ -450,7 +637,12 @@ class TestRelayControlPlane:
             for name in ('hello', 'counter'):
                 resp = http.post(
                     f'{relay_url}/_register',
-                    json={'name': name, 'server_id': server_id, 'address': ipc_addr},
+                    json={
+                        'name': name,
+                        'server_id': server_id,
+                        'server_instance_id': server_instance_id,
+                        'address': ipc_addr,
+                    },
                 )
                 assert resp.status_code == 201
 

@@ -1,6 +1,7 @@
 //! Relay-aware HTTP client with route failover.
 
 use std::collections::HashSet;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,21 +19,49 @@ struct RelayErrorBody {
 #[derive(Debug, Clone, Copy)]
 pub struct RelayAwareClientConfig {
     pub max_attempts: usize,
+    pub call_timeout_secs: f64,
 }
 
 impl Default for RelayAwareClientConfig {
     fn default() -> Self {
-        Self { max_attempts: 3 }
+        Self {
+            max_attempts: 3,
+            call_timeout_secs: 300.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayLocalIpcCandidate {
+    pub address: String,
+    pub server_id: String,
+    pub server_instance_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RelayResolvedTarget {
+    Ipc { candidate: RelayLocalIpcCandidate },
+    Http { relay_url: String },
+}
+
+impl RelayResolvedTarget {
+    pub fn as_url(&self) -> &str {
+        match self {
+            Self::Ipc { candidate } => &candidate.address,
+            Self::Http { relay_url } => relay_url,
+        }
     }
 }
 
 pub struct RelayAwareHttpClient {
-    control: RelayControlClient,
+    control: Arc<RelayControlClient>,
     pool: &'static HttpClientPool,
     route_name: String,
     use_proxy: bool,
     config: RelayAwareClientConfig,
     current: Mutex<Option<String>>,
+    anchor_allows_local_ipc: bool,
+    expected_crm: Option<(String, String, String)>,
 }
 
 impl RelayAwareHttpClient {
@@ -42,14 +71,47 @@ impl RelayAwareHttpClient {
         use_proxy: bool,
         config: RelayAwareClientConfig,
     ) -> Result<Self, HttpError> {
-        Ok(Self {
-            control: RelayControlClient::new(relay_url, use_proxy)?,
+        let control = Arc::new(RelayControlClient::new(relay_url, use_proxy)?);
+        Ok(Self::new_with_control(
+            control, route_name, use_proxy, config,
+        ))
+    }
+
+    pub fn new_with_control(
+        control: Arc<RelayControlClient>,
+        route_name: &str,
+        use_proxy: bool,
+        config: RelayAwareClientConfig,
+    ) -> Self {
+        Self {
+            anchor_allows_local_ipc: relay_anchor_allows_local_ipc(control.base_url()),
+            control,
             pool: HttpClientPool::instance(),
             route_name: route_name.to_string(),
             use_proxy,
             config,
             current: Mutex::new(None),
-        })
+            expected_crm: None,
+        }
+    }
+
+    pub fn with_expected_crm(mut self, crm_ns: &str, crm_name: &str, crm_ver: &str) -> Self {
+        if !crm_ns.is_empty() || !crm_name.is_empty() || !crm_ver.is_empty() {
+            self.expected_crm = Some((
+                crm_ns.to_string(),
+                crm_name.to_string(),
+                crm_ver.to_string(),
+            ));
+        }
+        self
+    }
+
+    fn expected_crm_tuple(&self) -> Option<(&str, &str, &str)> {
+        self.expected_crm
+            .as_ref()
+            .map(|(crm_ns, crm_name, crm_ver)| {
+                (crm_ns.as_str(), crm_name.as_str(), crm_ver.as_str())
+            })
     }
 
     pub fn call(&self, method_name: &str, data: &[u8]) -> Result<Vec<u8>, HttpError> {
@@ -64,7 +126,37 @@ impl RelayAwareHttpClient {
             .block_on(self.connect_async())
     }
 
+    pub fn resolve_target(&self) -> Result<RelayResolvedTarget, HttpError> {
+        super::client::runtime()
+            .handle()
+            .block_on(self.resolve_target_async())
+    }
+
+    pub fn resolve_http_target(&self) -> Result<RelayResolvedTarget, HttpError> {
+        super::client::runtime()
+            .handle()
+            .block_on(self.resolve_http_target_async())
+    }
+
     async fn connect_async(&self) -> Result<(), HttpError> {
+        match self.select_target_async(false).await? {
+            RelayResolvedTarget::Http { .. } => Ok(()),
+            RelayResolvedTarget::Ipc { .. } => unreachable!("HTTP selection cannot return IPC"),
+        }
+    }
+
+    pub async fn resolve_target_async(&self) -> Result<RelayResolvedTarget, HttpError> {
+        self.select_target_async(true).await
+    }
+
+    pub async fn resolve_http_target_async(&self) -> Result<RelayResolvedTarget, HttpError> {
+        self.select_target_async(false).await
+    }
+
+    async fn select_target_async(
+        &self,
+        prefer_local_ipc: bool,
+    ) -> Result<RelayResolvedTarget, HttpError> {
         let attempts = self.config.max_attempts.max(1);
         let mut last_error = None;
         let mut excluded_routes = HashSet::new();
@@ -87,6 +179,12 @@ impl RelayAwareHttpClient {
                 }
             };
 
+            if let Some(candidate) =
+                select_local_ipc_candidate(prefer_local_ipc, self.anchor_allows_local_ipc, &routes)
+            {
+                return Ok(RelayResolvedTarget::Ipc { candidate });
+            }
+
             let ordered = self.order_routes(routes, &excluded_routes);
             if ordered.is_empty() {
                 return Err(last_error.unwrap_or_else(|| {
@@ -99,10 +197,11 @@ impl RelayAwareHttpClient {
 
             for route in ordered {
                 let relay_url = route.relay_url.trim_end_matches('/').to_string();
-                let client = match self
-                    .pool
-                    .acquire_with_proxy_policy(&relay_url, self.use_proxy)
-                {
+                let client = match self.pool.acquire_with_options(
+                    &relay_url,
+                    self.use_proxy,
+                    self.config.call_timeout_secs,
+                ) {
                     Ok(client) => RelayPoolGuard {
                         pool: self.pool,
                         relay_url: relay_url.clone(),
@@ -114,10 +213,17 @@ impl RelayAwareHttpClient {
                     }
                 };
 
-                match client.client.probe_route_async(&self.route_name).await {
+                match client
+                    .client
+                    .probe_route_with_expected_crm_async(
+                        &self.route_name,
+                        self.expected_crm_tuple(),
+                    )
+                    .await
+                {
                     Ok(()) => {
-                        *self.current.lock() = Some(relay_url);
-                        return Ok(());
+                        *self.current.lock() = Some(relay_url.clone());
+                        return Ok(RelayResolvedTarget::Http { relay_url });
                     }
                     Err(err) if route_is_stale(&err) => {
                         self.control.invalidate(&self.route_name);
@@ -177,10 +283,11 @@ impl RelayAwareHttpClient {
             }
             for route in ordered {
                 let relay_url = route.relay_url.trim_end_matches('/').to_string();
-                let client = match self
-                    .pool
-                    .acquire_with_proxy_policy(&relay_url, self.use_proxy)
-                {
+                let client = match self.pool.acquire_with_options(
+                    &relay_url,
+                    self.use_proxy,
+                    self.config.call_timeout_secs,
+                ) {
                     Ok(client) => RelayPoolGuard {
                         pool: self.pool,
                         relay_url: relay_url.clone(),
@@ -194,7 +301,12 @@ impl RelayAwareHttpClient {
 
                 match client
                     .client
-                    .call_async(&self.route_name, method_name, data)
+                    .call_with_expected_crm_async(
+                        &self.route_name,
+                        method_name,
+                        data,
+                        self.expected_crm_tuple(),
+                    )
                     .await
                 {
                     Ok(bytes) => {
@@ -228,7 +340,44 @@ impl RelayAwareHttpClient {
         if force_refresh {
             self.control.invalidate(&self.route_name);
         }
-        self.control.resolve_async(&self.route_name).await
+        let expected_crm = self.expected_crm_tuple();
+        let routes = match expected_crm {
+            Some((crm_ns, crm_name, crm_ver)) => {
+                self.control
+                    .resolve_matching_async(&self.route_name, crm_ns, crm_name, crm_ver)
+                    .await?
+            }
+            None => self.control.resolve_async(&self.route_name).await?,
+        };
+        let raw_routes_non_empty = !routes.is_empty();
+        let filtered = filter_routes_by_expected_crm(routes, expected_crm);
+        if !force_refresh && expected_crm.is_some() && raw_routes_non_empty && filtered.is_empty() {
+            self.control.invalidate(&self.route_name);
+            let refreshed = match expected_crm {
+                Some((crm_ns, crm_name, crm_ver)) => {
+                    self.control
+                        .resolve_matching_async(&self.route_name, crm_ns, crm_name, crm_ver)
+                        .await?
+                }
+                None => self.control.resolve_async(&self.route_name).await?,
+            };
+            let refreshed_routes_non_empty = !refreshed.is_empty();
+            let refreshed_filtered = filter_routes_by_expected_crm(refreshed, expected_crm);
+            if refreshed_routes_non_empty && refreshed_filtered.is_empty() {
+                return Err(HttpError::ServerError(
+                    409,
+                    crm_contract_mismatch_body(&self.route_name),
+                ));
+            }
+            return Ok(refreshed_filtered);
+        }
+        if force_refresh && expected_crm.is_some() && raw_routes_non_empty && filtered.is_empty() {
+            return Err(HttpError::ServerError(
+                409,
+                crm_contract_mismatch_body(&self.route_name),
+            ));
+        }
+        Ok(filtered)
     }
 
     fn order_routes(
@@ -290,11 +439,69 @@ fn relay_error_body(error: &str, route_name: &str) -> String {
     .to_string()
 }
 
+fn crm_contract_mismatch_body(route_name: &str) -> String {
+    json!({
+        "error": "CRMContractMismatch",
+        "route": route_name,
+        "message": format!("CRM contract mismatch for route {route_name}"),
+    })
+    .to_string()
+}
+
 fn resolve_retryable(err: &HttpError) -> bool {
     matches!(
         err,
         HttpError::Transport(_) | HttpError::ServerError(500..=599, _)
     )
+}
+
+fn select_local_ipc_candidate(
+    prefer_local_ipc: bool,
+    anchor_allows_local_ipc: bool,
+    routes: &[RelayRouteInfo],
+) -> Option<RelayLocalIpcCandidate> {
+    if !prefer_local_ipc || !anchor_allows_local_ipc {
+        return None;
+    }
+    routes.iter().find_map(|route| {
+        Some(RelayLocalIpcCandidate {
+            address: route.ipc_address.clone()?,
+            server_id: route.server_id.clone()?,
+            server_instance_id: route.server_instance_id.clone()?,
+        })
+    })
+}
+
+fn filter_routes_by_expected_crm(
+    routes: Vec<RelayRouteInfo>,
+    expected: Option<(&str, &str, &str)>,
+) -> Vec<RelayRouteInfo> {
+    let Some((expected_ns, expected_name, expected_ver)) = expected else {
+        return routes;
+    };
+    routes
+        .into_iter()
+        .filter(|route| {
+            route.crm_ns == expected_ns
+                && route.crm_name == expected_name
+                && route.crm_ver == expected_ver
+        })
+        .collect()
+}
+
+fn relay_anchor_allows_local_ipc(anchor_url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(anchor_url) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let ip_host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || ip_host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 #[cfg(all(test, feature = "relay"))]
@@ -304,7 +511,7 @@ mod tests {
         Json, Router,
         body::Bytes,
         extract::{Path, State},
-        http::StatusCode,
+        http::{HeaderMap, StatusCode},
         response::{IntoResponse, Response},
         routing::{get, post},
     };
@@ -328,14 +535,20 @@ mod tests {
                 name: name.clone(),
                 relay_url: state.stale_url.clone(),
                 ipc_address: None,
+                server_id: None,
+                server_instance_id: None,
                 crm_ns: String::new(),
+                crm_name: String::new(),
                 crm_ver: String::new(),
             },
             RelayRouteInfo {
                 name,
                 relay_url: state.live_url.clone(),
                 ipc_address: None,
+                server_id: None,
+                server_instance_id: None,
                 crm_ns: String::new(),
+                crm_name: String::new(),
                 crm_ver: String::new(),
             },
         ])
@@ -378,7 +591,10 @@ mod tests {
             name,
             relay_url: state.live_url.clone(),
             ipc_address: None,
+            server_id: None,
+            server_instance_id: None,
             crm_ns: String::new(),
+            crm_name: String::new(),
             crm_ver: String::new(),
         }])
         .into_response()
@@ -408,6 +624,125 @@ mod tests {
         let mut out = b"ok:".to_vec();
         out.extend_from_slice(&body);
         (StatusCode::OK, out).into_response()
+    }
+
+    async fn registry_resolve_with_local_ipc(
+        State(state): State<RegistryState>,
+        Path(name): Path<String>,
+    ) -> Response {
+        state.resolve_count.fetch_add(1, Ordering::SeqCst);
+        Json(vec![
+            RelayRouteInfo {
+                name: name.clone(),
+                relay_url: state.live_url.clone(),
+                ipc_address: None,
+                server_id: None,
+                server_instance_id: None,
+                crm_ns: String::new(),
+                crm_name: String::new(),
+                crm_ver: String::new(),
+            },
+            RelayRouteInfo {
+                name,
+                relay_url: state.stale_url.clone(),
+                ipc_address: Some("ipc://local-grid".to_string()),
+                server_id: Some("local-grid".to_string()),
+                server_instance_id: Some("inst-local-grid".to_string()),
+                crm_ns: String::new(),
+                crm_name: String::new(),
+                crm_ver: String::new(),
+            },
+        ])
+        .into_response()
+    }
+
+    async fn registry_resolve_contract_changes(
+        State(state): State<RegistryState>,
+        Path(name): Path<String>,
+    ) -> Response {
+        let count = state.resolve_count.fetch_add(1, Ordering::SeqCst);
+        let (crm_ns, crm_ver) = if count == 0 {
+            ("other.grid", "0.1.0")
+        } else {
+            ("test.grid", "0.1.0")
+        };
+        Json(vec![RelayRouteInfo {
+            name,
+            relay_url: state.live_url.clone(),
+            ipc_address: None,
+            server_id: None,
+            server_instance_id: None,
+            crm_ns: crm_ns.to_string(),
+            crm_name: "Grid".to_string(),
+            crm_ver: crm_ver.to_string(),
+        }])
+        .into_response()
+    }
+
+    async fn registry_resolve_expected_contract(
+        State(state): State<RegistryState>,
+        Path(name): Path<String>,
+    ) -> Response {
+        state.resolve_count.fetch_add(1, Ordering::SeqCst);
+        Json(vec![RelayRouteInfo {
+            name,
+            relay_url: state.live_url.clone(),
+            ipc_address: None,
+            server_id: None,
+            server_instance_id: None,
+            crm_ns: "test.grid".to_string(),
+            crm_name: "Grid".to_string(),
+            crm_ver: "0.1.0".to_string(),
+        }])
+        .into_response()
+    }
+
+    fn expected_crm_headers_match(headers: &HeaderMap) -> bool {
+        headers
+            .get("x-c2-expected-crm-ns")
+            .is_some_and(|v| v == "test.grid")
+            && headers
+                .get("x-c2-expected-crm-name")
+                .is_some_and(|v| v == "Grid")
+            && headers
+                .get("x-c2-expected-crm-ver")
+                .is_some_and(|v| v == "0.1.0")
+    }
+
+    async fn probe_requires_expected_crm_headers(headers: HeaderMap) -> Response {
+        if expected_crm_headers_match(&headers) {
+            StatusCode::OK.into_response()
+        } else {
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "CRMContractMismatch",
+                    "message": "CRM contract mismatch for route grid",
+                })),
+            )
+                .into_response()
+        }
+    }
+
+    async fn call_requires_expected_crm_headers(
+        headers: HeaderMap,
+        Path((_route, _method)): Path<(String, String)>,
+        body: Bytes,
+    ) -> Response {
+        if expected_crm_headers_match(&headers) {
+            let mut out = b"ok:".to_vec();
+            out.extend_from_slice(&body);
+            (StatusCode::OK, out).into_response()
+        } else {
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "CRMContractMismatch",
+                    "message": "CRM contract mismatch for route grid",
+                })),
+            )
+                .into_response()
+        }
     }
 
     async fn spawn_app(app: Router) -> (String, tokio::task::JoinHandle<()>) {
@@ -442,7 +777,10 @@ mod tests {
             &registry_url,
             "grid",
             false,
-            RelayAwareClientConfig { max_attempts: 3 },
+            RelayAwareClientConfig {
+                max_attempts: 3,
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -484,7 +822,10 @@ mod tests {
             &registry_url,
             "grid",
             false,
-            RelayAwareClientConfig { max_attempts: 3 },
+            RelayAwareClientConfig {
+                max_attempts: 3,
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -495,6 +836,256 @@ mod tests {
 
         registry_handle.abort();
         live_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn resolve_target_prefers_local_ipc_route_without_http_probe() {
+        let resolve_count = Arc::new(AtomicUsize::new(0));
+        let registry_state = RegistryState {
+            stale_url: "http://127.0.0.1:9".to_string(),
+            live_url: "http://127.0.0.1:10".to_string(),
+            resolve_count: resolve_count.clone(),
+        };
+        let (registry_url, registry_handle) = spawn_app(
+            Router::new()
+                .route("/_resolve/{name}", get(registry_resolve_with_local_ipc))
+                .with_state(registry_state),
+        )
+        .await;
+
+        let client = RelayAwareHttpClient::new(
+            &registry_url,
+            "grid",
+            false,
+            RelayAwareClientConfig {
+                max_attempts: 3,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let target = client.resolve_target_async().await.unwrap();
+        assert_eq!(target.as_url(), "ipc://local-grid");
+        assert_eq!(
+            resolve_count.load(Ordering::SeqCst),
+            1,
+            "local IPC target selection should not probe or iterate HTTP routes"
+        );
+
+        registry_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn cached_wrong_contract_routes_force_fresh_resolve_before_404() {
+        let (live_url, live_handle) =
+            spawn_app(Router::new().route("/_probe/{route}", get(|| async { StatusCode::OK })))
+                .await;
+        let resolve_count = Arc::new(AtomicUsize::new(0));
+        let registry_state = RegistryState {
+            stale_url: String::new(),
+            live_url: live_url.clone(),
+            resolve_count: resolve_count.clone(),
+        };
+        let (registry_url, registry_handle) = spawn_app(
+            Router::new()
+                .route("/_resolve/{name}", get(registry_resolve_contract_changes))
+                .with_state(registry_state),
+        )
+        .await;
+
+        let client = RelayAwareHttpClient::new(
+            &registry_url,
+            "grid",
+            false,
+            RelayAwareClientConfig {
+                max_attempts: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .with_expected_crm("test.grid", "Grid", "0.1.0");
+
+        client.connect_async().await.unwrap();
+        assert_eq!(
+            resolve_count.load(Ordering::SeqCst),
+            2,
+            "CRM-filtered cached routes should force one fresh resolve before reporting no compatible route"
+        );
+
+        registry_handle.abort();
+        live_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn expected_crm_headers_are_sent_on_probe_and_call() {
+        let (live_url, live_handle) = spawn_app(
+            Router::new()
+                .route("/_probe/{route}", get(probe_requires_expected_crm_headers))
+                .route(
+                    "/{route}/{method}",
+                    post(call_requires_expected_crm_headers),
+                ),
+        )
+        .await;
+        let resolve_count = Arc::new(AtomicUsize::new(0));
+        let registry_state = RegistryState {
+            stale_url: String::new(),
+            live_url,
+            resolve_count,
+        };
+        let (registry_url, registry_handle) = spawn_app(
+            Router::new()
+                .route("/_resolve/{name}", get(registry_resolve_expected_contract))
+                .with_state(registry_state),
+        )
+        .await;
+
+        let client = RelayAwareHttpClient::new(
+            &registry_url,
+            "grid",
+            false,
+            RelayAwareClientConfig {
+                max_attempts: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .with_expected_crm("test.grid", "Grid", "0.1.0");
+
+        client.connect_async().await.unwrap();
+        let bytes = client.call_async("step", b"payload").await.unwrap();
+        assert_eq!(bytes, b"ok:payload");
+
+        registry_handle.abort();
+        live_handle.abort();
+    }
+
+    #[test]
+    fn local_ipc_selection_requires_loopback_anchor() {
+        let routes = vec![RelayRouteInfo {
+            name: "grid".to_string(),
+            relay_url: "http://relay.example".to_string(),
+            ipc_address: Some("ipc://local-grid".to_string()),
+            server_id: Some("local-grid".to_string()),
+            server_instance_id: Some("inst-local-grid".to_string()),
+            crm_ns: String::new(),
+            crm_name: String::new(),
+            crm_ver: String::new(),
+        }];
+
+        assert_eq!(
+            select_local_ipc_candidate(true, true, &routes).map(|candidate| candidate.address),
+            Some("ipc://local-grid".to_string())
+        );
+        assert_eq!(select_local_ipc_candidate(true, false, &routes), None);
+        assert_eq!(select_local_ipc_candidate(false, true, &routes), None);
+
+        assert!(relay_anchor_allows_local_ipc("http://127.0.0.1:8080"));
+        assert!(relay_anchor_allows_local_ipc("http://[::1]:8080"));
+        assert!(relay_anchor_allows_local_ipc("http://localhost:8080"));
+        assert!(!relay_anchor_allows_local_ipc("http://192.0.2.10:8080"));
+        assert!(!relay_anchor_allows_local_ipc("http://relay.example:8080"));
+    }
+
+    #[test]
+    fn local_ipc_selection_requires_identity_complete_route() {
+        let complete = RelayRouteInfo {
+            name: "grid".to_string(),
+            relay_url: "http://127.0.0.1:8080".to_string(),
+            ipc_address: Some("ipc://grid-server".to_string()),
+            server_id: Some("grid-server".to_string()),
+            server_instance_id: Some("inst-a".to_string()),
+            crm_ns: String::new(),
+            crm_name: String::new(),
+            crm_ver: String::new(),
+        };
+        let missing_instance = RelayRouteInfo {
+            server_instance_id: None,
+            ..complete.clone()
+        };
+        let missing_server_id = RelayRouteInfo {
+            server_id: None,
+            ..complete.clone()
+        };
+
+        assert_eq!(
+            select_local_ipc_candidate(true, true, &[missing_instance]),
+            None,
+        );
+        assert_eq!(
+            select_local_ipc_candidate(true, true, &[missing_server_id]),
+            None,
+        );
+        assert_eq!(
+            select_local_ipc_candidate(true, true, &[complete.clone()]),
+            Some(RelayLocalIpcCandidate {
+                address: "ipc://grid-server".to_string(),
+                server_id: "grid-server".to_string(),
+                server_instance_id: "inst-a".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn relay_resolved_ipc_target_carries_expected_identity() {
+        let route = RelayRouteInfo {
+            name: "grid".to_string(),
+            relay_url: "http://127.0.0.1:8080".to_string(),
+            ipc_address: Some("ipc://grid-server".to_string()),
+            server_id: Some("grid-server".to_string()),
+            server_instance_id: Some("inst-a".to_string()),
+            crm_ns: String::new(),
+            crm_name: String::new(),
+            crm_ver: String::new(),
+        };
+
+        let candidate = select_local_ipc_candidate(true, true, &[route]).expect("candidate");
+        assert_eq!(candidate.address, "ipc://grid-server");
+        assert_eq!(candidate.server_id, "grid-server");
+        assert_eq!(candidate.server_instance_id, "inst-a");
+    }
+
+    #[test]
+    fn crm_contract_filter_runs_before_local_ipc_selection() {
+        let mismatched_local = RelayRouteInfo {
+            name: "grid".to_string(),
+            relay_url: "http://127.0.0.1:8080".to_string(),
+            ipc_address: Some("ipc://wrong-grid".to_string()),
+            server_id: Some("wrong-grid".to_string()),
+            server_instance_id: Some("inst-wrong".to_string()),
+            crm_ns: "other.grid".to_string(),
+            crm_name: "Grid".to_string(),
+            crm_ver: "0.1.0".to_string(),
+        };
+        let mismatched_crm_name = RelayRouteInfo {
+            name: "grid".to_string(),
+            relay_url: "http://127.0.0.1:8082".to_string(),
+            ipc_address: Some("ipc://wrong-model".to_string()),
+            server_id: Some("wrong-model".to_string()),
+            server_instance_id: Some("inst-wrong-model".to_string()),
+            crm_ns: "test.grid".to_string(),
+            crm_name: "OtherGrid".to_string(),
+            crm_ver: "0.1.0".to_string(),
+        };
+        let matched_http = RelayRouteInfo {
+            name: "grid".to_string(),
+            relay_url: "http://127.0.0.1:8081".to_string(),
+            ipc_address: None,
+            server_id: None,
+            server_instance_id: None,
+            crm_ns: "test.grid".to_string(),
+            crm_name: "Grid".to_string(),
+            crm_ver: "0.1.0".to_string(),
+        };
+
+        let filtered = filter_routes_by_expected_crm(
+            vec![mismatched_local, mismatched_crm_name, matched_http.clone()],
+            Some(("test.grid", "Grid", "0.1.0")),
+        );
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].relay_url, matched_http.relay_url);
+        assert_eq!(select_local_ipc_candidate(true, true, &filtered), None);
     }
 
     #[tokio::test]
@@ -520,7 +1111,10 @@ mod tests {
             &registry_url,
             "grid",
             false,
-            RelayAwareClientConfig { max_attempts: 1 },
+            RelayAwareClientConfig {
+                max_attempts: 1,
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -556,7 +1150,10 @@ mod tests {
             &registry_url,
             "grid",
             false,
-            RelayAwareClientConfig { max_attempts: 1 },
+            RelayAwareClientConfig {
+                max_attempts: 1,
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -592,7 +1189,10 @@ mod tests {
             &registry_url,
             "grid",
             false,
-            RelayAwareClientConfig { max_attempts: 3 },
+            RelayAwareClientConfig {
+                max_attempts: 3,
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -628,7 +1228,10 @@ mod tests {
             &registry_url,
             "grid",
             false,
-            RelayAwareClientConfig { max_attempts: 1 },
+            RelayAwareClientConfig {
+                max_attempts: 1,
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -664,7 +1267,10 @@ mod tests {
             &registry_url,
             "grid",
             false,
-            RelayAwareClientConfig { max_attempts: 3 },
+            RelayAwareClientConfig {
+                max_attempts: 3,
+                ..Default::default()
+            },
         )
         .unwrap();
 
@@ -703,7 +1309,10 @@ mod tests {
             &registry_url,
             "grid",
             false,
-            RelayAwareClientConfig { max_attempts: 3 },
+            RelayAwareClientConfig {
+                max_attempts: 3,
+                ..Default::default()
+            },
         )
         .unwrap();
 

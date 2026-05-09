@@ -162,6 +162,7 @@ def crm(*, namespace: str = 'cc', version: str = '0.1.0'):
         # Add static tag attributes
         setattr(new_cls, '__tag__', f'{namespace}/{class_name}/{version}')
         setattr(new_cls, '__cc_namespace__', namespace)
+        setattr(new_cls, '__cc_name__', class_name)
         setattr(new_cls, '__cc_version__', version)
 
         return new_cls

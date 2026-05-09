@@ -9,7 +9,7 @@ from .transport.registry import (
     set_transport_policy,
     set_server,
     set_client,
-    set_relay,
+    set_relay_anchor,
     register,
     connect,
     close,

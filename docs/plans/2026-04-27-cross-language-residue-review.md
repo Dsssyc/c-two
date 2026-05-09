@@ -83,7 +83,7 @@ matrix.
 - Are docs, examples, and tests consistently using the standalone `c3 relay`
   workflow?
 - Do language SDKs only own client-side relay address selection via
-  `C2_RELAY_ADDRESS` or `cc.set_relay()` equivalents?
+  `C2_RELAY_ANCHOR_ADDRESS` or `cc.set_relay_anchor()` equivalents?
 
 ### 3. Workflow-policy tests still live under the Python SDK test tree
 
@@ -170,7 +170,7 @@ the product identity from the current Python SDK status.
 **Discussion questions:**
 
 - Should the root README describe C-Two as a language-neutral resource RPC
-  runtime with Python as the first SDK?
+  runtime?
 - Should Python-specific examples remain dominant until another SDK exists?
 - Should roadmap wording continue to track the Rust resolver as the
   configuration owner once migration work lands?
@@ -376,7 +376,7 @@ product identity from current Python SDK status.
 #### Discussion questions
 
 - Should the root README describe C-Two as a language-neutral resource RPC
-  runtime with Python as the first SDK?
+  runtime?
 - Should Python-specific examples remain dominant until another SDK exists?
 - Should roadmap wording continue to track the Rust resolver as the
   configuration owner once migration work lands?

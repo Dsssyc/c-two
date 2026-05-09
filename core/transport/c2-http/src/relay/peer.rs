@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Envelope wrapping every peer-to-peer message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,6 +20,7 @@ pub enum PeerMessage {
         relay_id: String,
         relay_url: String,
         crm_ns: String,
+        crm_name: String,
         crm_ver: String,
         registered_at: f64,
     },
@@ -63,6 +64,7 @@ pub enum DigestDiffEntry {
         relay_id: String,
         relay_url: String,
         crm_ns: String,
+        crm_name: String,
         crm_ver: String,
         registered_at: f64,
     },
@@ -121,6 +123,7 @@ mod tests {
                 relay_id: "relay-a".into(),
                 relay_url: "http://relay-a:8080".into(),
                 crm_ns: "cc.demo".into(),
+                crm_name: "Grid".into(),
                 crm_ver: "0.1.0".into(),
                 registered_at: 1000.0,
             },
@@ -128,7 +131,10 @@ mod tests {
         let json = serde_json::to_string(&env).unwrap();
         let decoded: PeerEnvelope = serde_json::from_str(&json).unwrap();
         match decoded.message {
-            PeerMessage::RouteAnnounce { name, .. } => assert_eq!(name, "grid"),
+            PeerMessage::RouteAnnounce { name, crm_name, .. } => {
+                assert_eq!(name, "grid");
+                assert_eq!(crm_name, "Grid");
+            }
             _ => panic!("wrong variant"),
         }
     }

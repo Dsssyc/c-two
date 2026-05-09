@@ -16,9 +16,10 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
+use crate::lease_ffi::PyBufferLeaseTracker;
 use c2_config::{BaseIpcConfig, ClientIpcConfig};
 use c2_ipc::{ClientPool, IpcError, ResponseData, ServerPoolState, SyncClient};
-use c2_mem::MemPool;
+use c2_mem::{BufferLeaseGuard, MemPool};
 
 // ---------------------------------------------------------------------------
 // CrmCallError — custom exception carrying serialised error bytes
@@ -56,6 +57,7 @@ enum ResponseBufferInner {
 #[pyclass(name = "ResponseBuffer", frozen)]
 pub struct PyResponseBuffer {
     inner: Mutex<Option<ResponseBufferInner>>,
+    lease: Mutex<Option<BufferLeaseGuard>>,
     data_len: usize,
     exports: AtomicU32,
 }
@@ -88,8 +90,23 @@ impl PyResponseBuffer {
         };
         Self {
             inner: Mutex::new(Some(inner)),
+            lease: Mutex::new(None),
             data_len,
             exports: AtomicU32::new(0),
+        }
+    }
+
+    fn storage_label_for_inner(inner: &ResponseBufferInner) -> &'static str {
+        match inner {
+            ResponseBufferInner::Inline(_) => "inline",
+            ResponseBufferInner::Shm { .. } => "shm",
+            ResponseBufferInner::Handle { handle, .. } => {
+                if handle.is_file_spill() {
+                    "file_spill"
+                } else {
+                    "handle"
+                }
+            }
         }
     }
 }
@@ -158,7 +175,11 @@ impl PyResponseBuffer {
                 "cannot release: buffer is currently exported as memoryview",
             ));
         }
-        match guard.take() {
+        let inner = guard.take();
+        self.lease.lock().take();
+        drop(guard);
+
+        match inner {
             Some(ResponseBufferInner::Shm {
                 pool,
                 seg_idx,
@@ -183,6 +204,32 @@ impl PyResponseBuffer {
             Some(ResponseBufferInner::Inline(_)) => Ok(()),
             None => Ok(()), // already released, idempotent
         }
+    }
+
+    #[pyo3(signature = (tracker, route_name, method_name, direction="client_response"))]
+    fn track_retained(
+        &self,
+        tracker: &PyBufferLeaseTracker,
+        route_name: &str,
+        method_name: &str,
+        direction: &str,
+    ) -> PyResult<()> {
+        let guard = self.inner.lock();
+        let Some(inner) = guard.as_ref() else {
+            return Ok(());
+        };
+        let storage = Self::storage_label_for_inner(inner);
+        let lease_guard = tracker.track_retained_guard(
+            route_name,
+            method_name,
+            direction,
+            storage,
+            self.data_len,
+        )?;
+        let mut current = self.lease.lock();
+        current.take();
+        *current = Some(lease_guard);
+        Ok(())
     }
 
     /// Buffer protocol — enables memoryview(response).
@@ -267,7 +314,11 @@ impl Drop for PyResponseBuffer {
     fn drop(&mut self) {
         // Auto-release SHM/Handle if Python forgot to call release()
         let mut guard = self.inner.lock();
-        match guard.take() {
+        let inner = guard.take();
+        self.lease.lock().take();
+        drop(guard);
+
+        match inner {
             Some(ResponseBufferInner::Shm {
                 pool,
                 seg_idx,
@@ -307,6 +358,87 @@ impl Drop for PyResponseBuffer {
 #[pyclass(name = "RustClient", frozen)]
 pub struct PyRustClient {
     inner: Arc<SyncClient>,
+}
+
+impl PyRustClient {
+    pub(crate) fn from_arc(inner: Arc<SyncClient>) -> Self {
+        Self { inner }
+    }
+}
+
+pub(crate) fn call_sync_client<'py>(
+    py: Python<'py>,
+    inner: &Arc<SyncClient>,
+    route_name: &str,
+    method_name: &str,
+    data: &[u8],
+) -> PyResult<PyResponseBuffer> {
+    let client = Arc::clone(inner);
+    let route = route_name.to_string();
+    let method = method_name.to_string();
+
+    // Fast path: direct SHM write for large payloads.
+    // While GIL is held, `data` is a zero-copy &[u8] from Python.
+    // Write directly to SHM (single copy), then release GIL to send
+    // buddy frame with just coordinates (no data movement).
+    if client.should_use_shm(data.len()) {
+        match client.pool_alloc_and_write(data) {
+            Ok(alloc) => {
+                let data_size = data.len();
+                let result =
+                    py.detach(move || client.call_prealloc(&route, &method, &alloc, data_size));
+                return match result {
+                    Ok(response_data) => {
+                        let pool = inner.server_pool_arc();
+                        let reassembly = inner.reassembly_pool_arc();
+                        Ok(PyResponseBuffer::from_response_data(
+                            response_data,
+                            pool,
+                            reassembly,
+                        ))
+                    }
+                    Err(IpcError::CrmError(err_bytes)) => {
+                        let exc = PyErr::new::<CrmCallError, _>("CRM method error");
+                        exc.value(py)
+                            .setattr("error_bytes", PyBytes::new(py, &err_bytes))?;
+                        Err(exc)
+                    }
+                    Err(e) => {
+                        // call_with_prealloc already freed on send failure.
+                        // For receive failures (Closed), server already consumed.
+                        Err(PyRuntimeError::new_err(format!("{e}")))
+                    }
+                };
+            }
+            Err(_) => {
+                // Pool alloc failed — fall through to inline path.
+            }
+        }
+    }
+
+    // Fallback: inline/chunked path (small payloads or pool unavailable).
+    // to_vec() is needed because detach requires owned data.
+    let payload = data.to_vec();
+    let result = py.detach(move || client.call(&route, &method, &payload));
+
+    match result {
+        Ok(response_data) => {
+            let pool = inner.server_pool_arc();
+            let reassembly = inner.reassembly_pool_arc();
+            Ok(PyResponseBuffer::from_response_data(
+                response_data,
+                pool,
+                reassembly,
+            ))
+        }
+        Err(IpcError::CrmError(err_bytes)) => {
+            let exc = PyErr::new::<CrmCallError, _>("CRM method error");
+            exc.value(py)
+                .setattr("error_bytes", PyBytes::new(py, &err_bytes))?;
+            Err(exc)
+        }
+        Err(e) => Err(PyRuntimeError::new_err(format!("{e}"))),
+    }
 }
 
 #[pymethods]
@@ -389,72 +521,7 @@ impl PyRustClient {
         method_name: &str,
         data: &[u8],
     ) -> PyResult<PyResponseBuffer> {
-        let inner = Arc::clone(&self.inner);
-        let route = route_name.to_string();
-        let method = method_name.to_string();
-
-        // Fast path: direct SHM write for large payloads.
-        // While GIL is held, `data` is a zero-copy &[u8] from Python.
-        // Write directly to SHM (single copy), then release GIL to send
-        // buddy frame with just coordinates (no data movement).
-        if inner.should_use_shm(data.len()) {
-            match inner.pool_alloc_and_write(data) {
-                Ok(alloc) => {
-                    let data_size = data.len();
-                    let result =
-                        py.detach(move || inner.call_prealloc(&route, &method, &alloc, data_size));
-                    return match result {
-                        Ok(response_data) => {
-                            let pool = self.inner.server_pool_arc();
-                            let reassembly = self.inner.reassembly_pool_arc();
-                            Ok(PyResponseBuffer::from_response_data(
-                                response_data,
-                                pool,
-                                reassembly,
-                            ))
-                        }
-                        Err(IpcError::CrmError(err_bytes)) => {
-                            let exc = PyErr::new::<CrmCallError, _>("CRM method error");
-                            exc.value(py)
-                                .setattr("error_bytes", PyBytes::new(py, &err_bytes))?;
-                            Err(exc)
-                        }
-                        Err(e) => {
-                            // call_with_prealloc already freed on send failure.
-                            // For receive failures (Closed), server already consumed.
-                            Err(PyRuntimeError::new_err(format!("{e}")))
-                        }
-                    };
-                }
-                Err(_) => {
-                    // Pool alloc failed — fall through to inline path.
-                }
-            }
-        }
-
-        // Fallback: inline/chunked path (small payloads or pool unavailable).
-        // to_vec() is needed because detach requires owned data.
-        let payload = data.to_vec();
-        let result = py.detach(move || inner.call(&route, &method, &payload));
-
-        match result {
-            Ok(response_data) => {
-                let pool = self.inner.server_pool_arc();
-                let reassembly = self.inner.reassembly_pool_arc();
-                Ok(PyResponseBuffer::from_response_data(
-                    response_data,
-                    pool,
-                    reassembly,
-                ))
-            }
-            Err(IpcError::CrmError(err_bytes)) => {
-                let exc = PyErr::new::<CrmCallError, _>("CRM method error");
-                exc.value(py)
-                    .setattr("error_bytes", PyBytes::new(py, &err_bytes))?;
-                Err(exc)
-            }
-            Err(e) => Err(PyRuntimeError::new_err(format!("{e}"))),
-        }
+        call_sync_client(py, &self.inner, route_name, method_name, data)
     }
 
     /// Whether the client is connected.
@@ -470,6 +537,31 @@ impl PyRustClient {
             .into_iter()
             .map(|s| s.to_string())
             .collect()
+    }
+
+    /// CRM tag advertised for a route by the IPC handshake.
+    fn route_contract(&self, route_name: &str) -> Option<(String, String, String)> {
+        self.inner
+            .route_contract(route_name)
+            .map(|(crm_ns, crm_name, crm_ver)| {
+                (
+                    crm_ns.to_string(),
+                    crm_name.to_string(),
+                    crm_ver.to_string(),
+                )
+            })
+    }
+
+    /// Stable logical server identity advertised by the IPC handshake.
+    #[getter]
+    fn server_id(&self) -> Option<String> {
+        self.inner.server_id().map(ToOwned::to_owned)
+    }
+
+    /// Per-process server incarnation identity advertised by the IPC handshake.
+    #[getter]
+    fn server_instance_id(&self) -> Option<String> {
+        self.inner.server_instance_id().map(ToOwned::to_owned)
     }
 
     /// Close the connection.
@@ -497,7 +589,15 @@ impl PyRustClient {
 /// ```
 #[pyclass(name = "RustClientPool", frozen)]
 pub struct PyRustClientPool {
-    inner: &'static ClientPool,
+    pub(crate) inner: &'static ClientPool,
+}
+
+impl PyRustClientPool {
+    pub(crate) fn global() -> Self {
+        Self {
+            inner: ClientPool::instance(),
+        }
+    }
 }
 
 #[pymethods]
@@ -505,9 +605,7 @@ impl PyRustClientPool {
     /// Get the process-level singleton pool.
     #[staticmethod]
     fn instance() -> Self {
-        Self {
-            inner: ClientPool::instance(),
-        }
+        Self::global()
     }
 
     /// Acquire (or create) a client for the given address.

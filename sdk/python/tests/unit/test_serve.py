@@ -4,7 +4,6 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from unittest.mock import patch
 
 import pytest
 
@@ -47,8 +46,7 @@ class TestServeBasic:
 
         assert any('no crm registered' in r.message.lower() for r in caplog.records)
 
-    @patch.object(_ProcessRegistry, '_relay_register')
-    def test_serve_non_blocking_returns(self, mock_relay):
+    def test_serve_non_blocking_returns(self):
         """serve(blocking=False) returns immediately."""
         self.registry.register(IServeCRM, ServeCRM(), name='svc')
 
@@ -58,16 +56,14 @@ class TestServeBasic:
 
         assert elapsed < 1.0  # Should return nearly instantly.
 
-    @patch.object(_ProcessRegistry, '_relay_register')
-    def test_serve_idempotent(self, mock_relay):
+    def test_serve_idempotent(self):
         """Calling serve() twice is a no-op (idempotent)."""
         self.registry.register(IServeCRM, ServeCRM(), name='svc')
 
         self.registry.serve(blocking=False)
         self.registry.serve(blocking=False)  # Should not raise.
 
-    @patch.object(_ProcessRegistry, '_relay_register')
-    def test_serve_blocking_unblocks_on_stop(self, mock_relay):
+    def test_serve_blocking_unblocks_on_stop(self):
         """serve(blocking=True) blocks until the stop event is set."""
         self.registry.register(IServeCRM, ServeCRM(), name='svc')
 
@@ -89,8 +85,7 @@ class TestServeBasic:
         done.wait(timeout=5.0)
         assert done.is_set()
 
-    @patch.object(_ProcessRegistry, '_relay_register')
-    def test_serve_prints_banner(self, mock_relay, capsys):
+    def test_serve_prints_banner(self, capsys):
         """serve() prints a banner with CRM route info."""
         self.registry.register(IServeCRM, ServeCRM(), name='my_service')
         self.registry.serve(blocking=False)

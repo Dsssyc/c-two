@@ -109,9 +109,3 @@ class TestCheckVersion:
         )
         result = self._run(cv, tmp_path, monkeypatch, "0.3.0", pypi_err=err)
         assert result["should_release"] == "false"
-
-
-def test_import_does_not_expose_logo_banner():
-    import c_two
-
-    assert not hasattr(c_two, "LOGO" + "_UNICODE")

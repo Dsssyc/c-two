@@ -47,6 +47,7 @@ from c_two._native import (  # noqa: F401 — re-export
     # Handshake dataclasses (Rust pyclasses)
     MethodEntry,
     RouteInfo,
+    ServerIdentity,
     Handshake,
     # Core functions (private, wrapped below)
     encode_client_handshake as _encode_client_hs,
@@ -75,9 +76,9 @@ def encode_client_handshake(
 ) -> bytes:
     """Encode client→server handshake.
 
-    Format (v6)::
+    Format (v9)::
 
-        [1B version=6]
+        [1B version=9]
         [1B prefix_len][prefix UTF-8]
         [2B seg_count LE]
         [per-segment: [4B size LE][1B name_len][name UTF-8]]
@@ -92,24 +93,38 @@ def encode_server_handshake(
     routes: list[RouteInfo],
     *,
     prefix: str = '',
+    server_id: str,
+    server_instance_id: str,
 ) -> bytes:
     """Encode server→client handshake ACK.
 
-    Format (v6)::
+    Format (v9)::
 
-        [1B version=6]
+        [1B version=9]
         [1B prefix_len][prefix UTF-8]
         [2B seg_count LE]
         [per-segment: [4B size LE][1B name_len][name UTF-8]]
         [2B capability_flags LE]
+        [1B server_id_len][server_id UTF-8]
+        [1B server_instance_id_len][server_instance_id UTF-8]
         [2B route_count LE]
         [per-route:
             [1B name_len][route_name UTF-8]
+            [1B crm_ns_len][crm_ns UTF-8]
+            [1B crm_name_len][crm_name UTF-8]
+            [1B crm_ver_len][crm_ver UTF-8]
             [2B method_count LE]
             [per-method: [1B name_len][method_name UTF-8][2B method_idx LE]]
         ]
     """
-    return _encode_server_hs(segments, capability_flags, routes, prefix)
+    return _encode_server_hs(
+        segments,
+        capability_flags,
+        routes,
+        prefix,
+        server_id,
+        server_instance_id,
+    )
 
 
 def decode_handshake(

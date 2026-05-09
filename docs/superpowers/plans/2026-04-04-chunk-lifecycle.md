@@ -1669,7 +1669,7 @@ Expected: ALL PASS.
 
 - [ ] **Step 3: Run full Python test suite**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30`
 Expected: ALL PASS — specifically:
 - `tests/unit/test_chunk_assembler.py` (ChunkAssembler Python bindings)
 - `tests/unit/test_mem_pool.py` (MemPool with new try_alloc_shm)
@@ -1678,7 +1678,7 @@ Expected: ALL PASS — specifically:
 
 - [ ] **Step 4: Run specific chunked transfer tests**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/unit/test_chunk_assembler.py tests/integration/test_zero_copy_ipc.py -v --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/unit/test_chunk_assembler.py tests/integration/test_zero_copy_ipc.py -v --timeout=30`
 Expected: ALL PASS — chunked transfer still works end-to-end.
 
 - [ ] **Step 5: Final commit + tag**
@@ -1700,7 +1700,7 @@ After all tasks complete, verify:
 
 - [ ] `cargo check --workspace` passes
 - [ ] `cargo test --workspace --no-default-features` passes
-- [ ] `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30` passes
+- [ ] `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30` passes
 - [ ] `ChunkRegistry.active_count() == 0` after every test (no leaks)
 - [ ] `ChunkRegistry.total_bytes() == 0` after every test (no leaks)
 - [ ] No `Connection.assemblers` field exists in `c2-server/src/connection.rs`

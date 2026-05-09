@@ -61,13 +61,6 @@ class ClientIPCOverrides(BaseIPCOverrides, total=False):
     """Client-side IPC code-level overrides."""
 
 
-_SERVER_KEYS = set(ServerIPCOverrides.__annotations__)
-_CLIENT_KEYS = set(ClientIPCOverrides.__annotations__)
-_FORBIDDEN_IPC_KEYS = {
-    'shm_threshold',
-}
-
-
 def _resolve_server_ipc_config(
     ipc_overrides: ServerIPCOverrides | Mapping[str, object] | None = None,
     settings: C2Settings | None = None,
@@ -75,7 +68,7 @@ def _resolve_server_ipc_config(
     """Resolve server IPC config through Rust from explicit overrides only."""
     native = _native_resolver()
     return dict(native.resolve_server_ipc_config(
-        _normalize_server_ipc_overrides(ipc_overrides),
+        ipc_overrides,
         _shm_overrides(settings),
     ))
 
@@ -87,60 +80,15 @@ def _resolve_client_ipc_config(
     """Resolve client IPC config through Rust from explicit overrides only."""
     native = _native_resolver()
     return dict(native.resolve_client_ipc_config(
-        _normalize_client_ipc_overrides(ipc_overrides),
+        ipc_overrides,
         _shm_overrides(settings),
     ))
-
-
-def _normalize_server_ipc_overrides(
-    ipc_overrides: ServerIPCOverrides | Mapping[str, object] | None,
-) -> ServerIPCOverrides | None:
-    """Return a copied server IPC override map after structural checks."""
-    cleaned = _clean_ipc_overrides(ipc_overrides, _SERVER_KEYS)
-    return cleaned or None
-
-
-def _normalize_client_ipc_overrides(
-    ipc_overrides: ClientIPCOverrides | Mapping[str, object] | None,
-) -> ClientIPCOverrides | None:
-    """Return a copied client IPC override map after structural checks."""
-    cleaned = _clean_ipc_overrides(ipc_overrides, _CLIENT_KEYS)
-    return cleaned or None
 
 
 def _native_resolver() -> Any:
     from c_two import _native
 
     return _native
-
-
-def _clean_ipc_overrides(
-    overrides: Mapping[str, object] | None,
-    allowed: set[str],
-) -> dict[str, object]:
-    if overrides is None:
-        return {}
-    if not isinstance(overrides, Mapping):
-        raise TypeError('ipc_overrides must be a mapping')
-
-    keys = set(overrides)
-    forbidden = sorted(keys & _FORBIDDEN_IPC_KEYS)
-    if forbidden:
-        raise ValueError(
-            'shm_threshold is a global transport policy; '
-            'use set_transport_policy(shm_threshold=...)',
-        )
-
-    unknown = sorted(keys - allowed)
-    if unknown:
-        joined = ', '.join(unknown)
-        raise TypeError(f'unknown IPC override option(s): {joined}')
-
-    return {
-        str(key): value
-        for key, value in overrides.items()
-        if value is not None
-    }
 
 
 def _shm_overrides(settings: C2Settings | None) -> dict[str, object]:

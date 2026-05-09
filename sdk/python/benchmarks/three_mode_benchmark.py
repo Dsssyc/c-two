@@ -14,8 +14,8 @@ Payload sizes: 64B, 256B, 1KB, 4KB, 64KB, 1MB, 10MB, 50MB, 100MB, 500MB, 1GB
 Results are written to sdk/python/benchmarks/results/ (git-ignored).
 
 Usage:
-    C2_RELAY_ADDRESS= uv run python sdk/python/benchmarks/three_mode_benchmark.py
-    C2_RELAY_ADDRESS= uv run python sdk/python/benchmarks/three_mode_benchmark.py --segment-size 268435456
+    C2_RELAY_ANCHOR_ADDRESS= uv run python sdk/python/benchmarks/three_mode_benchmark.py
+    C2_RELAY_ANCHOR_ADDRESS= uv run python sdk/python/benchmarks/three_mode_benchmark.py --segment-size 268435456
 """
 from __future__ import annotations
 

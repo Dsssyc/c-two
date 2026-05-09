@@ -1,7 +1,6 @@
 //! Chunked payload reassembly backed by [`MemHandle`].
 //!
-//! Replaces the Python `ChunkAssembler` and `_ReplyChunkAssembler` with a
-//! single Rust implementation that writes chunks directly into a unified
+//! Provides a single Rust implementation that writes chunks directly into a unified
 //! [`MemHandle`] (buddy SHM, dedicated SHM, or file-backed mmap).
 
 use c2_mem::MemPool;

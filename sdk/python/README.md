@@ -36,8 +36,11 @@ python tools/dev/c3_tool.py --build --link
 
 The Python SDK does not embed or start a relay server. Start the standalone
 Rust relay with `c3 relay`, Docker Compose, or orchestration such as
-Kubernetes, then point Python code at it with `C2_RELAY_ADDRESS` or
-`cc.set_relay()`.
+Kubernetes, then point Python code at its relay anchor with
+`C2_RELAY_ANCHOR_ADDRESS` or `cc.set_relay_anchor()`. The anchor is used for
+registration and name resolution. Remote HTTP calls still use the resolved
+route's `relay_url` directly, and local direct IPC is selected only for a
+loopback/local anchor.
 Relay-aware clients preflight routes before the first call and re-resolve
 structured stale-route responses; set `C2_RELAY_ROUTE_MAX_ATTEMPTS` to tune the
 maximum route acquisition attempts (default `3`, valid range `1..=32`, `0` is
@@ -46,7 +49,7 @@ treated as `1`). Ambiguous data-plane failures are not replayed.
 Run the Python SDK tests:
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest sdk/python/tests -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests -q --timeout=30
 ```
 
 Run Rust core checks when validating shared native runtime changes:
@@ -78,5 +81,5 @@ c3 relay --bind 127.0.0.1:8080
 Python-specific benchmarks live in `benchmarks/`:
 
 ```bash
-C2_RELAY_ADDRESS= uv run python sdk/python/benchmarks/segment_size_benchmark.py
+C2_RELAY_ANCHOR_ADDRESS= uv run python sdk/python/benchmarks/segment_size_benchmark.py
 ```

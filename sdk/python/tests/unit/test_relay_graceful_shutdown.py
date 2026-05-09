@@ -6,7 +6,6 @@ during ``cc.unregister()`` or ``cc.shutdown()``.
 from __future__ import annotations
 
 import logging
-from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -22,10 +21,20 @@ class IRelayShutdownCRM:
     def ping(self) -> str:
         ...
 
+    @cc.on_shutdown
+    def cleanup(self) -> None:
+        ...
+
 
 class RelayShutdownCRM:
+    def __init__(self) -> None:
+        self.cleanup_calls = 0
+
     def ping(self) -> str:
         return 'pong'
+
+    def cleanup(self) -> None:
+        self.cleanup_calls += 1
 
 
 # -- Tests: unregister tolerates relay absence -----------------------------
@@ -35,89 +44,76 @@ class TestUnregisterRelayAbsence:
 
     def setup_method(self):
         self.registry = _ProcessRegistry()
-        settings.relay_address = None
+        settings.relay_anchor_address = None
 
     def teardown_method(self):
         try:
             self.registry.shutdown()
         except Exception:
             pass
-        settings.relay_address = None
+        settings.relay_anchor_address = None
 
-    @patch.object(_ProcessRegistry, '_relay_register')
-    @patch.object(_ProcessRegistry, '_relay_unregister')
-    def test_unregister_no_relay(self, mock_unreg, mock_reg):
+    def test_unregister_no_relay(self):
         """Unregister works when relay calls are no-ops."""
         self.registry.register(IRelayShutdownCRM, RelayShutdownCRM(), name='test')
         self.registry.unregister('test')  # Should not raise
 
-    @patch.object(_ProcessRegistry, '_relay_register')
-    @patch.object(_ProcessRegistry, '_relay_unregister', side_effect=ConnectionError('relay down'))
-    def test_explicit_unregister_raises_when_relay_unreachable(self, mock_unreg, mock_reg):
+    def test_explicit_unregister_raises_when_relay_unreachable(self):
         """Explicit unregister reports relay cleanup failure after local removal."""
-        self.registry.register(IRelayShutdownCRM, RelayShutdownCRM(), name='test_down')
+        impl = RelayShutdownCRM()
+        self.registry.register(IRelayShutdownCRM, impl, name='test_down')
+        self.registry.set_relay_anchor('http://127.0.0.1:9')
 
-        with pytest.raises(ConnectionError, match='relay down'):
+        with pytest.raises(RuntimeError, match='Relay unregistration failed'):
             self.registry.unregister('test_down')
         assert 'test_down' not in self.registry.names
+        assert impl.cleanup_calls == 1
 
-    @patch.object(_ProcessRegistry, '_relay_register')
-    @patch.object(_ProcessRegistry, '_relay_unregister', side_effect=ConnectionError('relay down'))
-    def test_shutdown_relay_unreachable(self, mock_unreg, mock_reg, caplog):
+        self.registry.shutdown()
+        assert impl.cleanup_calls == 1
+
+    def test_shutdown_relay_unreachable(self, caplog):
         """Shutdown logs info when relay is unreachable (no error)."""
-        self.registry.register(IRelayShutdownCRM, RelayShutdownCRM(), name='test_sd')
+        impl = RelayShutdownCRM()
+        self.registry.register(IRelayShutdownCRM, impl, name='test_sd')
+        self.registry.set_relay_anchor('http://127.0.0.1:9')
 
         with caplog.at_level(logging.INFO):
             self.registry.shutdown()  # Should not raise
 
         assert any('unreachable' in r.message.lower() or 'relay' in r.message.lower()
                     for r in caplog.records)
+        assert impl.cleanup_calls == 1
 
-    def test_relay_unregister_surfaces_non_success_http_status(self):
-        settings.relay_address = 'http://relay.test'
+    def test_shutdown_after_unregister_does_not_double_call_callback(self):
+        """Native removed-route outcomes drive callback invocation once."""
+        impl = RelayShutdownCRM()
+        self.registry.register(IRelayShutdownCRM, impl, name='test_once')
+        self.registry.unregister('test_once')
 
-        class FailingRelayControl:
-            def unregister(self, name, server_id):  # noqa: ARG002
-                err = RuntimeError('HTTP 403: Forbidden')
-                err.status_code = 403
-                raise err
+        self.registry.shutdown()
 
-        self.registry._relay_control_client = FailingRelayControl()  # noqa: SLF001
-        self.registry._relay_control_address = 'http://relay.test'  # noqa: SLF001
+        assert impl.cleanup_calls == 1
 
-        with pytest.raises(RuntimeError, match='HTTP 403'):
-            self.registry._relay_unregister('grid', 'server-grid')
+    def test_reregister_after_unregister_still_works(self):
+        first = RelayShutdownCRM()
+        second = RelayShutdownCRM()
+        self.registry.register(IRelayShutdownCRM, first, name='test_reuse')
+        self.registry.unregister('test_reuse')
 
-    def test_relay_unregister_does_not_treat_404_as_success(self):
-        settings.relay_address = 'http://relay.test'
+        self.registry.register(IRelayShutdownCRM, second, name='test_reuse')
+        assert self.registry.names == ['test_reuse']
+        self.registry.unregister('test_reuse')
 
-        class MissingRelayControl:
-            def unregister(self, name, server_id):  # noqa: ARG002
-                err = RuntimeError('HTTP 404: Not Found')
-                err.status_code = 404
-                raise err
+        assert first.cleanup_calls == 1
+        assert second.cleanup_calls == 1
 
-        self.registry._relay_control_client = MissingRelayControl()  # noqa: SLF001
-        self.registry._relay_control_address = 'http://relay.test'  # noqa: SLF001
+    def test_register_surfaces_relay_http_error_from_native_session(self):
+        self.registry.set_relay_anchor('http://127.0.0.1:9')
 
-        with pytest.raises(RuntimeError, match='HTTP 404'):
-            self.registry._relay_unregister('grid', 'server-grid')
+        with pytest.raises(RuntimeError, match='relay error'):
+            self.registry.register(IRelayShutdownCRM, RelayShutdownCRM(), name='test_relay_fail')
 
-    def test_relay_register_surfaces_non_duplicate_http_status(self):
-        settings.relay_address = 'http://relay.test'
-
-        class RejectingRelayControl:
-            def register(self, name, server_id, ipc_address, crm_ns, crm_ver):  # noqa: ARG002
-                err = RuntimeError('HTTP 403: Forbidden')
-                err.status_code = 403
-                raise err
-
-        self.registry._relay_control_client = RejectingRelayControl()  # noqa: SLF001
-        self.registry._relay_control_address = 'http://relay.test'  # noqa: SLF001
-
-        with pytest.raises(RuntimeError, match='Relay registration failed.*HTTP 403'):
-            self.registry._relay_register(
-                'grid',
-                'server-grid',
-                'ipc://server-grid',
-            )
+        assert 'test_relay_fail' not in self.registry.names
+        assert self.registry.get_server_id() is None
+        assert self.registry.get_server_address() is None

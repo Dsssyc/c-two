@@ -637,6 +637,57 @@ class TestCrmToComBufferModes:
         result = wrapped(crm, pickle.dumps(42), _release_fn=lambda: released.append(True))
         assert released, '_release_fn must be called even on error'
 
+    def test_resource_input_deserialize_failure_remains_resource_deserialize_input(self):
+        from c_two import error
+
+        @cc.transferable
+        class BadDeserializeIn:
+            def serialize(val: int) -> bytes:
+                return pickle.dumps(val)
+
+            def deserialize(data) -> int:
+                raise RuntimeError('bad resource input deserialize')
+
+        wrapped = self._setup(BadDeserializeIn, buffer='view')
+        crm = self._make_icrm()
+        err_bytes, result_bytes = wrapped(
+            crm,
+            pickle.dumps(42),
+            _release_fn=lambda: None,
+        )
+        restored = error.CCError.deserialize(err_bytes)
+        assert isinstance(restored, error.ResourceDeserializeInput)
+        assert 'bad resource input deserialize' in str(restored)
+        assert result_bytes == b''
+
+    def test_resource_output_serialize_failure_is_resource_serialize_output(self):
+        from c_two import error
+        from c_two.crm.transferable import _build_transfer_wrapper
+
+        def echo(self, x: int) -> int: ...
+
+        input_trans = create_default_transferable(echo, is_input=True)
+
+        @cc.transferable
+        class BadOutput:
+            def serialize(value: int) -> bytes:
+                raise RuntimeError('bad resource output serialize')
+
+            def deserialize(data) -> int:
+                return 0
+
+        wrapped = _build_transfer_wrapper(echo, input=input_trans, output=BadOutput)
+        crm = self._make_icrm()
+        err_bytes, result_bytes = wrapped(
+            crm,
+            pickle.dumps(42),
+            _release_fn=lambda: None,
+        )
+        restored = error.CCError.deserialize(err_bytes)
+        assert isinstance(restored, error.ResourceSerializeOutput)
+        assert 'bad resource output serialize' in str(restored)
+        assert result_bytes == b''
+
     def test_transfer_wrapper_has_buffer_mode_attrs(self):
         """transfer_wrapper should expose _input_buffer_mode."""
         @cc.transferable
@@ -656,14 +707,16 @@ class TestComToCrmBufferModes:
 
     def _make_mock_response(self, data: bytes):
         """Create a mock PyShmBuffer-like response."""
-        class MockResponse:
+        class MockResponse(bytes):
+            def __new__(cls, data):
+                return super().__new__(cls, data)
+
             def __init__(self, data):
-                self._data = data
                 self.released = False
+
             def release(self):
                 self.released = True
-            def __buffer__(self, flags):
-                return memoryview(self._data)
+
         return MockResponse(data)
 
     def _make_icrm(self, response_data):
@@ -680,6 +733,32 @@ class TestComToCrmBufferModes:
                 self.client = client
         client = MockClient(mock_resp)
         return MockCRM(client), mock_resp
+
+    def _make_retained_response(self, data: bytes, tracker):
+        class RetainedResponse(bytes):
+            def __new__(cls, payload):
+                return super().__new__(cls, payload)
+
+            def __init__(self, payload):
+                self.released = False
+                self.lease = None
+
+            def track_retained(self, tracker, route_name, method_name, direction='client_response'):
+                self.lease = tracker.track_retained(
+                    route_name,
+                    method_name,
+                    direction,
+                    'inline',
+                    len(self),
+                )
+
+            def release(self):
+                self.released = True
+                if self.lease is not None:
+                    self.lease.release()
+                    self.lease = None
+
+        return RetainedResponse(data)
 
     def test_view_mode_releases_response(self):
         """view mode: response is deserialized and released."""
@@ -719,6 +798,115 @@ class TestComToCrmBufferModes:
         assert result.value == 42
         assert not mock_resp.released  # SHM held until explicit release
         result.release()
+        assert mock_resp.released
+
+    def test_hold_output_deserialize_success_tracks_retained_response_until_release(self):
+        from c_two import _native
+        from c_two.crm.transferable import _build_transfer_wrapper, HeldResult
+
+        tracker = _native.BufferLeaseTracker()
+
+        @cc.transferable
+        class DeserializeOnlyOut:
+            def serialize(val: int) -> bytes:
+                return pickle.dumps(val)
+
+            def deserialize(data) -> int:
+                return pickle.loads(bytes(data))
+
+        response = self._make_retained_response(pickle.dumps(42), tracker)
+
+        class MockClient:
+            supports_direct_call = False
+            lease_tracker = tracker
+            route_name = 'mock_route'
+
+            def call(self, method, data):
+                return response
+
+        class MockCRM:
+            direction = '->'
+            client = MockClient()
+
+        def fn(self) -> int: ...
+
+        wrapped = _build_transfer_wrapper(fn, input=None, output=DeserializeOnlyOut)
+        result = wrapped(MockCRM(), _c2_buffer='hold')
+
+        assert isinstance(result, HeldResult)
+        assert result.value == 42
+        assert not response.released
+        assert tracker.stats()['active_holds'] == 1
+        assert tracker.stats()['by_direction']['client_response']['active_holds'] == 1
+
+        result.release()
+
+        assert response.released
+        assert tracker.stats()['active_holds'] == 0
+
+    def test_hold_output_from_buffer_failure_raises_specific_error_and_releases_response(self):
+        from c_two import _native
+        from c_two import error
+        from c_two.crm.transferable import _build_transfer_wrapper
+
+        tracker = _native.BufferLeaseTracker()
+
+        @cc.transferable
+        class BadFromBufferOut:
+            def serialize(val: int) -> bytes:
+                return pickle.dumps(val)
+
+            def deserialize(data) -> int:
+                return pickle.loads(bytes(data))
+
+            def from_buffer(data: memoryview) -> int:
+                raise RuntimeError('bad output from_buffer')
+
+        response = self._make_retained_response(pickle.dumps(42), tracker)
+
+        class MockClient:
+            supports_direct_call = False
+            lease_tracker = tracker
+            route_name = 'mock_route'
+
+            def call(self, method, data):
+                return response
+
+        class MockCRM:
+            direction = '->'
+            client = MockClient()
+
+        def fn(self) -> int: ...
+
+        wrapped = _build_transfer_wrapper(fn, input=None, output=BadFromBufferOut)
+        with pytest.raises(error.ClientOutputFromBuffer) as exc_info:
+            wrapped(MockCRM(), _c2_buffer='hold')
+
+        assert 'bad output from_buffer' in str(exc_info.value)
+        assert response.released
+        assert tracker.stats()['active_holds'] == 0
+
+    def test_view_output_deserialize_failure_remains_client_deserialize_output(self):
+        from c_two import error
+        from c_two.crm.transferable import _build_transfer_wrapper
+
+        @cc.transferable
+        class BadDeserializeOut:
+            def serialize(val: int) -> bytes:
+                return pickle.dumps(val)
+
+            def deserialize(data) -> int:
+                raise RuntimeError('bad output deserialize')
+
+        crm, mock_resp = self._make_icrm(pickle.dumps(42))
+
+        def fn(self) -> int: ...
+
+        wrapped = _build_transfer_wrapper(fn, input=None, output=BadDeserializeOut)
+        with pytest.raises(error.ClientDeserializeOutput) as exc_info:
+            wrapped(crm)
+
+        assert 'bad output deserialize' in str(exc_info.value)
         assert mock_resp.released
 
 

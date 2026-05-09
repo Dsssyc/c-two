@@ -43,11 +43,11 @@ def test_ipc_client_requires_explicit_address():
 
 def test_ipc_client_ignores_relay_env_file(tmp_path):
     env_file = tmp_path / ".env"
-    env_file.write_text("C2_RELAY_ADDRESS=http://127.0.0.1:9999\n", encoding="utf-8")
+    env_file.write_text("C2_RELAY_ANCHOR_ADDRESS=http://127.0.0.1:9999\n", encoding="utf-8")
     result = _run_example_parse_args(
         "ipc_client.py",
         ["ipc://manual-address"],
-        env={"C2_ENV_FILE": str(env_file), "C2_RELAY_ADDRESS": "http://127.0.0.1:8888"},
+        env={"C2_ENV_FILE": str(env_file), "C2_RELAY_ANCHOR_ADDRESS": "http://127.0.0.1:8888"},
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "address=ipc://manual-address"
@@ -55,7 +55,7 @@ def test_ipc_client_ignores_relay_env_file(tmp_path):
 
 def test_relay_client_explicit_url_overrides_env_file(tmp_path):
     env_file = tmp_path / ".env"
-    env_file.write_text("C2_RELAY_ADDRESS=http://127.0.0.1:9137\n", encoding="utf-8")
+    env_file.write_text("C2_RELAY_ANCHOR_ADDRESS=http://127.0.0.1:9137\n", encoding="utf-8")
     result = _run_example_parse_args(
         "relay_client.py",
         ["--relay-url", "http://127.0.0.1:9140"],
@@ -66,7 +66,7 @@ def test_relay_client_explicit_url_overrides_env_file(tmp_path):
 
 
 def test_relay_client_defaults_to_local_relay_when_unconfigured():
-    result = _run_example_parse_args("relay_client.py", [], env={"C2_ENV_FILE": "", "C2_RELAY_ADDRESS": ""})
+    result = _run_example_parse_args("relay_client.py", [], env={"C2_ENV_FILE": "", "C2_RELAY_ANCHOR_ADDRESS": ""})
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "relay_url=http://127.0.0.1:8300"
 ```
@@ -209,7 +209,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 ```
 
-The main flow should call `cc.set_relay(args.relay_url)` before `cc.register(...)`.
+The main flow should call `cc.set_relay_anchor(args.relay_url)` before `cc.register(...)`.
 
 - [ ] **Step 4: Update relay client**
 
@@ -222,7 +222,7 @@ parser.add_argument("--relay-url", default=resolved_relay_url(DEFAULT_RELAY_URL)
 and main should always set the relay and connect by name:
 
 ```python
-cc.set_relay(args.relay_url)
+cc.set_relay_anchor(args.relay_url)
 grid = cc.connect(Grid, name="examples/grid")
 ```
 

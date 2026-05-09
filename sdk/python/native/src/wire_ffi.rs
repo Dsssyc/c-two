@@ -47,14 +47,33 @@ pub struct PyRouteInfo {
     #[pyo3(get)]
     name: String,
     #[pyo3(get)]
+    crm_ns: String,
+    #[pyo3(get)]
+    crm_name: String,
+    #[pyo3(get)]
+    crm_ver: String,
+    #[pyo3(get)]
     methods: Vec<Py<PyMethodEntry>>,
 }
 
 #[pymethods]
 impl PyRouteInfo {
     #[new]
-    fn new(name: String, methods: Vec<Py<PyMethodEntry>>) -> Self {
-        Self { name, methods }
+    #[pyo3(signature = (name, methods, crm_ns="", crm_name="", crm_ver=""))]
+    fn new(
+        name: String,
+        methods: Vec<Py<PyMethodEntry>>,
+        crm_ns: &str,
+        crm_name: &str,
+        crm_ver: &str,
+    ) -> Self {
+        Self {
+            name,
+            crm_ns: crm_ns.to_string(),
+            crm_name: crm_name.to_string(),
+            crm_ver: crm_ver.to_string(),
+            methods,
+        }
     }
 
     /// Look up method index by name, or `None` if not found.
@@ -83,8 +102,11 @@ impl PyRouteInfo {
 
     fn __repr__(&self) -> String {
         format!(
-            "RouteInfo(name='{}', methods=[{}])",
+            "RouteInfo(name='{}', crm_ns='{}', crm_name='{}', crm_ver='{}', methods=[{}])",
             self.name,
+            self.crm_ns,
+            self.crm_name,
+            self.crm_ver,
             self.methods
                 .iter()
                 .map(|m| {
@@ -93,6 +115,33 @@ impl PyRouteInfo {
                 })
                 .collect::<Vec<_>>()
                 .join(", ")
+        )
+    }
+}
+
+/// Server identity exchanged in server→client handshake ACKs.
+#[pyclass(name = "ServerIdentity", frozen)]
+pub struct PyServerIdentity {
+    #[pyo3(get)]
+    server_id: String,
+    #[pyo3(get)]
+    server_instance_id: String,
+}
+
+#[pymethods]
+impl PyServerIdentity {
+    #[new]
+    fn new(server_id: String, server_instance_id: String) -> Self {
+        Self {
+            server_id,
+            server_instance_id,
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "ServerIdentity(server_id='{}', server_instance_id='{}')",
+            self.server_id, self.server_instance_id,
         )
     }
 }
@@ -108,6 +157,8 @@ pub struct PyHandshake {
     routes: Vec<Py<PyRouteInfo>>,
     #[pyo3(get)]
     prefix: String,
+    #[pyo3(get)]
+    server_identity: Option<Py<PyServerIdentity>>,
 }
 
 #[pymethods]
@@ -304,6 +355,8 @@ fn encode_server_handshake(
     capability_flags: u16,
     routes: Vec<Py<PyRouteInfo>>,
     prefix: &str,
+    server_id: &str,
+    server_instance_id: &str,
 ) -> PyResult<Vec<u8>> {
     let rust_routes: Vec<c2_wire::handshake::RouteInfo> = routes
         .iter()
@@ -322,12 +375,25 @@ fn encode_server_handshake(
                 .collect();
             c2_wire::handshake::RouteInfo {
                 name: r_ref.name.clone(),
+                crm_ns: r_ref.crm_ns.clone(),
+                crm_name: r_ref.crm_name.clone(),
+                crm_ver: r_ref.crm_ver.clone(),
                 methods,
             }
         })
         .collect();
-    c2_wire::handshake::encode_server_handshake(&segments, capability_flags, &rust_routes, prefix)
-        .map_err(encode_err)
+    let identity = c2_wire::handshake::ServerIdentity {
+        server_id: server_id.to_string(),
+        server_instance_id: server_instance_id.to_string(),
+    };
+    c2_wire::handshake::encode_server_handshake(
+        &segments,
+        capability_flags,
+        &rust_routes,
+        prefix,
+        &identity,
+    )
+    .map_err(encode_err)
 }
 
 /// Decode handshake payload (both client and server directions).
@@ -354,16 +420,33 @@ fn decode_handshake(py: Python<'_>, payload: &[u8]) -> PyResult<PyHandshake> {
             py,
             PyRouteInfo {
                 name: route.name,
+                crm_ns: route.crm_ns,
+                crm_name: route.crm_name,
+                crm_ver: route.crm_ver,
                 methods: py_methods?,
             },
         )?);
     }
+
+    let server_identity = hs
+        .server_identity
+        .map(|identity| {
+            Py::new(
+                py,
+                PyServerIdentity {
+                    server_id: identity.server_id,
+                    server_instance_id: identity.server_instance_id,
+                },
+            )
+        })
+        .transpose()?;
 
     Ok(PyHandshake {
         segments: hs.segments,
         capability_flags: hs.capability_flags,
         routes: py_routes,
         prefix: hs.prefix,
+        server_identity,
     })
 }
 
@@ -373,6 +456,7 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // ── Classes ──────────────────────────────────────────────────────
     m.add_class::<PyMethodEntry>()?;
     m.add_class::<PyRouteInfo>()?;
+    m.add_class::<PyServerIdentity>()?;
     m.add_class::<PyHandshake>()?;
 
     // ── Frame codec ─────────────────────────────────────────────────

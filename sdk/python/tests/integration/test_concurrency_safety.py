@@ -16,6 +16,8 @@ import pytest
 import c_two as cc
 from c_two.transport.server import Server
 from c_two.transport.client.util import ping
+from c_two.transport.registry import _ProcessRegistry
+from c_two.transport.server.scheduler import ConcurrencyConfig, ConcurrencyMode
 
 
 # ---------------------------------------------------------------------------
@@ -32,6 +34,34 @@ class EchoImpl:
         return data
     def add(self, a: int, b: int) -> int:
         return a + b
+
+
+@cc.crm(namespace='cc.test.concurrency.drain', version='0.1.0')
+class IDrain:
+    @cc.write
+    def hold(self, delay: float) -> float: ...
+
+    @cc.write
+    def probe(self) -> int: ...
+
+
+class DrainImpl:
+    def __init__(self):
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.calls = 0
+        self.lock = threading.Lock()
+
+    def hold(self, delay: float) -> float:
+        self.entered.set()
+        self.release.wait(timeout=2)
+        time.sleep(delay)
+        return delay
+
+    def probe(self) -> int:
+        with self.lock:
+            self.calls += 1
+            return self.calls
 
 
 _counter = 0
@@ -241,3 +271,47 @@ class TestSOTAAPIConcurrency:
                 cc.register(IEcho, EchoImpl(), name='echo_dup')
         finally:
             cc.shutdown()
+
+
+class TestUnregisterDrain:
+    """Unregister should let in-flight calls drain but reject new ones."""
+
+    def test_unregister_closes_local_and_remote_new_calls(self):
+        cc.register(
+            IDrain,
+            DrainImpl(),
+            name='drain_route',
+            concurrency=ConcurrencyConfig(
+                mode=ConcurrencyMode.PARALLEL,
+                max_workers=1,
+            ),
+        )
+        addr = cc.server_address()
+        assert addr is not None
+        local = cc.connect(IDrain, name='drain_route')
+        remote = cc.connect(IDrain, name='drain_route', address=addr)
+        impl = _ProcessRegistry.get()._server._slots['drain_route'].crm_instance.resource  # noqa: SLF001
+
+        errors: list[BaseException] = []
+
+        def local_hold():
+            try:
+                assert local.hold(0.01) == 0.01
+            except BaseException as exc:
+                errors.append(exc)
+
+        t = threading.Thread(target=local_hold)
+        t.start()
+        assert impl.entered.wait(timeout=1)
+
+        cc.unregister('drain_route')
+
+        with pytest.raises(Exception):
+            local.probe()
+        with pytest.raises(Exception):
+            remote.probe()
+
+        impl.release.set()
+        t.join(timeout=5)
+        assert not t.is_alive()
+        assert not errors

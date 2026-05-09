@@ -279,7 +279,7 @@ Expected: Build success.
 - [ ] **Step 9: Run tests (existing behavior unchanged)**
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30 -k "not test_concurrent_large_calls"
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30 -k "not test_concurrent_large_calls"
 ```
 Expected: All pass — new fields have defaults matching old hardcoded values.
 
@@ -346,7 +346,7 @@ self._rust_server = RustServer(
 - [ ] **Step 3: Run tests**
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30 -k "not test_concurrent_large_calls"
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30 -k "not test_concurrent_large_calls"
 ```
 Expected: All pass.
 
@@ -549,7 +549,7 @@ def set_client_ipc_config(
 - [ ] **Step 5: Run tests**
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30 -k "not test_concurrent_large_calls"
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30 -k "not test_concurrent_large_calls"
 ```
 Expected: 1 failure in `test_concurrency_safety.py` (still uses old `set_ipc_config`). All others pass.
 
@@ -680,7 +680,7 @@ cc.set_client_ipc_config(segment_size=2 * 1024 * 1024 * 1024, max_segments=8)
 - [ ] **Step 7: Run full test suite**
 
 ```bash
-C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30 -k "not test_concurrent_large_calls"
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30 -k "not test_concurrent_large_calls"
 ```
 Expected: All pass.
 
@@ -716,7 +716,7 @@ cc.set_client_ipc_config(segment_size=seg_size, max_segments=8,
 
 Run:
 ```bash
-C2_RELAY_ADDRESS= uv run python benchmarks/segment_size_benchmark.py
+C2_RELAY_ANCHOR_ADDRESS= uv run python benchmarks/segment_size_benchmark.py
 ```
 
 - [ ] **Step 2: Compare 1GB results**

@@ -1,8 +1,7 @@
 //! UDS server — accept loop, per-connection frame handler, CRM dispatch.
 //!
-//! Replaces the Python asyncio server (`transport/server/core.py`).
-//! CRM method execution is delegated to [`CrmCallback`] (implemented
-//! by PyO3 wrappers in c2-ffi).
+//! CRM method execution is delegated to [`CrmCallback`] implementations
+//! supplied by language bindings or native runtime adapters.
 //!
 //! ## Lock conventions
 //!
@@ -10,9 +9,12 @@
 //! - `tokio::sync::RwLock` — async lock for `Dispatcher` (must `.await`)
 //! - `parking_lot::RwLock` — sync lock for `MemPool` (blocking, no `.await`)
 
+use std::io::ErrorKind;
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::OwnedWriteHalf;
@@ -30,6 +32,7 @@ use tracing::{debug, info, warn};
 /// suffix the max SHM name is 27 chars (within macOS 31-char limit).
 static RESPONSE_POOL_GEN: AtomicU64 = AtomicU64::new(0);
 
+use c2_error::{C2Error, ErrorCode};
 use c2_mem::MemPool;
 use c2_mem::config::PoolConfig;
 use c2_wire::buddy::{
@@ -42,6 +45,7 @@ use c2_wire::flags::{
     FLAG_SIGNAL,
 };
 use c2_wire::frame::{self, decode_frame_body, encode_frame};
+pub use c2_wire::handshake::ServerIdentity;
 use c2_wire::handshake::{
     CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX, MAX_METHODS, MAX_ROUTES, MethodEntry, RouteInfo,
     decode_handshake, encode_server_handshake, validate_name_len,
@@ -54,8 +58,14 @@ use crate::dispatcher::{
     CrmError, CrmRoute, Dispatcher, RequestData, ResponseMeta, cleanup_request,
 };
 use crate::heartbeat::run_heartbeat;
+use crate::response::buddy_response_data_size;
+use crate::scheduler::{Scheduler, SchedulerAcquireError};
 
 const IPC_SOCK_DIR: &str = "/tmp/c_two_ipc";
+
+fn error_wire(code: ErrorCode, message: impl Into<String>) -> Vec<u8> {
+    C2Error::new(code, message).to_wire_bytes()
+}
 
 // ---------------------------------------------------------------------------
 // Error
@@ -91,12 +101,34 @@ impl From<std::io::Error> for ServerError {
 // Server
 // ---------------------------------------------------------------------------
 
+/// Native lifecycle state for the IPC server accept loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerLifecycleState {
+    Initialized,
+    Starting,
+    Ready,
+    Stopping,
+    Stopped,
+    Failed(String),
+}
+
+impl ServerLifecycleState {
+    pub fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready)
+    }
+
+    pub fn is_running(&self) -> bool {
+        matches!(self, Self::Starting | Self::Ready | Self::Stopping)
+    }
+}
+
 /// The main IPC server.
 ///
 /// Binds a UDS socket, accepts connections, and dispatches CRM calls through
 /// the [`Dispatcher`].  Each connection runs in its own tokio task with a
 /// dedicated heartbeat probe.
 pub struct Server {
+    identity: ServerIdentity,
     config: ServerIpcConfig,
     socket_path: PathBuf,
     /// **tokio async RwLock** — guards CRM dispatch table; requires `.read().await`
@@ -104,6 +136,8 @@ pub struct Server {
     dispatcher: RwLock<Dispatcher>,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
+    lifecycle_tx: watch::Sender<ServerLifecycleState>,
+    socket_bound: AtomicBool,
     conn_counter: AtomicU64,
     /// Sharded chunk reassembly lifecycle manager.
     chunk_registry: Arc<c2_wire::chunk::ChunkRegistry>,
@@ -118,7 +152,21 @@ impl Server {
     /// Address format: `ipc://region_id`
     /// → socket at `/tmp/c_two_ipc/region_id.sock`
     pub fn new(address: &str, config: ServerIpcConfig) -> Result<Self, ServerError> {
+        let identity = ServerIdentity {
+            server_id: server_id_from_ipc_address(address)?,
+            server_instance_id: uuid::Uuid::new_v4().simple().to_string(),
+        };
+        Self::new_with_identity(address, config, identity)
+    }
+
+    /// Create a new server with an explicit identity.
+    pub fn new_with_identity(
+        address: &str,
+        config: ServerIpcConfig,
+        identity: ServerIdentity,
+    ) -> Result<Self, ServerError> {
         config.validate().map_err(ServerError::Config)?;
+        validate_server_identity(&identity)?;
         let socket_path = parse_socket_path(address)?;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let reassembly_cfg = PoolConfig {
@@ -161,22 +209,47 @@ impl Server {
         response_pool
             .ensure_ready()
             .map_err(|e| ServerError::Config(format!("response pool init: {e}")))?;
+        let (lifecycle_tx, _lifecycle_rx) = watch::channel(ServerLifecycleState::Initialized);
         Ok(Self {
+            identity,
             config,
             socket_path,
             dispatcher: RwLock::new(Dispatcher::new()),
             shutdown_tx,
             shutdown_rx,
+            lifecycle_tx,
+            socket_bound: AtomicBool::new(false),
             conn_counter: AtomicU64::new(0),
             chunk_registry,
             response_pool: Arc::new(parking_lot::RwLock::new(response_pool)),
         })
     }
 
+    /// Identity announced in server→client handshake ACKs.
+    pub fn identity(&self) -> &ServerIdentity {
+        &self.identity
+    }
+
+    /// Stable logical server identity.
+    pub fn server_id(&self) -> &str {
+        &self.identity.server_id
+    }
+
+    /// Per-server-incarnation identity.
+    pub fn server_instance_id(&self) -> &str {
+        &self.identity.server_instance_id
+    }
+
     /// Register a CRM route with the dispatcher.
     pub async fn register_route(&self, route: CrmRoute) -> Result<(), ServerError> {
         validate_route_for_wire(&route)?;
         let mut dispatcher = self.dispatcher.write().await;
+        if dispatcher.resolve(&route.name).is_some() {
+            return Err(ServerError::Protocol(format!(
+                "route already registered: {}",
+                route.name
+            )));
+        }
         if dispatcher.len() >= MAX_ROUTES && dispatcher.resolve(&route.name).is_none() {
             return Err(ServerError::Protocol(format!(
                 "route count exceeds wire limit: {} > {}",
@@ -189,8 +262,19 @@ impl Server {
     }
 
     /// Remove a CRM route. Returns `true` if it existed.
+    ///
+    /// The route handle is marked closed under the same dispatcher write lock
+    /// that removes the route, so local handle clones and remote route lookup
+    /// cannot observe an open-but-unregistered window.
     pub async fn unregister_route(&self, name: &str) -> bool {
-        self.dispatcher.write().await.unregister(name)
+        let mut dispatcher = self.dispatcher.write().await;
+        let removed = dispatcher.unregister(name);
+        if let Some(route) = removed.as_ref() {
+            route.scheduler.close();
+            true
+        } else {
+            false
+        }
     }
 
     /// Filesystem path of the bound UDS socket.
@@ -198,9 +282,150 @@ impl Server {
         &self.socket_path
     }
 
+    fn remove_owned_socket_file(&self) {
+        if self.socket_bound.swap(false, Ordering::AcqRel) {
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
+    }
+
+    fn set_lifecycle_state(&self, state: ServerLifecycleState) {
+        self.lifecycle_tx.send_replace(state);
+    }
+
+    pub fn lifecycle_state(&self) -> ServerLifecycleState {
+        self.lifecycle_tx.borrow().clone()
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.lifecycle_state().is_ready()
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.lifecycle_state().is_running()
+    }
+
+    /// Fence a new native start attempt.
+    ///
+    /// This resets the one-shot shutdown signal and moves stale terminal
+    /// lifecycle states (`Stopped` / `Failed`) back to `Starting` before the
+    /// async accept loop is spawned. Callers that start `run()` on a background
+    /// runtime should invoke this synchronously before they begin waiting for
+    /// readiness, otherwise a waiter can observe the previous attempt's
+    /// terminal state before the spawned task is polled.
+    pub fn begin_start_attempt(&self) -> Result<(), ServerError> {
+        match self.lifecycle_state() {
+            ServerLifecycleState::Initialized
+            | ServerLifecycleState::Stopped
+            | ServerLifecycleState::Failed(_) => {
+                self.shutdown_tx.send_replace(false);
+                self.set_lifecycle_state(ServerLifecycleState::Starting);
+                Ok(())
+            }
+            state => Err(ServerError::Config(format!(
+                "server cannot start while lifecycle state is {state:?}",
+            ))),
+        }
+    }
+
+    pub async fn wait_until_ready(&self, timeout: Duration) -> Result<(), ServerError> {
+        let mut rx = self.lifecycle_tx.subscribe();
+        let wait = async {
+            loop {
+                let state = rx.borrow().clone();
+                match state {
+                    ServerLifecycleState::Ready => return Ok(()),
+                    ServerLifecycleState::Failed(message) => {
+                        return Err(ServerError::Config(format!(
+                            "server failed to start: {message}",
+                        )));
+                    }
+                    ServerLifecycleState::Stopped => {
+                        return Err(ServerError::Config(
+                            "server stopped before becoming ready".to_string(),
+                        ));
+                    }
+                    ServerLifecycleState::Initialized
+                    | ServerLifecycleState::Starting
+                    | ServerLifecycleState::Stopping => {}
+                }
+                rx.changed().await.map_err(|_| {
+                    ServerError::Config("server readiness channel closed".to_string())
+                })?;
+            }
+        };
+
+        tokio::time::timeout(timeout, wait).await.map_err(|_| {
+            ServerError::Config(format!(
+                "server did not become ready within {:.3}s",
+                timeout.as_secs_f64(),
+            ))
+        })?
+    }
+
+    pub async fn wait_until_stopped(&self, timeout: Duration) -> Result<(), ServerError> {
+        let mut rx = self.lifecycle_tx.subscribe();
+        let wait = async {
+            loop {
+                let state = rx.borrow().clone();
+                match state {
+                    ServerLifecycleState::Initialized
+                    | ServerLifecycleState::Stopped
+                    | ServerLifecycleState::Failed(_) => return Ok(()),
+                    ServerLifecycleState::Starting
+                    | ServerLifecycleState::Ready
+                    | ServerLifecycleState::Stopping => {}
+                }
+                rx.changed().await.map_err(|_| {
+                    ServerError::Config("server lifecycle channel closed".to_string())
+                })?;
+            }
+        };
+
+        tokio::time::timeout(timeout, wait).await.map_err(|_| {
+            ServerError::Config(format!(
+                "server did not stop within {:.3}s",
+                timeout.as_secs_f64(),
+            ))
+        })?
+    }
+
+    /// Mark runtime-backed server work as stopped after its runtime is gone.
+    ///
+    /// This is a shutdown cleanup fence for runtime owners. It does not erase
+    /// startup failure diagnostics, but it prevents a force-dropped runtime from
+    /// leaving `Starting`, `Ready`, or `Stopping` as a stale non-terminal state.
+    pub fn finalize_runtime_stopped(&self) {
+        self.remove_owned_socket_file();
+        match self.lifecycle_state() {
+            ServerLifecycleState::Starting
+            | ServerLifecycleState::Ready
+            | ServerLifecycleState::Stopping => {
+                self.set_lifecycle_state(ServerLifecycleState::Stopped);
+            }
+            ServerLifecycleState::Initialized
+            | ServerLifecycleState::Stopped
+            | ServerLifecycleState::Failed(_) => {}
+        }
+    }
+
     /// Get a shared reference to the response pool (for zero-copy dispatch).
     pub fn response_pool_arc(&self) -> Arc<parking_lot::RwLock<MemPool>> {
         Arc::clone(&self.response_pool)
+    }
+
+    /// Return the configured response SHM threshold.
+    pub fn response_shm_threshold(&self) -> u64 {
+        self.config.shm_threshold
+    }
+
+    /// Return the configured maximum logical response payload size.
+    pub fn response_max_payload_size(&self) -> u64 {
+        self.config.max_payload_size
+    }
+
+    /// Return true if a route is currently registered.
+    pub async fn contains_route(&self, name: &str) -> bool {
+        self.dispatcher.read().await.resolve(name).is_some()
     }
 
     /// Get the chunk registry (for FFI or external use).
@@ -210,10 +435,26 @@ impl Server {
 
     /// Run the accept loop.  Blocks until [`shutdown`](Self::shutdown) is called.
     pub async fn run(self: &Arc<Self>) -> Result<(), ServerError> {
-        std::fs::create_dir_all(IPC_SOCK_DIR)?;
-        let _ = std::fs::remove_file(&self.socket_path);
+        if !matches!(self.lifecycle_state(), ServerLifecycleState::Starting) {
+            self.begin_start_attempt()?;
+        }
 
-        let listener = UnixListener::bind(&self.socket_path)?;
+        let startup = async {
+            std::fs::create_dir_all(IPC_SOCK_DIR)?;
+            remove_stale_socket_file(&self.socket_path)?;
+            let listener = UnixListener::bind(&self.socket_path)?;
+            self.socket_bound.store(true, Ordering::Release);
+            Ok::<UnixListener, ServerError>(listener)
+        }
+        .await;
+
+        let listener = match startup {
+            Ok(listener) => listener,
+            Err(err) => {
+                self.set_lifecycle_state(ServerLifecycleState::Failed(err.to_string()));
+                return Err(err);
+            }
+        };
 
         #[cfg(unix)]
         {
@@ -222,6 +463,7 @@ impl Server {
                 std::fs::set_permissions(&self.socket_path, std::fs::Permissions::from_mode(0o600));
         }
 
+        self.set_lifecycle_state(ServerLifecycleState::Ready);
         info!(path = %self.socket_path.display(), "server listening");
 
         // Spawn periodic GC sweep for expired chunk assemblies.
@@ -259,20 +501,25 @@ impl Server {
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
                         info!("server shutting down");
+                        self.set_lifecycle_state(ServerLifecycleState::Stopping);
                         break;
                     }
                 }
             }
         }
 
-        let _ = std::fs::remove_file(&self.socket_path);
+        self.remove_owned_socket_file();
+        self.set_lifecycle_state(ServerLifecycleState::Stopped);
         Ok(())
     }
 
     /// Signal the server to stop and remove the socket file.
     pub fn shutdown(&self) {
+        if self.is_running() {
+            self.set_lifecycle_state(ServerLifecycleState::Stopping);
+        }
         let _ = self.shutdown_tx.send(true);
-        let _ = std::fs::remove_file(&self.socket_path);
+        self.remove_owned_socket_file();
     }
 }
 
@@ -290,6 +537,52 @@ fn validate_route_for_wire(route: &CrmRoute) -> Result<(), ServerError> {
         validate_name_len("method name", method_name)
             .map_err(|e| ServerError::Protocol(e.to_string()))?;
     }
+    validate_name_len("crm namespace", &route.crm_ns)
+        .map_err(|e| ServerError::Protocol(e.to_string()))?;
+    validate_name_len("crm name", &route.crm_name)
+        .map_err(|e| ServerError::Protocol(e.to_string()))?;
+    validate_name_len("crm version", &route.crm_ver)
+        .map_err(|e| ServerError::Protocol(e.to_string()))?;
+    Ok(())
+}
+
+fn validate_server_identity(identity: &ServerIdentity) -> Result<(), ServerError> {
+    c2_config::validate_server_id(&identity.server_id).map_err(ServerError::Config)?;
+    validate_identity_wire_len("server_id", &identity.server_id).map_err(ServerError::Config)?;
+    validate_identity_component("server_instance_id", &identity.server_instance_id)
+        .map_err(ServerError::Config)
+}
+
+fn validate_identity_wire_len(label: &str, value: &str) -> Result<(), String> {
+    let actual = value.len();
+    if actual > c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES {
+        return Err(format!(
+            "{label} cannot exceed {} bytes",
+            c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES
+        ));
+    }
+    Ok(())
+}
+
+fn validate_identity_component(label: &str, value: &str) -> Result<(), String> {
+    validate_identity_wire_len(label, value)?;
+    if value.is_empty() {
+        return Err(format!("{label} cannot be empty"));
+    }
+    if value.trim() != value {
+        return Err(format!(
+            "{label} cannot contain leading or trailing whitespace"
+        ));
+    }
+    if value == "." || value == ".." || value.contains('/') || value.contains('\\') {
+        return Err(format!("{label} cannot contain path separators"));
+    }
+    if !value.is_ascii() {
+        return Err(format!("{label} must be ASCII"));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(format!("{label} cannot contain control characters"));
+    }
     Ok(())
 }
 
@@ -297,12 +590,43 @@ fn validate_route_for_wire(route: &CrmRoute) -> Result<(), ServerError> {
 // Address helpers
 // ---------------------------------------------------------------------------
 
+fn server_id_from_ipc_address(address: &str) -> Result<String, ServerError> {
+    let region = address
+        .strip_prefix("ipc://")
+        .ok_or_else(|| ServerError::Config(format!("invalid IPC address: {address}")))?;
+    validate_region_id(region).map_err(ServerError::Config)?;
+    Ok(region.to_string())
+}
+
 fn parse_socket_path(address: &str) -> Result<PathBuf, ServerError> {
     let region = address
         .strip_prefix("ipc://")
         .ok_or_else(|| ServerError::Config(format!("invalid IPC address: {address}")))?;
     validate_region_id(region).map_err(ServerError::Config)?;
     Ok(PathBuf::from(IPC_SOCK_DIR).join(format!("{region}.sock")))
+}
+
+fn remove_stale_socket_file(socket_path: &Path) -> Result<(), ServerError> {
+    if !socket_path.exists() {
+        return Ok(());
+    }
+
+    match StdUnixStream::connect(socket_path) {
+        Ok(_) => Err(ServerError::Config(format!(
+            "IPC socket {} already has an active listener",
+            socket_path.display(),
+        ))),
+        Err(err)
+            if matches!(
+                err.kind(),
+                ErrorKind::ConnectionRefused | ErrorKind::NotFound
+            ) =>
+        {
+            let _ = std::fs::remove_file(socket_path);
+            Ok(())
+        }
+        Err(err) => Err(ServerError::Io(err)),
+    }
 }
 
 fn validate_region_id(region: &str) -> Result<(), String> {
@@ -468,6 +792,9 @@ async fn handle_handshake(
         .iter()
         .map(|r| RouteInfo {
             name: r.name.clone(),
+            crm_ns: r.crm_ns.clone(),
+            crm_name: r.crm_name.clone(),
+            crm_ver: r.crm_ver.clone(),
             methods: r
                 .method_names
                 .iter()
@@ -482,8 +809,14 @@ async fn handle_handshake(
     drop(dispatcher);
 
     let cap = CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED;
-    let hs_bytes = encode_server_handshake(&server_segments, cap, &routes, &server_prefix)
-        .map_err(|e| ServerError::Protocol(e.to_string()))?;
+    let hs_bytes = encode_server_handshake(
+        &server_segments,
+        cap,
+        &routes,
+        &server_prefix,
+        server.identity(),
+    )
+    .map_err(|e| ServerError::Protocol(e.to_string()))?;
     let frame = encode_frame(request_id, FLAG_HANDSHAKE | FLAG_RESPONSE, &hs_bytes);
 
     writer.lock().await.write_all(&frame).await?;
@@ -519,6 +852,119 @@ async fn handle_signal(
         server.shutdown();
     }
     action
+}
+
+#[derive(Debug)]
+enum RouteExecutionError {
+    Acquire(SchedulerAcquireError),
+    Crm(CrmError),
+}
+
+async fn execute_route_request<F>(
+    scheduler: Scheduler,
+    method_idx: u16,
+    request: RequestData,
+    f: F,
+) -> Result<ResponseMeta, RouteExecutionError>
+where
+    F: FnOnce(RequestData) -> Result<ResponseMeta, CrmError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let guard = match scheduler.blocking_acquire(method_idx) {
+            Ok(guard) => guard,
+            Err(err) => {
+                cleanup_request(request);
+                return Err(RouteExecutionError::Acquire(err));
+            }
+        };
+        let _guard = guard;
+        f(request).map_err(RouteExecutionError::Crm)
+    })
+    .await
+    .expect("route execution task panicked")
+}
+
+async fn send_route_execution_result(
+    server: &Server,
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    request_id: u64,
+    result: Result<ResponseMeta, RouteExecutionError>,
+) {
+    match result {
+        Ok(meta) => {
+            if let Err(err) = send_response_meta(
+                &server.response_pool,
+                writer,
+                request_id,
+                meta,
+                server.config.shm_threshold,
+                server.config.chunk_size as usize,
+                server.config.max_payload_size,
+            )
+            .await
+            {
+                match err {
+                    ResponseSendError::UserVisible(message) => {
+                        write_reply(
+                            writer,
+                            request_id,
+                            &ReplyControl::Error(error_wire(
+                                ErrorCode::ResourceOutputSerializing,
+                                message,
+                            )),
+                        )
+                        .await;
+                    }
+                    ResponseSendError::Transport(message) => {
+                        warn!(request_id, error = %message, "response send failed");
+                    }
+                }
+            }
+        }
+        Err(RouteExecutionError::Crm(CrmError::UserError(b))) => {
+            write_reply(writer, request_id, &ReplyControl::Error(b)).await;
+        }
+        Err(RouteExecutionError::Crm(CrmError::InternalError(s))) => {
+            write_reply(
+                writer,
+                request_id,
+                &ReplyControl::Error(error_wire(ErrorCode::ResourceFunctionExecuting, s)),
+            )
+            .await;
+        }
+        Err(RouteExecutionError::Acquire(SchedulerAcquireError::Closed)) => {
+            write_reply(
+                writer,
+                request_id,
+                &ReplyControl::Error(error_wire(ErrorCode::ResourceUnavailable, "route closed")),
+            )
+            .await;
+        }
+        Err(RouteExecutionError::Acquire(SchedulerAcquireError::Capacity { field, limit })) => {
+            let msg = format!("route concurrency capacity exceeded: {field}={limit}");
+            write_reply(
+                writer,
+                request_id,
+                &ReplyControl::Error(error_wire(ErrorCode::ResourceUnavailable, msg)),
+            )
+            .await;
+        }
+    }
+}
+
+async fn write_unknown_method_index(
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    request_id: u64,
+    route_name: &str,
+    method_idx: u16,
+) {
+    let message = format!("unknown method index {method_idx} for route {route_name}");
+    write_reply(
+        writer,
+        request_id,
+        &ReplyControl::Error(error_wire(ErrorCode::ResourceFunctionExecuting, message)),
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -558,38 +1004,26 @@ async fn dispatch_call(
         }
     };
 
+    let idx = ctrl.method_idx;
+    if !route.has_method_index(idx) {
+        write_unknown_method_index(writer, request_id, &route.name, idx).await;
+        conn.flight_dec();
+        return;
+    }
+
     let callback = Arc::clone(&route.callback);
     let name = ctrl.route_name;
-    let idx = ctrl.method_idx;
     let args = payload[consumed..].to_vec();
     let resp_pool = Arc::clone(&server.response_pool);
 
-    let result = route
-        .scheduler
-        .execute(idx, move || {
-            callback.invoke(&name, idx, RequestData::Inline(args), resp_pool)
-        })
-        .await;
+    let scheduler = route.scheduler.as_ref().clone();
+    let request = RequestData::Inline(args);
+    let result = execute_route_request(scheduler, idx, request, move |request| {
+        callback.invoke(&name, idx, request, resp_pool)
+    })
+    .await;
 
-    match result {
-        Ok(meta) => {
-            send_response_meta(
-                &server.response_pool,
-                writer,
-                request_id,
-                meta,
-                server.config.shm_threshold,
-                server.config.chunk_size as usize,
-            )
-            .await
-        }
-        Err(CrmError::UserError(b)) => {
-            write_reply(writer, request_id, &ReplyControl::Error(b)).await;
-        }
-        Err(CrmError::InternalError(s)) => {
-            write_reply(writer, request_id, &ReplyControl::Error(s.into_bytes())).await;
-        }
-    }
+    send_route_execution_result(server, writer, request_id, result).await;
 
     conn.flight_dec();
 }
@@ -637,7 +1071,12 @@ async fn dispatch_buddy_call(
         Err(e) => {
             warn!(conn_id = conn.conn_id(), %e, "ensure_and_get_peer_pool failed");
             let msg = format!("buddy SHM segment open: {e}");
-            write_reply(writer, request_id, &ReplyControl::Error(msg.into_bytes())).await;
+            write_reply(
+                writer,
+                request_id,
+                &ReplyControl::Error(error_wire(ErrorCode::ResourceInputDeserializing, msg)),
+            )
+            .await;
             conn.flight_dec();
             return;
         }
@@ -672,7 +1111,12 @@ async fn dispatch_buddy_call(
             Err(e) => {
                 warn!(conn_id = conn.conn_id(), %e, "buddy SHM read failed (fallback)");
                 let msg = format!("buddy SHM read: {e}");
-                write_reply(writer, request_id, &ReplyControl::Error(msg.into_bytes())).await;
+                write_reply(
+                    writer,
+                    request_id,
+                    &ReplyControl::Error(error_wire(ErrorCode::ResourceInputDeserializing, msg)),
+                )
+                .await;
                 conn.flight_dec();
                 return;
             }
@@ -708,35 +1152,25 @@ async fn dispatch_buddy_call(
         }
     };
 
+    let idx = ctrl.method_idx;
+    if !route.has_method_index(idx) {
+        cleanup_request(request);
+        write_unknown_method_index(writer, request_id, &route.name, idx).await;
+        conn.flight_dec();
+        return;
+    }
+
     let callback = Arc::clone(&route.callback);
     let name = ctrl.route_name;
-    let idx = ctrl.method_idx;
     let resp_pool = Arc::clone(&server.response_pool);
 
-    let result = route
-        .scheduler
-        .execute(idx, move || callback.invoke(&name, idx, request, resp_pool))
-        .await;
+    let scheduler = route.scheduler.as_ref().clone();
+    let result = execute_route_request(scheduler, idx, request, move |request| {
+        callback.invoke(&name, idx, request, resp_pool)
+    })
+    .await;
 
-    match result {
-        Ok(meta) => {
-            send_response_meta(
-                &server.response_pool,
-                writer,
-                request_id,
-                meta,
-                server.config.shm_threshold,
-                server.config.chunk_size as usize,
-            )
-            .await
-        }
-        Err(CrmError::UserError(b)) => {
-            write_reply(writer, request_id, &ReplyControl::Error(b)).await;
-        }
-        Err(CrmError::InternalError(s)) => {
-            write_reply(writer, request_id, &ReplyControl::Error(s.into_bytes())).await;
-        }
-    }
+    send_route_execution_result(server, writer, request_id, result).await;
 
     conn.flight_dec();
 }
@@ -899,35 +1333,24 @@ async fn dispatch_chunked_call(
             }
         };
 
+        let idx = method_idx;
+        if !route.has_method_index(idx) {
+            cleanup_request(request);
+            write_unknown_method_index(writer, request_id, &route.name, idx).await;
+            return;
+        }
+
         let callback = Arc::clone(&route.callback);
         let name = route_name;
-        let idx = method_idx;
         let resp_pool = Arc::clone(&server.response_pool);
 
-        let result = route
-            .scheduler
-            .execute(idx, move || callback.invoke(&name, idx, request, resp_pool))
-            .await;
+        let scheduler = route.scheduler.as_ref().clone();
+        let result = execute_route_request(scheduler, idx, request, move |request| {
+            callback.invoke(&name, idx, request, resp_pool)
+        })
+        .await;
 
-        match result {
-            Ok(meta) => {
-                send_response_meta(
-                    &server.response_pool,
-                    writer,
-                    request_id,
-                    meta,
-                    server.config.shm_threshold,
-                    server.config.chunk_size as usize,
-                )
-                .await
-            }
-            Err(CrmError::UserError(b)) => {
-                write_reply(writer, request_id, &ReplyControl::Error(b)).await;
-            }
-            Err(CrmError::InternalError(s)) => {
-                write_reply(writer, request_id, &ReplyControl::Error(s.into_bytes())).await;
-            }
-        }
+        send_route_execution_result(server, writer, request_id, result).await;
     }
 }
 
@@ -937,6 +1360,79 @@ async fn dispatch_chunked_call(
 
 const REPLY_FLAGS: u32 = FLAG_RESPONSE | FLAG_REPLY_V2;
 
+fn checked_frame_total_len(payload_len: usize, context: &str) -> Result<u32, String> {
+    let total_len = 12usize
+        .checked_add(payload_len)
+        .ok_or_else(|| format!("{context} length overflow"))?;
+    u32::try_from(total_len)
+        .map_err(|_| format!("{context} length {total_len} exceeds u32 frame limit"))
+}
+
+fn inline_reply_total_len(data_len: usize) -> Result<u32, String> {
+    let ctrl_len = encode_reply_control(&ReplyControl::Success).len();
+    let payload_len = ctrl_len
+        .checked_add(data_len)
+        .ok_or_else(|| "inline reply frame length overflow".to_string())?;
+    checked_frame_total_len(payload_len, "inline reply frame")
+}
+
+fn reply_chunk_count(data_len: usize, chunk_size: usize) -> Result<u32, String> {
+    if chunk_size == 0 {
+        return Err("chunk_size must be > 0".to_string());
+    }
+    if data_len == 0 {
+        return Ok(0);
+    }
+    let chunks = data_len.div_ceil(chunk_size);
+    u32::try_from(chunks).map_err(|_| {
+        format!(
+            "chunk count {chunks} exceeds reply chunk metadata limit {}",
+            u32::MAX
+        )
+    })
+}
+
+fn ensure_response_meta_len(
+    data_len: usize,
+    max_payload_size: u64,
+) -> Result<(), ResponseSendError> {
+    let data_len_u64 = u64::try_from(data_len).unwrap_or(u64::MAX);
+    if data_len_u64 > max_payload_size {
+        return Err(ResponseSendError::UserVisible(format!(
+            "response payload size {data_len} exceeds max_payload_size {max_payload_size}"
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+enum BuddyReplyError {
+    Fallback(String),
+    Fatal(String),
+}
+
+impl std::fmt::Display for BuddyReplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fallback(message) | Self::Fatal(message) => f.write_str(message),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ResponseSendError {
+    UserVisible(String),
+    Transport(String),
+}
+
+impl std::fmt::Display for ResponseSendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UserVisible(message) | Self::Transport(message) => f.write_str(message),
+        }
+    }
+}
+
 async fn write_reply(writer: &Arc<Mutex<OwnedWriteHalf>>, request_id: u64, ctrl: &ReplyControl) {
     let payload = encode_reply_control(ctrl);
     let frame = encode_frame(request_id, REPLY_FLAGS, &payload);
@@ -945,10 +1441,16 @@ async fn write_reply(writer: &Arc<Mutex<OwnedWriteHalf>>, request_id: u64, ctrl:
 
 /// Write a success reply: control header (STATUS_SUCCESS) + result data.
 /// Uses stack buffer for small responses (≤1024B total frame) to avoid heap allocation.
-async fn write_reply_with_data(writer: &Arc<Mutex<OwnedWriteHalf>>, request_id: u64, data: &[u8]) {
+async fn write_reply_with_data(
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    request_id: u64,
+    data: &[u8],
+) -> Result<(), ResponseSendError> {
     let ctrl_bytes = encode_reply_control(&ReplyControl::Success);
-    let payload_len = ctrl_bytes.len() + data.len();
-    let total_len = (12 + payload_len) as u32;
+    let payload_len = ctrl_bytes.len().checked_add(data.len()).ok_or_else(|| {
+        ResponseSendError::UserVisible("inline reply frame length overflow".to_string())
+    })?;
+    let total_len = inline_reply_total_len(data.len()).map_err(ResponseSendError::UserVisible)?;
     let frame_size = frame::HEADER_SIZE + payload_len;
 
     if frame_size <= 1024 {
@@ -962,25 +1464,45 @@ async fn write_reply_with_data(writer: &Arc<Mutex<OwnedWriteHalf>>, request_id: 
         off += ctrl_bytes.len();
         buf[off..off + data.len()].copy_from_slice(data);
         off += data.len();
-        let _ = writer.lock().await.write_all(&buf[..off]).await;
+        writer
+            .lock()
+            .await
+            .write_all(&buf[..off])
+            .await
+            .map_err(|e| ResponseSendError::Transport(format!("inline reply write failed: {e}")))?;
     } else {
         // Large response: heap Vec (existing path)
-        let mut payload = Vec::with_capacity(ctrl_bytes.len() + data.len());
+        let mut payload = Vec::with_capacity(payload_len);
         payload.extend_from_slice(&ctrl_bytes);
         payload.extend_from_slice(data);
         let frame = encode_frame(request_id, REPLY_FLAGS, &payload);
-        let _ = writer.lock().await.write_all(&frame).await;
+        writer
+            .lock()
+            .await
+            .write_all(&frame)
+            .await
+            .map_err(|e| ResponseSendError::Transport(format!("inline reply write failed: {e}")))?;
     }
+    Ok(())
 }
 
 /// Write a success reply via buddy SHM: allocate from response pool, write
-/// data, send 11-byte pointer frame. Falls back to inline on alloc failure.
+/// data, send 11-byte pointer frame. The caller chooses inline or chunked
+/// fallback when SHM is unavailable.
 async fn write_buddy_reply_with_data(
     response_pool: &parking_lot::RwLock<MemPool>,
     writer: &Arc<Mutex<OwnedWriteHalf>>,
     request_id: u64,
     data: &[u8],
-) -> Result<(), String> {
+) -> Result<(), BuddyReplyError> {
+    let data_size = buddy_response_data_size(data.len()).ok_or_else(|| {
+        BuddyReplyError::Fallback(format!(
+            "response payload size {} exceeds buddy response wire limit {}",
+            data.len(),
+            u32::MAX
+        ))
+    })?;
+
     // 1. Allocate from response pool.
     let alloc = {
         let mut pool = response_pool.write();
@@ -989,7 +1511,7 @@ async fn write_buddy_reply_with_data(
     let alloc = match alloc {
         Ok(a) => a,
         Err(e) => {
-            return Err(format!("alloc failed: {e}"));
+            return Err(BuddyReplyError::Fallback(format!("alloc failed: {e}")));
         }
     };
 
@@ -1011,14 +1533,14 @@ async fn write_buddy_reply_with_data(
             let mut pool = response_pool.write();
             let _ = pool.free(&alloc);
         }
-        return Err("data_ptr failed".into());
+        return Err(BuddyReplyError::Fallback("data_ptr failed".into()));
     }
 
     // 3. Encode buddy payload + reply control.
     let bp = BuddyPayload {
         seg_idx: alloc.seg_idx as u16,
         offset: alloc.offset,
-        data_size: data.len() as u32,
+        data_size,
         is_dedicated: alloc.is_dedicated,
     };
     let buddy_bytes = encode_buddy_payload(&bp);
@@ -1031,7 +1553,13 @@ async fn write_buddy_reply_with_data(
     // 4. Send frame with FLAG_BUDDY.
     let flags = FLAG_RESPONSE | FLAG_REPLY_V2 | FLAG_BUDDY;
     let frame = encode_frame(request_id, flags, &payload);
-    let _ = writer.lock().await.write_all(&frame).await;
+    if let Err(err) = writer.lock().await.write_all(&frame).await {
+        let mut pool = response_pool.write();
+        let _ = pool.free(&alloc);
+        return Err(BuddyReplyError::Fatal(format!(
+            "buddy reply write failed: {err}"
+        )));
+    }
 
     // 5. Server-side free for dedicated segments: the client will lazy-open
     //    and read from SHM before gc_delay expires.  Buddy allocs use SHM
@@ -1052,20 +1580,27 @@ async fn write_chunked_reply(
     request_id: u64,
     data: &[u8],
     chunk_size: usize,
-) {
-    let total_chunks = ((data.len() + chunk_size - 1) / chunk_size) as u32;
+) -> Result<(), ResponseSendError> {
+    let total_chunks =
+        reply_chunk_count(data.len(), chunk_size).map_err(ResponseSendError::UserVisible)?;
     let total_size = data.len() as u64;
 
     for (idx, chunk) in data.chunks(chunk_size).enumerate() {
-        let meta = encode_reply_chunk_meta(total_size, total_chunks, idx as u32);
+        let chunk_idx = u32::try_from(idx).map_err(|_| {
+            ResponseSendError::UserVisible(format!(
+                "chunk index {idx} exceeds reply chunk metadata limit"
+            ))
+        })?;
+        let meta = encode_reply_chunk_meta(total_size, total_chunks, chunk_idx);
         let mut flags = REPLY_FLAGS | FLAG_CHUNKED;
-        if idx as u32 == total_chunks - 1 {
+        if chunk_idx == total_chunks - 1 {
             flags |= FLAG_CHUNK_LAST;
         }
 
         // Build frame: header + meta + chunk data
         let payload_len = REPLY_CHUNK_META_SIZE + chunk.len();
-        let total_len = (12 + payload_len) as u32;
+        let total_len = checked_frame_total_len(payload_len, "chunked reply frame")
+            .map_err(ResponseSendError::UserVisible)?;
 
         let mut frame = Vec::with_capacity(frame::HEADER_SIZE + payload_len);
         frame.extend_from_slice(&total_len.to_le_bytes());
@@ -1074,8 +1609,11 @@ async fn write_chunked_reply(
         frame.extend_from_slice(&meta);
         frame.extend_from_slice(chunk);
 
-        let _ = writer.lock().await.write_all(&frame).await;
+        writer.lock().await.write_all(&frame).await.map_err(|e| {
+            ResponseSendError::Transport(format!("chunked reply write failed: {e}"))
+        })?;
     }
+    Ok(())
 }
 
 /// Dispatch a `ResponseMeta` to the appropriate reply path.
@@ -1086,9 +1624,11 @@ async fn send_response_meta(
     meta: ResponseMeta,
     shm_threshold: u64,
     chunk_size: usize,
-) {
+    max_payload_size: u64,
+) -> Result<(), ResponseSendError> {
     match meta {
         ResponseMeta::Inline(data) => {
+            ensure_response_meta_len(data.len(), max_payload_size)?;
             smart_reply_with_data(
                 response_pool,
                 writer,
@@ -1097,10 +1637,10 @@ async fn send_response_meta(
                 shm_threshold,
                 chunk_size,
             )
-            .await;
+            .await?;
         }
         ResponseMeta::Empty => {
-            write_reply_with_data(writer, request_id, &[]).await;
+            write_reply_with_data(writer, request_id, &[]).await?;
         }
         ResponseMeta::ShmAlloc {
             seg_idx,
@@ -1108,6 +1648,13 @@ async fn send_response_meta(
             data_size,
             is_dedicated,
         } => {
+            if u64::from(data_size) > max_payload_size {
+                let mut pool = response_pool.write();
+                let _ = pool.free_at(seg_idx as u32, offset, data_size, is_dedicated);
+                return Err(ResponseSendError::UserVisible(format!(
+                    "response payload size {data_size} exceeds max_payload_size {max_payload_size}"
+                )));
+            }
             // CRM already wrote into our response pool — send buddy pointer.
             let bp = BuddyPayload {
                 seg_idx,
@@ -1122,7 +1669,13 @@ async fn send_response_meta(
             payload.extend_from_slice(&ctrl_bytes);
             let flags = FLAG_RESPONSE | FLAG_REPLY_V2 | FLAG_BUDDY;
             let frame = encode_frame(request_id, flags, &payload);
-            let _ = writer.lock().await.write_all(&frame).await;
+            if let Err(err) = writer.lock().await.write_all(&frame).await {
+                let mut pool = response_pool.write();
+                let _ = pool.free_at(seg_idx as u32, offset, data_size, is_dedicated);
+                return Err(ResponseSendError::Transport(format!(
+                    "prepared SHM reply write failed: {err}"
+                )));
+            }
 
             // Server-side free for dedicated segments (same as write_buddy_reply_with_data).
             if is_dedicated {
@@ -1131,6 +1684,7 @@ async fn send_response_meta(
             }
         }
     }
+    Ok(())
 }
 
 /// Choose buddy SHM or inline reply based on data size and threshold.
@@ -1141,23 +1695,31 @@ async fn smart_reply_with_data(
     data: &[u8],
     shm_threshold: u64,
     chunk_size: usize,
-) {
+) -> Result<(), ResponseSendError> {
     if data.len() as u64 > shm_threshold {
-        // Try buddy SHM first
-        if write_buddy_reply_with_data(response_pool, writer, request_id, data)
-            .await
-            .is_err()
-        {
-            // SHM failed — use chunked for large data, inline for small
-            if data.len() > chunk_size {
-                write_chunked_reply(writer, request_id, data, chunk_size).await;
-            } else {
-                write_reply_with_data(writer, request_id, data).await;
+        // Try buddy SHM first only when the buddy wire metadata can represent
+        // the payload. Larger responses must go straight to chunked fallback.
+        if buddy_response_data_size(data.len()).is_some() {
+            match write_buddy_reply_with_data(response_pool, writer, request_id, data).await {
+                Ok(()) => return Ok(()),
+                Err(BuddyReplyError::Fallback(_)) => {}
+                Err(BuddyReplyError::Fatal(message)) => {
+                    return Err(ResponseSendError::Transport(message));
+                }
             }
         }
-    } else {
-        write_reply_with_data(writer, request_id, data).await;
+
+        // SHM failed or is not representable. Use chunked for large data and
+        // for any data that cannot fit in a single inline frame.
+        if data.len() > chunk_size || inline_reply_total_len(data.len()).is_err() {
+            return write_chunked_reply(writer, request_id, data, chunk_size).await;
+        }
     }
+
+    if inline_reply_total_len(data.len()).is_err() {
+        return write_chunked_reply(writer, request_id, data, chunk_size).await;
+    }
+    write_reply_with_data(writer, request_id, data).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1224,6 +1786,75 @@ mod tests {
     }
 
     #[test]
+    fn server_new_derives_stable_server_id_and_instance_identity() {
+        let first = Server::new("ipc://identity_srv", ServerIpcConfig::default()).unwrap();
+        let second = Server::new("ipc://identity_srv", ServerIpcConfig::default()).unwrap();
+
+        assert_eq!(first.server_id(), "identity_srv");
+        assert_eq!(first.identity().server_id, "identity_srv");
+        assert_eq!(first.server_instance_id().len(), 32);
+        assert_ne!(first.server_instance_id(), second.server_instance_id());
+    }
+
+    #[test]
+    fn server_new_with_identity_uses_validated_identity() {
+        let identity = c2_wire::handshake::ServerIdentity {
+            server_id: "server-explicit".to_string(),
+            server_instance_id: "instance-explicit".to_string(),
+        };
+
+        let server = Server::new_with_identity(
+            "ipc://identity_explicit",
+            ServerIpcConfig::default(),
+            identity.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(server.identity(), &identity);
+        assert_eq!(server.server_id(), "server-explicit");
+        assert_eq!(server.server_instance_id(), "instance-explicit");
+    }
+
+    #[test]
+    fn server_new_with_identity_rejects_invalid_instance_id() {
+        let too_long = "a".repeat(c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES + 1);
+        for server_instance_id in ["../bad", "实例", too_long.as_str()] {
+            let identity = c2_wire::handshake::ServerIdentity {
+                server_id: "server-explicit".to_string(),
+                server_instance_id: server_instance_id.to_string(),
+            };
+
+            let err = Server::new_with_identity(
+                "ipc://identity_bad",
+                ServerIpcConfig::default(),
+                identity,
+            )
+            .err()
+            .expect("invalid identity should be rejected");
+
+            assert!(err.to_string().contains("server_instance_id"));
+        }
+    }
+
+    #[test]
+    fn server_new_with_identity_rejects_server_id_too_long_for_wire() {
+        let identity = c2_wire::handshake::ServerIdentity {
+            server_id: "s".repeat(c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES + 1),
+            server_instance_id: "instance-explicit".to_string(),
+        };
+
+        let err = Server::new_with_identity(
+            "ipc://identity_bad_server_id",
+            ServerIpcConfig::default(),
+            identity,
+        )
+        .err()
+        .expect("overlong server_id should be rejected");
+
+        assert!(err.to_string().contains("server_id"));
+    }
+
+    #[test]
     fn server_new_bad_address() {
         assert!(Server::new("http://bad", ServerIpcConfig::default()).is_err());
     }
@@ -1235,6 +1866,312 @@ mod tests {
             ..ServerIpcConfig::default()
         };
         assert!(Server::new("ipc://x", cfg).is_err());
+    }
+
+    fn unique_readiness_address(prefix: &str) -> String {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        format!("ipc://{prefix}_{}_{}", std::process::id(), n)
+    }
+
+    fn unique_response_pool_prefix(label: &str) -> String {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        format!("/c2sw{:04x}{:04x}", std::process::id() as u16, n as u16) + label
+    }
+
+    fn small_response_pool(label: &str) -> parking_lot::RwLock<MemPool> {
+        parking_lot::RwLock::new(MemPool::new_with_prefix(
+            PoolConfig {
+                segment_size: 64 * 1024,
+                min_block_size: 4096,
+                max_segments: 1,
+                max_dedicated_segments: 1,
+                dedicated_crash_timeout_secs: 0.0,
+                ..PoolConfig::default()
+            },
+            unique_response_pool_prefix(label),
+        ))
+    }
+
+    fn closed_writer() -> Arc<Mutex<OwnedWriteHalf>> {
+        let (client, server) = StdUnixStream::pair().unwrap();
+        client.shutdown(std::net::Shutdown::Both).unwrap();
+        server.set_nonblocking(true).unwrap();
+        let server = UnixStream::from_std(server).unwrap();
+        let (_read_half, write_half) = server.into_split();
+        Arc::new(Mutex::new(write_half))
+    }
+
+    #[tokio::test]
+    async fn wait_until_ready_times_out_before_start() {
+        let server = Arc::new(
+            Server::new(
+                &unique_readiness_address("ready_timeout"),
+                ServerIpcConfig::default(),
+            )
+            .unwrap(),
+        );
+
+        let err = server
+            .wait_until_ready(Duration::from_millis(1))
+            .await
+            .expect_err("server that was never started must time out");
+
+        assert!(err.to_string().contains("did not become ready"));
+        assert_eq!(server.lifecycle_state(), ServerLifecycleState::Initialized);
+        assert!(!server.is_ready());
+        assert!(!server.is_running());
+    }
+
+    #[tokio::test]
+    async fn run_sets_ready_then_shutdown_sets_stopped() {
+        let server = Arc::new(
+            Server::new(
+                &unique_readiness_address("ready_state"),
+                ServerIpcConfig::default(),
+            )
+            .unwrap(),
+        );
+        let runner = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { server.run().await })
+        };
+
+        server
+            .wait_until_ready(Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(server.lifecycle_state(), ServerLifecycleState::Ready);
+        assert!(server.is_ready());
+        assert!(server.is_running());
+        assert!(StdUnixStream::connect(server.socket_path()).is_ok());
+
+        server.shutdown();
+        runner.await.unwrap().unwrap();
+        assert_eq!(server.lifecycle_state(), ServerLifecycleState::Stopped);
+        assert!(!server.is_ready());
+        assert!(!server.is_running());
+    }
+
+    #[tokio::test]
+    async fn active_socket_is_not_unlinked_by_second_server() {
+        let address = unique_readiness_address("active_socket");
+        let first = Arc::new(Server::new(&address, ServerIpcConfig::default()).unwrap());
+        let first_runner = {
+            let first = Arc::clone(&first);
+            tokio::spawn(async move { first.run().await })
+        };
+        first
+            .wait_until_ready(Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(StdUnixStream::connect(first.socket_path()).is_ok());
+
+        let second = Arc::new(Server::new(&address, ServerIpcConfig::default()).unwrap());
+        let second_result = tokio::time::timeout(Duration::from_millis(200), {
+            let second = Arc::clone(&second);
+            async move { second.run().await }
+        })
+        .await;
+
+        match second_result {
+            Ok(Err(err)) => {
+                let message = err.to_string();
+                assert!(
+                    message.contains("already has an active listener")
+                        || message.contains("address already in use"),
+                    "unexpected error: {message}",
+                );
+            }
+            Ok(Ok(())) => panic!("second server unexpectedly started and stopped cleanly"),
+            Err(_) => {
+                second.shutdown();
+                panic!("second server hung instead of rejecting the active socket");
+            }
+        }
+
+        assert!(first.is_ready());
+        assert!(StdUnixStream::connect(first.socket_path()).is_ok());
+        first.shutdown();
+        first_runner.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_after_failed_bind_does_not_unlink_active_socket() {
+        let address = unique_readiness_address("failed_bind_shutdown");
+        let first = Arc::new(Server::new(&address, ServerIpcConfig::default()).unwrap());
+        let first_runner = {
+            let first = Arc::clone(&first);
+            tokio::spawn(async move { first.run().await })
+        };
+        first
+            .wait_until_ready(Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(StdUnixStream::connect(first.socket_path()).is_ok());
+
+        let second = Arc::new(Server::new(&address, ServerIpcConfig::default()).unwrap());
+        let second_result = tokio::time::timeout(Duration::from_millis(200), {
+            let second = Arc::clone(&second);
+            async move { second.run().await }
+        })
+        .await;
+        let err = second_result
+            .expect("second server hung instead of rejecting the active socket")
+            .expect_err("second bind must fail");
+        assert!(
+            err.to_string().contains("active listener")
+                || err.to_string().contains("address already in use"),
+            "unexpected error: {err}",
+        );
+        second.shutdown();
+
+        assert!(first.is_ready());
+        assert!(StdUnixStream::connect(first.socket_path()).is_ok());
+        first.shutdown();
+        first_runner.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn same_server_can_start_again_after_shutdown() {
+        let server = Arc::new(
+            Server::new(
+                &unique_readiness_address("restart_after_shutdown"),
+                ServerIpcConfig::default(),
+            )
+            .unwrap(),
+        );
+
+        server.begin_start_attempt().unwrap();
+        let first_runner = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { server.run().await })
+        };
+        server
+            .wait_until_ready(Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(StdUnixStream::connect(server.socket_path()).is_ok());
+
+        server.shutdown();
+        first_runner.await.unwrap().unwrap();
+        assert_eq!(server.lifecycle_state(), ServerLifecycleState::Stopped);
+
+        server.begin_start_attempt().unwrap();
+        let second_runner = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { server.run().await })
+        };
+        server
+            .wait_until_ready(Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(StdUnixStream::connect(server.socket_path()).is_ok());
+
+        server.shutdown();
+        second_runner.await.unwrap().unwrap();
+        assert_eq!(server.lifecycle_state(), ServerLifecycleState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn failed_bind_can_retry_after_socket_released() {
+        let address = unique_readiness_address("retry_after_failed_bind");
+        let first = Arc::new(Server::new(&address, ServerIpcConfig::default()).unwrap());
+        first.begin_start_attempt().unwrap();
+        let first_runner = {
+            let first = Arc::clone(&first);
+            tokio::spawn(async move { first.run().await })
+        };
+        first
+            .wait_until_ready(Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        let second = Arc::new(Server::new(&address, ServerIpcConfig::default()).unwrap());
+        second.begin_start_attempt().unwrap();
+        let failed = second
+            .run()
+            .await
+            .expect_err("active socket should reject the first attempt");
+        assert!(
+            failed.to_string().contains("active listener")
+                || failed.to_string().contains("address already in use"),
+            "unexpected error: {failed}",
+        );
+        assert!(matches!(
+            second.lifecycle_state(),
+            ServerLifecycleState::Failed(_)
+        ));
+
+        first.shutdown();
+        first_runner.await.unwrap().unwrap();
+
+        second.begin_start_attempt().unwrap();
+        let second_runner = {
+            let second = Arc::clone(&second);
+            tokio::spawn(async move { second.run().await })
+        };
+        second
+            .wait_until_ready(Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(StdUnixStream::connect(second.socket_path()).is_ok());
+
+        second.shutdown();
+        second_runner.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_until_stopped_fences_restart_after_shutdown() {
+        let server = Arc::new(
+            Server::new(
+                &unique_readiness_address("wait_stop_restart"),
+                ServerIpcConfig::default(),
+            )
+            .unwrap(),
+        );
+
+        server.begin_start_attempt().unwrap();
+        let runner = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { server.run().await })
+        };
+        server
+            .wait_until_ready(Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        server.shutdown();
+        server
+            .wait_until_stopped(Duration::from_secs(2))
+            .await
+            .unwrap();
+        server
+            .begin_start_attempt()
+            .expect("stopped lifecycle should permit a new start attempt");
+
+        runner.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn finalize_runtime_stopped_terminalizes_running_states_but_preserves_failed() {
+        let server = Server::new(
+            &unique_readiness_address("finalize_runtime"),
+            ServerIpcConfig::default(),
+        )
+        .unwrap();
+
+        server.set_lifecycle_state(ServerLifecycleState::Stopping);
+        server.finalize_runtime_stopped();
+        assert_eq!(server.lifecycle_state(), ServerLifecycleState::Stopped);
+
+        server.set_lifecycle_state(ServerLifecycleState::Failed("bind failed".to_string()));
+        server.finalize_runtime_stopped();
+        assert_eq!(
+            server.lifecycle_state(),
+            ServerLifecycleState::Failed("bind failed".to_string()),
+        );
     }
 
     // -- route registration --
@@ -1255,6 +2192,9 @@ mod tests {
     fn make_route(name: &str) -> CrmRoute {
         CrmRoute {
             name: name.into(),
+            crm_ns: "test.grid".into(),
+            crm_name: "Grid".into(),
+            crm_ver: "0.1.0".into(),
             scheduler: Arc::new(Scheduler::new(
                 ConcurrencyMode::ReadParallel,
                 HashMap::new(),
@@ -1268,11 +2208,83 @@ mod tests {
     async fn register_unregister_route() {
         let s = Arc::new(Server::new("ipc://reg_test", ServerIpcConfig::default()).unwrap());
 
-        s.register_route(make_route("grid")).await.unwrap();
+        let route = make_route("grid");
+        let scheduler = route.scheduler.as_ref().clone();
+        s.register_route(route).await.unwrap();
         assert!(s.dispatcher.read().await.resolve("grid").is_some());
+        assert!(s.contains_route("grid").await);
 
         assert!(s.unregister_route("grid").await);
         assert!(s.dispatcher.read().await.resolve("grid").is_none());
+        assert!(!s.contains_route("grid").await);
+        assert!(scheduler.snapshot().closed);
+        assert_eq!(
+            scheduler.try_acquire(0).unwrap_err(),
+            crate::scheduler::SchedulerAcquireError::Closed,
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_route_registration_is_rejected() {
+        let s = Arc::new(Server::new("ipc://dup_route_test", ServerIpcConfig::default()).unwrap());
+
+        s.register_route(make_route("grid")).await.unwrap();
+        let err = s.register_route(make_route("grid")).await.unwrap_err();
+
+        assert!(err.to_string().contains("already registered"));
+    }
+
+    #[tokio::test]
+    async fn rejected_acquire_cleans_materialized_request() {
+        use crate::scheduler::{SchedulerAcquireError, SchedulerLimits};
+        use c2_mem::PoolConfig;
+        use std::num::NonZeroUsize;
+
+        let pool = Arc::new(parking_lot::RwLock::new(MemPool::new_with_prefix(
+            PoolConfig {
+                segment_size: 4096,
+                min_block_size: 128,
+                max_segments: 1,
+                max_dedicated_segments: 0,
+                dedicated_crash_timeout_secs: 0.0,
+                ..PoolConfig::default()
+            },
+            format!("/cc2s{:04x}{:04x}", std::process::id() as u16, 0xaceu16,),
+        )));
+        pool.write().ensure_ready().unwrap();
+        let alloc = pool.write().alloc(128).unwrap();
+        let request = RequestData::Shm {
+            pool: Arc::clone(&pool),
+            seg_idx: alloc.seg_idx as u16,
+            offset: alloc.offset,
+            data_size: 128,
+            is_dedicated: alloc.is_dedicated,
+        };
+        let scheduler = Scheduler::with_limits(
+            ConcurrencyMode::Parallel,
+            HashMap::new(),
+            SchedulerLimits {
+                max_pending: Some(NonZeroUsize::new(1).unwrap()),
+                max_workers: Some(NonZeroUsize::new(1).unwrap()),
+            },
+        );
+        let _first = scheduler.try_acquire(0).unwrap();
+
+        let err = execute_route_request(scheduler.clone(), 0, request, |_request| {
+            panic!("callback must not run when acquire fails")
+        })
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            err,
+            RouteExecutionError::Acquire(SchedulerAcquireError::Capacity {
+                field: "max_pending",
+                limit: 1,
+            })
+        ));
+        let reused = pool.write().alloc(128).unwrap();
+        assert_eq!(reused.offset, alloc.offset);
     }
 
     #[tokio::test]
@@ -1316,6 +2328,67 @@ mod tests {
 
         assert!(err.to_string().contains("route count"));
         assert!(s.dispatcher.read().await.resolve("overflow").is_none());
+    }
+
+    #[tokio::test]
+    async fn inline_dispatch_rejects_unknown_method_index_before_callback() {
+        use c2_wire::control::{decode_reply_control, encode_call_control};
+        use c2_wire::frame::decode_frame;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingCallback {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl CrmCallback for CountingCallback {
+            fn invoke(
+                &self,
+                _: &str,
+                _: u16,
+                _request: RequestData,
+                _response_pool: Arc<parking_lot::RwLock<MemPool>>,
+            ) -> Result<ResponseMeta, CrmError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(ResponseMeta::Inline(b"should-not-run".to_vec()))
+            }
+        }
+
+        let server =
+            Arc::new(Server::new("ipc://unknown_method_idx", ServerIpcConfig::default()).unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut route = make_route("grid");
+        route.callback = Arc::new(CountingCallback {
+            calls: Arc::clone(&calls),
+        });
+        server.register_route(route).await.unwrap();
+
+        let conn = Connection::new(1);
+        let (mut client_stream, server_stream) = UnixStream::pair().unwrap();
+        let (_read_half, write_half) = server_stream.into_split();
+        let writer = Arc::new(Mutex::new(write_half));
+        let payload = encode_call_control("grid", 99).unwrap();
+
+        dispatch_call(&server, &conn, 42, &payload, &writer).await;
+
+        let mut total_len_buf = [0u8; 4];
+        client_stream.read_exact(&mut total_len_buf).await.unwrap();
+        let total_len = u32::from_le_bytes(total_len_buf);
+        let mut body = vec![0u8; total_len as usize];
+        client_stream.read_exact(&mut body).await.unwrap();
+        let mut frame = Vec::with_capacity(4 + body.len());
+        frame.extend_from_slice(&total_len_buf);
+        frame.extend_from_slice(&body);
+        let (header, reply_payload) = decode_frame(&frame).unwrap();
+
+        assert_eq!(header.request_id, 42);
+        match decode_reply_control(reply_payload, 0).unwrap().0 {
+            ReplyControl::Error(err) => {
+                let message = String::from_utf8_lossy(&err);
+                assert!(message.contains("unknown method index 99"));
+            }
+            other => panic!("expected method-index error reply, got {other:?}"),
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     // -- shutdown --
@@ -1421,6 +2494,145 @@ mod tests {
         assert_eq!(&slice[16..18], b"cc");
         drop(p);
         pool.write().release_handle(finished.handle);
+    }
+
+    #[test]
+    fn buddy_response_wire_limit_rejects_oversized_payloads() {
+        assert_eq!(
+            crate::response::buddy_response_data_size(u32::MAX as usize),
+            Some(u32::MAX)
+        );
+        assert_eq!(
+            crate::response::buddy_response_data_size(u32::MAX as usize + 1),
+            None
+        );
+    }
+
+    #[test]
+    fn reply_chunk_count_rejects_unrepresentable_chunk_counts() {
+        assert!(reply_chunk_count(0, 0).unwrap_err().contains("chunk_size"));
+        assert_eq!(reply_chunk_count(0, 128).unwrap(), 0);
+        assert_eq!(reply_chunk_count(1025, 512).unwrap(), 3);
+
+        let err = reply_chunk_count(u32::MAX as usize + 1, 1).unwrap_err();
+        assert!(err.contains("chunk count"));
+    }
+
+    #[test]
+    fn inline_reply_frame_len_rejects_unrepresentable_frames() {
+        assert!(inline_reply_total_len(16).is_ok());
+
+        let err = inline_reply_total_len(u32::MAX as usize).unwrap_err();
+        assert!(err.contains("inline reply frame"));
+    }
+
+    #[tokio::test]
+    async fn buddy_reply_write_failure_frees_allocated_response_block() {
+        let pool = small_response_pool("a");
+        let writer = closed_writer();
+        let payload = b"x".repeat(8192);
+
+        let err = write_buddy_reply_with_data(&pool, &writer, 7, payload.as_slice())
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("buddy reply write failed"));
+        assert_eq!(pool.read().stats().alloc_count, 0);
+    }
+
+    #[tokio::test]
+    async fn prepared_shm_reply_write_failure_frees_allocated_response_block() {
+        let pool = small_response_pool("b");
+        let alloc = pool.write().alloc(8192).unwrap();
+        let writer = closed_writer();
+
+        let err = send_response_meta(
+            &pool,
+            &writer,
+            7,
+            ResponseMeta::ShmAlloc {
+                seg_idx: alloc.seg_idx as u16,
+                offset: alloc.offset,
+                data_size: 8192,
+                is_dedicated: alloc.is_dedicated,
+            },
+            1024,
+            4096,
+            16 * 1024,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("prepared SHM reply write failed"));
+        assert_eq!(pool.read().stats().alloc_count, 0);
+    }
+
+    #[tokio::test]
+    async fn inline_response_over_max_payload_is_rejected_before_transport() {
+        let pool = small_response_pool("c");
+        let writer = closed_writer();
+
+        let err = send_response_meta(
+            &pool,
+            &writer,
+            7,
+            ResponseMeta::Inline(b"x".repeat(1025)),
+            1024,
+            4096,
+            1024,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("response payload size 1025 exceeds max_payload_size 1024")
+        );
+        assert_eq!(pool.read().stats().alloc_count, 0);
+    }
+
+    #[tokio::test]
+    async fn prepared_shm_response_over_max_payload_is_rejected_and_freed() {
+        let pool = small_response_pool("d");
+        let alloc = pool.write().alloc(8192).unwrap();
+        let writer = closed_writer();
+
+        let err = send_response_meta(
+            &pool,
+            &writer,
+            7,
+            ResponseMeta::ShmAlloc {
+                seg_idx: alloc.seg_idx as u16,
+                offset: alloc.offset,
+                data_size: 8192,
+                is_dedicated: alloc.is_dedicated,
+            },
+            1024,
+            4096,
+            4096,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("response payload size 8192 exceeds max_payload_size 4096")
+        );
+        assert_eq!(pool.read().stats().alloc_count, 0);
+    }
+
+    #[tokio::test]
+    async fn smart_reply_treats_buddy_write_failure_as_fatal() {
+        let pool = small_response_pool("e");
+        let writer = closed_writer();
+        let payload = b"x".repeat(8192);
+
+        let err = smart_reply_with_data(&pool, &writer, 7, payload.as_slice(), 1024, 4096)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("buddy reply write failed"));
+        assert_eq!(pool.read().stats().alloc_count, 0);
     }
 
     // -- handshake extraction --

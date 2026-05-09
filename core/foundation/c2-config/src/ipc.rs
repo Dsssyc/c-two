@@ -11,6 +11,48 @@
 use std::ops::Deref;
 use std::time::Duration;
 
+/// Code-level IPC override fields shared by both server and client roles.
+pub const BASE_IPC_OVERRIDE_KEYS: &[&str] = &[
+    "pool_enabled",
+    "pool_segment_size",
+    "max_pool_segments",
+    "reassembly_segment_size",
+    "reassembly_max_segments",
+    "max_total_chunks",
+    "chunk_gc_interval",
+    "chunk_threshold_ratio",
+    "chunk_assembler_timeout",
+    "max_reassembly_bytes",
+    "chunk_size",
+];
+
+/// Code-level IPC override fields accepted for server config resolution.
+pub const SERVER_IPC_OVERRIDE_KEYS: &[&str] = &[
+    "pool_enabled",
+    "pool_segment_size",
+    "max_pool_segments",
+    "reassembly_segment_size",
+    "reassembly_max_segments",
+    "max_total_chunks",
+    "chunk_gc_interval",
+    "chunk_threshold_ratio",
+    "chunk_assembler_timeout",
+    "max_reassembly_bytes",
+    "chunk_size",
+    "max_frame_size",
+    "max_payload_size",
+    "max_pending_requests",
+    "pool_decay_seconds",
+    "heartbeat_interval",
+    "heartbeat_timeout",
+];
+
+/// Code-level IPC override fields accepted for client config resolution.
+pub const CLIENT_IPC_OVERRIDE_KEYS: &[&str] = BASE_IPC_OVERRIDE_KEYS;
+
+/// Global transport policy fields that are not valid role-level IPC overrides.
+pub const FORBIDDEN_IPC_OVERRIDE_KEYS: &[&str] = &["shm_threshold"];
+
 // ─── Base ────────────────────────────────────────────────────────────────────
 
 /// Fields shared by both server and client IPC configs.
@@ -299,6 +341,20 @@ mod tests {
     use super::*;
 
     // ── Default validation ───────────────────────────────────────────────
+
+    #[test]
+    fn override_key_catalogs_exclude_derived_and_global_fields() {
+        assert_eq!(CLIENT_IPC_OVERRIDE_KEYS, BASE_IPC_OVERRIDE_KEYS);
+        assert!(SERVER_IPC_OVERRIDE_KEYS.contains(&"max_frame_size"));
+        assert!(SERVER_IPC_OVERRIDE_KEYS.contains(&"heartbeat_timeout"));
+        assert!(!CLIENT_IPC_OVERRIDE_KEYS.contains(&"max_frame_size"));
+
+        for keys in [BASE_IPC_OVERRIDE_KEYS, SERVER_IPC_OVERRIDE_KEYS] {
+            assert!(!keys.contains(&"max_pool_memory"));
+            assert!(!keys.contains(&"shm_threshold"));
+        }
+        assert_eq!(FORBIDDEN_IPC_OVERRIDE_KEYS, &["shm_threshold"]);
+    }
 
     #[test]
     fn server_default_validates() {

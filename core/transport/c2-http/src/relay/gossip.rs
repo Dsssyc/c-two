@@ -12,6 +12,7 @@ pub(crate) fn broadcast_route_announce(state: &Arc<RelayState>, entry: &RouteEnt
             relay_id: entry.relay_id.clone(),
             relay_url: entry.relay_url.clone(),
             crm_ns: entry.crm_ns.clone(),
+            crm_name: entry.crm_name.clone(),
             crm_ver: entry.crm_ver.clone(),
             registered_at: entry.registered_at,
         },

@@ -16,6 +16,8 @@ pub(crate) mod route_table;
 pub(crate) mod router;
 pub mod server;
 pub(crate) mod state;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub(crate) mod types;
 pub(crate) mod url;
 

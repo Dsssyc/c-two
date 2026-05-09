@@ -162,8 +162,8 @@ impl ClientPool {
     }
 
     /// Sweep expired entries that have been unreferenced longer than
-    /// `grace_period`. Call this periodically (e.g., from Python on a
-    /// timer or before acquire).
+    /// `grace_period`. Call this periodically from SDK bindings or before
+    /// acquire.
     pub fn sweep_expired(&self) {
         let mut entries = self.entries.lock();
         let grace = self.grace_period;

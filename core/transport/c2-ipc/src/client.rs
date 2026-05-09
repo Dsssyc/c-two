@@ -1,4 +1,4 @@
-//! Async IPC client — connects to Python ServerV2 via UDS.
+//! Async IPC client — connects to a C-Two IPC server via UDS.
 //!
 //! Performs handshake, then multiplexes concurrent requests over
 //! a single UDS connection using request IDs.
@@ -23,7 +23,7 @@ use c2_wire::control::{ReplyControl, decode_reply_control, encode_call_control};
 use c2_wire::flags;
 use c2_wire::frame::{self, DecodeError, FrameHeader, HEADER_SIZE};
 use c2_wire::handshake::{
-    CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX, Handshake, MethodEntry, decode_handshake,
+    CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX, Handshake, MethodEntry, RouteInfo, decode_handshake,
     encode_client_handshake,
 };
 
@@ -74,9 +74,9 @@ impl ServerPoolState {
 
     /// Lazy-open the segment for the given coordinates if not yet mapped.
     ///
-    /// Called transparently by `PyResponseBuffer` before any SHM access
-    /// (`__getbuffer__`, `release`, `Drop`).  Python never needs to know
-    /// about segment management — this keeps it entirely inside Rust.
+    /// Called transparently by language binding response buffers before any
+    /// SHM access. SDKs do not need to know about segment management; this
+    /// keeps it entirely inside Rust.
     pub fn ensure_segment(
         &mut self,
         seg_idx: u16,
@@ -187,16 +187,38 @@ impl From<c2_wire::control::EncodeError> for IpcError {
 /// Per-route method table (name ↔ index).
 #[derive(Debug, Clone)]
 pub struct MethodTable {
+    crm_ns: String,
+    crm_name: String,
+    crm_ver: String,
     name_to_idx: HashMap<String, u16>,
 }
 
 impl MethodTable {
-    fn from_entries(entries: &[MethodEntry]) -> Self {
+    fn from_route(route: &RouteInfo) -> Self {
+        Self::from_entries(
+            &route.methods,
+            route.crm_ns.clone(),
+            route.crm_name.clone(),
+            route.crm_ver.clone(),
+        )
+    }
+
+    fn from_entries(
+        entries: &[MethodEntry],
+        crm_ns: String,
+        crm_name: String,
+        crm_ver: String,
+    ) -> Self {
         let mut name_to_idx = HashMap::with_capacity(entries.len());
         for e in entries {
             name_to_idx.insert(e.name.clone(), e.index);
         }
-        Self { name_to_idx }
+        Self {
+            crm_ns,
+            crm_name,
+            crm_ver,
+            name_to_idx,
+        }
     }
 
     /// Look up method index by name.
@@ -208,6 +230,21 @@ impl MethodTable {
     pub fn method_names(&self) -> Vec<&str> {
         self.name_to_idx.keys().map(|s| s.as_str()).collect()
     }
+
+    /// CRM namespace advertised for this route in the IPC handshake.
+    pub fn crm_ns(&self) -> &str {
+        &self.crm_ns
+    }
+
+    /// CRM contract class/model name advertised for this route in the IPC handshake.
+    pub fn crm_name(&self) -> &str {
+        &self.crm_name
+    }
+
+    /// CRM version advertised for this route in the IPC handshake.
+    pub fn crm_ver(&self) -> &str {
+        &self.crm_ver
+    }
 }
 
 // ── Pending call ─────────────────────────────────────────────────────────
@@ -218,7 +255,7 @@ type PendingMap = HashMap<u32, oneshot::Sender<Result<ResponseData, IpcError>>>;
 
 /// Async IPC client for the C-Two relay.
 ///
-/// Connects to a Python `ServerV2` via Unix Domain Socket, performs
+/// Connects to a C-Two IPC server via Unix Domain Socket, performs
 /// handshake, and multiplexes concurrent CRM calls.
 pub struct IpcClient {
     socket_path: PathBuf,
@@ -228,6 +265,7 @@ pub struct IpcClient {
     rid_counter: AtomicU32,
     pub(crate) route_tables: HashMap<String, MethodTable>,
     server_segments: Vec<(String, u32)>,
+    pub(crate) server_identity: Option<c2_wire::handshake::ServerIdentity>,
     /// Server SHM pool state for reading buddy reply responses.
     pub(crate) server_pool: Arc<StdMutex<Option<ServerPoolState>>>,
     recv_handle: Arc<StdMutex<Option<tokio::task::JoinHandle<()>>>>,
@@ -242,8 +280,8 @@ pub struct IpcClient {
 
 // Compile-time assertion: IpcClient is Send+Sync because all fields are
 // Arc-wrapped (Send+Sync), atomic (Send+Sync), or standard collections
-// of Send+Sync types. This is required for safe use from PyO3 frozen
-// pyclass wrappers under Python 3.14t free-threading.
+// of Send+Sync types. This is required for safe use from language
+// bindings that share clients across threads.
 const _: () = {
     fn _assert_send<T: Send>() {}
     fn _assert_sync<T: Sync>() {}
@@ -260,30 +298,14 @@ static REASSEMBLY_POOL_GEN: AtomicU64 = AtomicU64::new(0);
 /// Monotonic counter so each IpcClient gets a unique conn_id.
 static CLIENT_CONN_COUNTER: AtomicU64 = AtomicU64::new(1);
 
-const IPC_SOCK_DIR: &str = "/tmp/c_two_ipc";
-
 fn socket_path_from_address(address: &str) -> (PathBuf, Option<String>) {
-    match region_from_address(address).and_then(validate_region_id) {
-        Ok(region) => (
-            PathBuf::from(IPC_SOCK_DIR).join(format!("{region}.sock")),
-            None,
-        ),
+    match crate::control::socket_path_from_ipc_address(address) {
+        Ok(path) => (path, None),
         Err(error) => (
-            PathBuf::from(IPC_SOCK_DIR).join("invalid.sock"),
-            Some(error),
+            PathBuf::from("/tmp/c_two_ipc").join("invalid.sock"),
+            Some(error.to_string()),
         ),
     }
-}
-
-fn region_from_address(address: &str) -> Result<&str, String> {
-    address
-        .strip_prefix("ipc://")
-        .ok_or_else(|| format!("invalid IPC address: {address}"))
-}
-
-fn validate_region_id(region: &str) -> Result<&str, String> {
-    c2_config::validate_ipc_region_id(region)?;
-    Ok(region)
 }
 
 impl IpcClient {
@@ -319,6 +341,7 @@ impl IpcClient {
             rid_counter: AtomicU32::new(1),
             route_tables: HashMap::new(),
             server_segments: Vec::new(),
+            server_identity: None,
             server_pool: Arc::new(StdMutex::new(None)),
             recv_handle: Arc::new(StdMutex::new(None)),
             connected: Arc::new(AtomicBool::new(false)),
@@ -344,6 +367,7 @@ impl IpcClient {
             rid_counter: AtomicU32::new(1),
             route_tables: HashMap::new(),
             server_segments: Vec::new(),
+            server_identity: None,
             server_pool: Arc::new(StdMutex::new(None)),
             recv_handle: Arc::new(StdMutex::new(None)),
             connected: Arc::new(AtomicBool::new(false)),
@@ -371,13 +395,17 @@ impl IpcClient {
 
         // Perform handshake.
         let hs = self.do_handshake(&mut writer, reader).await?;
+        let server_identity = hs.server_identity.clone().ok_or_else(|| {
+            IpcError::Handshake("server handshake missing server identity".into())
+        })?;
 
         // Store method tables from the handshake response.
         for route in &hs.routes {
-            let table = MethodTable::from_entries(&route.methods);
+            let table = MethodTable::from_route(route);
             self.route_tables.insert(route.name.clone(), table);
         }
         self.server_segments = hs.segments.clone();
+        self.server_identity = Some(server_identity);
 
         // Open server SHM segments into a ServerPoolState for buddy response reads.
         if !hs.segments.is_empty() {
@@ -469,6 +497,11 @@ impl IpcClient {
                 "Server does not support v2 call frames".into(),
             ));
         }
+        if hs.server_identity.is_none() {
+            return Err(IpcError::Handshake(
+                "server handshake missing server identity".into(),
+            ));
+        }
 
         // Spawn recv loop with the reader.
         let pending = self.pending.clone();
@@ -502,6 +535,25 @@ impl IpcClient {
     /// Get a reference to the reassembly pool (for materialising Handle responses).
     pub fn reassembly_pool_arc(&self) -> Arc<RwLock<MemPool>> {
         self.chunk_registry.pool().clone()
+    }
+
+    /// Identity announced by the connected IPC server handshake.
+    pub fn server_identity(&self) -> Option<&c2_wire::handshake::ServerIdentity> {
+        self.server_identity.as_ref()
+    }
+
+    /// Stable logical server ID announced by the connected IPC server.
+    pub fn server_id(&self) -> Option<&str> {
+        self.server_identity
+            .as_ref()
+            .map(|identity| identity.server_id.as_str())
+    }
+
+    /// Per-server-incarnation ID announced by the connected IPC server.
+    pub fn server_instance_id(&self) -> Option<&str> {
+        self.server_identity
+            .as_ref()
+            .map(|identity| identity.server_instance_id.as_str())
     }
 
     /// Send a CRM call and wait for the response (inline path only).
@@ -886,6 +938,47 @@ impl IpcClient {
         self.route_tables.contains_key(name)
     }
 
+    /// Validate that the connected route matches the expected CRM contract.
+    ///
+    /// Empty expected namespace and version mean "no CRM contract expectation",
+    /// which keeps low-level transport probes usable without inventing dummy CRM
+    /// identities.
+    pub fn validate_route_contract(
+        &self,
+        route_name: &str,
+        expected_crm_ns: &str,
+        expected_crm_name: &str,
+        expected_crm_ver: &str,
+    ) -> Result<(), IpcError> {
+        if expected_crm_ns.is_empty() && expected_crm_name.is_empty() && expected_crm_ver.is_empty()
+        {
+            return Ok(());
+        }
+        let table = self
+            .route_tables
+            .get(route_name)
+            .ok_or_else(|| IpcError::RouteNotFound(route_name.to_string()))?;
+        if table.crm_ns() == expected_crm_ns
+            && table.crm_name() == expected_crm_name
+            && table.crm_ver() == expected_crm_ver
+        {
+            return Ok(());
+        }
+        Err(IpcError::Handshake(format!(
+            "CRM contract mismatch for route {route_name}: expected {expected_crm_ns}/{expected_crm_name}/{expected_crm_ver}, got {}/{}/{}",
+            table.crm_ns(),
+            table.crm_name(),
+            table.crm_ver(),
+        )))
+    }
+
+    /// CRM tag advertised by a route, if present.
+    pub fn route_contract(&self, route_name: &str) -> Option<(&str, &str, &str)> {
+        self.route_tables
+            .get(route_name)
+            .map(|table| (table.crm_ns(), table.crm_name(), table.crm_ver()))
+    }
+
     /// Get all route names.
     pub fn route_names(&self) -> Vec<&str> {
         self.route_tables.keys().map(|s| s.as_str()).collect()
@@ -945,7 +1038,7 @@ impl IpcClient {
 
 // ── Recv loop ────────────────────────────────────────────────────────────
 
-/// Signal byte constants (match Python `MsgType` enum).
+/// Signal byte constants from the canonical wire protocol.
 const SIG_PING: u8 = 0x01;
 const SIG_PONG: u8 = 0x02;
 const SIG_DISCONNECT: u8 = 0x08;
@@ -1164,6 +1257,48 @@ mod tests {
             prefix1.len() <= 24,
             "prefix exceeds SHM name limit: {}",
             prefix1.len()
+        );
+    }
+
+    #[test]
+    fn client_projects_server_identity() {
+        let identity = c2_wire::handshake::ServerIdentity {
+            server_id: "identity-server".to_string(),
+            server_instance_id: "identity-instance".to_string(),
+        };
+        let mut client = IpcClient::new("ipc://identity_projection");
+        client.server_identity = Some(identity.clone());
+
+        assert_eq!(client.server_identity(), Some(&identity));
+        assert_eq!(client.server_id(), Some("identity-server"));
+        assert_eq!(client.server_instance_id(), Some("identity-instance"));
+    }
+
+    #[test]
+    fn client_validates_route_crm_contract_from_handshake_metadata() {
+        let mut client = IpcClient::new("ipc://contract_projection");
+        let mut methods = HashMap::new();
+        methods.insert("ping".to_string(), 0);
+        client.route_tables.insert(
+            "grid".to_string(),
+            MethodTable {
+                crm_ns: "test.grid".to_string(),
+                crm_name: "Grid".to_string(),
+                crm_ver: "0.1.0".to_string(),
+                name_to_idx: methods,
+            },
+        );
+
+        client
+            .validate_route_contract("grid", "test.grid", "Grid", "0.1.0")
+            .expect("matching CRM contract should be accepted");
+
+        let err = client
+            .validate_route_contract("grid", "test.grid", "OtherGrid", "0.1.0")
+            .expect_err("mismatched CRM name should be rejected");
+        assert!(
+            err.to_string().contains("CRM contract mismatch"),
+            "unexpected error: {err}"
         );
     }
 

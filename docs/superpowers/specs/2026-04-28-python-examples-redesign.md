@@ -18,7 +18,7 @@ points:
   its boundary relative to the basic relay example is unclear.
 
 This makes the examples harder to use as teaching material and less reliable as
-manual smoke tests. A developer can set `C2_RELAY_ADDRESS` in `.env` and
+manual smoke tests. A developer can set `C2_RELAY_ANCHOR_ADDRESS` in `.env` and
 accidentally change a supposedly IPC-only example into a relay example. That
 violates the intended precedence model where explicit code/CLI input beats
 environment and env-file configuration.
@@ -82,11 +82,11 @@ examples/python/ipc_client.py
 ```
 
 `ipc_resource.py` starts a Grid resource process and prints its `ipc://...`
-address. It does not call `cc.set_relay()` and does not read
-`C2_RELAY_ADDRESS`.
+address. It does not call `cc.set_relay_anchor()` and does not read
+`C2_RELAY_ANCHOR_ADDRESS`.
 
 `ipc_client.py` requires an explicit `ipc://...` address argument. It does not
-read relay config. If `C2_RELAY_ADDRESS` is present in the process environment
+read relay config. If `C2_RELAY_ANCHOR_ADDRESS` is present in the process environment
 or `.env`, this script must still use only the explicit IPC address.
 
 Expected commands:
@@ -113,7 +113,7 @@ relay-only.
 Relay URL precedence:
 
 ```text
-explicit --relay-url > C2_RELAY_ADDRESS / C2_ENV_FILE resolved by Rust config > default http://127.0.0.1:8300
+explicit --relay-url > C2_RELAY_ANCHOR_ADDRESS / C2_ENV_FILE resolved by Rust config > default http://127.0.0.1:8300
 ```
 
 The helper in `relay_config.py` may remain example-local. Its purpose is only
@@ -147,7 +147,7 @@ The mesh example should assume relay operation and should use the same relay URL
 resolution helper or an equivalent local helper:
 
 ```text
-explicit CLI option if added > Rust-resolved C2_RELAY_ADDRESS / env file > default http://127.0.0.1:8300
+explicit CLI option if added > Rust-resolved C2_RELAY_ANCHOR_ADDRESS / env file > default http://127.0.0.1:8300
 ```
 
 It should not be presented as the default relay smoke test. The single-relay
@@ -157,8 +157,8 @@ example owns that role.
 
 IPC examples:
 
-- Must not read `C2_RELAY_ADDRESS`.
-- Must not call `cc.set_relay()`.
+- Must not read `C2_RELAY_ANCHOR_ADDRESS`.
+- Must not call `cc.set_relay_anchor()`.
 - Must fail clearly if no IPC address is provided.
 - Must continue using the explicit IPC address even when `.env` contains a relay
   URL.
@@ -203,10 +203,10 @@ building `c3` through `tools/dev/c3_tool.py` when relay behavior is involved.
 Add or update tests to cover:
 
 - `ipc_client.py` requires an IPC address.
-- `ipc_client.py ipc://...` ignores `C2_RELAY_ADDRESS` from both process env and
+- `ipc_client.py ipc://...` ignores `C2_RELAY_ANCHOR_ADDRESS` from both process env and
   `C2_ENV_FILE`.
 - `relay_client.py --relay-url X` uses `X`.
-- `relay_client.py` reads `C2_RELAY_ADDRESS` from env file through the Rust
+- `relay_client.py` reads `C2_RELAY_ANCHOR_ADDRESS` from env file through the Rust
   resolver.
 - `relay_client.py` defaults to `http://127.0.0.1:8300` when no relay URL is
   configured.
@@ -237,8 +237,8 @@ reintroduce automatic mode selection.
 - A new developer can identify which script demonstrates which transport mode
   without reading script internals.
 - Manual smoke testing has one command sequence for IPC and one for relay.
-- Setting `C2_RELAY_ADDRESS` cannot change direct IPC examples.
+- Setting `C2_RELAY_ANCHOR_ADDRESS` cannot change direct IPC examples.
 - Explicit `--relay-url` beats env/env-file in relay examples.
-- `C2_RELAY_ADDRESS` env-file support remains demonstrated in relay examples.
+- `C2_RELAY_ANCHOR_ADDRESS` env-file support remains demonstrated in relay examples.
 - No Python example directly parses C-Two runtime env variables when a shared
   Rust-backed resolver path exists.

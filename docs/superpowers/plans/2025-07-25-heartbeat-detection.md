@@ -412,7 +412,7 @@ from ..ipc.msg_type import (
 
 - [ ] **Step 4: Run full test suite to verify no regression**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30`
 Expected: 675+ tests pass, 0 failures
 
 - [ ] **Step 5: Commit**
@@ -491,7 +491,7 @@ from .heartbeat import run_heartbeat
 
 - [ ] **Step 4: Run full test suite**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30`
 Expected: 675+ tests pass, 0 failures
 
 - [ ] **Step 5: Commit**
@@ -551,7 +551,7 @@ In the `finally` block, after cancelling heartbeat_task, check if heartbeat trig
 
 - [ ] **Step 2: Run full test suite**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30`
 Expected: 675+ tests pass, 0 failures
 
 - [ ] **Step 3: Commit**
@@ -796,7 +796,7 @@ class TestHeartbeatIntegration:
 
 - [ ] **Step 2: Run integration test**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/integration/test_heartbeat.py -v --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/integration/test_heartbeat.py -v --timeout=30`
 Expected: PASS (3/3)
 
 - [ ] **Step 3: Commit**
@@ -812,7 +812,7 @@ git commit -m "test(heartbeat): add integration tests for heartbeat cycle"
 
 - [ ] **Step 1: Run full test suite**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30`
 Expected: All tests pass (675+ existing + ~10 new heartbeat tests)
 
 - [ ] **Step 2: Final commit (if any fixups needed)**

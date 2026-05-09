@@ -33,6 +33,15 @@ from c_two.transport.wire import (
 )
 
 
+def _append_server_identity(buf: bytearray) -> None:
+    server_id = b'security-server'
+    instance_id = b'security-instance'
+    buf.append(len(server_id))
+    buf += server_id
+    buf.append(len(instance_id))
+    buf += instance_id
+
+
 # ---------------------------------------------------------------------------
 # decode_handshake bounds checking
 # ---------------------------------------------------------------------------
@@ -103,7 +112,13 @@ class TestHandshakeBoundsChecking:
         """Route section present but truncated."""
         segs = [('s1', 100)]
         routes = [RouteInfo('r1', [MethodEntry('m1', 0)])]
-        full = encode_server_handshake(segs, CAP_CALL, routes)
+        full = encode_server_handshake(
+            segs,
+            CAP_CALL,
+            routes,
+            server_id='security-server',
+            server_instance_id='security-instance',
+        )
         # Truncate inside route section
         truncated = full[:len(full) - 3]
         with pytest.raises(ValueError, match='need.*bytes'):
@@ -113,8 +128,9 @@ class TestHandshakeBoundsChecking:
         """Craft payload with route_count exceeding limit."""
         segs = [('s1', 100)]
         encoded = encode_client_handshake(segs, CAP_CALL)
-        # Append a fake route section with excessive count
+        # Append a fake server identity and route section with excessive count.
         buf = bytearray(encoded)
+        _append_server_identity(buf)
         buf += struct.pack('<H', _MAX_HANDSHAKE_ROUTES + 1)
         with pytest.raises(ValueError, match='invalid value|exceeds'):
             decode_handshake(bytes(buf))
@@ -123,11 +139,15 @@ class TestHandshakeBoundsChecking:
         """Craft payload with method_count exceeding limit."""
         segs = [('s1', 100)]
         encoded = encode_client_handshake(segs, CAP_CALL)
-        # Append route section: 1 route, with excessive method count
+        # Append server identity and route section: 1 route, with excessive method count.
         buf = bytearray(encoded)
+        _append_server_identity(buf)
         buf += struct.pack('<H', 1)     # route_count=1
         buf.append(2)                   # route_name_len=2
         buf += b'r1'                    # route_name
+        buf.append(0)                   # crm_ns_len=0
+        buf.append(0)                   # crm_name_len=0
+        buf.append(0)                   # crm_ver_len=0
         buf += struct.pack('<H', _MAX_HANDSHAKE_METHODS + 1)  # method count
         with pytest.raises(ValueError, match='invalid value|exceeds'):
             decode_handshake(bytes(buf))
@@ -139,7 +159,13 @@ class TestHandshakeBoundsChecking:
             RouteInfo('ns1', [MethodEntry('add', 0), MethodEntry('mul', 1)]),
             RouteInfo('ns2', [MethodEntry('get', 0)]),
         ]
-        encoded = encode_server_handshake(segs, CAP_CALL | CAP_METHOD_IDX, routes)
+        encoded = encode_server_handshake(
+            segs,
+            CAP_CALL | CAP_METHOD_IDX,
+            routes,
+            server_id='security-server',
+            server_instance_id='security-instance',
+        )
         hs = decode_handshake(encoded)
         assert len(hs.segments) == 2
         assert len(hs.routes) == 2
@@ -296,35 +322,3 @@ class TestMethodTableSafety:
         assert t.names() == []
         assert not t.has_name('x')
         assert not t.has_index(0)
-
-
-class TestSchedulerSafety:
-    """Validate scheduler edge cases."""
-
-    def test_begin_after_shutdown_raises(self):
-        from c_two.transport.server.scheduler import ConcurrencyConfig, Scheduler
-        sched = Scheduler(ConcurrencyConfig())
-        sched.shutdown()
-        with pytest.raises(RuntimeError, match='shut down'):
-            sched.begin()
-
-    def test_begin_at_capacity_raises(self):
-        from c_two.transport.server.scheduler import ConcurrencyConfig, Scheduler
-        sched = Scheduler(ConcurrencyConfig(max_pending=1))
-        sched.begin()  # fills to capacity
-        with pytest.raises(RuntimeError, match='capacity'):
-            sched.begin()
-        # Clean up: decrement so shutdown doesn't wait forever
-        with sched._state_lock:
-            sched._pending_count = 0
-            sched._drain_event.set()
-        sched.shutdown()
-
-    def test_execute_decrements_pending(self):
-        from c_two.transport.server.scheduler import ConcurrencyConfig, Scheduler
-        sched = Scheduler(ConcurrencyConfig(max_pending=2))
-        sched.begin()
-        assert sched._pending_count == 1
-        sched.execute(lambda b: b, b'test')
-        assert sched._pending_count == 0
-        sched.shutdown()

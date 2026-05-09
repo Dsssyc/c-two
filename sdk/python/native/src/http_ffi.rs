@@ -11,8 +11,7 @@ use pyo3::types::{PyBytes, PyDict};
 
 use c2_config::{ConfigResolver, ConfigSources};
 use c2_http::client::{
-    HttpClient, HttpClientPool, HttpError, RelayAwareClientConfig, RelayAwareHttpClient,
-    RelayControlClient, RelayRouteInfo,
+    HttpClient, HttpClientPool, HttpError, RelayAwareHttpClient, RelayControlClient, RelayRouteInfo,
 };
 
 // ---------------------------------------------------------------------------
@@ -47,9 +46,76 @@ pub struct PyRustHttpClient {
     inner: Arc<HttpClient>,
 }
 
-#[pyclass(name = "RustRelayAwareHttpClient", frozen)]
-pub struct PyRustRelayAwareHttpClient {
-    inner: Arc<RelayAwareHttpClient>,
+impl PyRustHttpClient {
+    pub(crate) fn from_arc(inner: Arc<HttpClient>) -> Self {
+        Self { inner }
+    }
+}
+
+pub(crate) fn acquire_http_client_from_global_pool(
+    base_url: &str,
+    use_proxy: bool,
+    call_timeout_secs: f64,
+) -> Result<Arc<HttpClient>, HttpError> {
+    HttpClientPool::instance().acquire_with_options(base_url, use_proxy, call_timeout_secs)
+}
+
+pub(crate) fn call_http_client<'py>(
+    py: Python<'py>,
+    inner: &Arc<HttpClient>,
+    route_name: &str,
+    method_name: &str,
+    data: &[u8],
+) -> PyResult<Bound<'py, PyBytes>> {
+    let client = Arc::clone(inner);
+    let route = route_name.to_string();
+    let method = method_name.to_string();
+    let payload = data.to_vec();
+
+    let result = py.detach(move || client.call(&route, &method, &payload));
+    http_call_result_to_py(py, result)
+}
+
+pub(crate) fn call_relay_aware_http_client<'py>(
+    py: Python<'py>,
+    inner: &Arc<RelayAwareHttpClient>,
+    method_name: &str,
+    data: &[u8],
+) -> PyResult<Bound<'py, PyBytes>> {
+    let client = Arc::clone(inner);
+    let method = method_name.to_string();
+    let payload = data.to_vec();
+
+    let result = py.detach(move || client.call(&method, &payload));
+    http_call_result_to_py(py, result)
+}
+
+fn http_call_result_to_py<'py>(
+    py: Python<'py>,
+    result: Result<Vec<u8>, HttpError>,
+) -> PyResult<Bound<'py, PyBytes>> {
+    match result {
+        Ok(bytes) => Ok(PyBytes::new(py, &bytes)),
+        Err(HttpError::CrmError(err_bytes)) => {
+            let exc = PyErr::new::<HttpCrmCallError, _>("CRM method error");
+            exc.value(py)
+                .setattr("error_bytes", PyBytes::new(py, &err_bytes))?;
+            Err(exc)
+        }
+        Err(e) => Err(PyRuntimeError::new_err(format!("{e}"))),
+    }
+}
+
+pub(crate) fn release_http_client_from_global_pool(base_url: &str) {
+    HttpClientPool::instance().release(base_url);
+}
+
+pub(crate) fn http_client_refcount_from_global_pool(base_url: &str) -> usize {
+    HttpClientPool::instance().refcount(base_url)
+}
+
+pub(crate) fn shutdown_http_clients_from_global_pool() {
+    HttpClientPool::instance().shutdown_all();
 }
 
 #[pymethods]
@@ -66,23 +132,7 @@ impl PyRustHttpClient {
         method_name: &str,
         data: &[u8],
     ) -> PyResult<Bound<'py, PyBytes>> {
-        let inner = Arc::clone(&self.inner);
-        let route = route_name.to_string();
-        let method = method_name.to_string();
-        let payload = data.to_vec();
-
-        let result = py.detach(move || inner.call(&route, &method, &payload));
-
-        match result {
-            Ok(bytes) => Ok(PyBytes::new(py, &bytes)),
-            Err(HttpError::CrmError(err_bytes)) => {
-                let exc = PyErr::new::<HttpCrmCallError, _>("CRM method error");
-                exc.value(py)
-                    .setattr("error_bytes", PyBytes::new(py, &err_bytes))?;
-                Err(exc)
-            }
-            Err(e) => Err(PyRuntimeError::new_err(format!("{e}"))),
-        }
+        call_http_client(py, &self.inner, route_name, method_name, data)
     }
 
     /// Health check — GET /health on the relay.
@@ -93,58 +143,6 @@ impl PyRustHttpClient {
     }
 
     /// No-op close (Arc cleanup on drop).
-    fn close(&self) -> PyResult<()> {
-        Ok(())
-    }
-}
-
-#[pymethods]
-impl PyRustRelayAwareHttpClient {
-    #[new]
-    fn new(relay_url: &str, route_name: &str) -> PyResult<Self> {
-        let use_proxy = ConfigResolver::resolve_relay_use_proxy(ConfigSources::from_process())
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-        let max_attempts =
-            ConfigResolver::resolve_relay_route_max_attempts(ConfigSources::from_process())
-                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-        let client = RelayAwareHttpClient::new(
-            relay_url,
-            route_name,
-            use_proxy,
-            RelayAwareClientConfig { max_attempts },
-        )
-        .map_err(py_http_error)?;
-        client.connect().map_err(py_http_error)?;
-        Ok(Self {
-            inner: Arc::new(client),
-        })
-    }
-
-    fn call<'py>(
-        &self,
-        py: Python<'py>,
-        _route_name: &str,
-        method_name: &str,
-        data: &[u8],
-    ) -> PyResult<Bound<'py, PyBytes>> {
-        let inner = Arc::clone(&self.inner);
-        let method = method_name.to_string();
-        let payload = data.to_vec();
-
-        let result = py.detach(move || inner.call(&method, &payload));
-
-        match result {
-            Ok(bytes) => Ok(PyBytes::new(py, &bytes)),
-            Err(HttpError::CrmError(err_bytes)) => {
-                let exc = PyErr::new::<HttpCrmCallError, _>("CRM method error");
-                exc.value(py)
-                    .setattr("error_bytes", PyBytes::new(py, &err_bytes))?;
-                Err(exc)
-            }
-            Err(e) => Err(PyRuntimeError::new_err(format!("{e}"))),
-        }
-    }
-
     fn close(&self) -> PyResult<()> {
         Ok(())
     }
@@ -189,24 +187,38 @@ impl PyRustRelayControlClient {
         })
     }
 
-    #[pyo3(signature = (name, server_id, ipc_address, crm_ns="", crm_ver=""))]
+    #[pyo3(signature = (name, server_id, server_instance_id, ipc_address, crm_ns="", crm_name="", crm_ver=""))]
     fn register(
         &self,
         py: Python<'_>,
         name: &str,
         server_id: &str,
+        server_instance_id: &str,
         ipc_address: &str,
         crm_ns: &str,
+        crm_name: &str,
         crm_ver: &str,
     ) -> PyResult<()> {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
         let server_id = server_id.to_string();
+        let server_instance_id = server_instance_id.to_string();
         let ipc_address = ipc_address.to_string();
         let crm_ns = crm_ns.to_string();
+        let crm_name = crm_name.to_string();
         let crm_ver = crm_ver.to_string();
-        py.detach(move || inner.register(&name, &server_id, &ipc_address, &crm_ns, &crm_ver))
-            .map_err(py_http_error)
+        py.detach(move || {
+            inner.register(
+                &name,
+                &server_id,
+                &server_instance_id,
+                &ipc_address,
+                &crm_ns,
+                &crm_name,
+                &crm_ver,
+            )
+        })
+        .map_err(py_http_error)
     }
 
     fn unregister(&self, py: Python<'_>, name: &str, server_id: &str) -> PyResult<()> {
@@ -244,6 +256,7 @@ fn routes_to_py(py: Python<'_>, routes: Vec<RelayRouteInfo>) -> PyResult<Vec<Py<
             dict.set_item("relay_url", route.relay_url)?;
             dict.set_item("ipc_address", route.ipc_address)?;
             dict.set_item("crm_ns", route.crm_ns)?;
+            dict.set_item("crm_name", route.crm_name)?;
             dict.set_item("crm_ver", route.crm_ver)?;
             Ok(dict.into_any().unbind())
         })
@@ -284,7 +297,10 @@ impl PyRustHttpClientPool {
                 let use_proxy =
                     ConfigResolver::resolve_relay_use_proxy(ConfigSources::from_process())
                         .map_err(|e| HttpError::Transport(e.to_string()))?;
-                pool.acquire_with_proxy_policy(&url, use_proxy)
+                let call_timeout_secs =
+                    ConfigResolver::resolve_relay_call_timeout_secs(ConfigSources::from_process())
+                        .map_err(|e| HttpError::Transport(e.to_string()))?;
+                pool.acquire_with_options(&url, use_proxy, call_timeout_secs)
             })
             .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
         Ok(PyRustHttpClient { inner: client })
@@ -318,7 +334,6 @@ impl PyRustHttpClientPool {
 /// Register HTTP client classes and exceptions on the parent module.
 pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRustHttpClient>()?;
-    m.add_class::<PyRustRelayAwareHttpClient>()?;
     m.add_class::<PyRustHttpClientPool>()?;
     m.add_class::<PyRustRelayControlClient>()?;
     m.add("HttpCrmCallError", m.py().get_type::<HttpCrmCallError>())?;

@@ -115,7 +115,7 @@ class TestBufferMode:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/unit/test_transferable.py::TestBufferMode -v --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/unit/test_transferable.py::TestBufferMode -v --timeout=30`
 Expected: FAIL — `_buffer_mode` attribute does not exist.
 
 - [ ] **Step 3: Add `_buffer_mode` to Transferable base class**
@@ -182,12 +182,12 @@ DynamicOutputTransferable._buffer_mode = 'view'
 
 - [ ] **Step 6: Run tests to verify they pass**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/unit/test_transferable.py::TestBufferMode -v --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/unit/test_transferable.py::TestBufferMode -v --timeout=30`
 Expected: All 8 tests PASS.
 
 - [ ] **Step 7: Run full test suite to verify no regressions**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30 -k "not test_concurrent_large_calls"`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30 -k "not test_concurrent_large_calls"`
 Expected: All tests pass (502+).
 
 - [ ] **Step 8: Commit**
@@ -321,7 +321,7 @@ class TestCrmToComBufferModes:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/unit/test_transferable.py::TestCrmToComBufferModes -v --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/unit/test_transferable.py::TestCrmToComBufferModes -v --timeout=30`
 Expected: FAIL — `crm_to_com` does not accept `_release_fn` kwarg.
 
 - [ ] **Step 3: Modify `crm_to_com` to handle buffer modes**
@@ -436,12 +436,12 @@ return transfer_wrapper
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/unit/test_transferable.py::TestCrmToComBufferModes -v --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/unit/test_transferable.py::TestCrmToComBufferModes -v --timeout=30`
 Expected: All 7 tests PASS.
 
 - [ ] **Step 6: Run full test suite**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30 -k "not test_concurrent_large_calls"`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30 -k "not test_concurrent_large_calls"`
 Expected: All tests pass.
 
 - [ ] **Step 7: Commit**
@@ -543,7 +543,7 @@ class TestComToCrmBufferModes:
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/unit/test_transferable.py::TestComToCrmBufferModes -v --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/unit/test_transferable.py::TestComToCrmBufferModes -v --timeout=30`
 Expected: FAIL — current `com_to_crm` always releases.
 
 - [ ] **Step 3: Modify `com_to_crm` to handle output buffer modes**
@@ -591,12 +591,12 @@ def com_to_crm(*args: any) -> any:
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/unit/test_transferable.py::TestComToCrmBufferModes -v --timeout=30`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/unit/test_transferable.py::TestComToCrmBufferModes -v --timeout=30`
 Expected: All tests PASS.
 
 - [ ] **Step 5: Run full test suite**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30 -k "not test_concurrent_large_calls"`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30 -k "not test_concurrent_large_calls"`
 Expected: All tests pass.
 
 - [ ] **Step 6: Commit**
@@ -725,7 +725,7 @@ def dispatch(
 
 - [ ] **Step 4: Run full test suite**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30 -k "not test_concurrent_large_calls"`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30 -k "not test_concurrent_large_calls"`
 Expected: All tests pass. Default pickle path now uses `view` mode — zero-copy on server request!
 
 - [ ] **Step 5: Commit**
@@ -777,12 +777,12 @@ def test_copy_mode_custom_transferable(self):
 
 - [ ] **Step 3: Run integration tests**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/integration/test_ipc_buddy_reply.py -v --timeout=30 -k "not test_concurrent_large_calls"`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/integration/test_ipc_buddy_reply.py -v --timeout=30 -k "not test_concurrent_large_calls"`
 Expected: All tests PASS.
 
 - [ ] **Step 4: Run full test suite**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30 -k "not test_concurrent_large_calls"`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30 -k "not test_concurrent_large_calls"`
 Expected: All tests pass.
 
 - [ ] **Step 5: Commit**
@@ -813,7 +813,7 @@ Run the existing benchmark to verify performance improvement. Compare against ba
 - [ ] **Step 1: Run bytes echo benchmark (256MB segment)**
 
 ```bash
-C2_RELAY_ADDRESS= uv run python benchmarks/segment_size_benchmark.py
+C2_RELAY_ANCHOR_ADDRESS= uv run python benchmarks/segment_size_benchmark.py
 ```
 
 Record results for 64B, 1KB, 64KB, 1MB, 10MB, 100MB, 500MB, 1GB.

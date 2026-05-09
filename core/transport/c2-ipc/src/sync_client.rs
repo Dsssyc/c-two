@@ -1,6 +1,6 @@
 //! Synchronous IPC client — embeds a tokio runtime handle.
 //!
-//! Wraps [`IpcClient`] for blocking calls from Python (via PyO3).
+//! Wraps [`IpcClient`] for blocking calls from SDK bindings.
 //! Multiple `SyncClient` instances share a single tokio runtime.
 
 use parking_lot::{Mutex, RwLock};
@@ -33,15 +33,15 @@ fn get_or_create_runtime() -> &'static tokio::runtime::Runtime {
 
 /// Synchronous IPC client — embeds a tokio runtime handle.
 ///
-/// Wraps `IpcClient` for blocking calls from Python (via PyO3).
+/// Wraps `IpcClient` for blocking calls from SDK bindings.
 /// Multiple SyncClients share a single tokio runtime.
 pub struct SyncClient {
     inner: IpcClient,
     rt: tokio::runtime::Handle,
 }
 
-// Compile-time assertion: SyncClient must be Send+Sync for PyO3
-// `#[pyclass(frozen)]`.
+// Compile-time assertion: SyncClient must be Send+Sync for binding wrappers
+// that may be shared across threads.
 const _: () = {
     fn _assert_send<T: Send>() {}
     fn _assert_sync<T: Sync>() {}
@@ -169,6 +169,42 @@ impl SyncClient {
     pub fn route_names(&self) -> Vec<&str> {
         self.inner.route_names()
     }
+
+    /// Validate the connected route against an expected CRM contract.
+    pub fn validate_route_contract(
+        &self,
+        route_name: &str,
+        expected_crm_ns: &str,
+        expected_crm_name: &str,
+        expected_crm_ver: &str,
+    ) -> Result<(), IpcError> {
+        self.inner.validate_route_contract(
+            route_name,
+            expected_crm_ns,
+            expected_crm_name,
+            expected_crm_ver,
+        )
+    }
+
+    /// CRM tag advertised by a route, if present.
+    pub fn route_contract(&self, route_name: &str) -> Option<(&str, &str, &str)> {
+        self.inner.route_contract(route_name)
+    }
+
+    /// Identity announced by the connected IPC server handshake.
+    pub fn server_identity(&self) -> Option<&c2_wire::handshake::ServerIdentity> {
+        self.inner.server_identity()
+    }
+
+    /// Stable logical server ID announced by the connected IPC server.
+    pub fn server_id(&self) -> Option<&str> {
+        self.inner.server_id()
+    }
+
+    /// Per-server-incarnation ID announced by the connected IPC server.
+    pub fn server_instance_id(&self) -> Option<&str> {
+        self.inner.server_instance_id()
+    }
 }
 
 // ── Test-only helpers ────────────────────────────────────────────────────
@@ -214,5 +250,19 @@ pub(crate) mod tests {
         assert_eq!(result, 42);
         let result2 = h2.block_on(async { 43 });
         assert_eq!(result2, 43);
+    }
+
+    #[test]
+    fn sync_client_projects_server_identity() {
+        let identity = c2_wire::handshake::ServerIdentity {
+            server_id: "identity-server".to_string(),
+            server_instance_id: "identity-instance".to_string(),
+        };
+        let mut client = SyncClient::new_unconnected("ipc://identity_projection_sync");
+        client.inner.server_identity = Some(identity.clone());
+
+        assert_eq!(client.server_identity(), Some(&identity));
+        assert_eq!(client.server_id(), Some("identity-server"));
+        assert_eq!(client.server_instance_id(), Some("identity-instance"));
     }
 }

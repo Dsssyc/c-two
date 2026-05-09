@@ -17,6 +17,7 @@ struct PoolEntry {
     client: Arc<HttpClient>,
     ref_count: usize,
     use_proxy: bool,
+    timeout_secs: f64,
     /// Set to `Some(Instant::now())` when `ref_count` drops to 0.
     last_release: Option<Instant>,
 }
@@ -52,7 +53,7 @@ impl HttpClientPool {
         Self {
             entries: Mutex::new(HashMap::new()),
             grace_period: Duration::from_secs_f64(grace_secs),
-            default_timeout: 30.0,
+            default_timeout: 300.0,
             default_max_connections: 100,
         }
     }
@@ -63,20 +64,35 @@ impl HttpClientPool {
         base_url: &str,
         use_proxy: bool,
     ) -> Result<Arc<HttpClient>, HttpError> {
+        self.acquire_with_options(base_url, use_proxy, self.default_timeout)
+    }
+
+    /// Acquire (or create) a client for `base_url` with explicit proxy and timeout policy.
+    pub fn acquire_with_options(
+        &self,
+        base_url: &str,
+        use_proxy: bool,
+        timeout_secs: f64,
+    ) -> Result<Arc<HttpClient>, HttpError> {
         self.sweep_expired();
         let key = canonical_base_url(base_url);
 
         let mut entries = self.entries.lock();
 
         if let Some(entry) = entries.get_mut(&key) {
-            if entry.use_proxy == use_proxy {
+            if entry.use_proxy == use_proxy && entry.timeout_secs == timeout_secs {
                 entry.ref_count += 1;
                 entry.last_release = None;
                 return Ok(Arc::clone(&entry.client));
             }
-            if entry.ref_count > 0 {
+            if entry.ref_count > 0 && entry.use_proxy != use_proxy {
                 return Err(HttpError::Transport(format!(
                     "active pooled HTTP client for {base_url} has proxy policy mismatch"
+                )));
+            }
+            if entry.ref_count > 0 {
+                return Err(HttpError::Transport(format!(
+                    "active pooled HTTP client for {base_url} has timeout policy mismatch"
                 )));
             }
         }
@@ -84,7 +100,7 @@ impl HttpClientPool {
         // Create a new client (lock held — HttpClient::new is fast).
         let client = Arc::new(HttpClient::new_with_proxy_policy(
             &key,
-            self.default_timeout,
+            timeout_secs,
             self.default_max_connections,
             use_proxy,
         )?);
@@ -95,6 +111,7 @@ impl HttpClientPool {
                 client: Arc::clone(&client),
                 ref_count: 1,
                 use_proxy,
+                timeout_secs,
                 last_release: None,
             },
         );
@@ -256,6 +273,41 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&first, &second),
             "idle entry with stale proxy policy should be replaced"
+        );
+        assert_eq!(pool.refcount(url), 1);
+    }
+
+    #[test]
+    fn active_timeout_policy_mismatch_is_rejected_without_refcount_change() {
+        let pool = HttpClientPool::new(60.0);
+        let url = "http://localhost:9993";
+
+        let _client = pool.acquire_with_options(url, false, 300.0).unwrap();
+        let err = match pool.acquire_with_options(url, false, 900.0) {
+            Ok(_) => panic!("active client with different timeout policy must be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("timeout policy mismatch"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(pool.refcount(url), 1);
+    }
+
+    #[test]
+    fn released_timeout_policy_mismatch_replaces_idle_entry() {
+        let pool = HttpClientPool::new(60.0);
+        let url = "http://localhost:9992";
+
+        let first = pool.acquire_with_options(url, false, 300.0).unwrap();
+        pool.release(url);
+
+        let second = pool.acquire_with_options(url, false, 900.0).unwrap();
+
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "idle entry with stale timeout policy should be replaced"
         );
         assert_eq!(pool.refcount(url), 1);
     }

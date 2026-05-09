@@ -22,10 +22,10 @@ cd src/c_two/_native && cargo test -p c2-mem -p c2-wire --no-default-features
 uv sync --reinstall-package c-two
 
 # Full Python test suite
-C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30
 
 # Single test file
-C2_RELAY_ADDRESS= uv run pytest tests/integration/test_ipc_buddy_reply.py -q
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/integration/test_ipc_buddy_reply.py -q
 ```
 
 ---
@@ -443,7 +443,7 @@ Expected: Clean compilation
 
 - [ ] **Step 3: Build + test**
 
-Run: `uv sync --reinstall-package c-two && C2_RELAY_ADDRESS= uv run pytest tests/integration/test_ipc_buddy_reply.py -q --timeout=30`
+Run: `uv sync --reinstall-package c-two && C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/integration/test_ipc_buddy_reply.py -q --timeout=30`
 Expected: All tests pass
 
 - [ ] **Step 4: Commit**
@@ -497,7 +497,7 @@ def test_small_payload_stress(self):
 
 - [ ] **Step 3: Run full test suite**
 
-Run: `uv sync --reinstall-package c-two && C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
+Run: `uv sync --reinstall-package c-two && C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30`
 Expected: All tests pass (491+)
 
 - [ ] **Step 4: Commit**
@@ -683,7 +683,7 @@ return result
 
 - [ ] **Step 2: Build + full test suite**
 
-Run: `uv sync --reinstall-package c-two && C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=30`
+Run: `uv sync --reinstall-package c-two && C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=30`
 
 - [ ] **Step 3: Add Phase 2 integration tests**
 
@@ -819,7 +819,7 @@ In recv_loop, detect `is_response() && is_chunked()`:
 ```bash
 cd src/c_two/_native && cargo check -p c2-ipc -p c2-ffi
 uv sync --reinstall-package c-two
-C2_RELAY_ADDRESS= uv run pytest tests/integration/test_ipc_buddy_reply.py -q --timeout=30
+C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/integration/test_ipc_buddy_reply.py -q --timeout=30
 ```
 
 - [ ] **Step 5: Commit**
@@ -853,12 +853,12 @@ def test_chunked_response_path(self):
 
 - [ ] **Step 2: Run full test suite**
 
-Run: `C2_RELAY_ADDRESS= uv run pytest tests/ -q --timeout=60`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run pytest tests/ -q --timeout=60`
 Expected: All tests pass
 
 - [ ] **Step 3: Benchmark**
 
-Run: `C2_RELAY_ADDRESS= uv run python benchmarks/three_mode_benchmark.py`
+Run: `C2_RELAY_ANCHOR_ADDRESS= uv run python benchmarks/three_mode_benchmark.py`
 Compare: 100MB IPC target <= 25ms, 64B IPC target <= 0.15ms
 
 - [ ] **Step 4: Commit**

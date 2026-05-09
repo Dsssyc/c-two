@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import threading
 import time
-from unittest.mock import patch
 
 import pytest
 
@@ -25,6 +24,18 @@ from c_two.transport.client.proxy import CRMProxy
 from tests.fixtures.ihello import Hello
 from tests.fixtures.hello import HelloImpl
 from tests.fixtures.counter import Counter, CounterImpl
+
+
+@cc.crm(namespace='test.other_hello', version='0.1.0')
+class OtherHello:
+    def greeting(self, name: str) -> str:
+        ...
+
+
+@cc.crm(namespace='test.hello', version='0.1.0')
+class RenamedHello:
+    def greeting(self, name: str) -> str:
+        ...
 
 
 @pytest.fixture(autouse=True)
@@ -66,6 +77,18 @@ class TestRegisterConnect:
         finally:
             cc.close(crm)
 
+    def test_connect_thread_local_rejects_crm_contract_mismatch(self):
+        cc.register(Hello, HelloImpl(), name='hello')
+
+        with pytest.raises(TypeError, match='CRM contract mismatch'):
+            cc.connect(OtherHello, name='hello')
+
+    def test_connect_thread_local_rejects_crm_name_mismatch(self):
+        cc.register(Hello, HelloImpl(), name='hello')
+
+        with pytest.raises(TypeError, match='CRM contract mismatch'):
+            cc.connect(RenamedHello, name='hello')
+
     def test_connect_ipc(self):
         """IPC connect via explicit address returns ipc-mode proxy."""
         cc.register(Hello, HelloImpl(), name='hello')
@@ -80,6 +103,22 @@ class TestRegisterConnect:
             assert result == 'Hello, IPC!'
         finally:
             cc.close(crm)
+
+    def test_connect_ipc_rejects_crm_contract_mismatch(self):
+        cc.register(Hello, HelloImpl(), name='hello')
+        addr = cc.server_address()
+        assert addr is not None
+
+        with pytest.raises(RuntimeError, match='CRM contract mismatch'):
+            cc.connect(OtherHello, name='hello', address=addr)
+
+    def test_connect_ipc_rejects_crm_name_mismatch(self):
+        cc.register(Hello, HelloImpl(), name='hello')
+        addr = cc.server_address()
+        assert addr is not None
+
+        with pytest.raises(RuntimeError, match='CRM contract mismatch'):
+            cc.connect(RenamedHello, name='hello', address=addr)
 
     def test_close_terminates_proxy(self):
         cc.register(Hello, HelloImpl(), name='hello')
@@ -289,56 +328,51 @@ class TestErrors:
         finally:
             cc.close(crm)
 
-    def test_relay_registration_failure_rolls_back_local_registration(self):
-        registry = _ProcessRegistry.get()
-        with patch.object(
-            registry,
-            '_relay_register',
-            side_effect=ResourceAlreadyRegistered("Route name already registered: 'hello'"),
-        ):
-            with pytest.raises(ResourceAlreadyRegistered, match='already registered'):
-                cc.register(Hello, HelloImpl(), name='hello')
-
-        assert 'hello' not in registry.names
-        assert cc.server_address() is None
-
     def test_unreachable_relay_registration_rolls_back_local_registration(self):
         registry = _ProcessRegistry.get()
-        previous_relay = settings.relay_address
+        previous_relay = settings.relay_anchor_address
         try:
-            registry.set_relay('http://127.0.0.1:9')
-            with pytest.raises(Exception, match='Relay registration failed'):
+            registry.set_relay_anchor('http://127.0.0.1:9')
+            with pytest.raises(Exception, match='relay error'):
                 registry.register(Hello, HelloImpl(), name='hello')
 
             assert 'hello' not in registry.names
             assert registry.get_server_address() is None
+            assert registry.get_server_id() is None
         finally:
-            settings.relay_address = previous_relay
+            settings.relay_anchor_address = previous_relay
 
-    def test_set_relay_clears_existing_relay_control_client(self):
+    def test_failed_relay_registration_leaves_existing_route_usable(self):
+        registry = _ProcessRegistry.get()
+        previous_relay = settings.relay_anchor_address
+        try:
+            cc.register(Hello, HelloImpl(), name='hello')
+            registry.set_relay_anchor('http://127.0.0.1:9')
+            with pytest.raises(Exception, match='relay error'):
+                registry.register(Counter, CounterImpl(), name='counter')
+
+            assert registry.names == ['hello']
+            crm = cc.connect(Hello, name='hello')
+            try:
+                assert crm.greeting('Z') == 'Hello, Z!'
+            finally:
+                cc.close(crm)
+        finally:
+            settings.relay_anchor_address = previous_relay
+
+    def test_set_relay_anchor_updates_native_relay_projection_without_python_cache(self):
         registry = _ProcessRegistry()
-        previous_relay = settings.relay_address
-
-        class FakeRelayControlClient:
-            def __init__(self):
-                self.cleared = False
-
-            def clear_cache(self):
-                self.cleared = True
-
-        client = FakeRelayControlClient()
+        previous_relay = settings.relay_anchor_address
 
         try:
-            registry._relay_control_client = client  # noqa: SLF001
-            registry._relay_control_address = 'http://relay-a.test'  # noqa: SLF001
-            registry.set_relay('http://relay-b.test')
+            registry.set_relay_anchor('http://relay-b.test/')
 
-            assert client.cleared is True
-            assert registry._relay_control_client is None  # noqa: SLF001
-            assert registry._relay_control_address is None  # noqa: SLF001
+            assert registry._runtime_session.relay_anchor_address_override == 'http://relay-b.test'  # noqa: SLF001
+            assert not hasattr(registry, '_relay_control_client')
+            assert not hasattr(registry, '_relay_control_address')
         finally:
             registry.shutdown()
-            settings.relay_address = previous_relay
+            settings.relay_anchor_address = previous_relay
 
     def test_relay_rejects_duplicate_name_from_second_registry(self, start_c3_relay):
         relay = start_c3_relay()
@@ -346,10 +380,10 @@ class TestErrors:
 
         first = _ProcessRegistry()
         second = _ProcessRegistry()
-        previous_relay = settings.relay_address
+        previous_relay = settings.relay_anchor_address
         try:
-            first.set_relay(relay_url)
-            second.set_relay(relay_url)
+            first.set_relay_anchor(relay_url)
+            second.set_relay_anchor(relay_url)
 
             first.register(Hello, HelloImpl(), name='hello')
 
@@ -361,4 +395,4 @@ class TestErrors:
         finally:
             second.shutdown()
             first.shutdown()
-            settings.relay_address = previous_relay
+            settings.relay_anchor_address = previous_relay

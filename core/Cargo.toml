@@ -8,6 +8,7 @@ members = [
     "transport/c2-ipc",
     "transport/c2-http",
     "transport/c2-server",
+    "runtime/c2-runtime",
 ]
 
 [workspace.package]

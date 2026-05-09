@@ -12,7 +12,8 @@ use pyo3::exceptions::{PyBufferError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 
-use c2_mem::{MemHandle, MemPool};
+use crate::lease_ffi::PyBufferLeaseTracker;
+use c2_mem::{BufferLeaseGuard, MemHandle, MemPool};
 
 // ---------------------------------------------------------------------------
 // Inner enum
@@ -48,6 +49,7 @@ enum ShmBufferInner {
 #[pyclass(name = "ShmBuffer", frozen, weakref)]
 pub struct PyShmBuffer {
     inner: Mutex<Option<ShmBufferInner>>,
+    lease: Mutex<Option<BufferLeaseGuard>>,
     data_len: usize,
     exports: AtomicU32,
 }
@@ -62,6 +64,7 @@ impl PyShmBuffer {
         let data_len = data.len();
         Self {
             inner: Mutex::new(Some(ShmBufferInner::Inline(data))),
+            lease: Mutex::new(None),
             data_len,
             exports: AtomicU32::new(0),
         }
@@ -83,6 +86,7 @@ impl PyShmBuffer {
                 data_size,
                 is_dedicated,
             })),
+            lease: Mutex::new(None),
             data_len: data_size as usize,
             exports: AtomicU32::new(0),
         }
@@ -93,8 +97,23 @@ impl PyShmBuffer {
         let data_len = handle.len();
         Self {
             inner: Mutex::new(Some(ShmBufferInner::Handle { handle, pool })),
+            lease: Mutex::new(None),
             data_len,
             exports: AtomicU32::new(0),
+        }
+    }
+
+    fn storage_label_for_inner(inner: &ShmBufferInner) -> &'static str {
+        match inner {
+            ShmBufferInner::Inline(_) => "inline",
+            ShmBufferInner::PeerShm { .. } => "shm",
+            ShmBufferInner::Handle { handle, .. } => {
+                if handle.is_file_spill() {
+                    "file_spill"
+                } else {
+                    "handle"
+                }
+            }
         }
     }
 }
@@ -151,7 +170,11 @@ impl PyShmBuffer {
                 "cannot release: active memoryview exports",
             ));
         }
-        match guard.take() {
+        let inner = guard.take();
+        self.lease.lock().take();
+        drop(guard);
+
+        match inner {
             Some(ShmBufferInner::PeerShm {
                 pool,
                 seg_idx,
@@ -171,6 +194,32 @@ impl PyShmBuffer {
             Some(ShmBufferInner::Inline(_)) => Ok(()),
             None => Ok(()), // already released — idempotent
         }
+    }
+
+    #[pyo3(signature = (tracker, route_name, method_name, direction="resource_input"))]
+    fn track_retained(
+        &self,
+        tracker: &PyBufferLeaseTracker,
+        route_name: &str,
+        method_name: &str,
+        direction: &str,
+    ) -> PyResult<()> {
+        let guard = self.inner.lock();
+        let Some(inner) = guard.as_ref() else {
+            return Ok(());
+        };
+        let storage = Self::storage_label_for_inner(inner);
+        let lease_guard = tracker.track_retained_guard(
+            route_name,
+            method_name,
+            direction,
+            storage,
+            self.data_len,
+        )?;
+        let mut current = self.lease.lock();
+        current.take();
+        *current = Some(lease_guard);
+        Ok(())
     }
 
     /// Buffer protocol — enables `memoryview(shm_buf)`.
@@ -257,7 +306,11 @@ impl PyShmBuffer {
 impl Drop for PyShmBuffer {
     fn drop(&mut self) {
         let mut guard = self.inner.lock();
-        if let Some(inner) = guard.take() {
+        let inner = guard.take();
+        self.lease.lock().take();
+        drop(guard);
+
+        if let Some(inner) = inner {
             match inner {
                 ShmBufferInner::PeerShm {
                     pool,
