@@ -105,6 +105,36 @@ def test_import_does_not_expose_logo_banner():
     assert not hasattr(c_two, "LOGO" + "_UNICODE")
 
 
+def test_top_level_exposes_register_concurrency_facade():
+    import c_two as cc
+    from c_two.transport.server.scheduler import ConcurrencyConfig, ConcurrencyMode
+
+    assert cc.ConcurrencyConfig is ConcurrencyConfig
+    assert cc.ConcurrencyMode is ConcurrencyMode
+    assert {'ConcurrencyConfig', 'ConcurrencyMode'} <= set(cc.__all__)
+
+    cfg = cc.ConcurrencyConfig(mode=cc.ConcurrencyMode.PARALLEL)
+    assert cfg.mode is cc.ConcurrencyMode.PARALLEL
+
+
+def test_top_level_exposes_public_override_schemas():
+    import c_two as cc
+    from c_two.config import (
+        BaseIPCOverrides,
+        ClientIPCOverrides,
+        ServerIPCOverrides,
+    )
+
+    assert cc.BaseIPCOverrides is BaseIPCOverrides
+    assert cc.ServerIPCOverrides is ServerIPCOverrides
+    assert cc.ClientIPCOverrides is ClientIPCOverrides
+    assert {
+        'BaseIPCOverrides',
+        'ServerIPCOverrides',
+        'ClientIPCOverrides',
+    } <= set(cc.__all__)
+
+
 def test_error_facade_does_not_reimplement_wire_codec():
     source_path = Path(__file__).resolve().parents[2] / "src" / "c_two" / "error.py"
     source = source_path.read_text(encoding="utf-8")

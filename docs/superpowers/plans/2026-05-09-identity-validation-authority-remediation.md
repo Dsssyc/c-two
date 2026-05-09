@@ -24,6 +24,8 @@
   - Require explicit CrmTag fields in Python `RouteInfo`.
 - Modify `sdk/python/tests/unit/test_wire.py`
   - Update helper route construction and add malformed-CrmTag facade tests.
+- Modify `sdk/python/tests/unit/test_security.py`
+  - Update low-level handshake security tests to use explicit valid CrmTag metadata except in tests that deliberately assert invalid CrmTag behavior.
 - Modify `sdk/python/src/c_two/crm/meta.py`
   - Validate namespace, CRM class name, and version before building `__tag__`.
 - Modify `sdk/python/src/c_two/transport/server/native.py`
@@ -35,9 +37,9 @@
 - Modify `sdk/python/native/src/server_ffi.rs`
   - Reject invalid CrmTag at PyO3 route construction before native route state.
 - Modify `core/transport/c2-http/src/relay/route_table.rs`
-  - Delegate CrmTag validation to `c2-wire` and relay-id validation to `c2-config`.
+  - Delegate CrmTag validation to `c2-wire`, relay-id validation to `c2-config`, reject invalid direct `register_route()` entries as defense-in-depth, and reject invalid `record_peer_join()` peer-table mutations.
 - Modify `core/transport/c2-http/src/relay/authority.rs`
-  - Enforce canonical CrmTag and relay-id validation before every route mutation.
+  - Enforce canonical CrmTag and relay-id validation before every route mutation and add self-contained authority tests with local fixtures.
 - Modify `core/transport/c2-http/src/relay/state.rs`
   - Add `RegisterCommitResult::Invalid { reason }`.
 - Modify `core/transport/c2-http/src/relay/router.rs`
@@ -55,10 +57,16 @@
 
 - CrmTag fields are `crm_ns`, `crm_name`, and `crm_ver`. All three must be non-empty, no more than `MAX_HANDSHAKE_NAME_BYTES`, free of control characters, free of leading/trailing whitespace, and free of `/` or `\` path/tag delimiters.
 - Server handshake encode and decode both validate CrmTag. A malformed peer handshake must not become trusted route metadata.
-- Python fast feedback mirrors the Rust rule, but Rust remains authoritative.
+- Python fast feedback mirrors the Rust rule, including non-ASCII Unicode control characters, but Rust remains authoritative.
 - Relay local state may never store empty CrmTag fields, including `skip_ipc_validation`.
 - `skip_ipc_validation` remains test-only. HTTP skip registration must supply a complete CrmTag in the body. Command-loop skip registration, which has no CRM fields in its public CLI syntax, uses a fixed explicit test CrmTag and tests assert that behavior.
 - Relay-id validation is enforced at `RouteAuthority`, not only at HTTP handlers. This covers HTTP peer endpoints, background digest application, and direct authority calls in tests.
+- `RouteTable::register_route()` is still a crate-internal mutation primitive, so it must reject malformed route names, relay ids, CrmTags, non-finite timestamps, and invalid locality/private-field combinations itself. Authority validation is the primary gate; route-table validation prevents future internal call sites and test fixtures from bypassing the invariant.
+- `RouteTable::record_peer_join()` directly mutates the peer table, so relay-id validation must live there too. Peer handlers should reject malformed join envelopes early for clean control-flow, but the route table must still return `false` without mutation if a future internal caller bypasses handler checks.
+- Any new enum variant in a relay state result type must be propagated through every exhaustive match before running tests. Use `rg` immediately after adding variants; do not rely on the compiler as the first integration check.
+- Task 1 and Task 2 are a single commit boundary. Do not commit after Task 1 alone: once `c2-wire` rejects empty CrmTags, the current Python `RouteInfo` default empty metadata becomes invalid until Task 2 migrates the facade and tests.
+- Any Python test that imports `c_two._native` after Rust native changes must be preceded by `env UV_CACHE_DIR=.uv-cache C2_RELAY_ANCHOR_ADDRESS= uv sync --reinstall-package c-two`. `cargo check` proves Rust compilation only; it does not reinstall the PyO3 extension used by pytest.
+- Any relay integration test or full Python suite after `c2-http` relay changes must be preceded by `python tools/dev/c3_tool.py --build --link`, because pytest starts the existing `c3` binary from `cli/target` and can otherwise exercise stale relay code.
 
 ## Task 1: Make c2-wire The Real CrmTag Authority
 
@@ -73,6 +81,23 @@
 Add these tests to `core/protocol/c2-wire/src/tests.rs`:
 
 ```rust
+fn route(name: &str, methods: &[&str]) -> RouteInfo {
+    RouteInfo {
+        name: name.into(),
+        crm_ns: "test.grid".into(),
+        crm_name: "Grid".into(),
+        crm_ver: "0.1.0".into(),
+        methods: methods
+            .iter()
+            .enumerate()
+            .map(|(index, method)| MethodEntry {
+                name: (*method).into(),
+                index: index as u16,
+            })
+            .collect(),
+    }
+}
+
 #[test]
 fn crm_tag_validator_accepts_normal_contract_identity() {
     validate_crm_tag("test.grid", "Grid", "0.1.0").unwrap();
@@ -258,22 +283,21 @@ cargo test --manifest-path core/Cargo.toml -p c2-wire -- --nocapture
 
 Expected: all c2-wire tests pass.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Do not commit this intermediate state**
 
-```bash
-git add core/protocol/c2-wire/src/control.rs core/protocol/c2-wire/src/frame.rs core/protocol/c2-wire/src/handshake.rs core/protocol/c2-wire/src/tests.rs
-git commit -m "fix: enforce canonical CrmTag validation in wire codec"
-```
+Do not commit after Task 1 alone. At this point `c2-wire` rejects empty CrmTags, while the Python `RouteInfo` facade still has empty defaults. Continue directly to Task 2 and make the first commit after the Python facade and tests have been migrated.
 
 ## Task 2: Align Python CrmTag Facades With Wire Authority
 
 **Files:**
 - Modify: `sdk/python/native/src/wire_ffi.rs`
 - Modify: `sdk/python/tests/unit/test_wire.py`
+- Modify: `sdk/python/tests/unit/test_security.py`
 - Modify: `sdk/python/src/c_two/crm/meta.py`
 - Modify: `sdk/python/src/c_two/transport/server/native.py`
 - Test: `sdk/python/tests/unit/test_crm_decorator.py`
 - Test: `sdk/python/tests/unit/test_wire.py`
+- Test: `sdk/python/tests/unit/test_security.py`
 
 - [ ] **Step 1: Write failing Python facade tests**
 
@@ -291,6 +315,11 @@ def test_class_name_rejects_control_characters(self):
     with pytest.raises(ValueError, match='control characters'):
         cc.crm(namespace='ns', version='1.0.0')(Bad)
 
+def test_class_name_rejects_unicode_control_characters(self):
+    Bad = type('Bad\u0085Name', (), {'__module__': __name__})
+    with pytest.raises(ValueError, match='control characters'):
+        cc.crm(namespace='ns', version='1.0.0')(Bad)
+
 def test_class_name_rejects_path_separator(self):
     Bad = type('Bad/Name', (), {'__module__': __name__})
     with pytest.raises(ValueError, match='separators'):
@@ -303,7 +332,7 @@ def test_version_rejects_overlong_wire_field(self):
             pass
 ```
 
-Add to `sdk/python/tests/unit/test_wire.py`:
+Add near the top of `sdk/python/tests/unit/test_wire.py`, after imports:
 
 ```python
 def route_info(name: str, methods: list[MethodEntry]) -> RouteInfo:
@@ -319,30 +348,67 @@ def test_route_info_requires_explicit_crm_tag():
     with pytest.raises(TypeError):
         RouteInfo(name='grid', methods=[MethodEntry(name='get', index=0)])
 
-def test_server_handshake_rejects_invalid_crm_tag():
-    route = RouteInfo(
-        name='grid',
-        methods=[MethodEntry(name='get', index=0)],
-        crm_ns='test.wire',
-        crm_name='Bad\nRoute',
-        crm_ver='0.1.0',
-    )
+def test_route_info_rejects_invalid_crm_tag():
     with pytest.raises(ValueError, match='control characters'):
-        encode_server_handshake(
-            [],
-            CAP_CALL,
-            [route],
-            server_id='wire-server',
-            server_instance_id='wire-instance',
+        RouteInfo(
+            name='grid',
+            methods=[MethodEntry(name='get', index=0)],
+            crm_ns='test.wire',
+            crm_name='Bad\nRoute',
+            crm_ver='0.1.0',
         )
 ```
 
-Update existing `RouteInfo("route_a", ...)` calls in `test_wire.py` to use `route_info(...)`.
+Update every remaining `RouteInfo(...)` construction in `test_wire.py` so it supplies explicit CrmTag metadata. For existing route-name-only cases, use the new helper:
+
+```python
+r1 = route_info("route_a", [MethodEntry("m1", 0)])
+r2 = route_info("route_b", [MethodEntry("m2", 0), MethodEntry("m3", 1)])
+routes = [route_info("grid", [MethodEntry(name="get", index=0)])]
+```
+
+Add near the top of `sdk/python/tests/unit/test_security.py`, after imports:
+
+```python
+def route_info(name: str, methods: list[MethodEntry]) -> RouteInfo:
+    return RouteInfo(
+        name=name,
+        methods=methods,
+        crm_ns='test.security',
+        crm_name='SecurityRoute',
+        crm_ver='0.1.0',
+    )
+```
+
+Update `test_security.py` route construction:
+
+```python
+routes = [route_info('r1', [MethodEntry('m1', 0)])]
+
+routes = [
+    route_info('ns1', [MethodEntry('add', 0), MethodEntry('mul', 1)]),
+    route_info('ns2', [MethodEntry('get', 0)]),
+]
+```
+
+Update `test_excessive_method_count()` in `test_security.py` so the handcrafted server handshake carries a valid CrmTag and still reaches the method-count check:
+
+```python
+buf.append(2)                   # route_name_len=2
+buf += b'r1'                    # route_name
+buf.append(len(b'test.security'))
+buf += b'test.security'
+buf.append(len(b'SecurityRoute'))
+buf += b'SecurityRoute'
+buf.append(len(b'0.1.0'))
+buf += b'0.1.0'
+buf += struct.pack('<H', _MAX_HANDSHAKE_METHODS + 1)  # method count
+```
 
 - [ ] **Step 2: Run the failing tests**
 
 ```bash
-env UV_CACHE_DIR=.uv-cache C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_crm_decorator.py::TestIcrmValidation sdk/python/tests/unit/test_wire.py::TestHandshake -q --timeout=30 -rs
+env UV_CACHE_DIR=.uv-cache C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_crm_decorator.py::TestIcrmValidation sdk/python/tests/unit/test_wire.py sdk/python/tests/unit/test_security.py::TestHandshakeBoundsChecking -q --timeout=30 -rs
 ```
 
 Expected: fails until Python facade validation and explicit RouteInfo signatures are updated.
@@ -376,9 +442,11 @@ Change return type from `Self` to `PyResult<Self>`.
 
 - [ ] **Step 4: Add Python CRM field validation**
 
-In `sdk/python/src/c_two/crm/meta.py`, add:
+In `sdk/python/src/c_two/crm/meta.py`, add `unicodedata` beside the existing imports, then add the validation helper:
 
 ```python
+import unicodedata
+
 _CRM_TAG_MAX_BYTES = 255
 
 
@@ -391,7 +459,7 @@ def _validate_crm_tag_field(label: str, value: str) -> None:
         raise ValueError(f'{label} cannot exceed {_CRM_TAG_MAX_BYTES} bytes.')
     if value.strip() != value:
         raise ValueError(f'{label} cannot contain leading or trailing whitespace.')
-    if any(ch < ' ' or ch == '\x7f' for ch in value):
+    if any(unicodedata.category(ch) == 'Cc' for ch in value):
         raise ValueError(f'{label} cannot contain control characters.')
     if '/' in value or '\\' in value:
         raise ValueError(f'{label} cannot contain path or tag separators.')
@@ -425,19 +493,27 @@ def _extract_namespace(crm_class: type) -> str:
 
 This makes undecorated CRM contracts fail at the Python boundary instead of producing empty native CrmTags.
 
-- [ ] **Step 6: Run Python tests**
+- [ ] **Step 6: Rebuild the Python native extension**
 
 ```bash
-env UV_CACHE_DIR=.uv-cache C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_crm_decorator.py::TestIcrmValidation sdk/python/tests/unit/test_wire.py -q --timeout=30 -rs
+env UV_CACHE_DIR=.uv-cache C2_RELAY_ANCHOR_ADDRESS= uv sync --reinstall-package c-two
+```
+
+Expected: the PyO3 extension is rebuilt from the current Rust sources. Do not run the pytest commands below against a stale `_native` extension.
+
+- [ ] **Step 7: Run Python tests**
+
+```bash
+env UV_CACHE_DIR=.uv-cache C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_crm_decorator.py::TestIcrmValidation sdk/python/tests/unit/test_wire.py sdk/python/tests/unit/test_security.py::TestHandshakeBoundsChecking -q --timeout=30 -rs
 ```
 
 Expected: all selected tests pass.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit Task 1 and Task 2 together**
 
 ```bash
-git add sdk/python/native/src/wire_ffi.rs sdk/python/tests/unit/test_wire.py sdk/python/src/c_two/crm/meta.py sdk/python/src/c_two/transport/server/native.py sdk/python/tests/unit/test_crm_decorator.py
-git commit -m "fix: align Python CrmTag facades with wire authority"
+git add core/protocol/c2-wire/src/control.rs core/protocol/c2-wire/src/frame.rs core/protocol/c2-wire/src/handshake.rs core/protocol/c2-wire/src/tests.rs sdk/python/native/src/wire_ffi.rs sdk/python/tests/unit/test_wire.py sdk/python/tests/unit/test_security.py sdk/python/src/c_two/crm/meta.py sdk/python/src/c_two/transport/server/native.py sdk/python/tests/unit/test_crm_decorator.py
+git commit -m "fix: enforce CrmTag validation across wire and Python facades"
 ```
 
 ## Task 3: Enforce CrmTag At Native Server And Relay Registration Choke Points
@@ -451,6 +527,7 @@ git commit -m "fix: align Python CrmTag facades with wire authority"
 - Modify: `core/transport/c2-http/src/relay/router.rs`
 - Modify: `core/transport/c2-http/src/relay/server.rs`
 - Test: `core/transport/c2-server/src/server.rs`
+- Test: `core/transport/c2-http/src/relay/route_table.rs`
 - Test: `core/transport/c2-http/src/relay/router.rs`
 - Test: `core/transport/c2-http/src/relay/server.rs`
 - Test: `core/transport/c2-http/src/relay/state.rs`
@@ -462,12 +539,7 @@ Add to `core/transport/c2-server/src/server.rs` tests:
 ```rust
 #[tokio::test]
 async fn register_route_rejects_invalid_crm_tag_fields() {
-    let s = Server::new(
-        "ipc://invalid_crm_tag_route",
-        ServerIpcConfig::default(),
-        Some("invalid-crm-tag-route".to_string()),
-    )
-    .unwrap();
+    let s = Server::new("ipc://invalid_crm_tag_route", ServerIpcConfig::default()).unwrap();
     let mut route = make_route("grid");
     route.crm_name = "Grid\0Injected".to_string();
 
@@ -501,6 +573,35 @@ fn local_commit_rejects_invalid_crm_tag_without_fake_duplicate() {
 
     assert!(matches!(result, RegisterCommitResult::Invalid { reason } if reason.contains("control characters")));
     assert!(state.resolve("grid").is_empty());
+}
+```
+
+Add to `core/transport/c2-http/src/relay/route_table.rs` tests:
+
+```rust
+#[test]
+fn register_route_rejects_invalid_identity_fields_without_mutation() {
+    let mut rt = RouteTable::new("relay-a".into());
+
+    let mut bad_crm = peer_entry("grid", "relay-b", 1000.0);
+    bad_crm.crm_name = "Grid\nInjected".into();
+    assert!(!rt.register_route(bad_crm));
+    assert!(rt.resolve("grid").is_empty());
+
+    let bad_route_name = peer_entry("bad\nroute", "relay-b", 1000.0);
+    assert!(!rt.register_route(bad_route_name));
+    assert!(rt.resolve("bad\nroute").is_empty());
+
+    let mut peer_with_private_fields = peer_entry("peer-private", "relay-b", 1000.0);
+    peer_with_private_fields.server_id = Some("server-leak".into());
+    peer_with_private_fields.server_instance_id = Some("instance-leak".into());
+    peer_with_private_fields.ipc_address = Some("ipc://leaked".into());
+    assert!(!rt.register_route(peer_with_private_fields));
+    assert!(rt.resolve("peer-private").is_empty());
+
+    let local_wrong_relay = local_entry("local-wrong-relay", "relay-b");
+    assert!(!rt.register_route(local_wrong_relay));
+    assert!(rt.resolve("local-wrong-relay").is_empty());
 }
 ```
 
@@ -577,6 +678,7 @@ async fn command_register_skip_validation_publishes_explicit_test_crm_tag() {
 
 ```bash
 cargo test --manifest-path core/Cargo.toml -p c2-server register_route_rejects_invalid_crm_tag_fields -- --nocapture
+cargo test --manifest-path core/Cargo.toml -p c2-http --features relay register_route_rejects_invalid_identity_fields_without_mutation -- --nocapture
 cargo test --manifest-path core/Cargo.toml -p c2-http --features relay invalid_crm_tag -- --nocapture
 cargo test --manifest-path core/Cargo.toml -p c2-http --features relay command_register_skip_validation_publishes_explicit_test_crm_tag -- --nocapture
 ```
@@ -603,9 +705,9 @@ c2_wire::handshake::validate_crm_tag(crm_ns, crm_name, crm_ver)
     .map_err(PyValueError::new_err)?;
 ```
 
-- [ ] **Step 5: Delegate relay CrmTag validation to c2-wire**
+- [ ] **Step 5: Delegate relay CrmTag validation to c2-wire and guard direct route-table mutation**
 
-In `core/transport/c2-http/src/relay/route_table.rs`, replace the local CrmTag helper:
+In `core/transport/c2-http/src/relay/route_table.rs`, remove the unused `MAX_HANDSHAKE_NAME_BYTES` import and replace the local CrmTag helper:
 
 ```rust
 pub(crate) fn valid_crm_tag(crm_ns: &str, crm_name: &str, crm_ver: &str) -> bool {
@@ -614,6 +716,69 @@ pub(crate) fn valid_crm_tag(crm_ns: &str, crm_name: &str, crm_ver: &str) -> bool
 ```
 
 Delete `valid_crm_tag_field()`.
+
+Add a private `RouteTable` entry validator that checks both field syntax and route shape. Put `valid_route_entry()` inside the `impl RouteTable` block so it can compare against `self.relay_id`; keep the small `valid_nonempty_identity()` helper near the other local validators. A peer route must never carry private IPC/server identity, and a local route must belong to this relay:
+
+```rust
+fn valid_nonempty_identity(value: &str) -> bool {
+    !value.is_empty() && value.trim() == value && !value.chars().any(char::is_control)
+}
+
+fn valid_route_entry(&self, entry: &RouteEntry) -> bool {
+    if !valid_route_name(&entry.name)
+        || !valid_relay_id(&entry.relay_id)
+        || !valid_crm_tag(&entry.crm_ns, &entry.crm_name, &entry.crm_ver)
+        || !entry.registered_at.is_finite()
+    {
+        return false;
+    }
+
+    match entry.locality {
+        Locality::Local => {
+            entry.relay_id == self.relay_id
+                && entry
+                    .server_id
+                    .as_deref()
+                    .is_some_and(|server_id| c2_config::validate_server_id(server_id).is_ok())
+                && entry
+                    .server_instance_id
+                    .as_deref()
+                    .is_some_and(valid_nonempty_identity)
+                && entry
+                    .ipc_address
+                    .as_deref()
+                    .is_some_and(|address| address.starts_with("ipc://"))
+        }
+        Locality::Peer => {
+            entry.relay_id != self.relay_id
+                && entry.server_id.is_none()
+                && entry.server_instance_id.is_none()
+                && entry.ipc_address.is_none()
+        }
+    }
+}
+```
+
+Then make `register_route()` reject malformed direct writes before computing the key:
+
+```rust
+pub fn register_route(&mut self, entry: RouteEntry) -> bool {
+    if !self.valid_route_entry(&entry) {
+        return false;
+    }
+    let key = (entry.name.clone(), entry.relay_id.clone());
+    if let Some(tombstone) = self.tombstones.get(&key) {
+        if entry.registered_at <= tombstone.removed_at {
+            return false;
+        }
+    }
+    self.tombstones.remove(&key);
+    self.routes.insert(key, entry);
+    true
+}
+```
+
+Keep the existing `merge_snapshot()` prevalidation. The direct `register_route()` check is defense-in-depth for internal call sites and tests, not a replacement for authority validation.
 
 - [ ] **Step 6: Add invalid commit result and authority validation**
 
@@ -638,6 +803,72 @@ Err(ControlError::InvalidName { reason })
 | Err(ControlError::ContractMismatch { reason }) => {
     RegisterCommitResult::Invalid { reason }
 }
+```
+
+Immediately update every exhaustive match on `RegisterCommitResult`:
+
+```bash
+rg -n "RegisterCommitResult::|commit_register_upstream\\(" core/transport/c2-http/src/relay -g '*.rs'
+```
+
+In the `core/transport/c2-http/src/relay/state.rs` test helper that unwraps successful local registration, include the new invalid case explicitly:
+
+```rust
+match state.commit_register_upstream(
+    name.to_string(),
+    server_id.to_string(),
+    server_instance_id.to_string(),
+    address.to_string(),
+    crm_ns.to_string(),
+    crm_name.to_string(),
+    crm_ver.to_string(),
+    client,
+    None,
+) {
+    RegisterCommitResult::Registered { entry }
+    | RegisterCommitResult::SameOwner { entry } => entry,
+    RegisterCommitResult::Duplicate { existing_address }
+    | RegisterCommitResult::ConflictingOwner { existing_address } => {
+        panic!("unexpected duplicate route at {existing_address}")
+    }
+    RegisterCommitResult::Invalid { reason } => {
+        panic!("unexpected invalid route in test helper: {reason}")
+    }
+}
+```
+
+In `core/transport/c2-http/src/relay/router.rs`, update the data-plane precheck hook match:
+
+```rust
+match state_for_hook.commit_register_upstream(
+    route_for_hook.clone(),
+    "server-new".into(),
+    "server-new-instance".into(),
+    new_address_for_hook,
+    "test.other".into(),
+    "OtherEcho".into(),
+    "0.1.0".into(),
+    new_client,
+    None,
+) {
+    RegisterCommitResult::Registered { .. }
+    | RegisterCommitResult::SameOwner { .. } => {}
+    RegisterCommitResult::Duplicate { existing_address }
+    | RegisterCommitResult::ConflictingOwner { existing_address } => {
+        panic!("failed to install mismatched route in precheck hook: {existing_address}")
+    }
+    RegisterCommitResult::Invalid { reason } => {
+        panic!("failed to install mismatched route in precheck hook: {reason}")
+    }
+}
+```
+
+Update any existing inline test fixture that writes empty local CrmTag fields through `RouteTable::register_route()` directly. For `route_authority_preflight_uses_route_table_when_connection_entry_is_missing`, use:
+
+```rust
+crm_ns: "test.old".into(),
+crm_name: "OldGrid".into(),
+crm_ver: "0.1.0".into(),
 ```
 
 In `core/transport/c2-http/src/relay/authority.rs`, add before the route-table write lock in `register_local()`:
@@ -719,6 +950,7 @@ RegisterCommitResult::Invalid { reason } => {
 
 ```bash
 cargo test --manifest-path core/Cargo.toml -p c2-server register_route_rejects_invalid_crm_tag_fields -- --nocapture
+cargo test --manifest-path core/Cargo.toml -p c2-http --features relay register_route_rejects_invalid_identity_fields_without_mutation -- --nocapture
 cargo test --manifest-path core/Cargo.toml -p c2-http --features relay invalid_crm_tag -- --nocapture
 cargo test --manifest-path core/Cargo.toml -p c2-http --features relay command_register_skip_validation_publishes_explicit_test_crm_tag -- --nocapture
 ```
@@ -743,6 +975,7 @@ git commit -m "fix: enforce CrmTag validation at route mutation boundaries"
 - Modify: `core/transport/c2-http/src/relay/peer_handlers.rs`
 - Test: `core/foundation/c2-config/src/identity.rs`
 - Test: `core/foundation/c2-config/src/relay.rs`
+- Test: `core/transport/c2-http/src/relay/route_table.rs`
 - Test: `core/transport/c2-http/src/relay/authority.rs`
 - Test: `core/transport/c2-http/src/relay/peer_handlers.rs`
 
@@ -791,27 +1024,101 @@ fn relay_config_rejects_invalid_relay_id() {
 }
 ```
 
-Add to `core/transport/c2-http/src/relay/authority.rs` tests:
+Add to `core/transport/c2-http/src/relay/route_table.rs` tests:
 
 ```rust
 #[test]
-fn authority_rejects_invalid_relay_id_before_peer_route_mutation() {
-    let state = RelayState::new(test_config(), null_disseminator());
-    let authority = RouteAuthority::new(&state);
-    let mut entry = peer_entry("grid", "bad\nrelay", 1000.0);
-    entry.crm_ns = "test.ns".into();
-    entry.crm_name = "Grid".into();
-    entry.crm_ver = "0.1.0".into();
+fn register_route_rejects_invalid_relay_id_without_mutation() {
+    let mut rt = RouteTable::new("relay-a".into());
 
-    let err = authority
-        .execute(RouteCommand::AnnouncePeer {
+    let bad_relay = peer_entry("grid", "bad/relay", 1000.0);
+    assert!(!rt.register_route(bad_relay));
+    assert!(rt.resolve("grid").is_empty());
+}
+
+#[test]
+fn record_peer_join_rejects_invalid_relay_id_without_peer_mutation() {
+    let mut rt = RouteTable::new("relay-a".into());
+
+    assert!(!rt.record_peer_join("bad/relay".into(), "http://bad:8080".into()));
+    assert!(!rt.has_peer("bad/relay"));
+
+    assert!(!rt.record_peer_join("relay-a".into(), "http://self:8080".into()));
+    assert!(!rt.has_peer("relay-a"));
+}
+```
+
+Add this self-contained test module to the bottom of `core/transport/c2-http/src/relay/authority.rs`. Do not reuse private helpers from `state.rs` or `route_table.rs`; those helpers are scoped to their own `#[cfg(test)]` modules.
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use c2_config::RelayConfig;
+
+    use crate::relay::disseminator::Disseminator;
+    use crate::relay::peer::PeerEnvelope;
+    use crate::relay::state::RelayState;
+    use crate::relay::types::{Locality, PeerSnapshot, RouteEntry};
+
+    struct NullDisseminator;
+
+    impl Disseminator for NullDisseminator {
+        fn broadcast(
+            &self,
+            _envelope: PeerEnvelope,
+            _peers: &[PeerSnapshot],
+        ) -> Option<tokio::task::JoinHandle<()>> {
+            None
+        }
+    }
+
+    fn test_state() -> RelayState {
+        RelayState::new(
+            Arc::new(RelayConfig {
+                relay_id: "relay-a".into(),
+                advertise_url: "http://relay-a:8080".into(),
+                ..RelayConfig::default()
+            }),
+            Arc::new(NullDisseminator),
+        )
+    }
+
+    fn peer_entry(name: &str, relay_id: &str, registered_at: f64) -> RouteEntry {
+        RouteEntry {
+            name: name.into(),
+            relay_id: relay_id.into(),
+            relay_url: format!("http://{relay_id}:8080"),
+            server_id: None,
+            server_instance_id: None,
+            ipc_address: None,
+            crm_ns: "test.ns".into(),
+            crm_name: "Grid".into(),
+            crm_ver: "0.1.0".into(),
+            locality: Locality::Peer,
+            registered_at,
+        }
+    }
+
+    #[test]
+    fn authority_rejects_invalid_relay_id_before_peer_route_mutation() {
+        let state = test_state();
+        let authority = RouteAuthority::new(&state);
+        let entry = peer_entry("grid", "bad\nrelay", 1000.0);
+
+        let err = match authority.execute(RouteCommand::AnnouncePeer {
             sender_relay_id: "bad\nrelay".into(),
             entry,
-        })
-        .expect_err("invalid relay id must not mutate route state");
+        }) {
+            Err(err) => err,
+            Ok(_) => panic!("invalid relay id must not mutate route state"),
+        };
 
-    assert!(matches!(err, ControlError::OwnerMismatch));
-    assert!(state.resolve("grid").is_empty());
+        assert!(matches!(err, ControlError::OwnerMismatch));
+        assert!(state.resolve("grid").is_empty());
+    }
 }
 ```
 
@@ -845,7 +1152,7 @@ cargo test --manifest-path core/Cargo.toml -p c2-config relay_id -- --nocapture
 cargo test --manifest-path core/Cargo.toml -p c2-http --features relay relay_id -- --nocapture
 ```
 
-Expected: fails until canonical relay-id validation is added and authority uses it.
+Expected: fails until canonical relay-id validation is added, authority uses it, and `RouteTable` rejects invalid peer joins itself.
 
 - [ ] **Step 3: Add canonical relay-id validation**
 
@@ -893,7 +1200,40 @@ pub(crate) fn validate_relay_id(&self, relay_id: &str) -> Result<(), ControlErro
 
 This keeps malformed peer ids as ignored/unauthorized ownership attempts instead of exposing new public error semantics.
 
-- [ ] **Step 5: Add peer-handler early rejection**
+- [ ] **Step 5: Add route-table and peer-handler early rejection**
+
+In `core/transport/c2-http/src/relay/route_table.rs`, make peer-table mutation return whether it accepted the join. This is the low-level guard; handlers are not the authority for peer-table integrity:
+
+```rust
+pub fn record_peer_join(&mut self, relay_id: String, url: String) -> bool {
+    if relay_id == self.relay_id || !valid_relay_id(&relay_id) {
+        return false;
+    }
+
+    let now = Instant::now();
+    match self.peers.get_mut(&relay_id) {
+        Some(peer) => {
+            peer.url = url.clone();
+            peer.last_heartbeat = now;
+            peer.status = PeerStatus::Alive;
+        }
+        None => {
+            self.peers.insert(
+                relay_id.clone(),
+                PeerInfo {
+                    relay_id: relay_id.clone(),
+                    url: url.clone(),
+                    route_count: 0,
+                    last_heartbeat: now,
+                    status: PeerStatus::Alive,
+                },
+            );
+        }
+    }
+    self.sync_peer_route_urls(&relay_id, &url);
+    true
+}
+```
 
 In `core/transport/c2-http/src/relay/peer_handlers.rs`, add:
 
@@ -907,6 +1247,15 @@ Before `record_peer_join()`:
 
 ```rust
 if !valid_peer_relay_id(&sender_relay_id) || !valid_peer_relay_id(&relay_id) {
+    return (
+        StatusCode::OK,
+        Json(serde_json::json!({"status": "ignored"})),
+    )
+        .into_response();
+}
+
+let accepted = state.with_route_table_mut(|rt| rt.record_peer_join(relay_id, url));
+if !accepted {
     return (
         StatusCode::OK,
         Json(serde_json::json!({"status": "ignored"})),
@@ -1011,24 +1360,31 @@ Add to `sdk/python/tests/integration/test_http_relay.py`:
 ```python
 def test_relay_call_rejects_invalid_expected_crm_header(self, start_c3_relay):
     relay = start_c3_relay(skip_ipc_validation=True)
-    req = urllib.request.Request(
-        f"{relay.url}/grid/get",
-        data=b"",
-        headers={
-            "x-c2-expected-crm-ns": "test/grid",
-            "x-c2-expected-crm-name": "Grid",
-            "x-c2-expected-crm-ver": "0.1.0",
-        },
-        method="POST",
-    )
+    with httpx.Client(trust_env=False, timeout=5.0) as http:
+        resp = http.post(
+            f"{relay.url}/grid/get",
+            content=b"",
+            headers={
+                "x-c2-expected-crm-ns": "test/grid",
+                "x-c2-expected-crm-name": "Grid",
+                "x-c2-expected-crm-ver": "0.1.0",
+            },
+        )
 
-    with pytest.raises(urllib.error.HTTPError) as exc:
-        urllib.request.urlopen(req, timeout=5)
-
-    assert exc.value.code == 400
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "InvalidCrmTag"
 ```
 
-- [ ] **Step 4: Run boundary and regression tests**
+- [ ] **Step 4: Rebuild Python native extension and c3 relay binary**
+
+```bash
+env UV_CACHE_DIR=.uv-cache C2_RELAY_ANCHOR_ADDRESS= uv sync --reinstall-package c-two
+python tools/dev/c3_tool.py --build --link
+```
+
+Expected: pytest imports the rebuilt `_native` extension and relay integration tests start the rebuilt `c3` binary. If linking `c3` requires approval in a sandboxed agent session, request it instead of running relay tests against a stale binary.
+
+- [ ] **Step 5: Run boundary and regression tests**
 
 ```bash
 env UV_CACHE_DIR=.uv-cache C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_sdk_boundary.py::test_relay_does_not_keep_second_crm_tag_validator sdk/python/tests/unit/test_sdk_boundary.py::test_route_authority_uses_canonical_relay_id_validator sdk/python/tests/unit/test_sdk_boundary.py::test_python_crm_metadata_is_not_parsed_from_slash_tag -q --timeout=30 -rs
@@ -1038,7 +1394,7 @@ env UV_CACHE_DIR=.uv-cache C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tes
 
 Expected: all selected tests pass.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add sdk/python/tests/unit/test_sdk_boundary.py sdk/python/tests/integration/test_relay_mesh.py sdk/python/tests/integration/test_http_relay.py
@@ -1073,7 +1429,16 @@ cargo check --manifest-path sdk/python/native/Cargo.toml -q
 
 Expected: all commands pass.
 
-- [ ] **Step 3: Run Python verification**
+- [ ] **Step 3: Rebuild Python native extension and c3 relay binary**
+
+```bash
+env UV_CACHE_DIR=.uv-cache C2_RELAY_ANCHOR_ADDRESS= uv sync --reinstall-package c-two
+python tools/dev/c3_tool.py --build --link
+```
+
+Expected: `_native` and `c3` both reflect the current Rust sources before full Python verification starts.
+
+- [ ] **Step 4: Run Python verification**
 
 ```bash
 env UV_CACHE_DIR=.uv-cache C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30 -rs
@@ -1081,7 +1446,7 @@ env UV_CACHE_DIR=.uv-cache C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tes
 
 Expected: full Python suite passes with the current skip count only.
 
-- [ ] **Step 4: Run diff hygiene checks**
+- [ ] **Step 5: Run diff hygiene checks**
 
 ```bash
 git diff --check
@@ -1090,31 +1455,38 @@ git status --short
 
 Expected: no whitespace errors; status shows only intended source, test, and plan files.
 
-- [ ] **Step 5: Perform final code review pass**
+- [ ] **Step 6: Perform final code review pass**
 
 Review these exact invariants before declaring completion:
 
-- `rg -n "valid_crm_tag_field|relay_id\\.trim\\(\\)\\.is_empty|tag\\.split\\('/'\\)" core sdk/python/src sdk/python/tests`
-  - Expected: no production duplicate CrmTag helper, no authority relay-id trim-only validator, and no Python semantic parsing from slash tag.
+- `rg -n "\\bfn\\s+valid_crm_tag_field\\b|relay_id\\.trim\\(\\)\\.is_empty|tag\\.split\\('/'\\)" core/transport/c2-http/src/relay sdk/python/src`
+  - Expected: no relay duplicate CrmTag helper, no authority relay-id trim-only validator, and no Python semantic parsing from slash tag. The canonical `c2-wire` helper is intentionally outside this search path.
 - `rg -n "String::new\\(\\).*crm|crm_ns: String::new\\(\\)|crm_name: String::new\\(\\)|crm_ver: String::new\\(\\)" core/transport/c2-http/src/relay`
   - Expected: no relay registration path committing empty CrmTag metadata.
 - `rg -n "validate_crm_tag\\(" core/protocol/c2-wire/src core/transport/c2-server/src sdk/python/native/src core/transport/c2-http/src/relay`
   - Expected: hits in wire codec, server ingress, native ingress, relay route table/authority/router boundaries.
+- `rg -n "RouteInfo\\([^\\n]*methods=.*crm_ns=|RouteInfo\\([^\\n]*\\[MethodEntry" sdk/python/tests/unit/test_wire.py sdk/python/tests/unit/test_security.py`
+  - Expected: no old one-line `RouteInfo(...)` calls that rely on default empty CrmTag metadata. Any remaining direct construction must be multi-line and visibly pass `crm_ns`, `crm_name`, and `crm_ver`.
 
-- [ ] **Step 6: Final commit if verification changed tracked files**
+- [ ] **Step 7: Final commit if verification changed tracked files**
 
 ```bash
-git add core sdk/python docs
+git status --short
+git diff --name-only
+git add core/protocol/c2-wire/src/control.rs core/protocol/c2-wire/src/frame.rs core/protocol/c2-wire/src/handshake.rs core/protocol/c2-wire/src/tests.rs sdk/python/native/src/wire_ffi.rs sdk/python/tests/unit/test_wire.py sdk/python/tests/unit/test_security.py sdk/python/src/c_two/crm/meta.py sdk/python/src/c_two/transport/server/native.py sdk/python/tests/unit/test_crm_decorator.py core/transport/c2-server/src/server.rs sdk/python/native/src/server_ffi.rs core/transport/c2-http/src/relay/route_table.rs core/transport/c2-http/src/relay/authority.rs core/transport/c2-http/src/relay/state.rs core/transport/c2-http/src/relay/router.rs core/transport/c2-http/src/relay/server.rs core/foundation/c2-config/src/identity.rs core/foundation/c2-config/src/lib.rs core/foundation/c2-config/src/relay.rs core/transport/c2-http/src/relay/peer_handlers.rs sdk/python/tests/unit/test_sdk_boundary.py sdk/python/tests/integration/test_relay_mesh.py sdk/python/tests/integration/test_http_relay.py docs/superpowers/plans/2026-05-09-identity-validation-authority-remediation.md
 git commit -m "chore: verify identity validation authority hardening"
 ```
 
-Only run this commit if formatting or verification produced tracked edits that were not included in earlier task commits.
+Only run this commit if formatting or verification produced tracked edits that were not included in earlier task commits. Do not use broad `git add core sdk/python docs`: first inspect `git diff -- <path>` for each dirty file, and stage only intentional implementation-plan paths. This matters in a dirty worktree because `sdk/python/tests/unit/test_sdk_boundary.py` and other touched files may already contain unrelated user edits.
 
 ## Self-Review
 
 - Spec coverage: This plan covers the four strict-review findings: command-loop skip-validation empty CrmTags, c2-wire helper not enforced in codec paths, relay-id validation missing the authority choke point, and Python class-name/slash tag ambiguity.
 - Regression control: The plan keeps `skip_ipc_validation` usable only with explicit non-empty test metadata and rejects incomplete HTTP skip registrations.
+- Destructive-review coverage: The plan now avoids undefined test helpers, uses current `Server::new()` signatures, migrates all Python `RouteInfo` test callers including `test_security.py`, propagates `RegisterCommitResult::Invalid` through non-primary exhaustive matches, gives `authority.rs` self-contained relay-id fixtures, updates empty-tag inline test fixtures, keeps the first commit boundary after the Python facade migration, rebuilds `_native` and `c3` before Python verification, and scopes final invariant scans so they do not flag canonical authority code.
 - Authority consistency: CrmTag validation is canonical in `c2-wire`; relay-id validation is canonical in `c2-config`; relay mutation uses `RouteAuthority` as the final gate.
+- Internal mutation safety: `RouteTable::register_route()` rejects malformed direct entries too, so future crate-internal call sites cannot bypass route identity invariants by skipping `RouteAuthority`.
 - Performance: Validation runs at registration, handshake, resolve/header parsing, and peer ingestion boundaries. It does not add per-call serialization, route resolving, or payload copying.
 - Security: Malformed identity fields cannot enter relay state through HTTP, peer gossip, background digest application, direct state commit, native server registration, or decoded IPC handshake metadata.
+- Peer-table safety: `RouteTable::record_peer_join()` rejects malformed and self relay ids directly, so peer handler tests cannot be the only protection for peer-table integrity.
 - Placeholder scan: No task uses unresolved placeholder wording; each task names exact files, concrete code changes, test commands, and expected outcomes.
