@@ -323,6 +323,19 @@ async fn handle_register(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    let claimed_has_crm_tag = !crm_ns.is_empty() || !crm_name.is_empty() || !crm_ver.is_empty();
+    if (claimed_has_crm_tag || state.config().skip_ipc_validation)
+        && !valid_crm_tag(&crm_ns, &crm_name, &crm_ver)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "InvalidCrmTag",
+                "message": "crm_ns, crm_name, and crm_ver must be non-empty, control-character-free, separator-free, and fit the IPC handshake field limit",
+            })),
+        )
+            .into_response();
+    }
 
     if let Err(ControlError::InvalidServerInstanceId { reason }) =
         RouteAuthority::new(&state).validate_server_instance_id(&server_instance_id)
@@ -368,6 +381,7 @@ async fn handle_register(
         Err(ControlError::InvalidName { reason })
         | Err(ControlError::InvalidServerId { reason })
         | Err(ControlError::InvalidServerInstanceId { reason })
+        | Err(ControlError::InvalidAddress { reason })
         | Err(ControlError::ContractMismatch { reason }) => {
             return (StatusCode::BAD_REQUEST, reason).into_response();
         }
@@ -465,6 +479,10 @@ async fn handle_register(
         | RegisterCommitResult::ConflictingOwner { existing_address } => {
             close_arc_client(client);
             return duplicate_route_response(&name, &existing_address);
+        }
+        RegisterCommitResult::Invalid { reason } => {
+            close_arc_client(client);
+            return (StatusCode::BAD_REQUEST, reason).into_response();
         }
     };
 
@@ -872,6 +890,10 @@ mod tests {
     };
     use crate::relay::types::RouteInfo;
 
+    const TEST_CRM_NS: &str = "test.relay";
+    const TEST_CRM_NAME: &str = "RelayGrid";
+    const TEST_CRM_VER: &str = "0.1.0";
+
     fn test_state() -> Arc<RelayState> {
         test_state_for_client()
     }
@@ -946,6 +968,32 @@ mod tests {
         let status = response.status();
         let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         status
+    }
+
+    #[tokio::test]
+    async fn skip_validation_register_rejects_incomplete_crm_tag() {
+        let state = Arc::new(RelayState::new(
+            Arc::new(c2_config::RelayConfig {
+                relay_id: "test-relay".into(),
+                skip_ipc_validation: true,
+                ..Default::default()
+            }),
+            Arc::new(crate::relay::test_support::NoopDisseminator),
+        ));
+
+        let status = post_register_with_crm(
+            state.clone(),
+            "grid",
+            "server-grid",
+            "ipc://grid",
+            "test.mesh",
+            "",
+            "0.1.0",
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(state.resolve("grid").is_empty());
     }
 
     async fn post_unregister(state: Arc<RelayState>, name: &str, server_id: &str) -> StatusCode {
@@ -1229,9 +1277,9 @@ mod tests {
             "server-grid".into(),
             "inst-grid".into(),
             "ipc://grid".into(),
-            String::new(),
-            String::new(),
-            String::new(),
+            TEST_CRM_NS.to_string(),
+            TEST_CRM_NAME.to_string(),
+            TEST_CRM_VER.to_string(),
             Arc::new(IpcClient::new("ipc://grid")),
             None,
         );
@@ -1467,9 +1515,9 @@ mod tests {
             "server-grid".into(),
             "inst-grid".into(),
             "ipc://missing-grid".into(),
-            String::new(),
-            String::new(),
-            String::new(),
+            TEST_CRM_NS.to_string(),
+            TEST_CRM_NAME.to_string(),
+            TEST_CRM_VER.to_string(),
             stale_client,
             None,
         );
@@ -1629,6 +1677,9 @@ mod tests {
                     panic!(
                         "failed to install mismatched route in precheck hook: {existing_address}"
                     )
+                }
+                RegisterCommitResult::Invalid { reason } => {
+                    panic!("failed to install mismatched route in precheck hook: {reason}")
                 }
             }
         });

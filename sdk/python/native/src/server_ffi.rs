@@ -176,6 +176,8 @@ impl PyServer {
             shm_threshold: self.inner.response_shm_threshold(),
             max_payload_size: self.inner.response_max_payload_size(),
         });
+        c2_wire::handshake::validate_crm_tag(crm_ns, crm_name, crm_ver)
+            .map_err(PyValueError::new_err)?;
 
         let route = CrmRoute {
             name: name.to_string(),

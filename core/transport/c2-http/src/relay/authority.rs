@@ -9,7 +9,9 @@ use c2_ipc::IpcClient;
 use c2_wire::control::MAX_CALL_ROUTE_NAME_BYTES;
 
 use crate::relay::conn_pool::{CachedClient, OwnerToken};
-use crate::relay::route_table::{valid_crm_tag, valid_route_name};
+use crate::relay::route_table::{
+    valid_crm_tag, valid_route_name, validate_server_instance_id_value,
+};
 use crate::relay::state::RelayState;
 use crate::relay::types::{Locality, RouteEntry};
 
@@ -18,6 +20,7 @@ pub(crate) enum ControlError {
     InvalidName { reason: String },
     InvalidServerId { reason: String },
     InvalidServerInstanceId { reason: String },
+    InvalidAddress { reason: String },
     ContractMismatch { reason: String },
     AddressMismatch { existing_address: String },
     DuplicateRoute { existing_address: String },
@@ -45,6 +48,11 @@ pub(crate) fn attest_ipc_route_contract(
     if crm_ns.is_empty() || crm_name.is_empty() || crm_ver.is_empty() {
         return Err(ControlError::ContractMismatch {
             reason: format!("IPC upstream route '{route_name}' did not advertise a CRM contract"),
+        });
+    }
+    if !valid_crm_tag(crm_ns, crm_name, crm_ver) {
+        return Err(ControlError::ContractMismatch {
+            reason: format!("IPC upstream route '{route_name}' advertised an invalid CRM tag"),
         });
     }
     if (!claimed_crm_ns.is_empty() && claimed_crm_ns != crm_ns)
@@ -181,8 +189,16 @@ impl<'a> RouteAuthority<'a> {
         &self,
         server_instance_id: &str,
     ) -> Result<(), ControlError> {
-        validate_server_instance_id(server_instance_id)
+        validate_server_instance_id_value(server_instance_id)
             .map_err(|reason| ControlError::InvalidServerInstanceId { reason })
+    }
+
+    pub(crate) fn validate_ipc_address(&self, address: &str) -> Result<(), ControlError> {
+        c2_ipc::socket_path_from_ipc_address(address)
+            .map(|_| ())
+            .map_err(|err| ControlError::InvalidAddress {
+                reason: err.to_string(),
+            })
     }
 
     pub(crate) fn validate_crm_tag(
@@ -191,13 +207,8 @@ impl<'a> RouteAuthority<'a> {
         crm_name: &str,
         crm_ver: &str,
     ) -> Result<(), ControlError> {
-        if valid_crm_tag(crm_ns, crm_name, crm_ver) {
-            Ok(())
-        } else {
-            Err(ControlError::ContractMismatch {
-                reason: "CRM tag fields must be non-empty, control-character-free, and fit the IPC handshake field limit".to_string(),
-            })
-        }
+        c2_wire::handshake::validate_crm_tag(crm_ns, crm_name, crm_ver)
+            .map_err(|reason| ControlError::ContractMismatch { reason })
     }
 
     pub(crate) fn register_local_preflight(
@@ -210,6 +221,7 @@ impl<'a> RouteAuthority<'a> {
         self.validate_route_name(name)?;
         self.validate_server_id(server_id)?;
         self.validate_server_instance_id(server_instance_id)?;
+        self.validate_ipc_address(address)?;
 
         let existing = self.state.local_route(name);
         let Some(existing) = existing else {
@@ -245,6 +257,7 @@ impl<'a> RouteAuthority<'a> {
         for _ in 0..3 {
             self.validate_route_name(name)?;
             self.validate_server_id(server_id)?;
+            self.validate_ipc_address(address)?;
 
             let existing = self.state.local_route(name);
             let Some(existing) = existing else {
@@ -392,6 +405,8 @@ impl<'a> RouteAuthority<'a> {
         self.validate_route_name(&name)?;
         self.validate_server_id(&server_id)?;
         self.validate_server_instance_id(&server_instance_id)?;
+        self.validate_ipc_address(&address)?;
+        self.validate_crm_tag(&crm_ns, &crm_name, &crm_ver)?;
 
         let mut route_table = self.state.route_table_write();
         if let Some(existing) = route_table.local_route(&name) {
@@ -599,31 +614,4 @@ enum OwnerProbe {
     RouteMissing,
     Dead,
     Stale,
-}
-
-fn validate_server_instance_id(value: &str) -> Result<(), String> {
-    if value.is_empty() {
-        return Err("invalid server_instance_id: cannot be empty".to_string());
-    }
-    if value.len() > c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES {
-        return Err(format!(
-            "invalid server_instance_id: cannot exceed {} bytes",
-            c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES
-        ));
-    }
-    if value.trim() != value {
-        return Err(
-            "invalid server_instance_id: cannot contain leading or trailing whitespace".to_string(),
-        );
-    }
-    if value == "." || value == ".." || value.contains('/') || value.contains('\\') {
-        return Err("invalid server_instance_id: cannot contain path separators".to_string());
-    }
-    if !value.is_ascii() {
-        return Err("invalid server_instance_id: must be ASCII".to_string());
-    }
-    if value.chars().any(char::is_control) {
-        return Err("invalid server_instance_id: cannot contain control characters".to_string());
-    }
-    Ok(())
 }

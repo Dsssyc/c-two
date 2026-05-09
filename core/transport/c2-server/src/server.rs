@@ -537,12 +537,8 @@ fn validate_route_for_wire(route: &CrmRoute) -> Result<(), ServerError> {
         validate_name_len("method name", method_name)
             .map_err(|e| ServerError::Protocol(e.to_string()))?;
     }
-    validate_name_len("crm namespace", &route.crm_ns)
-        .map_err(|e| ServerError::Protocol(e.to_string()))?;
-    validate_name_len("crm name", &route.crm_name)
-        .map_err(|e| ServerError::Protocol(e.to_string()))?;
-    validate_name_len("crm version", &route.crm_ver)
-        .map_err(|e| ServerError::Protocol(e.to_string()))?;
+    c2_wire::handshake::validate_crm_tag(&route.crm_ns, &route.crm_name, &route.crm_ver)
+        .map_err(ServerError::Protocol)?;
     Ok(())
 }
 
@@ -2296,6 +2292,20 @@ mod tests {
 
         assert!(err.to_string().contains("route name"));
         assert!(s.dispatcher.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn register_route_rejects_invalid_crm_tag_fields() {
+        let s = Server::new("ipc://invalid_crm_tag_route", ServerIpcConfig::default()).unwrap();
+        let mut route = make_route("grid");
+        route.crm_name = "Grid\0Injected".to_string();
+
+        let err = s
+            .register_route(route)
+            .await
+            .expect_err("invalid CrmTag must fail before route registration");
+
+        assert!(err.to_string().contains("control characters"));
     }
 
     #[tokio::test]

@@ -39,6 +39,7 @@ pub enum RegisterCommitResult {
     SameOwner { entry: RouteEntry },
     Duplicate { existing_address: String },
     ConflictingOwner { existing_address: String },
+    Invalid { reason: String },
 }
 
 pub enum UnregisterResult {
@@ -126,16 +127,12 @@ impl RelayState {
             Err(ControlError::DuplicateRoute { existing_address }) => {
                 RegisterCommitResult::Duplicate { existing_address }
             }
-            Err(ControlError::InvalidServerId { .. }) | Err(ControlError::InvalidName { .. }) => {
-                RegisterCommitResult::ConflictingOwner {
-                    existing_address: "<invalid>".to_string(),
-                }
-            }
-            Err(ControlError::InvalidServerInstanceId { .. })
-            | Err(ControlError::ContractMismatch { .. }) => {
-                RegisterCommitResult::ConflictingOwner {
-                    existing_address: "<invalid>".to_string(),
-                }
+            Err(ControlError::InvalidName { reason })
+            | Err(ControlError::InvalidServerId { reason })
+            | Err(ControlError::InvalidServerInstanceId { reason })
+            | Err(ControlError::InvalidAddress { reason })
+            | Err(ControlError::ContractMismatch { reason }) => {
+                RegisterCommitResult::Invalid { reason }
             }
             Ok(
                 RouteCommandResult::Unregistered { .. }
@@ -178,6 +175,7 @@ impl RelayState {
             | Err(ControlError::InvalidName { .. })
             | Err(ControlError::InvalidServerId { .. })
             | Err(ControlError::InvalidServerInstanceId { .. })
+            | Err(ControlError::InvalidAddress { .. })
             | Err(ControlError::ContractMismatch { .. }) => UnregisterResult::OwnerMismatch,
             Err(ControlError::DuplicateRoute { .. }) => UnregisterResult::OwnerMismatch,
         }
@@ -462,6 +460,10 @@ impl RelayState {
 mod tests {
     use super::*;
 
+    const TEST_CRM_NS: &str = "test.relay";
+    const TEST_CRM_NAME: &str = "RelayGrid";
+    const TEST_CRM_VER: &str = "0.1.0";
+
     struct NullDisseminator;
     impl crate::relay::disseminator::Disseminator for NullDisseminator {
         fn broadcast(
@@ -551,6 +553,9 @@ mod tests {
             | RegisterCommitResult::ConflictingOwner { existing_address } => {
                 panic!("unexpected duplicate route at {existing_address}")
             }
+            RegisterCommitResult::Invalid { reason } => {
+                panic!("unexpected invalid route in test helper: {reason}")
+            }
         }
     }
 
@@ -584,6 +589,52 @@ mod tests {
                 .unwrap(),
             RouteCommandResult::PeerRoutesRemoved
         ));
+    }
+
+    #[test]
+    fn local_commit_rejects_invalid_crm_tag_without_fake_duplicate() {
+        let state = RelayState::new(test_config(), null_disseminator());
+        let client = Arc::new(IpcClient::new("ipc://grid"));
+
+        let result = state.commit_register_upstream(
+            "grid".into(),
+            "server-grid".into(),
+            "server-grid-instance".into(),
+            "ipc://grid".into(),
+            "test.mesh".into(),
+            "Grid\nInjected".into(),
+            "0.1.0".into(),
+            client,
+            None,
+        );
+
+        assert!(
+            matches!(result, RegisterCommitResult::Invalid { reason } if reason.contains("control characters"))
+        );
+        assert!(state.resolve("grid").is_empty());
+    }
+
+    #[test]
+    fn local_commit_rejects_invalid_ipc_address_without_fake_duplicate() {
+        let state = RelayState::new(test_config(), null_disseminator());
+        let client = Arc::new(IpcClient::new("ipc://../escape"));
+
+        let result = state.commit_register_upstream(
+            "grid".into(),
+            "server-grid".into(),
+            "server-grid-instance".into(),
+            "ipc://../escape".into(),
+            "test.mesh".into(),
+            "Grid".into(),
+            "0.1.0".into(),
+            client,
+            None,
+        );
+
+        assert!(
+            matches!(result, RegisterCommitResult::Invalid { reason } if reason.contains("path separators"))
+        );
+        assert!(state.resolve("grid").is_empty());
     }
 
     #[test]
@@ -740,9 +791,9 @@ mod tests {
                 server_id: Some("server-old".into()),
                 server_instance_id: Some("instance-old".into()),
                 ipc_address: Some("ipc://grid-old".into()),
-                crm_ns: String::new(),
-                crm_name: String::new(),
-                crm_ver: String::new(),
+                crm_ns: TEST_CRM_NS.to_string(),
+                crm_name: TEST_CRM_NAME.to_string(),
+                crm_ver: TEST_CRM_VER.to_string(),
                 locality: Locality::Local,
                 registered_at: 1000.0,
             });
@@ -781,9 +832,9 @@ mod tests {
             "server-first".into(),
             "instance-first".into(),
             "ipc://first".into(),
-            String::new(),
-            String::new(),
-            String::new(),
+            TEST_CRM_NS.to_string(),
+            TEST_CRM_NAME.to_string(),
+            TEST_CRM_VER.to_string(),
             first,
             None,
         );
@@ -797,9 +848,9 @@ mod tests {
             "server-second".into(),
             "instance-second".into(),
             "ipc://second".into(),
-            String::new(),
-            String::new(),
-            String::new(),
+            TEST_CRM_NS.to_string(),
+            TEST_CRM_NAME.to_string(),
+            TEST_CRM_VER.to_string(),
             second,
             None,
         );
@@ -828,9 +879,9 @@ mod tests {
             "server-racer".into(),
             "instance-racer".into(),
             "ipc://racer".into(),
-            String::new(),
-            String::new(),
-            String::new(),
+            TEST_CRM_NS.to_string(),
+            TEST_CRM_NAME.to_string(),
+            TEST_CRM_VER.to_string(),
             racer,
             None,
         );
@@ -846,9 +897,9 @@ mod tests {
             "server-candidate".into(),
             "instance-candidate".into(),
             "ipc://candidate".into(),
-            String::new(),
-            String::new(),
-            String::new(),
+            TEST_CRM_NS.to_string(),
+            TEST_CRM_NAME.to_string(),
+            TEST_CRM_VER.to_string(),
             candidate,
             None,
         );
@@ -878,9 +929,9 @@ mod tests {
             "server-new".into(),
             "instance-new".into(),
             "ipc://new".into(),
-            String::new(),
-            String::new(),
-            String::new(),
+            TEST_CRM_NS.to_string(),
+            TEST_CRM_NAME.to_string(),
+            TEST_CRM_VER.to_string(),
             replacement,
             Some(OwnerReplacementToken {
                 existing_address: "ipc://old".into(),
@@ -921,9 +972,9 @@ mod tests {
             "server-racer".into(),
             "instance-racer".into(),
             "ipc://replacement".into(),
-            String::new(),
-            String::new(),
-            String::new(),
+            TEST_CRM_NS.to_string(),
+            TEST_CRM_NAME.to_string(),
+            TEST_CRM_VER.to_string(),
             stale_replacement,
             Some(OwnerReplacementToken {
                 existing_address: "ipc://same".into(),
@@ -1020,9 +1071,9 @@ mod tests {
             "server-new".into(),
             "instance-new".into(),
             "ipc://replacement".into(),
-            String::new(),
-            String::new(),
-            String::new(),
+            TEST_CRM_NS.to_string(),
+            TEST_CRM_NAME.to_string(),
+            TEST_CRM_VER.to_string(),
             replacement,
             Some(OwnerReplacementToken {
                 existing_address: "ipc://same-slot".into(),
@@ -1057,9 +1108,9 @@ mod tests {
             "server-grid".into(),
             "server-grid-instance".into(),
             "ipc://grid".into(),
-            String::new(),
-            String::new(),
-            String::new(),
+            TEST_CRM_NS.to_string(),
+            TEST_CRM_NAME.to_string(),
+            TEST_CRM_VER.to_string(),
             ignored,
             None,
         );
@@ -1102,9 +1153,9 @@ mod tests {
             "server-grid".into(),
             "instance-new".into(),
             "ipc://grid".into(),
-            String::new(),
-            String::new(),
-            String::new(),
+            TEST_CRM_NS.to_string(),
+            TEST_CRM_NAME.to_string(),
+            TEST_CRM_VER.to_string(),
             replacement,
             None,
         );
@@ -1135,9 +1186,9 @@ mod tests {
             "server-grid".into(),
             "instance-grid".into(),
             "ipc://new".into(),
-            String::new(),
-            String::new(),
-            String::new(),
+            TEST_CRM_NS.to_string(),
+            TEST_CRM_NAME.to_string(),
+            TEST_CRM_VER.to_string(),
             moved,
             None,
         );
@@ -1184,9 +1235,9 @@ mod tests {
             "server-grid".into(),
             "server-grid-instance".into(),
             "ipc://grid".into(),
-            String::new(),
-            String::new(),
-            String::new(),
+            TEST_CRM_NS.to_string(),
+            TEST_CRM_NAME.to_string(),
+            TEST_CRM_VER.to_string(),
             replacement,
             None,
         );

@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use c2_wire::control::MAX_CALL_ROUTE_NAME_BYTES;
-use c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES;
 
 use crate::relay::types::*;
 
@@ -42,11 +41,47 @@ impl RouteTable {
         &self.relay_id
     }
 
+    fn valid_route_entry(&self, entry: &RouteEntry) -> bool {
+        if !valid_route_name(&entry.name)
+            || !valid_relay_id(&entry.relay_id)
+            || !valid_relay_url(&entry.relay_url)
+            || !valid_crm_tag(&entry.crm_ns, &entry.crm_name, &entry.crm_ver)
+            || !entry.registered_at.is_finite()
+        {
+            return false;
+        }
+
+        match entry.locality {
+            Locality::Local => {
+                entry.relay_id == self.relay_id
+                    && entry.server_id.as_deref().is_some_and(valid_server_id)
+                    && entry
+                        .server_instance_id
+                        .as_deref()
+                        .is_some_and(valid_server_instance_id)
+                    && entry.ipc_address.as_deref().is_some_and(valid_ipc_address)
+            }
+            Locality::Peer => {
+                entry.relay_id != self.relay_id
+                    && entry.server_id.is_none()
+                    && entry.server_instance_id.is_none()
+                    && entry.ipc_address.is_none()
+            }
+        }
+    }
+
+    fn valid_tombstone(&self, tombstone: &RouteTombstone) -> bool {
+        tombstone.removed_at.is_finite()
+            && valid_route_name(&tombstone.name)
+            && valid_relay_id(&tombstone.relay_id)
+            && tombstone.server_id.as_deref().map_or(true, valid_server_id)
+    }
+
     // -- Route operations --
 
     /// Register or update a route (upsert semantics).
     pub fn register_route(&mut self, entry: RouteEntry) -> bool {
-        if !entry.registered_at.is_finite() {
+        if !self.valid_route_entry(&entry) {
             return false;
         }
         let key = (entry.name.clone(), entry.relay_id.clone());
@@ -66,21 +101,28 @@ impl RouteTable {
         relay_id: &str,
         removed_at: f64,
     ) -> Option<RouteEntry> {
-        if !removed_at.is_finite() {
-            return None;
-        }
-        let key = (name.to_string(), relay_id.to_string());
-        let removed = match self.routes.get(&key) {
-            Some(entry) if entry.registered_at > removed_at => None,
-            _ => self.routes.remove(&key),
-        };
-        self.apply_tombstone(RouteTombstone {
+        let tombstone = RouteTombstone {
             name: name.to_string(),
             relay_id: relay_id.to_string(),
             removed_at,
             server_id: None,
             observed_at: Instant::now(),
-        });
+        };
+        if !self.valid_tombstone(&tombstone) {
+            return None;
+        }
+        let key = (name.to_string(), relay_id.to_string());
+        if self
+            .routes
+            .get(&key)
+            .is_some_and(|entry| entry.registered_at > removed_at)
+        {
+            return None;
+        }
+        let removed = self.routes.get(&key).cloned();
+        if !self.apply_tombstone(tombstone) {
+            return None;
+        }
         removed
     }
 
@@ -90,19 +132,29 @@ impl RouteTable {
         server_id: &str,
     ) -> (Option<RouteEntry>, f64) {
         let relay_id = self.relay_id.clone();
-        let key = (name.to_string(), relay_id.clone());
         let removed_at = self.next_local_timestamp();
-        let removed = match self.routes.get(&key) {
-            Some(entry) if entry.registered_at > removed_at => None,
-            _ => self.routes.remove(&key),
-        };
-        self.apply_tombstone(RouteTombstone {
+        let tombstone = RouteTombstone {
             name: name.to_string(),
-            relay_id,
+            relay_id: relay_id.clone(),
             removed_at,
             server_id: Some(server_id.to_string()),
             observed_at: Instant::now(),
-        });
+        };
+        if !self.valid_tombstone(&tombstone) {
+            return (None, removed_at);
+        }
+        let key = (name.to_string(), relay_id);
+        if self
+            .routes
+            .get(&key)
+            .is_some_and(|entry| entry.registered_at > removed_at)
+        {
+            return (None, removed_at);
+        }
+        let removed = self.routes.get(&key).cloned();
+        if !self.apply_tombstone(tombstone) {
+            return (None, removed_at);
+        }
         (removed, removed_at)
     }
 
@@ -120,18 +172,31 @@ impl RouteTable {
             return (None, self.next_local_timestamp());
         }
         let removed_at = self.next_local_timestamp();
-        let removed = match self.routes.get(&key) {
-            Some(entry) if entry.registered_at > removed_at => None,
-            _ => self.routes.remove(&key),
-        };
-        let server_id = removed.as_ref().and_then(|entry| entry.server_id.clone());
-        self.apply_tombstone(RouteTombstone {
+        let server_id = self
+            .routes
+            .get(&key)
+            .and_then(|entry| entry.server_id.clone());
+        let tombstone = RouteTombstone {
             name: expected.name.clone(),
             relay_id,
             removed_at,
             server_id,
             observed_at: Instant::now(),
-        });
+        };
+        if !self.valid_tombstone(&tombstone) {
+            return (None, removed_at);
+        }
+        if self
+            .routes
+            .get(&key)
+            .is_some_and(|entry| entry.registered_at > removed_at)
+        {
+            return (None, removed_at);
+        }
+        let removed = self.routes.get(&key).cloned();
+        if !self.apply_tombstone(tombstone) {
+            return (None, removed_at);
+        }
         (removed, removed_at)
     }
 
@@ -153,7 +218,7 @@ impl RouteTable {
     }
 
     pub fn apply_tombstone(&mut self, mut tombstone: RouteTombstone) -> bool {
-        if !tombstone.removed_at.is_finite() {
+        if !self.valid_tombstone(&tombstone) {
             return false;
         }
         let key = (tombstone.name.clone(), tombstone.relay_id.clone());
@@ -297,6 +362,9 @@ impl RouteTable {
     }
 
     pub fn record_peer_join(&mut self, relay_id: String, url: String) {
+        if !valid_relay_id(&relay_id) || relay_id == self.relay_id || !valid_relay_url(&url) {
+            return;
+        }
         let now = Instant::now();
         match self.peers.get_mut(&relay_id) {
             Some(peer) => {
@@ -401,7 +469,7 @@ impl RouteTable {
             if peer.relay_id == self.relay_id {
                 continue;
             }
-            if !valid_relay_id(&peer.relay_id) {
+            if !valid_relay_id(&peer.relay_id) || !valid_relay_url(&peer.url) {
                 return;
             }
         }
@@ -410,7 +478,7 @@ impl RouteTable {
             if tombstone.relay_id == self.relay_id {
                 continue;
             }
-            if !valid_route_name(&tombstone.name) || !valid_relay_id(&tombstone.relay_id) {
+            if !self.valid_tombstone(tombstone) {
                 return;
             }
         }
@@ -447,6 +515,9 @@ impl RouteTable {
             entry.ipc_address = None;
             entry.server_id = None;
             entry.server_instance_id = None;
+            if !self.valid_route_entry(&entry) {
+                return;
+            }
             let key = (entry.name.clone(), entry.relay_id.clone());
             replacement_routes.insert(key, entry);
         }
@@ -613,14 +684,61 @@ fn valid_relay_id(relay_id: &str) -> bool {
 }
 
 pub(crate) fn valid_crm_tag(crm_ns: &str, crm_name: &str, crm_ver: &str) -> bool {
-    valid_crm_tag_field(crm_ns) && valid_crm_tag_field(crm_name) && valid_crm_tag_field(crm_ver)
+    c2_wire::handshake::validate_crm_tag(crm_ns, crm_name, crm_ver).is_ok()
 }
 
-fn valid_crm_tag_field(value: &str) -> bool {
-    !value.is_empty()
-        && value.trim() == value
-        && value.as_bytes().len() <= MAX_HANDSHAKE_NAME_BYTES
-        && !value.chars().any(char::is_control)
+fn valid_server_id(server_id: &str) -> bool {
+    c2_config::validate_server_id(server_id).is_ok()
+        && server_id.as_bytes().len() <= c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES
+}
+
+pub(crate) fn validate_server_instance_id_value(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("invalid server_instance_id: cannot be empty".to_string());
+    }
+    if value.as_bytes().len() > c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES {
+        return Err(format!(
+            "invalid server_instance_id: cannot exceed {} bytes",
+            c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES
+        ));
+    }
+    if value.trim() != value {
+        return Err(
+            "invalid server_instance_id: cannot contain leading or trailing whitespace".to_string(),
+        );
+    }
+    if value == "." || value == ".." || value.contains('/') || value.contains('\\') {
+        return Err("invalid server_instance_id: cannot contain path separators".to_string());
+    }
+    if !value.is_ascii() {
+        return Err("invalid server_instance_id: must be ASCII".to_string());
+    }
+    if value.chars().any(char::is_control) {
+        return Err("invalid server_instance_id: cannot contain control characters".to_string());
+    }
+    Ok(())
+}
+
+fn valid_server_instance_id(value: &str) -> bool {
+    validate_server_instance_id_value(value).is_ok()
+}
+
+fn valid_ipc_address(address: &str) -> bool {
+    c2_ipc::socket_path_from_ipc_address(address).is_ok()
+}
+
+pub(crate) fn valid_relay_url(url: &str) -> bool {
+    match reqwest::Url::parse(url) {
+        Ok(parsed) => {
+            matches!(parsed.scheme(), "http" | "https")
+                && parsed.host_str().is_some()
+                && parsed.query().is_none()
+                && parsed.fragment().is_none()
+                && parsed.username().is_empty()
+                && parsed.password().is_none()
+        }
+        Err(_) => false,
+    }
 }
 
 fn current_epoch_millis() -> u64 {
@@ -1072,6 +1190,52 @@ mod tests {
     }
 
     #[test]
+    fn register_route_rejects_invalid_identity_fields_without_mutation() {
+        let mut rt = RouteTable::new("relay-a".into());
+
+        let mut bad_crm = peer_entry("grid", "relay-b", 1000.0);
+        bad_crm.crm_name = "Grid\nInjected".into();
+        assert!(!rt.register_route(bad_crm));
+        assert!(rt.resolve("grid").is_empty());
+
+        let bad_route_name = peer_entry("bad\nroute", "relay-b", 1000.0);
+        assert!(!rt.register_route(bad_route_name));
+        assert!(rt.resolve("bad\nroute").is_empty());
+
+        let mut peer_with_private_fields = peer_entry("peer-private", "relay-b", 1000.0);
+        peer_with_private_fields.server_id = Some("server-leak".into());
+        peer_with_private_fields.server_instance_id = Some("instance-leak".into());
+        peer_with_private_fields.ipc_address = Some("ipc://leaked".into());
+        assert!(!rt.register_route(peer_with_private_fields));
+        assert!(rt.resolve("peer-private").is_empty());
+
+        let local_wrong_relay = local_entry("local-wrong-relay", "relay-b");
+        assert!(!rt.register_route(local_wrong_relay));
+        assert!(rt.resolve("local-wrong-relay").is_empty());
+
+        let mut local_bad_server_id = local_entry("local-bad-server", "relay-a");
+        local_bad_server_id.server_id =
+            Some("s".repeat(c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES + 1));
+        assert!(!rt.register_route(local_bad_server_id));
+        assert!(rt.resolve("local-bad-server").is_empty());
+
+        let mut local_bad_instance = local_entry("local-bad-instance", "relay-a");
+        local_bad_instance.server_instance_id = Some("bad/instance".into());
+        assert!(!rt.register_route(local_bad_instance));
+        assert!(rt.resolve("local-bad-instance").is_empty());
+
+        let mut local_bad_ipc = local_entry("local-bad-ipc", "relay-a");
+        local_bad_ipc.ipc_address = Some("ipc://../escape".into());
+        assert!(!rt.register_route(local_bad_ipc));
+        assert!(rt.resolve("local-bad-ipc").is_empty());
+
+        let mut bad_relay_url = peer_entry("bad-relay-url", "relay-b", 1000.0);
+        bad_relay_url.relay_url = "not a url".into();
+        assert!(!rt.register_route(bad_relay_url));
+        assert!(rt.resolve("bad-relay-url").is_empty());
+    }
+
+    #[test]
     fn apply_tombstone_rejects_non_finite_timestamp() {
         let mut rt = RouteTable::new("relay-b".into());
         register_alive_peer(&mut rt, "relay-a");
@@ -1090,6 +1254,40 @@ mod tests {
     }
 
     #[test]
+    fn apply_tombstone_rejects_invalid_identity_fields_without_mutation() {
+        let mut rt = RouteTable::new("relay-b".into());
+        register_alive_peer(&mut rt, "relay-a");
+        assert!(rt.register_route(peer_entry("grid", "relay-a", 1000.0)));
+
+        assert!(!rt.apply_tombstone(RouteTombstone {
+            name: "bad\nroute".into(),
+            relay_id: "relay-a".into(),
+            removed_at: 2000.0,
+            server_id: None,
+            observed_at: Instant::now(),
+        }));
+
+        assert!(!rt.apply_tombstone(RouteTombstone {
+            name: "grid".into(),
+            relay_id: " ".into(),
+            removed_at: 2000.0,
+            server_id: None,
+            observed_at: Instant::now(),
+        }));
+
+        assert!(!rt.apply_tombstone(RouteTombstone {
+            name: "grid".into(),
+            relay_id: "relay-a".into(),
+            removed_at: 2000.0,
+            server_id: Some("bad/server".into()),
+            observed_at: Instant::now(),
+        }));
+
+        assert_eq!(rt.resolve("grid").len(), 1);
+        assert!(rt.list_tombstones().is_empty());
+    }
+
+    #[test]
     fn unregister_route_rejects_non_finite_tombstone_without_removing_route() {
         let mut rt = RouteTable::new("relay-b".into());
         register_alive_peer(&mut rt, "relay-a");
@@ -1100,6 +1298,34 @@ mod tests {
         assert!(removed.is_none());
         assert_eq!(rt.resolve("grid").len(), 1);
         assert!(rt.list_tombstones().is_empty());
+    }
+
+    #[test]
+    fn unregister_local_route_rejects_invalid_tombstone_without_removing_route() {
+        let mut rt = RouteTable::new("relay-a".into());
+        assert!(rt.register_route(local_entry("grid", "relay-a")));
+
+        let (removed, _) = rt.unregister_local_route_with_tombstone("grid", "bad/server");
+
+        assert!(removed.is_none());
+        assert!(rt.local_route("grid").is_some());
+        assert!(rt.list_tombstones().is_empty());
+    }
+
+    #[test]
+    fn valid_relay_url_rejects_non_base_urls() {
+        assert!(valid_relay_url("http://relay-a:8080"));
+        assert!(valid_relay_url("https://relay-a.example/mesh"));
+
+        for url in [
+            "not a url",
+            "ftp://relay-a:8080",
+            "http://relay-a:8080?token=secret",
+            "http://relay-a:8080/#fragment",
+            "http://user:pass@relay-a:8080",
+        ] {
+            assert!(!valid_relay_url(url), "{url}");
+        }
     }
 
     #[test]

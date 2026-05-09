@@ -26,6 +26,10 @@ use crate::relay::url::peer_endpoint_url;
 use c2_config::RelayConfig;
 use c2_ipc::IpcClient;
 
+const SKIP_VALIDATION_CRM_NS: &str = "test.relay.skip";
+const SKIP_VALIDATION_CRM_NAME: &str = "SkipValidationUpstream";
+const SKIP_VALIDATION_CRM_VER: &str = "0.1.0";
+
 /// Errors from the relay control API.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelayControlError {
@@ -110,6 +114,7 @@ fn control_error_to_relay_error(err: ControlError) -> RelayControlError {
         ControlError::InvalidName { reason }
         | ControlError::InvalidServerId { reason }
         | ControlError::InvalidServerInstanceId { reason }
+        | ControlError::InvalidAddress { reason }
         | ControlError::ContractMismatch { reason } => RelayControlError::Other(reason),
         ControlError::AddressMismatch { .. }
         | ControlError::DuplicateRoute { .. }
@@ -147,6 +152,13 @@ impl RelayServer {
             .bind
             .parse()
             .map_err(|e| format!("Invalid bind address '{}': {e}", config.bind))?;
+        let effective_advertise_url = config.effective_advertise_url();
+        if !crate::relay::route_table::valid_relay_url(&effective_advertise_url) {
+            return Err(format!(
+                "Invalid relay advertise_url '{}': must be an http(s) URL with a host",
+                effective_advertise_url
+            ));
+        }
 
         let config = Arc::new(config);
         let disseminator: Arc<dyn crate::relay::disseminator::Disseminator> = Arc::new(
@@ -423,6 +435,7 @@ impl RelayServer {
                         Err(ControlError::InvalidName { reason })
                         | Err(ControlError::InvalidServerId { reason })
                         | Err(ControlError::InvalidServerInstanceId { reason })
+                        | Err(ControlError::InvalidAddress { reason })
                         | Err(ControlError::ContractMismatch { reason }) => {
                             let _ = reply.send(Err(RelayControlError::Other(reason)));
                             continue;
@@ -458,9 +471,9 @@ impl RelayServer {
                                 {
                                     (
                                         format!("{server_id}-instance"),
-                                        String::new(),
-                                        String::new(),
-                                        String::new(),
+                                        SKIP_VALIDATION_CRM_NS.to_string(),
+                                        SKIP_VALIDATION_CRM_NAME.to_string(),
+                                        SKIP_VALIDATION_CRM_VER.to_string(),
                                     )
                                 } else {
                                     let Some(server_instance_id) =
@@ -541,6 +554,10 @@ impl RelayServer {
                                     | RegisterCommitResult::ConflictingOwner { .. } => {
                                         tokio::spawn(async move { client.close_shared().await });
                                         Err(RelayControlError::DuplicateRoute { name })
+                                    }
+                                    RegisterCommitResult::Invalid { reason } => {
+                                        tokio::spawn(async move { client.close_shared().await });
+                                        Err(RelayControlError::Other(reason))
                                     }
                                 }
                             }
@@ -728,6 +745,35 @@ mod tests {
     }
 
     #[test]
+    fn start_rejects_invalid_advertise_url_before_route_state() {
+        let mut config = RelayConfig {
+            bind: "127.0.0.1:0".into(),
+            relay_id: "relay-invalid-url".into(),
+            advertise_url: "not a url".into(),
+            ..RelayConfig::default()
+        };
+
+        let err = match RelayServer::start(config.clone()) {
+            Err(err) => err,
+            Ok(mut relay) => {
+                let _ = relay.stop();
+                panic!("invalid advertise URL must fail");
+            }
+        };
+        assert!(err.contains("advertise_url"));
+
+        config.advertise_url = "ftp://relay-a:8080".into();
+        let err = match RelayServer::start(config) {
+            Err(err) => err,
+            Ok(mut relay) => {
+                let _ = relay.stop();
+                panic!("non-http advertise URL must fail");
+            }
+        };
+        assert!(err.contains("advertise_url"));
+    }
+
+    #[test]
     fn relay_control_unregister_rejects_wrong_server_id() {
         let config = RelayConfig {
             bind: "127.0.0.1:0".to_string(),
@@ -774,6 +820,41 @@ mod tests {
                 assert_eq!(name, "grid");
                 assert_eq!(relay_id, "relay-a");
                 assert_eq!(relay_url, "http://relay-a:8080");
+            }
+            other => panic!("expected RouteAnnounce, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn command_register_skip_validation_publishes_explicit_test_crm_tag() {
+        let (_state, disseminator, tx, task) = command_loop_state();
+        let (reply, result) = oneshot::channel();
+
+        tx.send(Command::RegisterUpstream {
+            name: "grid".into(),
+            server_id: "server-grid".into(),
+            address: "ipc://grid".into(),
+            reply,
+        })
+        .await
+        .unwrap();
+
+        result.await.unwrap().unwrap();
+        drop(tx);
+        task.await.unwrap();
+
+        let envelopes = disseminator.envelopes();
+        assert_eq!(envelopes.len(), 1);
+        match &envelopes[0].message {
+            PeerMessage::RouteAnnounce {
+                crm_ns,
+                crm_name,
+                crm_ver,
+                ..
+            } => {
+                assert_eq!(crm_ns, "test.relay.skip");
+                assert_eq!(crm_name, "SkipValidationUpstream");
+                assert_eq!(crm_ver, "0.1.0");
             }
             other => panic!("expected RouteAnnounce, got {other:?}"),
         }
