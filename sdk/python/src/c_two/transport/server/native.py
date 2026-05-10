@@ -91,12 +91,8 @@ class NativeServerBridge:
     def __init__(
         self,
         bind_address: str,
-        crm_class: type | None = None,
-        crm_instance: object | None = None,
-        concurrency: ConcurrencyConfig | None = None,
         *,
         ipc_overrides: ServerIPCOverrides | Mapping[str, object] | None = None,
-        name: str | None = None,
         server_id: str | None = None,
         server_instance_id: str | None = None,
         hold_warn_seconds: float = 60.0,
@@ -104,11 +100,9 @@ class NativeServerBridge:
     ) -> None:
         self._config = _resolve_server_ipc_config(ipc_overrides)
         self._address = bind_address
-        self._default_concurrency = concurrency
 
         self._slots: dict[str, CRMSlot] = {}
         self._slots_lock = threading.Lock()
-        self._default_name: str | None = None
 
         if lease_tracker is None:
             from c_two._native import BufferLeaseTracker
@@ -150,12 +144,6 @@ class NativeServerBridge:
             server_instance_id=server_instance_id,
         )
 
-        # Register initial CRM if provided (compat with old Server constructor).
-        if crm_class is not None and crm_instance is not None:
-            self.register_crm(
-                crm_class, crm_instance, concurrency, name=name,
-            )
-
     # ------------------------------------------------------------------
     # CRM registration
     # ------------------------------------------------------------------
@@ -174,7 +162,7 @@ class NativeServerBridge:
         routing_name = name if name is not None else crm_ns
         instance = self._create_crm_instance(crm_class, crm_instance)
         methods = self._discover_methods(crm_class)
-        cc_config = concurrency or self._default_concurrency or ConcurrencyConfig()
+        cc_config = concurrency or ConcurrencyConfig()
         sd_method = get_shutdown_method(crm_class)
 
         if sd_method is not None:
@@ -255,8 +243,6 @@ class NativeServerBridge:
                 )
             slot.scheduler = Scheduler(native_concurrency, method_index)
             self._slots[routing_name] = slot
-            if self._default_name is None:
-                self._default_name = routing_name
         return routing_name
 
     def unregister_crm(
@@ -285,8 +271,6 @@ class NativeServerBridge:
 
         with self._slots_lock:
             slot = self._slots.pop(name, None)
-            if slot is not None and self._default_name == name:
-                self._default_name = next(iter(self._slots), None)
         if slot is not None:
             slot.scheduler.shutdown()
             self._invoke_shutdown(slot)
@@ -349,9 +333,6 @@ class NativeServerBridge:
                 slot = self._slots.pop(name, None)
                 if slot is not None:
                     removed_slots.append(slot)
-            self._default_name = None
-            if self._slots:
-                self._default_name = next(iter(self._slots), None)
 
         for slot in removed_slots:
             slot.scheduler.shutdown()

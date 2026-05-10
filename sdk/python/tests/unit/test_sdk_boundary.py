@@ -203,6 +203,26 @@ def test_python_server_bridge_does_not_own_readiness_polling():
     assert "if self.is_started()" not in shutdown_source
 
 
+def test_native_server_bridge_constructor_has_no_crm_registration_compat():
+    import inspect
+    from c_two.transport.server.native import NativeServerBridge
+
+    signature = inspect.signature(NativeServerBridge)
+    for obsolete in ("crm_class", "crm_instance", "concurrency", "name"):
+        assert obsolete not in signature.parameters
+
+    source = inspect.getsource(NativeServerBridge.__init__)
+    forbidden = [
+        "Register initial CRM",
+        "if crm_class is not None",
+        "self.register_crm(",
+        "_default_concurrency",
+        "_default_name",
+    ]
+    offenders = [needle for needle in forbidden if needle in source]
+    assert offenders == []
+
+
 def test_runtime_session_does_not_infer_started_from_socket_file():
     from pathlib import Path
 

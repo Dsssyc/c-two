@@ -126,7 +126,6 @@ class TestServerNameCollision:
             ),
         }
         bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
-        bridge._default_name = 'grid'  # noqa: SLF001
         bridge._rust_server = object()  # noqa: SLF001
 
         bridge.unregister_crm(
@@ -182,7 +181,6 @@ class TestServerNameCollision:
             ),
         }
         bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
-        bridge._default_name = 'grid'  # noqa: SLF001
         bridge._rust_server = object()  # noqa: SLF001
 
         with pytest.raises(KeyError, match='Name not registered in native server'):
@@ -243,7 +241,6 @@ class TestServerNameCollision:
             ),
         }
         bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
-        bridge._default_name = 'grid'  # noqa: SLF001
         bridge._rust_server = FakeRustServer()  # noqa: SLF001
 
         bridge.shutdown(
@@ -309,7 +306,6 @@ class TestServerNameCollision:
             ),
         }
         bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
-        bridge._default_name = 'grid'  # noqa: SLF001
         bridge._rust_server = FakeRustServer()  # noqa: SLF001
 
         bridge.shutdown(runtime_session=FakeRuntimeSession())
@@ -343,7 +339,6 @@ class TestServerNameCollision:
         bridge = object.__new__(NativeServerBridge)
         bridge._slots = {}  # noqa: SLF001
         bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
-        bridge._default_name = None  # noqa: SLF001
         bridge._rust_server = FakeRustServer()  # noqa: SLF001
 
         bridge.shutdown(runtime_session=FakeRuntimeSession())
@@ -387,9 +382,7 @@ class TestServerNameCollision:
         bridge = object.__new__(NativeServerBridge)
         bridge._slots = {}  # noqa: SLF001
         bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
-        bridge._default_name = None  # noqa: SLF001
         bridge._shm_threshold = 1024  # noqa: SLF001
-        bridge._default_concurrency = ConcurrencyConfig(max_workers=1)  # noqa: SLF001
         bridge._rust_server = FakeRustServer()  # noqa: SLF001
 
         def fake_create(_crm_class, crm_instance):
@@ -410,7 +403,12 @@ class TestServerNameCollision:
         bridge._make_dispatcher = fake_make_dispatcher  # noqa: SLF001
 
         with pytest.raises(RuntimeError, match='boom'):
-            bridge.register_crm(FakeCRM, FakeCRM(), name='grid')
+            bridge.register_crm(
+                FakeCRM,
+                FakeCRM(),
+                concurrency=ConcurrencyConfig(max_workers=1),
+                name='grid',
+            )
 
         assert events == ['rust_register:read_parallel:None:1:unit.name_collision:FakeCRM:0.1.0']
         assert bridge.names == []

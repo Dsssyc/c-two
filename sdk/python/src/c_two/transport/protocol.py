@@ -56,7 +56,7 @@ from c_two._native import (  # noqa: F401 — re-export
 )
 
 # ---------------------------------------------------------------------------
-# Handshake safety limits (kept for API compat; enforced inside Rust codec)
+# Handshake safety limits mirrored from Rust for bounds-checking tests.
 # ---------------------------------------------------------------------------
 
 _MAX_HANDSHAKE_SEGMENTS = 16
@@ -127,19 +127,10 @@ def encode_server_handshake(
     )
 
 
-def decode_handshake(
-    payload: bytes | memoryview,
-    *,
-    max_segments: int = _MAX_HANDSHAKE_SEGMENTS,
-    max_routes: int = _MAX_HANDSHAKE_ROUTES,
-    max_methods: int = _MAX_HANDSHAKE_METHODS,
-) -> Handshake:
+def decode_handshake(payload: bytes | memoryview) -> Handshake:
     """Decode handshake from either direction.
 
     Client payloads have no route section (detected by exhausting bytes
     after capability_flags).
-
-    Safety limits are enforced inside the Rust codec; the keyword
-    arguments are kept for API compatibility but ignored.
     """
     return _decode_hs(payload)

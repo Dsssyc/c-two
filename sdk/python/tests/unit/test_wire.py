@@ -165,6 +165,11 @@ class TestHandshake:
         with pytest.raises(ValueError):
             decode_handshake(bytes([HANDSHAKE_VERSION]))
 
+    def test_decode_handshake_does_not_accept_ignored_limit_keywords(self):
+        encoded = encode_client_handshake([], CAP_CALL | CAP_METHOD_IDX)
+        with pytest.raises(TypeError):
+            decode_handshake(encoded, max_segments=1)
+
 
 class TestHandshakePrefixExchange:
     """Handshake v7: prefix and server identity fields."""
