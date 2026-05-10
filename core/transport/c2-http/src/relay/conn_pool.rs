@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::pin;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use c2_ipc::IpcClient;
 use parking_lot::Mutex;
@@ -27,6 +27,9 @@ struct SlotInner {
     last_activity: u64,
     active_requests: usize,
     state: SlotState,
+    owner_generation: u64,
+    owner_lease_epoch: u64,
+    owner_lease_deadline: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,10 +62,31 @@ pub enum CachedClient {
     Missing,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerReplacementEvidence {
+    ConfirmedDead,
+    ConfirmedRouteMissing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnerReplaceError {
+    StaleToken,
+    NotReplaceable,
+}
+
 #[derive(Clone)]
-pub struct OwnerToken {
+pub struct OwnerSlotToken {
     slot: Arc<UpstreamSlot>,
     address: String,
+    owner_generation: u64,
+    owner_lease_epoch: u64,
+}
+
+pub type OwnerToken = OwnerSlotToken;
+
+struct PoolInner {
+    entries: HashMap<String, Arc<UpstreamSlot>>,
+    next_owner_generation: u64,
 }
 
 /// Pool of IPC connections keyed by route name.
@@ -70,23 +94,38 @@ pub struct OwnerToken {
 /// Separated from RouteTable to keep route metadata independent of
 /// connection lifecycle. Supports lazy reconnection and idle eviction.
 pub struct ConnectionPool {
-    entries: Mutex<HashMap<String, Arc<UpstreamSlot>>>,
+    inner: Mutex<PoolInner>,
+    owner_lease_duration: Option<Duration>,
 }
 
 impl ConnectionPool {
+    #[cfg(test)]
     pub fn new() -> Self {
+        Self::with_owner_lease_duration(None)
+    }
+
+    pub fn with_owner_lease_duration(owner_lease_duration: Option<Duration>) -> Self {
         Self {
-            entries: Mutex::new(HashMap::new()),
+            inner: Mutex::new(PoolInner {
+                entries: HashMap::new(),
+                next_owner_generation: 1,
+            }),
+            owner_lease_duration,
         }
     }
 
     fn slot(&self, name: &str) -> Option<Arc<UpstreamSlot>> {
-        self.entries.lock().get(name).cloned()
+        self.inner.lock().entries.get(name).cloned()
     }
 
     fn slot_matches(&self, name: &str, expected: &Arc<UpstreamSlot>) -> bool {
         self.slot(name)
             .is_some_and(|current| Arc::ptr_eq(&current, expected))
+    }
+
+    fn owner_lease_deadline(&self) -> Option<Instant> {
+        self.owner_lease_duration
+            .and_then(|duration| Instant::now().checked_add(duration))
     }
 
     pub async fn acquire_with<C, Fut>(
@@ -106,10 +145,19 @@ impl ConnectionPool {
 
     /// Insert a pre-connected client for a route name.
     pub fn insert(&self, name: String, address: String, client: Arc<IpcClient>) {
-        let old_slot = self.entries.lock().insert(
+        let mut inner = self.inner.lock();
+        let owner_generation = next_owner_generation(&mut inner);
+        let old_slot = inner.entries.insert(
             name,
-            Arc::new(UpstreamSlot::new(address, Some(client), SlotState::Ready)),
+            Arc::new(UpstreamSlot::new(
+                address,
+                Some(client),
+                SlotState::Ready,
+                owner_generation,
+                self.owner_lease_deadline(),
+            )),
         );
+        drop(inner);
         if let Some(old_slot) = old_slot {
             if let Some(client) = old_slot.retire() {
                 close_replaced_client(client);
@@ -133,14 +181,14 @@ impl ConnectionPool {
     /// Capture the current owner identity before awaiting a probe.
     pub fn owner_token(&self, name: &str) -> Option<OwnerToken> {
         let slot = self.slot(name)?;
-        let address = slot.address();
-        Some(OwnerToken { slot, address })
+        slot.owner_token()
     }
 
     /// Names of entries to evict (dead or idle beyond timeout_ms).
     pub fn idle_entries(&self, idle_timeout_ms: u64) -> Vec<String> {
-        self.entries
+        self.inner
             .lock()
+            .entries
             .iter()
             .filter(|(_, slot)| slot.is_idle_candidate(idle_timeout_ms))
             .map(|(name, _)| name.clone())
@@ -177,14 +225,19 @@ impl ConnectionPool {
     #[cfg(test)]
     pub fn reconnect(&self, name: &str, client: Arc<IpcClient>) {
         if let Some(slot) = self.slot(name) {
-            slot.reconnect(client);
+            let owner_generation = {
+                let mut inner = self.inner.lock();
+                next_owner_generation(&mut inner)
+            };
+            slot.reconnect(client, owner_generation, self.owner_lease_deadline());
         }
     }
 
     /// Remove entry entirely.
     pub fn remove(&self, name: &str) -> Option<Arc<IpcClient>> {
-        self.entries
+        self.inner
             .lock()
+            .entries
             .remove(name)
             .and_then(|slot| slot.retire())
     }
@@ -192,27 +245,93 @@ impl ConnectionPool {
     /// List route names with addresses.
     #[cfg(test)]
     pub fn list_connections(&self) -> Vec<(String, String)> {
-        self.entries
+        self.inner
             .lock()
+            .entries
             .iter()
             .map(|(n, slot)| (n.clone(), slot.address()))
             .collect()
     }
 
     pub fn matches_owner_token(&self, name: &str, token: &OwnerToken) -> bool {
-        self.slot_matches(name, &token.slot) && token.slot.address() == token.address
+        self.slot_matches(name, &token.slot) && token.slot.matches_owner_token(token)
     }
 
-    pub fn can_replace_owner_token(&self, name: &str, token: &OwnerToken) -> bool {
+    pub fn renew_owner_lease(&self, name: &str, token: &OwnerToken) -> bool {
         self.slot_matches(name, &token.slot)
-            && token.slot.address() == token.address
-            && token.slot.is_replaceable()
+            && token
+                .slot
+                .renew_owner_lease(token, self.owner_lease_deadline())
+    }
+
+    pub fn renew_current_owner_lease(&self, name: &str) -> bool {
+        let Some(slot) = self.slot(name) else {
+            return false;
+        };
+        slot.renew_current_owner_lease(self.owner_lease_deadline())
+    }
+
+    pub fn replace_if_owner_token(
+        &self,
+        name: &str,
+        token: &OwnerToken,
+        new_address: String,
+        new_client: Arc<IpcClient>,
+        evidence: OwnerReplacementEvidence,
+    ) -> Result<Option<Arc<IpcClient>>, OwnerReplaceError> {
+        let evidence: OwnerReplacementEvidence = evidence;
+        let mut inner = self.inner.lock();
+        let Some(current) = inner.entries.get(name).cloned() else {
+            return Err(OwnerReplaceError::StaleToken);
+        };
+        if !Arc::ptr_eq(&current, &token.slot) {
+            return Err(OwnerReplaceError::StaleToken);
+        }
+
+        let old_client = {
+            let mut locked = current.inner.lock();
+            if locked.address != token.address
+                || locked.owner_generation != token.owner_generation
+                || locked.owner_lease_epoch != token.owner_lease_epoch
+            {
+                return Err(OwnerReplaceError::StaleToken);
+            }
+            if locked.active_requests != 0 {
+                return Err(OwnerReplaceError::NotReplaceable);
+            }
+            if !replacement_evidence_allows_locked(&locked, token, evidence) {
+                return Err(OwnerReplaceError::NotReplaceable);
+            }
+            locked.state = SlotState::Retired;
+            locked.client.take()
+        };
+
+        let owner_generation = next_owner_generation(&mut inner);
+        inner.entries.insert(
+            name.to_string(),
+            Arc::new(UpstreamSlot::new(
+                new_address,
+                Some(new_client),
+                SlotState::Ready,
+                owner_generation,
+                self.owner_lease_deadline(),
+            )),
+        );
+        drop(inner);
+        current.notify.notify_waiters();
+        Ok(old_client)
     }
 
     #[cfg(test)]
     fn begin_request_for_test(&self, name: &str) -> Option<UpstreamLease> {
         self.slot(name)?.begin_request_for_test()
     }
+}
+
+fn next_owner_generation(inner: &mut PoolInner) -> u64 {
+    let generation = inner.next_owner_generation;
+    inner.next_owner_generation = inner.next_owner_generation.saturating_add(1);
+    generation
 }
 
 fn close_replaced_client(client: Arc<IpcClient>) {
@@ -222,7 +341,13 @@ fn close_replaced_client(client: Arc<IpcClient>) {
 }
 
 impl UpstreamSlot {
-    fn new(address: String, client: Option<Arc<IpcClient>>, state: SlotState) -> Self {
+    fn new(
+        address: String,
+        client: Option<Arc<IpcClient>>,
+        state: SlotState,
+        owner_generation: u64,
+        owner_lease_deadline: Option<Instant>,
+    ) -> Self {
         Self {
             inner: Mutex::new(SlotInner {
                 address,
@@ -230,6 +355,9 @@ impl UpstreamSlot {
                 last_activity: now_millis(),
                 active_requests: 0,
                 state,
+                owner_generation,
+                owner_lease_epoch: 0,
+                owner_lease_deadline,
             }),
             notify: Notify::new(),
         }
@@ -324,15 +452,19 @@ impl UpstreamSlot {
     }
 
     fn lookup(&self) -> CachedClient {
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
         match inner.state {
             SlotState::Ready => match &inner.client {
                 Some(client) if client.is_connected() => CachedClient::Ready {
                     address: inner.address.clone(),
                 },
-                Some(_) => CachedClient::Disconnected {
-                    address: inner.address.clone(),
-                },
+                Some(_) => {
+                    inner.client = None;
+                    inner.state = SlotState::Disconnected;
+                    CachedClient::Disconnected {
+                        address: inner.address.clone(),
+                    }
+                }
                 None => CachedClient::Evicted {
                     address: inner.address.clone(),
                 },
@@ -377,6 +509,51 @@ impl UpstreamSlot {
 
     fn address(&self) -> String {
         self.inner.lock().address.clone()
+    }
+
+    fn owner_token(self: Arc<Self>) -> Option<OwnerToken> {
+        let inner = self.inner.lock();
+        if inner.state == SlotState::Retired {
+            return None;
+        }
+        Some(OwnerToken {
+            slot: self.clone(),
+            address: inner.address.clone(),
+            owner_generation: inner.owner_generation,
+            owner_lease_epoch: inner.owner_lease_epoch,
+        })
+    }
+
+    fn matches_owner_token(&self, token: &OwnerToken) -> bool {
+        let inner = self.inner.lock();
+        inner.address == token.address
+            && inner.owner_generation == token.owner_generation
+            && inner.owner_lease_epoch == token.owner_lease_epoch
+            && inner.state != SlotState::Retired
+    }
+
+    fn renew_owner_lease(&self, token: &OwnerToken, deadline: Option<Instant>) -> bool {
+        let mut inner = self.inner.lock();
+        if inner.address != token.address
+            || inner.owner_generation != token.owner_generation
+            || inner.owner_lease_epoch != token.owner_lease_epoch
+            || inner.state == SlotState::Retired
+        {
+            return false;
+        }
+        inner.owner_lease_epoch = inner.owner_lease_epoch.saturating_add(1);
+        inner.owner_lease_deadline = deadline;
+        true
+    }
+
+    fn renew_current_owner_lease(&self, deadline: Option<Instant>) -> bool {
+        let mut inner = self.inner.lock();
+        if inner.state == SlotState::Retired {
+            return false;
+        }
+        inner.owner_lease_epoch = inner.owner_lease_epoch.saturating_add(1);
+        inner.owner_lease_deadline = deadline;
+        true
     }
 
     fn is_idle_candidate(&self, idle_timeout_ms: u64) -> bool {
@@ -430,20 +607,13 @@ impl UpstreamSlot {
         client
     }
 
-    fn is_replaceable(&self) -> bool {
-        let inner = self.inner.lock();
-        match inner.state {
-            SlotState::Evicted | SlotState::Disconnected => true,
-            SlotState::Ready => inner
-                .client
-                .as_ref()
-                .is_none_or(|client| !client.is_connected()),
-            SlotState::Reconnecting | SlotState::Retired => false,
-        }
-    }
-
     #[cfg(test)]
-    fn reconnect(&self, client: Arc<IpcClient>) {
+    fn reconnect(
+        &self,
+        client: Arc<IpcClient>,
+        owner_generation: u64,
+        owner_lease_deadline: Option<Instant>,
+    ) {
         let mut inner = self.inner.lock();
         if inner.state == SlotState::Retired {
             return;
@@ -451,6 +621,9 @@ impl UpstreamSlot {
         inner.client = Some(client);
         inner.state = SlotState::Ready;
         inner.last_activity = now_millis();
+        inner.owner_generation = owner_generation;
+        inner.owner_lease_epoch = 0;
+        inner.owner_lease_deadline = owner_lease_deadline;
         self.notify.notify_waiters();
     }
 
@@ -461,6 +634,32 @@ impl UpstreamSlot {
         drop(inner);
         self.notify.notify_waiters();
         client
+    }
+}
+
+fn replacement_evidence_allows_locked(
+    inner: &SlotInner,
+    token: &OwnerToken,
+    evidence: OwnerReplacementEvidence,
+) -> bool {
+    if inner.address != token.address
+        || inner.owner_generation != token.owner_generation
+        || inner.owner_lease_epoch != token.owner_lease_epoch
+    {
+        return false;
+    }
+
+    match evidence {
+        OwnerReplacementEvidence::ConfirmedDead
+        | OwnerReplacementEvidence::ConfirmedRouteMissing => {
+            inner.active_requests == 0 && inner.state.is_replaceable()
+        }
+    }
+}
+
+impl SlotState {
+    fn is_replaceable(self) -> bool {
+        matches!(self, SlotState::Evicted | SlotState::Disconnected)
     }
 }
 
@@ -798,7 +997,7 @@ mod tests {
     }
 
     #[test]
-    fn owner_token_matches_same_slot_after_reconnect() {
+    fn owner_token_does_not_match_same_slot_after_reconnect() {
         let pool = ConnectionPool::new();
         let old_client = Arc::new(IpcClient::new("ipc://old"));
         old_client.force_connected(true);
@@ -811,7 +1010,7 @@ mod tests {
 
         let lease = pool.begin_request_for_test("grid").unwrap();
         assert!(Arc::ptr_eq(&lease.client(), &new_client));
-        assert!(pool.matches_owner_token("grid", &token));
+        assert!(!pool.matches_owner_token("grid", &token));
     }
 
     #[test]
@@ -829,6 +1028,88 @@ mod tests {
         pool.insert("grid".into(), "ipc://same".into(), new_client);
 
         assert!(!pool.matches_owner_token("grid", &token));
+    }
+
+    #[test]
+    fn owner_token_does_not_match_after_lease_renewal() {
+        let pool = ConnectionPool::new();
+        let old_client = Arc::new(IpcClient::new("ipc://same-slot"));
+        old_client.force_connected(true);
+        pool.insert("grid".into(), "ipc://same-slot".into(), old_client);
+        let token = pool.owner_token("grid").unwrap();
+
+        assert!(pool.renew_owner_lease("grid", &token));
+
+        assert!(!pool.matches_owner_token("grid", &token));
+    }
+
+    #[test]
+    fn current_owner_lease_renewal_is_not_stale_token_based() {
+        let pool = ConnectionPool::new();
+        let old_client = Arc::new(IpcClient::new("ipc://same-slot"));
+        old_client.force_connected(true);
+        pool.insert("grid".into(), "ipc://same-slot".into(), old_client);
+        let token = pool.owner_token("grid").unwrap();
+
+        assert!(pool.renew_current_owner_lease("grid"));
+        assert!(pool.renew_current_owner_lease("grid"));
+
+        assert!(!pool.matches_owner_token("grid", &token));
+    }
+
+    #[test]
+    fn disabled_owner_lease_deadline_does_not_block_evidence_based_replacement() {
+        let pool = ConnectionPool::with_owner_lease_duration(None);
+        let old_client = Arc::new(IpcClient::new("ipc://old"));
+        old_client.force_connected(true);
+        pool.insert("grid".into(), "ipc://old".into(), old_client);
+        let token = pool.owner_token("grid").unwrap();
+        assert!(token.slot.inner.lock().owner_lease_deadline.is_none());
+
+        assert!(pool.renew_current_owner_lease("grid"));
+        assert!(token.slot.inner.lock().owner_lease_deadline.is_none());
+        pool.evict("grid");
+
+        let replacement = Arc::new(IpcClient::new("ipc://replacement"));
+        replacement.force_connected(true);
+        let result = pool.replace_if_owner_token(
+            "grid",
+            &pool.owner_token("grid").unwrap(),
+            "ipc://replacement".to_string(),
+            replacement,
+            OwnerReplacementEvidence::ConfirmedDead,
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(
+            pool.get_address("grid").as_deref(),
+            Some("ipc://replacement")
+        );
+    }
+
+    #[test]
+    fn replace_if_owner_token_rejects_active_disconnected_slot() {
+        let pool = ConnectionPool::new();
+        let old_client = Arc::new(IpcClient::new("ipc://old"));
+        old_client.force_connected(true);
+        pool.insert("grid".into(), "ipc://old".into(), old_client);
+        let token = pool.owner_token("grid").unwrap();
+        let lease = pool.begin_request_for_test("grid").unwrap();
+        lease.client().force_connected(false);
+
+        let replacement = Arc::new(IpcClient::new("ipc://replacement"));
+        replacement.force_connected(true);
+        let result = pool.replace_if_owner_token(
+            "grid",
+            &token,
+            "ipc://replacement".to_string(),
+            replacement,
+            OwnerReplacementEvidence::ConfirmedDead,
+        );
+
+        assert!(matches!(result, Err(OwnerReplaceError::NotReplaceable)));
+        assert!(pool.matches_owner_token("grid", &token));
+        drop(lease);
     }
 
     #[tokio::test]

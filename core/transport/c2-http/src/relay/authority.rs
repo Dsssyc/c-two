@@ -8,7 +8,9 @@ use std::sync::Arc;
 use c2_ipc::IpcClient;
 use c2_wire::control::MAX_CALL_ROUTE_NAME_BYTES;
 
-use crate::relay::conn_pool::{CachedClient, OwnerToken};
+use crate::relay::conn_pool::{
+    CachedClient, OwnerReplaceError, OwnerReplacementEvidence, OwnerToken,
+};
 use crate::relay::route_table::{
     valid_crm_tag, valid_route_name, validate_server_instance_id_value,
 };
@@ -75,7 +77,7 @@ pub(crate) fn attest_ipc_route_contract(
 #[derive(Clone)]
 pub(crate) enum RegisterPreflight {
     Available {
-        replacement: Option<OwnerReplacement>,
+        replacement: Option<OwnerReplacementCandidate>,
     },
     SameOwner,
 }
@@ -92,8 +94,37 @@ pub(crate) enum RegisterPreparation {
 
 #[derive(Clone)]
 pub(crate) struct OwnerReplacement {
+    pub route_name: String,
+    pub server_id: String,
+    pub server_instance_id: String,
+    pub ipc_address: String,
     pub existing_address: String,
     pub token: OwnerToken,
+    pub evidence: OwnerReplacementEvidence,
+}
+
+#[derive(Clone)]
+pub(crate) struct OwnerReplacementCandidate {
+    route_name: String,
+    server_id: String,
+    server_instance_id: String,
+    ipc_address: String,
+    existing_address: String,
+    token: OwnerToken,
+}
+
+impl OwnerReplacementCandidate {
+    fn with_evidence(self, evidence: OwnerReplacementEvidence) -> OwnerReplacement {
+        OwnerReplacement {
+            route_name: self.route_name,
+            server_id: self.server_id,
+            server_instance_id: self.server_instance_id,
+            ipc_address: self.ipc_address,
+            existing_address: self.existing_address,
+            token: self.token,
+            evidence,
+        }
+    }
 }
 
 pub(crate) enum RouteCommand {
@@ -226,8 +257,9 @@ impl<'a> RouteAuthority<'a> {
         };
 
         let existing_address = existing.ipc_address.clone().unwrap_or_default();
-        let existing_server_id = existing.server_id.unwrap_or_default();
-        let existing_server_instance_id = existing.server_instance_id.unwrap_or_default();
+        let existing_server_id = existing.server_id.as_deref().unwrap_or_default();
+        let existing_server_instance_id =
+            existing.server_instance_id.as_deref().unwrap_or_default();
         if existing_server_id == server_id {
             if existing_address == address {
                 if existing_server_instance_id == server_instance_id {
@@ -238,7 +270,7 @@ impl<'a> RouteAuthority<'a> {
             return Err(ControlError::AddressMismatch { existing_address });
         }
 
-        let replacement = self.different_owner_replacement(name, existing_address)?;
+        let replacement = self.different_owner_replacement(&existing)?;
         Ok(RegisterPreflight::Available {
             replacement: Some(replacement),
         })
@@ -262,7 +294,7 @@ impl<'a> RouteAuthority<'a> {
             };
 
             let existing_address = existing.ipc_address.clone().unwrap_or_default();
-            let existing_server_id = existing.server_id.unwrap_or_default();
+            let existing_server_id = existing.server_id.as_deref().unwrap_or_default();
             if existing_server_id == server_id {
                 if existing_address == address {
                     return Ok(None);
@@ -270,8 +302,7 @@ impl<'a> RouteAuthority<'a> {
                 return Err(ControlError::AddressMismatch { existing_address });
             }
 
-            let replacement = match self.different_owner_replacement(name, existing_address.clone())
-            {
+            let replacement = match self.different_owner_replacement(&existing) {
                 Ok(replacement) => replacement,
                 Err(ControlError::DuplicateRoute { existing_address }) => {
                     return Err(ControlError::DuplicateRoute { existing_address });
@@ -288,7 +319,16 @@ impl<'a> RouteAuthority<'a> {
                         existing_address: replacement.existing_address,
                     });
                 }
-                OwnerProbe::RouteMissing | OwnerProbe::Dead => return Ok(Some(replacement)),
+                OwnerProbe::RouteMissing => {
+                    return Ok(Some(
+                        replacement.with_evidence(OwnerReplacementEvidence::ConfirmedRouteMissing),
+                    ));
+                }
+                OwnerProbe::Dead => {
+                    return Ok(Some(
+                        replacement.with_evidence(OwnerReplacementEvidence::ConfirmedDead),
+                    ));
+                }
                 OwnerProbe::Stale => {
                     last_stale_owner = Some(replacement.existing_address);
                 }
@@ -325,9 +365,19 @@ impl<'a> RouteAuthority<'a> {
                             existing_address: replacement.existing_address,
                         });
                     }
-                    OwnerProbe::RouteMissing | OwnerProbe::Dead => {
+                    OwnerProbe::RouteMissing => {
                         return Ok(RegisterPreparation::Available {
-                            replacement: Some(replacement),
+                            replacement: Some(
+                                replacement
+                                    .with_evidence(OwnerReplacementEvidence::ConfirmedRouteMissing),
+                            ),
+                        });
+                    }
+                    OwnerProbe::Dead => {
+                        return Ok(RegisterPreparation::Available {
+                            replacement: Some(
+                                replacement.with_evidence(OwnerReplacementEvidence::ConfirmedDead),
+                            ),
                         });
                     }
                     OwnerProbe::Stale => {
@@ -414,15 +464,22 @@ impl<'a> RouteAuthority<'a> {
             if existing_server_id == server_id {
                 if existing_address == address {
                     if existing_server_instance_id == server_instance_id {
+                        if let Some(token) = self.state.owner_token(&name) {
+                            self.state.renew_owner_lease(&name, &token);
+                        }
                         return Ok(RouteCommandResult::SameOwner { entry: existing });
                     }
                 } else {
                     return Err(ControlError::AddressMismatch { existing_address });
                 }
             } else {
-                match replacement {
+                match replacement.as_ref() {
                     Some(token) if token.existing_address == existing_address => {
-                        if !self.state.can_replace_owner_token(&name, &token.token) {
+                        if token.route_name != name
+                            || token.server_id != existing_server_id
+                            || token.server_instance_id != existing_server_instance_id
+                            || token.ipc_address != existing_address
+                        {
                             return Err(ControlError::DuplicateRoute { existing_address });
                         }
                     }
@@ -444,19 +501,45 @@ impl<'a> RouteAuthority<'a> {
             locality: Locality::Local,
             registered_at: route_table.next_local_timestamp(),
         };
-        if !route_table.register_route(entry.clone()) {
+        if !route_table.can_register_route(&entry) {
             return Err(ControlError::OwnerMismatch);
         }
-        self.state.insert_connection(name, address, client);
+
+        let old_client = if let Some(token) = replacement {
+            let token_existing_address = token.existing_address.clone();
+            let evidence: OwnerReplacementEvidence = token.evidence;
+            match self.state.replace_if_owner_token(
+                &name,
+                &token.token,
+                address.clone(),
+                client.clone(),
+                evidence,
+            ) {
+                Ok(old_client) => old_client,
+                Err(OwnerReplaceError::StaleToken | OwnerReplaceError::NotReplaceable) => {
+                    return Err(ControlError::DuplicateRoute {
+                        existing_address: token_existing_address,
+                    });
+                }
+            }
+        } else {
+            self.state.insert_connection(name.clone(), address, client);
+            None
+        };
+        route_table.register_prevalidated_route(entry.clone());
         drop(route_table);
+        if let Some(client) = old_client {
+            close_replaced_owner_client(client);
+        }
         Ok(RouteCommandResult::Registered { entry })
     }
 
     fn different_owner_replacement(
         &self,
-        name: &str,
-        existing_address: String,
-    ) -> Result<OwnerReplacement, ControlError> {
+        existing: &RouteEntry,
+    ) -> Result<OwnerReplacementCandidate, ControlError> {
+        let name = existing.name.as_str();
+        let existing_address = existing.ipc_address.clone().unwrap_or_default();
         match self.state.connection_lookup(name) {
             CachedClient::Ready { address, .. } => Err(ControlError::DuplicateRoute {
                 existing_address: address,
@@ -467,7 +550,11 @@ impl<'a> RouteAuthority<'a> {
                         existing_address: address,
                     });
                 };
-                Ok(OwnerReplacement {
+                Ok(OwnerReplacementCandidate {
+                    route_name: existing.name.clone(),
+                    server_id: existing.server_id.clone().unwrap_or_default(),
+                    server_instance_id: existing.server_instance_id.clone().unwrap_or_default(),
+                    ipc_address: existing_address.clone(),
                     existing_address: address,
                     token,
                 })
@@ -611,6 +698,12 @@ enum OwnerProbe {
     RouteMissing,
     Dead,
     Stale,
+}
+
+fn close_replaced_owner_client(client: Arc<IpcClient>) {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move { client.close_shared().await });
+    }
 }
 
 #[cfg(test)]

@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use c2_config::RelayConfig;
 use c2_ipc::IpcClient;
@@ -16,7 +17,8 @@ use crate::relay::authority::{
     ControlError, OwnerReplacement, RouteAuthority, RouteCommand, RouteCommandResult,
 };
 use crate::relay::conn_pool::{
-    AcquireError as PoolAcquireError, CachedClient, ConnectionPool, OwnerToken, UpstreamLease,
+    AcquireError as PoolAcquireError, CachedClient, ConnectionPool, OwnerReplaceError,
+    OwnerReplacementEvidence, OwnerToken, UpstreamLease,
 };
 use crate::relay::route_table::RouteTable;
 use crate::relay::types::*;
@@ -28,10 +30,22 @@ pub struct RelayState {
     disseminator: Arc<dyn crate::relay::disseminator::Disseminator>,
 }
 
+fn owner_lease_duration(config: &RelayConfig) -> Option<Duration> {
+    match config.idle_timeout_secs {
+        0 => None,
+        seconds => Some(Duration::from_secs(seconds)),
+    }
+}
+
 #[derive(Clone)]
 pub struct OwnerReplacementToken {
+    pub route_name: String,
+    pub server_id: String,
+    pub server_instance_id: String,
+    pub ipc_address: String,
     pub existing_address: String,
     pub token: OwnerToken,
+    pub evidence: OwnerReplacementEvidence,
 }
 
 pub enum RegisterCommitResult {
@@ -67,9 +81,10 @@ impl RelayState {
         config: Arc<RelayConfig>,
         disseminator: Arc<dyn crate::relay::disseminator::Disseminator>,
     ) -> Self {
+        let owner_lease_duration = owner_lease_duration(&config);
         Self {
             route_table: RwLock::new(RouteTable::new(config.relay_id.clone())),
-            conn_pool: ConnectionPool::new(),
+            conn_pool: ConnectionPool::with_owner_lease_duration(owner_lease_duration),
             disseminator,
             config,
         }
@@ -101,8 +116,13 @@ impl RelayState {
         replacement: Option<OwnerReplacementToken>,
     ) -> RegisterCommitResult {
         let replacement = replacement.map(|token| OwnerReplacement {
+            route_name: token.route_name,
+            server_id: token.server_id,
+            server_instance_id: token.server_instance_id,
+            ipc_address: token.ipc_address,
             existing_address: token.existing_address,
             token: token.token,
+            evidence: token.evidence,
         });
         match RouteAuthority::new(self).execute(RouteCommand::RegisterLocal {
             name,
@@ -299,14 +319,8 @@ impl RelayState {
         };
 
         let lease_address = lease.address();
-        let route_matches_lease = self
-            .route_table
-            .read()
-            .local_route(name)
-            .is_some_and(|entry| {
-                local_route_matches(&entry, &expected)
-                    && entry.ipc_address.as_deref() == Some(lease_address.as_str())
-            });
+        let route_matches_lease =
+            self.renew_owner_lease_if_current_route(&expected, lease_address.as_str());
 
         if route_matches_lease {
             Ok((lease, expected))
@@ -316,6 +330,23 @@ impl RelayState {
             client.close_shared().await;
             Err(UpstreamAcquireError::NotFound)
         }
+    }
+
+    fn renew_owner_lease_if_current_route(
+        &self,
+        expected: &RouteEntry,
+        lease_address: &str,
+    ) -> bool {
+        let route_table = self.route_table.read();
+        let Some(entry) = route_table.local_route(&expected.name) else {
+            return false;
+        };
+        if !local_route_matches(&entry, expected)
+            || entry.ipc_address.as_deref() != Some(lease_address)
+        {
+            return false;
+        }
+        self.conn_pool.renew_current_owner_lease(&expected.name)
     }
 
     #[cfg(test)]
@@ -331,8 +362,20 @@ impl RelayState {
         self.conn_pool.matches_owner_token(name, token)
     }
 
-    pub(crate) fn can_replace_owner_token(&self, name: &str, token: &OwnerToken) -> bool {
-        self.conn_pool.can_replace_owner_token(name, token)
+    pub(crate) fn renew_owner_lease(&self, name: &str, token: &OwnerToken) -> bool {
+        self.conn_pool.renew_owner_lease(name, token)
+    }
+
+    pub(crate) fn replace_if_owner_token(
+        &self,
+        name: &str,
+        token: &OwnerToken,
+        new_address: String,
+        new_client: Arc<IpcClient>,
+        evidence: OwnerReplacementEvidence,
+    ) -> Result<Option<Arc<IpcClient>>, OwnerReplaceError> {
+        self.conn_pool
+            .replace_if_owner_token(name, token, new_address, new_client, evidence)
     }
 
     pub(crate) fn connection_lookup(&self, name: &str) -> CachedClient {
@@ -556,6 +599,25 @@ mod tests {
             RegisterCommitResult::Invalid { reason } => {
                 panic!("unexpected invalid route in test helper: {reason}")
             }
+        }
+    }
+
+    fn replacement_token(
+        route_name: &str,
+        server_id: &str,
+        server_instance_id: &str,
+        ipc_address: &str,
+        token: OwnerToken,
+        evidence: OwnerReplacementEvidence,
+    ) -> OwnerReplacementToken {
+        OwnerReplacementToken {
+            route_name: route_name.to_string(),
+            server_id: server_id.to_string(),
+            server_instance_id: server_instance_id.to_string(),
+            ipc_address: ipc_address.to_string(),
+            existing_address: ipc_address.to_string(),
+            token,
+            evidence,
         }
     }
 
@@ -933,10 +995,14 @@ mod tests {
             TEST_CRM_NAME.to_string(),
             TEST_CRM_VER.to_string(),
             replacement,
-            Some(OwnerReplacementToken {
-                existing_address: "ipc://old".into(),
-                token: old_token,
-            }),
+            Some(replacement_token(
+                "grid",
+                "server-old",
+                "server-old-instance",
+                "ipc://old",
+                old_token,
+                OwnerReplacementEvidence::ConfirmedDead,
+            )),
         );
 
         assert!(matches!(result, RegisterCommitResult::Registered { .. }));
@@ -976,10 +1042,14 @@ mod tests {
             TEST_CRM_NAME.to_string(),
             TEST_CRM_VER.to_string(),
             stale_replacement,
-            Some(OwnerReplacementToken {
-                existing_address: "ipc://same".into(),
-                token: old_token,
-            }),
+            Some(replacement_token(
+                "grid",
+                "server-old",
+                "server-old-instance",
+                "ipc://same",
+                old_token,
+                OwnerReplacementEvidence::ConfirmedDead,
+            )),
         );
 
         assert!(matches!(
@@ -989,6 +1059,127 @@ mod tests {
             } if existing_address == "ipc://same"
         ));
         assert_eq!(state.get_address("grid").as_deref(), Some("ipc://same"));
+    }
+
+    #[test]
+    fn replacement_token_is_rejected_after_same_owner_lease_renewal() {
+        let state = RelayState::new(test_config(), null_disseminator());
+        let old = Arc::new(IpcClient::new("ipc://old"));
+        old.force_connected(true);
+        register_local(&state, "grid", "server-old", "ipc://old", old);
+        let old_token = state.owner_token("grid").unwrap();
+
+        let same_owner = Arc::new(IpcClient::new("ipc://old"));
+        same_owner.force_connected(true);
+        let same_owner_result = state.commit_register_upstream(
+            "grid".into(),
+            "server-old".into(),
+            "server-old-instance".into(),
+            "ipc://old".into(),
+            TEST_CRM_NS.to_string(),
+            TEST_CRM_NAME.to_string(),
+            TEST_CRM_VER.to_string(),
+            same_owner,
+            None,
+        );
+        assert!(matches!(
+            same_owner_result,
+            RegisterCommitResult::SameOwner { .. }
+        ));
+
+        state.evict_connection("grid");
+        let replacement = Arc::new(IpcClient::new("ipc://replacement"));
+        replacement.force_connected(true);
+        let result = state.commit_register_upstream(
+            "grid".into(),
+            "server-new".into(),
+            "server-new-instance".into(),
+            "ipc://replacement".into(),
+            TEST_CRM_NS.to_string(),
+            TEST_CRM_NAME.to_string(),
+            TEST_CRM_VER.to_string(),
+            replacement,
+            Some(replacement_token(
+                "grid",
+                "server-old",
+                "server-old-instance",
+                "ipc://old",
+                old_token,
+                OwnerReplacementEvidence::ConfirmedDead,
+            )),
+        );
+
+        assert!(matches!(
+            result,
+            RegisterCommitResult::Duplicate {
+                existing_address
+            } if existing_address == "ipc://old"
+        ));
+        assert_eq!(state.get_address("grid").as_deref(), Some("ipc://old"));
+    }
+
+    #[tokio::test]
+    async fn replacement_token_is_rejected_after_successful_upstream_acquire() {
+        let state = RelayState::new(test_config(), null_disseminator());
+        let old = Arc::new(IpcClient::new("ipc://old"));
+        old.force_connected(true);
+        register_local(&state, "grid", "server-old", "ipc://old", old);
+        let old_token = state.owner_token("grid").unwrap();
+
+        let (lease, route) = match state.acquire_upstream("grid").await {
+            Ok(acquired) => acquired,
+            Err(_) => panic!("expected test upstream acquire to succeed"),
+        };
+        assert_eq!(route.name, "grid");
+        drop(lease);
+
+        state.evict_connection("grid");
+        let replacement = Arc::new(IpcClient::new("ipc://replacement"));
+        replacement.force_connected(true);
+        let result = state.commit_register_upstream(
+            "grid".into(),
+            "server-new".into(),
+            "server-new-instance".into(),
+            "ipc://replacement".into(),
+            TEST_CRM_NS.to_string(),
+            TEST_CRM_NAME.to_string(),
+            TEST_CRM_VER.to_string(),
+            replacement,
+            Some(replacement_token(
+                "grid",
+                "server-old",
+                "server-old-instance",
+                "ipc://old",
+                old_token,
+                OwnerReplacementEvidence::ConfirmedDead,
+            )),
+        );
+
+        assert!(matches!(
+            result,
+            RegisterCommitResult::Duplicate {
+                existing_address
+            } if existing_address == "ipc://old"
+        ));
+        assert_eq!(state.get_address("grid").as_deref(), Some("ipc://old"));
+    }
+
+    #[test]
+    fn owner_lease_renewal_is_not_peer_visible_route_state() {
+        let state = RelayState::new(test_config(), null_disseminator());
+        let old = Arc::new(IpcClient::new("ipc://old"));
+        old.force_connected(true);
+        register_local(&state, "grid", "server-old", "ipc://old", old);
+
+        let before_snapshot = serde_json::to_value(state.full_snapshot()).unwrap();
+        let before_digest = state.route_digest();
+        assert!(state.conn_pool.renew_current_owner_lease("grid"));
+
+        assert_eq!(
+            serde_json::to_value(state.full_snapshot()).unwrap(),
+            before_snapshot
+        );
+        assert_eq!(state.route_digest(), before_digest);
     }
 
     #[test]
@@ -1075,10 +1266,14 @@ mod tests {
             TEST_CRM_NAME.to_string(),
             TEST_CRM_VER.to_string(),
             replacement,
-            Some(OwnerReplacementToken {
-                existing_address: "ipc://same-slot".into(),
-                token: old_token,
-            }),
+            Some(replacement_token(
+                "grid",
+                "server-old",
+                "server-old-instance",
+                "ipc://same-slot",
+                old_token,
+                OwnerReplacementEvidence::ConfirmedDead,
+            )),
         );
 
         assert!(matches!(

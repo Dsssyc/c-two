@@ -79,9 +79,8 @@ impl RouteTable {
 
     // -- Route operations --
 
-    /// Register or update a route (upsert semantics).
-    pub fn register_route(&mut self, entry: RouteEntry) -> bool {
-        if !self.valid_route_entry(&entry) {
+    pub(crate) fn can_register_route(&self, entry: &RouteEntry) -> bool {
+        if !self.valid_route_entry(entry) {
             return false;
         }
         let key = (entry.name.clone(), entry.relay_id.clone());
@@ -90,8 +89,25 @@ impl RouteTable {
                 return false;
             }
         }
+        true
+    }
+
+    pub(crate) fn register_prevalidated_route(&mut self, entry: RouteEntry) {
+        assert!(
+            self.can_register_route(&entry),
+            "prevalidated route became invalid before commit"
+        );
+        let key = (entry.name.clone(), entry.relay_id.clone());
         self.tombstones.remove(&key);
         self.routes.insert(key, entry);
+    }
+
+    /// Register or update a route (upsert semantics).
+    pub fn register_route(&mut self, entry: RouteEntry) -> bool {
+        if !self.can_register_route(&entry) {
+            return false;
+        }
+        self.register_prevalidated_route(entry);
         true
     }
 

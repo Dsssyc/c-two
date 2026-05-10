@@ -423,8 +423,13 @@ impl RelayServer {
                     {
                         Ok(replacement) => {
                             replacement.map(|r| crate::relay::state::OwnerReplacementToken {
+                                route_name: r.route_name,
+                                server_id: r.server_id,
+                                server_instance_id: r.server_instance_id,
+                                ipc_address: r.ipc_address,
                                 existing_address: r.existing_address,
                                 token: r.token,
+                                evidence: r.evidence,
                             })
                         }
                         Err(ControlError::AddressMismatch { .. })
