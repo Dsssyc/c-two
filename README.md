@@ -30,7 +30,7 @@
 
 - **Built for scientific workloads** — The Python SDK has native support for Apache Arrow, NumPy arrays, and large payloads (chunked streaming for data beyond 256 MB). Designed for computational workloads, not microservices.
 
-- **Rust-powered core** — Shared transport, memory, wire codec, relay, and configuration live in Rust so future SDKs reuse one runtime contract.
+- **Rust-powered core** — Shared transport, memory, wire codec, route-contract validation, relay, and configuration live in Rust so future SDKs reuse one runtime contract.
 
 ---
 
@@ -194,7 +194,7 @@ cc.serve()                                     # blocks; Ctrl-C triggers gracefu
 
 ### Relay — Distributed Discovery
 
-An **HTTP relay** (`c3 relay`) is a lightweight broker that lets clients reach servers **by name**, across machines. Servers announce their IPC address to the relay when they register; clients ask the relay and get routed transparently.
+An **HTTP relay** (`c3 relay`) is a lightweight broker that lets clients reach servers **by route name and CRM contract**, across machines. Servers announce their IPC address plus CRM tag and contract fingerprints to the relay when they register; clients ask the relay with the route name and the expected CRM contract derived from `cc.connect(CRMClass, name='...')`.
 
 The `c3` command is C-Two's cross-language native CLI. From a source checkout,
 build and link a local development binary with
@@ -210,7 +210,9 @@ structured stale-route responses; set `C2_RELAY_ROUTE_MAX_ATTEMPTS` to tune the
 maximum route acquisition attempts (default `3`, valid range `1..=32`, `0` is
 treated as `1`). Set `C2_RELAY_CALL_TIMEOUT` to tune CRM call timeout seconds
 (default `300`; `0` disables the reqwest total timeout). Ambiguous data-plane
-failures are not replayed.
+failures are not replayed. Relay resolve, probe, and call paths reject
+name-only lookups and CRM contract mismatches instead of falling back to an
+untyped route with the same name.
 
 ```bash
 # Start a relay anywhere reachable on your network
@@ -228,14 +230,14 @@ cc.set_relay_anchor('http://relay-host:8080')
 cc.register(MeshStore, MeshStoreImpl(), name='mesh')
 cc.serve()
 
-# Client side — resolve by name, no address needed
+# Client side — resolve by name plus the MeshStore CRM contract, no address needed
 cc.set_relay_anchor('http://relay-host:8080')
 mesh = cc.connect(MeshStore, name='mesh')
 ```
 
 Multiple relays can form a **mesh cluster** via gossip — any relay can resolve any resource registered anywhere in the mesh. See the [Relay Mesh example](#relay-mesh--multi-relay-clusters) below.
 
-> **When do I need a relay?** Only for cross-machine or name-based discovery. Same-process and same-host (IPC) usage work without any relay.
+> **When do I need a relay?** Only for cross-machine or name-and-contract-based discovery. Same-process and same-host (IPC) usage work without any relay.
 
 ### @transferable — Custom Serialization
 
@@ -336,8 +338,8 @@ When `cc.connect()` targets a CRM registered in the same process, the proxy call
 ```python
 import c_two as cc
 
-cc.register(Greeter, Greeter(lang='en'), name='greeter')
-cc.register(Counter, Counter(initial=100), name='counter')
+cc.register(Greeter, GreeterImpl(lang='en'), name='greeter')
+cc.register(Counter, CounterImpl(initial=100), name='counter')
 
 greeter = cc.connect(Greeter, name='greeter')
 counter = cc.connect(Counter, name='counter')
@@ -398,7 +400,7 @@ class MeshStore:
 import c_two as cc
 from types import MeshStore, Mesh
 
-class MeshStore:
+class MeshStoreImpl:
     def __init__(self):
         self._mesh = Mesh(n_vertices=0, positions=np.empty((0, 3)))
 
@@ -412,7 +414,7 @@ class MeshStore:
     def cleanup(self):
         print('MeshStore shutting down')
 
-cc.register(MeshStore, MeshStore(), name='mesh')
+cc.register(MeshStore, MeshStoreImpl(), name='mesh')
 print(cc.server_id())
 print(cc.server_address())
 cc.serve()  # blocks until interrupted
@@ -445,14 +447,14 @@ cc.close(mesh_store)
 
 ### Cross-Machine — HTTP Relay
 
-An HTTP relay bridges network requests to CRM processes running on IPC. CRM processes register with the relay, and clients discover resources **by name**.
+An HTTP relay bridges network requests to CRM processes running on IPC. CRM processes register with the relay, and clients discover resources by **route name plus expected CRM contract**. The CRM tag and contract hashes prevent accidental or stale matches when a relay mesh contains an old route or another resource with the same name.
 
 **CRM Server** (`resource.py`):
 ```python
 import c_two as cc
 
 cc.set_relay_anchor('http://relay-host:8080')
-cc.register(MeshStore, MeshStore(), name='mesh')
+cc.register(MeshStore, MeshStoreImpl(), name='mesh')
 cc.serve()  # blocks until Ctrl-C
 ```
 
@@ -495,7 +497,7 @@ c3 relay --bind 0.0.0.0:8080 --relay-id relay-b \
 Mesh peer endpoints (`/_peer/*`) accept route gossip from configured peers and
 must be protected by the same trusted network boundary as the relay HTTP API.
 
-CRM processes register with their local relay; the mesh propagates routes automatically. Clients can connect through **any** relay in the mesh.
+CRM processes register with their local relay; the mesh propagates routes automatically. Clients can connect through **any** relay in the mesh using the same CRM class and route name.
 
 > **Best for:** multi-node clusters, high availability, geographic distribution.
 
@@ -528,6 +530,7 @@ Any code that calls `cc.connect(...)` to consume a resource. The returned proxy 
 
 - `cc.connect(CRMClass, name='...', address='...')` returns a typed CRM proxy
 - The proxy supports context management: `with cc.connect(...) as x:` auto-closes
+- For IPC and relay paths, the SDK derives the expected route contract from the CRM class and native code validates the route name, CRM tag, ABI hash, and signature hash before calls are made.
 
 ### Resource Layer
 
@@ -556,8 +559,9 @@ The IPC transport uses a **control-plane / data-plane separation**: method routi
 
 The core runtime is language-neutral Rust; SDKs bind to the same core contracts rather than reimplement transport behavior. Performance-critical components are implemented in Rust and exposed to Python through a native extension built with [PyO3](https://pyo3.rs) + [maturin](https://www.maturin.rs):
 
-The Rust workspace contains 7 crates organized in 4 layers (foundation → protocol → transport → bridge):
+The Rust workspace contains 9 core crates organized in 4 layers (foundation → protocol → transport → runtime), plus the Python PyO3 extension under `sdk/python/native/`:
 
+- **Contract Core (`c2-contract`)** — Language-neutral CRM route contract validation and canonical descriptor hashing.
 - **Buddy Allocator** — Zero-syscall shared memory allocation for the IPC transport. Cross-process, lock-free on the fast path.
 - **Wire Protocol** — Frame encoding, chunk assembly, and chunk registry for large-payload lifecycle management.
 - **HTTP Relay** — High-throughput [axum](https://github.com/tokio-rs/axum)-based gateway bridging HTTP to IPC. Handles connection pooling and request multiplexing.

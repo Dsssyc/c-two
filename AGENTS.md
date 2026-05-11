@@ -104,9 +104,10 @@ C-Two has a language-neutral Rust core and language SDKs. Python is the current
 SDK surface, not the canonical home for generic runtime mechanisms. The Python
 SDK owns Python domain logic, CRM contracts, Python resource invocation,
 serialization orchestration, and same-process direct-call glue. Rust owns
-shared transport, memory, wire codec, route concurrency enforcement and state,
-HTTP relay, and configuration resolution. PyO3/maturin bridges Rust into Python
-as `c_two._native`.
+shared transport, memory, wire codec, CRM route contract validation and
+fingerprints, route concurrency enforcement and state, HTTP relay, and
+configuration resolution. PyO3/maturin bridges Rust into Python as
+`c_two._native`.
 
 ### CRM Layer
 
@@ -115,6 +116,10 @@ Path: `sdk/python/src/c_two/crm/`
 - CRM contracts are interface classes decorated with
   `@cc.crm(namespace='...', version='...')`.
 - Only methods in the contract are exposed remotely.
+- CRM route contracts are identified by route name plus the CRM namespace,
+  CRM name, CRM version, ABI hash, and signature hash. Python may compute the
+  descriptor/fingerprints from the CRM class, but Rust `c2-contract` validates
+  the complete expected route contract at IPC and relay boundaries.
 - Resource implementations are plain Python classes and are not decorated.
 - `@transferable` marks custom data types that cross the wire. It converts the
   class into a dataclass and registers `serialize`, `deserialize`, and optional
@@ -288,6 +293,16 @@ resolution is allowed only when the anchor endpoint is loopback/local; nonlocal
 relay responses must be treated as HTTP relay targets even if they include an
 `ipc_address`.
 
+Relay resolution and data-plane calls are contract-scoped, not name-only.
+`cc.connect(CRMClass, name='...')` derives an `ExpectedRouteContract` from the
+CRM class and the route name. Runtime relay resolve, probe, and call paths must
+carry and validate the full route name, CRM tag, ABI hash, and signature hash.
+Do not add production APIs, fallback behavior, cache keys, or wire paths that
+resolve, probe, or call a CRM route by name alone. A future "find by name" or
+diagnostic relay-mesh lookup must be a separate discovery/admin surface that
+returns candidate route metadata and CRM tags; it must not be reused as the
+normal CRM call path.
+
 Relay-discovered IPC fast paths must validate endpoint identity in Rust before
 accepting the IPC client. The relay response identity (`server_id` and
 `server_instance_id`) must match the identity returned by the IPC handshake,
@@ -307,6 +322,7 @@ extension crate under `sdk/python/native/`.
 
 | Layer | Crate | Purpose |
 | --- | --- | --- |
+| foundation | `c2-contract` | Route contract validation and canonical descriptor hashing |
 | foundation | `c2-config` | Unified IPC and relay configuration structs/resolvers |
 | foundation | `c2-error` | Canonical error registry and `code:message` wire codec |
 | foundation | `c2-mem` | Buddy allocator, SHM regions, unified memory pool |
@@ -482,6 +498,9 @@ cc.shutdown()
 The `name` parameter in `cc.register()` is a user-chosen routing key. It is not
 the CRM namespace. Multiple resources using different CRM contracts, or the
 same CRM contract with different instances, can coexist under distinct names.
+For remote IPC/relay paths, name is necessary but not sufficient: the native
+runtime also matches the expected CRM tag and contract hashes derived from the
+client's CRM class.
 
 ### Error Handling
 
