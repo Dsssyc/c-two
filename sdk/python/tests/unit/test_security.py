@@ -32,6 +32,9 @@ from c_two.transport.wire import (
     decode_reply_control,
 )
 
+ABI_HASH = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+SIG_HASH = 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789'
+
 
 def route_info(name: str, methods: list[MethodEntry]) -> RouteInfo:
     return RouteInfo(
@@ -40,6 +43,8 @@ def route_info(name: str, methods: list[MethodEntry]) -> RouteInfo:
         crm_ns='test.security',
         crm_name='SecurityRoute',
         crm_ver='0.1.0',
+        abi_hash=ABI_HASH,
+        signature_hash=SIG_HASH,
     )
 
 
@@ -161,6 +166,10 @@ class TestHandshakeBoundsChecking:
         buf += b'SecurityRoute'
         buf.append(len(b'0.1.0'))
         buf += b'0.1.0'
+        buf.append(len(ABI_HASH))
+        buf += ABI_HASH.encode()
+        buf.append(len(SIG_HASH))
+        buf += SIG_HASH.encode()
         buf += struct.pack('<H', _MAX_HANDSHAKE_METHODS + 1)  # method count
         with pytest.raises(ValueError, match='invalid value|exceeds'):
             decode_handshake(bytes(buf))

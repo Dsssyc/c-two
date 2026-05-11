@@ -46,6 +46,12 @@ def _wait_for_server(address: str, timeout: float = 5.0) -> None:
     raise TimeoutError(f'Server at {address} not ready after {timeout}s')
 
 
+def _hello_server(address: str, **kwargs) -> Server:
+    server = Server(bind_address=address, **kwargs)
+    server.register_crm(Hello, HelloImpl(), name='hello')
+    return server
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -54,12 +60,7 @@ def _wait_for_server(address: str, timeout: float = 5.0) -> None:
 def server_addr():
     """Start a Server hosting the Hello CRM + Hello CRM."""
     addr = f'ipc://{_unique_region()}'
-    server = Server(
-        bind_address=addr,
-        crm_class=Hello,
-        crm_instance=HelloImpl(),
-        name='hello',
-    )
+    server = _hello_server(addr)
     server.start()
     _wait_for_server(addr)
     yield addr
@@ -72,12 +73,7 @@ def server_small_shm(monkeypatch):
     addr = f'ipc://{_unique_region("small")}'
     monkeypatch.setenv('C2_ENV_FILE', '')
     monkeypatch.setenv('C2_SHM_THRESHOLD', '16')
-    server = Server(
-        bind_address=addr,
-        crm_class=Hello,
-        crm_instance=HelloImpl(),
-        name='hello',
-    )
+    server = _hello_server(addr)
     server.start()
     _wait_for_server(addr)
     yield addr
@@ -120,12 +116,7 @@ class TestServerBasic:
 
     def test_shutdown(self):
         addr = f'ipc://{_unique_region("shut")}'
-        server = Server(
-            bind_address=addr,
-            crm_class=Hello,
-            crm_instance=HelloImpl(),
-            name='hello',
-        )
+        server = _hello_server(addr)
         server.start()
         _wait_for_server(addr)
         assert shutdown(addr)

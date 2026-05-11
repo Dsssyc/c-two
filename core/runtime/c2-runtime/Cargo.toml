@@ -9,6 +9,7 @@ name = "c2_runtime"
 
 [dependencies]
 c2-config = { path = "../../foundation/c2-config" }
+c2-contract = { path = "../../foundation/c2-contract" }
 c2-mem = { path = "../../foundation/c2-mem" }
 c2-http = { path = "../../transport/c2-http" }
 c2-server = { path = "../../transport/c2-server" }

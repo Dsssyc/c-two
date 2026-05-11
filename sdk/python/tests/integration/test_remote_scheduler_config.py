@@ -43,7 +43,7 @@ def _join_all(threads: list[threading.Thread]) -> None:
     assert not alive, f'threads did not finish: {alive}'
 
 
-@cc.transferable
+@cc.transferable(abi_id='c-two.tests.remote-scheduler.delay.pickle-float.v1')
 class Delay:
     value: float
 
@@ -54,7 +54,7 @@ class Delay:
         return Delay(float(pickle.loads(bytes(buf))))
 
 
-@cc.transferable
+@cc.transferable(abi_id='c-two.tests.remote-scheduler.window.pickle-tuple-float-float.v1')
 class Window:
     start: float
     end: float
@@ -67,7 +67,7 @@ class Window:
         return Window(float(start), float(end))
 
 
-@cc.transferable
+@cc.transferable(abi_id='c-two.tests.remote-scheduler.count.pickle-int.v1')
 class Count:
     value: int
 
@@ -303,7 +303,7 @@ def test_remote_ipc_registers_all_public_concurrency_modes(mode):
         cc.close(client)
 
 
-@cc.transferable
+@cc.transferable(abi_id='c-two.tests.remote-scheduler.large-payload.raw-bytes.v1')
 class LargePayload:
     data: bytes
 

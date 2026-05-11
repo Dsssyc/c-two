@@ -5,15 +5,13 @@
 
 use std::sync::Arc;
 
+use c2_contract::{ExpectedRouteContract, MAX_WIRE_TEXT_BYTES};
 use c2_ipc::IpcClient;
-use c2_wire::control::MAX_CALL_ROUTE_NAME_BYTES;
 
 use crate::relay::conn_pool::{
     CachedClient, OwnerReplaceError, OwnerReplacementEvidence, OwnerToken,
 };
-use crate::relay::route_table::{
-    valid_crm_tag, valid_route_name, validate_server_instance_id_value,
-};
+use crate::relay::route_table::{valid_route_name, validate_server_instance_id_value};
 use crate::relay::state::RelayState;
 use crate::relay::types::{Locality, RouteEntry};
 
@@ -35,6 +33,66 @@ pub(crate) struct AttestedRouteContract {
     pub crm_ns: String,
     pub crm_name: String,
     pub crm_ver: String,
+    pub abi_hash: String,
+    pub signature_hash: String,
+}
+
+fn existing_contract_mismatch_reason(
+    route_name: &str,
+    existing: &RouteEntry,
+    crm_ns: &str,
+    crm_name: &str,
+    crm_ver: &str,
+    abi_hash: &str,
+    signature_hash: &str,
+) -> Option<String> {
+    if existing.crm_ns != crm_ns
+        || existing.crm_name != crm_name
+        || existing.crm_ver != crm_ver
+        || existing.abi_hash != abi_hash
+        || existing.signature_hash != signature_hash
+    {
+        return Some(format!(
+            "CRM contract mismatch for route '{route_name}': existing {}/{}/{} hashes={}/{}, got {}/{}/{} hashes={}/{}",
+            existing.crm_ns,
+            existing.crm_name,
+            existing.crm_ver,
+            existing.abi_hash,
+            existing.signature_hash,
+            crm_ns,
+            crm_name,
+            crm_ver,
+            abi_hash,
+            signature_hash
+        ));
+    }
+    None
+}
+
+pub(crate) fn read_ipc_route_contract(
+    client: &IpcClient,
+    route_name: &str,
+) -> Result<AttestedRouteContract, ControlError> {
+    let Some(contract) = client.route_contract(route_name) else {
+        return Err(ControlError::NotFound);
+    };
+    if contract.crm_ns.is_empty() || contract.crm_name.is_empty() || contract.crm_ver.is_empty() {
+        return Err(ControlError::ContractMismatch {
+            reason: format!("IPC upstream route '{route_name}' did not advertise a CRM contract"),
+        });
+    }
+    if c2_contract::validate_expected_route_contract(&contract).is_err() {
+        return Err(ControlError::ContractMismatch {
+            reason: format!("IPC upstream route '{route_name}' advertised an invalid CRM contract"),
+        });
+    }
+    Ok(AttestedRouteContract {
+        crm_ns: contract.crm_ns,
+        crm_name: contract.crm_name,
+        crm_ver: contract.crm_ver,
+        abi_hash: contract.abi_hash,
+        signature_hash: contract.signature_hash,
+    })
 }
 
 pub(crate) fn attest_ipc_route_contract(
@@ -43,34 +101,51 @@ pub(crate) fn attest_ipc_route_contract(
     claimed_crm_ns: &str,
     claimed_crm_name: &str,
     claimed_crm_ver: &str,
+    claimed_abi_hash: &str,
+    claimed_signature_hash: &str,
 ) -> Result<AttestedRouteContract, ControlError> {
-    let Some((crm_ns, crm_name, crm_ver)) = client.route_contract(route_name) else {
-        return Err(ControlError::NotFound);
+    let contract = client
+        .route_contract(route_name)
+        .ok_or(ControlError::NotFound)?;
+    read_ipc_route_contract(client, route_name)?;
+    let claimed = ExpectedRouteContract {
+        route_name: route_name.to_string(),
+        crm_ns: claimed_crm_ns.to_string(),
+        crm_name: claimed_crm_name.to_string(),
+        crm_ver: claimed_crm_ver.to_string(),
+        abi_hash: claimed_abi_hash.to_string(),
+        signature_hash: claimed_signature_hash.to_string(),
     };
-    if crm_ns.is_empty() || crm_name.is_empty() || crm_ver.is_empty() {
-        return Err(ControlError::ContractMismatch {
-            reason: format!("IPC upstream route '{route_name}' did not advertise a CRM contract"),
-        });
-    }
-    if !valid_crm_tag(crm_ns, crm_name, crm_ver) {
-        return Err(ControlError::ContractMismatch {
-            reason: format!("IPC upstream route '{route_name}' advertised an invalid CRM tag"),
-        });
-    }
-    if (!claimed_crm_ns.is_empty() && claimed_crm_ns != crm_ns)
-        || (!claimed_crm_name.is_empty() && claimed_crm_name != crm_name)
-        || (!claimed_crm_ver.is_empty() && claimed_crm_ver != crm_ver)
-    {
+    if c2_contract::validate_expected_route_contract(&claimed).is_err() {
         return Err(ControlError::ContractMismatch {
             reason: format!(
-                "IPC upstream route '{route_name}' CRM contract mismatch: claimed {claimed_crm_ns}/{claimed_crm_name}/{claimed_crm_ver}, got {crm_ns}/{crm_name}/{crm_ver}",
+                "IPC upstream route '{route_name}' registration did not claim a complete CRM contract"
+            ),
+        });
+    }
+    if claimed != contract {
+        return Err(ControlError::ContractMismatch {
+            reason: format!(
+                "IPC upstream route '{route_name}' CRM contract mismatch: claimed {}/{}/{} hashes={}/{}, got {}/{}/{} hashes={}/{}",
+                claimed.crm_ns,
+                claimed.crm_name,
+                claimed.crm_ver,
+                claimed.abi_hash,
+                claimed.signature_hash,
+                contract.crm_ns,
+                contract.crm_name,
+                contract.crm_ver,
+                contract.abi_hash,
+                contract.signature_hash,
             ),
         });
     }
     Ok(AttestedRouteContract {
-        crm_ns: crm_ns.to_string(),
-        crm_name: crm_name.to_string(),
-        crm_ver: crm_ver.to_string(),
+        crm_ns: contract.crm_ns,
+        crm_name: contract.crm_name,
+        crm_ver: contract.crm_ver,
+        abi_hash: contract.abi_hash,
+        signature_hash: contract.signature_hash,
     })
 }
 
@@ -136,6 +211,8 @@ pub(crate) enum RouteCommand {
         crm_ns: String,
         crm_name: String,
         crm_ver: String,
+        abi_hash: String,
+        signature_hash: String,
         client: Arc<IpcClient>,
         replacement: Option<OwnerReplacement>,
     },
@@ -188,7 +265,7 @@ impl<'a> RouteAuthority<'a> {
         if !valid_route_name(name) {
             return Err(ControlError::InvalidName {
                 reason: format!(
-                    "name must be non-empty, control-character-free, and no more than {MAX_CALL_ROUTE_NAME_BYTES} bytes"
+                    "name must be non-empty, control-character-free, and no more than {MAX_WIRE_TEXT_BYTES} bytes"
                 ),
             });
         }
@@ -202,12 +279,9 @@ impl<'a> RouteAuthority<'a> {
     pub(crate) fn validate_server_id(&self, server_id: &str) -> Result<(), ControlError> {
         c2_config::validate_server_id(server_id)
             .map_err(|reason| ControlError::InvalidServerId { reason })?;
-        if server_id.len() > c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES {
+        if server_id.len() > MAX_WIRE_TEXT_BYTES {
             return Err(ControlError::InvalidServerId {
-                reason: format!(
-                    "server_id cannot exceed {} bytes",
-                    c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES
-                ),
+                reason: format!("server_id cannot exceed {MAX_WIRE_TEXT_BYTES} bytes"),
             });
         }
         Ok(())
@@ -235,8 +309,11 @@ impl<'a> RouteAuthority<'a> {
         crm_name: &str,
         crm_ver: &str,
     ) -> Result<(), ControlError> {
-        c2_wire::handshake::validate_crm_tag(crm_ns, crm_name, crm_ver)
-            .map_err(|reason| ControlError::ContractMismatch { reason })
+        c2_contract::validate_crm_tag(crm_ns, crm_name, crm_ver).map_err(|err| {
+            ControlError::ContractMismatch {
+                reason: err.to_string(),
+            }
+        })
     }
 
     pub(crate) fn register_local_preflight(
@@ -404,6 +481,8 @@ impl<'a> RouteAuthority<'a> {
                 crm_ns,
                 crm_name,
                 crm_ver,
+                abi_hash,
+                signature_hash,
                 client,
                 replacement,
             } => self.register_local(
@@ -414,6 +493,8 @@ impl<'a> RouteAuthority<'a> {
                 crm_ns,
                 crm_name,
                 crm_ver,
+                abi_hash,
+                signature_hash,
                 client,
                 replacement,
             ),
@@ -446,6 +527,8 @@ impl<'a> RouteAuthority<'a> {
         crm_ns: String,
         crm_name: String,
         crm_ver: String,
+        abi_hash: String,
+        signature_hash: String,
         client: Arc<IpcClient>,
         replacement: Option<OwnerReplacement>,
     ) -> Result<RouteCommandResult, ControlError> {
@@ -454,6 +537,16 @@ impl<'a> RouteAuthority<'a> {
         self.validate_server_instance_id(&server_instance_id)?;
         self.validate_ipc_address(&address)?;
         self.validate_crm_tag(&crm_ns, &crm_name, &crm_ver)?;
+        c2_contract::validate_contract_hash("abi_hash", &abi_hash).map_err(|err| {
+            ControlError::ContractMismatch {
+                reason: err.to_string(),
+            }
+        })?;
+        c2_contract::validate_contract_hash("signature_hash", &signature_hash).map_err(|err| {
+            ControlError::ContractMismatch {
+                reason: err.to_string(),
+            }
+        })?;
 
         let mut route_table = self.state.route_table_write();
         if let Some(existing) = route_table.local_route(&name) {
@@ -464,6 +557,17 @@ impl<'a> RouteAuthority<'a> {
             if existing_server_id == server_id {
                 if existing_address == address {
                     if existing_server_instance_id == server_instance_id {
+                        if let Some(reason) = existing_contract_mismatch_reason(
+                            &name,
+                            &existing,
+                            &crm_ns,
+                            &crm_name,
+                            &crm_ver,
+                            &abi_hash,
+                            &signature_hash,
+                        ) {
+                            return Err(ControlError::ContractMismatch { reason });
+                        }
                         if let Some(token) = self.state.owner_token(&name) {
                             self.state.renew_owner_lease(&name, &token);
                         }
@@ -498,6 +602,8 @@ impl<'a> RouteAuthority<'a> {
             crm_ns,
             crm_name,
             crm_ver,
+            abi_hash,
+            signature_hash,
             locality: Locality::Local,
             registered_at: route_table.next_local_timestamp(),
         };
@@ -606,6 +712,16 @@ impl<'a> RouteAuthority<'a> {
         self.validate_relay_id(&sender_relay_id)?;
         self.validate_relay_id(&entry.relay_id)?;
         self.validate_crm_tag(&entry.crm_ns, &entry.crm_name, &entry.crm_ver)?;
+        c2_contract::validate_contract_hash("abi_hash", &entry.abi_hash).map_err(|err| {
+            ControlError::ContractMismatch {
+                reason: err.to_string(),
+            }
+        })?;
+        c2_contract::validate_contract_hash("signature_hash", &entry.signature_hash).map_err(
+            |err| ControlError::ContractMismatch {
+                reason: err.to_string(),
+            },
+        )?;
         if !entry.registered_at.is_finite() {
             return Err(ControlError::ContractMismatch {
                 reason: "route registered_at must be finite".to_string(),
@@ -750,6 +866,9 @@ mod tests {
             crm_ns: "test.ns".into(),
             crm_name: "Grid".into(),
             crm_ver: "0.1.0".into(),
+            abi_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                .into(),
             locality: Locality::Peer,
             registered_at: 1000.0,
         }

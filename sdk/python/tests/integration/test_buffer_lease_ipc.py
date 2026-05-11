@@ -20,7 +20,7 @@ def _cleanup():
     _ProcessRegistry._instance = None  # noqa: SLF001
 
 
-@cc.transferable
+@cc.transferable(abi_id="c-two.tests.buffer-lease.bytes-view.raw-bytes.v1")
 class BytesView:
     data: memoryview | bytes
 
@@ -46,7 +46,7 @@ class PayloadResource:
         return BytesView(b"x" * size)
 
 
-@cc.transferable
+@cc.transferable(abi_id="c-two.tests.buffer-lease.bytes-deserialize-only.raw-bytes.v1")
 class BytesDeserializeOnly:
     data: bytes
 
@@ -229,7 +229,7 @@ def test_resource_input_hold_execute_failure_preserves_retained_view_until_resou
         cc.close(client)
 
 
-@cc.transferable
+@cc.transferable(abi_id="c-two.tests.buffer-lease.bad-input-from-buffer.raw-bytes.v1")
 class BadInputFromBuffer:
     data: memoryview | bytes
 
@@ -272,7 +272,7 @@ def test_resource_input_from_buffer_failure_uses_specific_error_and_releases_req
         cc.close(client)
 
 
-@cc.transferable
+@cc.transferable(abi_id="c-two.tests.buffer-lease.bad-output-from-buffer.raw-bytes.v1")
 class BadOutputFromBuffer:
     data: memoryview | bytes
 

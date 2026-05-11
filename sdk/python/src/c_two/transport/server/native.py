@@ -9,7 +9,6 @@ frame parsing, heartbeat, and concurrency scheduling move to Rust.
 """
 from __future__ import annotations
 
-import inspect
 import logging
 import math
 import threading
@@ -17,6 +16,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from ...crm.contract import (
+    CRMContract,
+    crm_contract_identity,
+    crm_route_contract_hashes,
+)
+from ...crm.methods import rpc_method_names
 from ...crm.meta import MethodAccess, get_method_access, get_shutdown_method
 from ...error import ResourceAlreadyRegistered
 from c_two.config.ipc import ServerIPCOverrides, _resolve_server_ipc_config
@@ -50,6 +55,8 @@ class CRMSlot:
     crm_ns: str
     crm_name: str
     crm_ver: str
+    abi_hash: str
+    signature_hash: str
     method_table: MethodTable
     scheduler: Scheduler
     methods: list[str]
@@ -154,12 +161,14 @@ class NativeServerBridge:
         crm_instance: object,
         concurrency: ConcurrencyConfig | None = None,
         *,
-        name: str | None = None,
+        name: str,
         runtime_session: object | None = None,
         relay_anchor_address: str | None = None,
     ) -> str:
         crm_ns, crm_name, crm_ver = self._extract_contract_identity(crm_class)
-        routing_name = name if name is not None else crm_ns
+        if not isinstance(name, str):
+            raise TypeError('name must be an explicit route name string')
+        routing_name = name
         instance = self._create_crm_instance(crm_class, crm_instance)
         methods = self._discover_methods(crm_class)
         cc_config = concurrency or ConcurrencyConfig()
@@ -168,6 +177,13 @@ class NativeServerBridge:
         if sd_method is not None:
             methods = [m for m in methods if m != sd_method]
         method_table = MethodTable.from_methods(methods)
+        abi_hash, signature_hash = self._route_contract_hashes(
+            crm_ns,
+            crm_name,
+            crm_ver,
+            methods,
+            crm_class,
+        )
 
         slot = CRMSlot(
             name=routing_name,
@@ -176,6 +192,8 @@ class NativeServerBridge:
             crm_ns=crm_ns,
             crm_name=crm_name,
             crm_ver=crm_ver,
+            abi_hash=abi_hash,
+            signature_hash=signature_hash,
             method_table=method_table,
             scheduler=None,  # type: ignore[arg-type]
             methods=methods,
@@ -215,6 +233,8 @@ class NativeServerBridge:
                         crm_ns,
                         crm_name,
                         crm_ver,
+                        abi_hash,
+                        signature_hash,
                         relay_anchor_address,
                     )
                 except Exception as exc:
@@ -240,6 +260,8 @@ class NativeServerBridge:
                     slot.crm_ns,
                     slot.crm_name,
                     slot.crm_ver,
+                    slot.abi_hash,
+                    slot.signature_hash,
                 )
             slot.scheduler = Scheduler(native_concurrency, method_index)
             self._slots[routing_name] = slot
@@ -283,13 +305,23 @@ class NativeServerBridge:
             raise KeyError(f'Name not registered: {name!r}')
         return slot.scheduler
 
-    def get_local_slot_info(self, name: str) -> tuple[object, Scheduler, str, str, str] | None:
+    def get_local_slot_info(self, name: str) -> tuple[object, Scheduler, CRMContract] | None:
         """Return Python dispatch glue for same-process fast-path calls."""
         with self._slots_lock:
             slot = self._slots.get(name)
         if slot is None:
             return None
-        return slot.direct_instance, slot.scheduler, slot.crm_ns, slot.crm_name, slot.crm_ver
+        return (
+            slot.direct_instance,
+            slot.scheduler,
+            CRMContract(
+                crm_ns=slot.crm_ns,
+                crm_name=slot.crm_name,
+                crm_ver=slot.crm_ver,
+                abi_hash=slot.abi_hash,
+                signature_hash=slot.signature_hash,
+            ),
+        )
 
     @property
     def names(self) -> list[str]:
@@ -359,13 +391,7 @@ class NativeServerBridge:
 
     @staticmethod
     def _discover_methods(crm_class: type) -> list[str]:
-        return sorted(
-            name
-            for name, _ in inspect.getmembers(
-                crm_class, predicate=inspect.isfunction,
-            )
-            if not name.startswith('_')
-        )
+        return rpc_method_names(crm_class)
 
     @staticmethod
     def _extract_namespace(crm_class: type) -> str:
@@ -373,15 +399,17 @@ class NativeServerBridge:
 
     @staticmethod
     def _extract_contract_identity(crm_class: type) -> tuple[str, str, str]:
-        crm_ns = getattr(crm_class, '__cc_namespace__', '')
-        crm_name = getattr(crm_class, '__cc_name__', '')
-        crm_ver = getattr(crm_class, '__cc_version__', '')
-        if crm_ns and crm_name and crm_ver:
-            return crm_ns, crm_name, crm_ver
-        raise ValueError(
-            f'{crm_class.__name__} is not a valid CRM contract class '
-            '(decorate it with @cc.crm).',
-        )
+        return crm_contract_identity(crm_class)
+
+    @staticmethod
+    def _route_contract_hashes(
+        crm_ns: str,
+        crm_name: str,
+        crm_ver: str,
+        methods: list[str],
+        crm_class: type,
+    ) -> tuple[str, str]:
+        return crm_route_contract_hashes(crm_ns, crm_name, crm_ver, methods, crm_class)
 
     # ------------------------------------------------------------------
     # Shutdown callback

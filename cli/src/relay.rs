@@ -35,10 +35,6 @@ pub struct RelayArgs {
     /// Validate and print relay configuration without starting the server.
     #[arg(long, hide = true)]
     pub dry_run: bool,
-
-    /// Skip IPC validation in /_register. Intended for relay control-plane tests only.
-    #[arg(long = "skip-ipc-validation", hide = true)]
-    pub skip_ipc_validation: bool,
 }
 
 pub fn parse_upstream(value: &str) -> Result<(String, String, String), String> {
@@ -77,11 +73,6 @@ pub fn run(args: RelayArgs) -> Result<()> {
             Some(args.seeds.clone())
         },
         idle_timeout_secs: args.idle_timeout_secs,
-        skip_ipc_validation: if args.skip_ipc_validation {
-            Some(true)
-        } else {
-            None
-        },
         ..Default::default()
     };
     let resolved = ConfigResolver::resolve_relay_server(overrides, ConfigSources::from_process())

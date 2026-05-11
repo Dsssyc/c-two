@@ -73,7 +73,7 @@ equivalent to a passing 3.10 check.
 
 | File | Description |
 |------|-------------|
-| `test_wire_v2.py` | Wire v2 codec — call/reply control encoding, default-route cache |
+| `test_wire_v2.py` | Wire v2 codec — call/reply control encoding and explicit route keys |
 | `test_scheduler.py` | Read/write concurrency scheduler for CRM method dispatch |
 | `test_concurrency.py` | Read/write lock semantics for CRM method scheduling |
 | `test_client_pool.py` | `ClientPool` — ref-counted IPC client management, grace period |

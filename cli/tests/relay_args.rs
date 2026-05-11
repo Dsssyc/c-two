@@ -116,12 +116,12 @@ fn relay_help_hides_skip_ipc_validation() {
 }
 
 #[test]
-fn relay_dry_run_accepts_hidden_skip_ipc_validation_for_tests() {
+fn relay_rejects_skip_ipc_validation_even_when_hidden() {
     let mut cmd = Command::cargo_bin("c3").unwrap();
     cmd.env("C2_ENV_FILE", "")
         .args(["relay", "--skip-ipc-validation", "--dry-run"])
         .assert()
-        .success();
+        .failure();
 }
 
 #[test]

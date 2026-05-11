@@ -8,6 +8,8 @@ pub struct RuntimeRouteSpec {
     pub crm_ns: String,
     pub crm_name: String,
     pub crm_ver: String,
+    pub abi_hash: String,
+    pub signature_hash: String,
     pub method_names: Vec<String>,
     pub access_map: HashMap<u16, AccessLevel>,
     pub concurrency_mode: ConcurrencyMode,

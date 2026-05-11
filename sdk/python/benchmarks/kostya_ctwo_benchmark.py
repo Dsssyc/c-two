@@ -26,6 +26,8 @@ import numpy as np
 
 import c_two as cc
 
+BENCH_PICKLE_PROTOCOL = pickle.HIGHEST_PROTOCOL
+
 # ---------------------------------------------------------------------------
 # fastdb is optional; only required for the fastdb-hold variant
 # ---------------------------------------------------------------------------
@@ -49,7 +51,13 @@ except ImportError:
 # Transferables — one per wire-format strategy
 # ---------------------------------------------------------------------------
 
-@cc.transferable
+@cc.transferable(
+    abi_schema=(
+        'c-two.bench.kostya.coord-records;'
+        f'pickle-protocol={BENCH_PICKLE_PROTOCOL};'
+        'shape=list[dict[row_id:int,x:float,y:float,z:float,name:str]]'
+    ),
+)
 class CoordRecords:
     """Pickle of list[dict] — kostya canonical, brutal on per-row overhead."""
     records: list
@@ -61,7 +69,14 @@ class CoordRecords:
         return CoordRecords(records=pickle.loads(buf))
 
 
-@cc.transferable
+@cc.transferable(
+    abi_schema=(
+        'c-two.bench.kostya.coord-arrays;'
+        f'pickle-protocol={BENCH_PICKLE_PROTOCOL};'
+        'fields=row_id:uint32-array,x:float64-array,y:float64-array,'
+        'z:float64-array,name:list[str]'
+    ),
+)
 class CoordArrays:
     """Pickle of 4 numpy arrays + 1 string list — numpy fast path."""
     row_id: np.ndarray
@@ -82,7 +97,13 @@ class CoordArrays:
 
 
 if HAS_FASTDB:
-    @cc.transferable
+    @cc.transferable(
+        abi_schema=(
+            'c-two.bench.kostya.coord-fastdb.raw-xbuffer;'
+            'schema=row_id:uint32,x:float64,y:float64,z:float64,name:string;'
+            'layout=fastdb4py-WxDatabase-xbuffer'
+        ),
+    )
     class CoordFastdb:
         """Wraps a fastdb ORM and exposes its raw columnar buffer.
 

@@ -141,6 +141,10 @@ pub struct CrmRoute {
     pub crm_name: String,
     /// CRM semantic version from the language-neutral contract descriptor.
     pub crm_ver: String,
+    /// Canonical ABI descriptor hash for the route contract.
+    pub abi_hash: String,
+    /// Canonical method signature descriptor hash for the route contract.
+    pub signature_hash: String,
     /// Concurrency scheduler for this CRM
     pub scheduler: Arc<Scheduler>,
     /// Callback to invoke CRM methods
@@ -163,46 +167,29 @@ impl CrmRoute {
 /// Route dispatcher — resolves (route_name, method_idx) to CrmRoute.
 pub struct Dispatcher {
     routes: HashMap<String, Arc<CrmRoute>>,
-    /// Default route name (first registered, used when client sends empty route key)
-    default_route: Option<String>,
 }
 
 impl Dispatcher {
     pub fn new() -> Self {
         Self {
             routes: HashMap::new(),
-            default_route: None,
         }
     }
 
     /// Register a CRM route.
     pub fn register(&mut self, route: CrmRoute) {
         let name = route.name.clone();
-        if self.default_route.is_none() {
-            self.default_route = Some(name.clone());
-        }
         self.routes.insert(name, Arc::new(route));
     }
 
     /// Remove a CRM route. Returns the removed route if it existed.
     pub fn unregister(&mut self, name: &str) -> Option<Arc<CrmRoute>> {
-        let removed = self.routes.remove(name);
-        if self.default_route.as_deref() == Some(name) {
-            self.default_route = self.routes.keys().next().cloned();
-        }
-        removed
+        self.routes.remove(name)
     }
 
-    /// Resolve a route by name. Empty name uses default route.
+    /// Resolve a route by explicit name.
     pub fn resolve(&self, route_name: &str) -> Option<Arc<CrmRoute>> {
-        if route_name.is_empty() {
-            self.default_route
-                .as_ref()
-                .and_then(|name| self.routes.get(name))
-                .cloned()
-        } else {
-            self.routes.get(route_name).cloned()
-        }
+        self.routes.get(route_name).cloned()
     }
 
     /// Get a snapshot of all routes (for handshake response).
@@ -253,6 +240,10 @@ mod tests {
             crm_ns: "test.grid".to_string(),
             crm_name: "Grid".to_string(),
             crm_ver: "0.1.0".to_string(),
+            abi_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_string(),
+            signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                .to_string(),
             scheduler: Arc::new(Scheduler::new(
                 ConcurrencyMode::ReadParallel,
                 HashMap::new(),
@@ -301,13 +292,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_name_resolves_to_default() {
+    fn empty_name_does_not_resolve_to_default() {
         let mut d = Dispatcher::new();
         d.register(make_route("first"));
         d.register(make_route("second"));
 
-        let route = d.resolve("").expect("empty name should resolve to default");
-        assert_eq!(route.name, "first");
+        assert!(d.resolve("").is_none());
     }
 
     #[test]
@@ -321,20 +311,16 @@ mod tests {
     }
 
     #[test]
-    fn unregister_default_promotes_next() {
+    fn unregister_does_not_create_default_route() {
         let mut d = Dispatcher::new();
         d.register(make_route("alpha"));
         d.register(make_route("beta"));
 
-        // default is "alpha" (first registered)
-        assert_eq!(d.resolve("").unwrap().name, "alpha");
-
         let removed = d.unregister("alpha");
         assert!(removed.is_some());
 
-        // default should now be "beta"
-        let route = d.resolve("").expect("should have a new default");
-        assert_eq!(route.name, "beta");
+        assert!(d.resolve("").is_none());
+        assert_eq!(d.resolve("beta").unwrap().name, "beta");
     }
 
     #[test]

@@ -42,7 +42,6 @@ The `cli` package builds a native `c3` binary. It owns runtime commands such as:
 
 - `c3 relay`
 - `c3 registry list-routes`
-- `c3 registry resolve`
 - `c3 registry peers`
 - future runtime diagnostics such as `c3 doctor`
 

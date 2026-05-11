@@ -53,6 +53,7 @@ from c_two._native import (  # noqa: F401 — re-export
     encode_client_handshake as _encode_client_hs,
     encode_server_handshake as _encode_server_hs,
     decode_handshake as _decode_hs,
+    contract_descriptor_sha256_hex,
 )
 
 # ---------------------------------------------------------------------------
@@ -76,9 +77,9 @@ def encode_client_handshake(
 ) -> bytes:
     """Encode client→server handshake.
 
-    Format (v9)::
+    Format (v10)::
 
-        [1B version=9]
+        [1B version=10]
         [1B prefix_len][prefix UTF-8]
         [2B seg_count LE]
         [per-segment: [4B size LE][1B name_len][name UTF-8]]
@@ -98,9 +99,9 @@ def encode_server_handshake(
 ) -> bytes:
     """Encode server→client handshake ACK.
 
-    Format (v9)::
+    Format (v10)::
 
-        [1B version=9]
+        [1B version=10]
         [1B prefix_len][prefix UTF-8]
         [2B seg_count LE]
         [per-segment: [4B size LE][1B name_len][name UTF-8]]
@@ -113,6 +114,8 @@ def encode_server_handshake(
             [1B crm_ns_len][crm_ns UTF-8]
             [1B crm_name_len][crm_name UTF-8]
             [1B crm_ver_len][crm_ver UTF-8]
+            [1B abi_hash_len][abi_hash UTF-8]
+            [1B signature_hash_len][signature_hash UTF-8]
             [2B method_count LE]
             [per-method: [1B name_len][method_name UTF-8][2B method_idx LE]]
         ]

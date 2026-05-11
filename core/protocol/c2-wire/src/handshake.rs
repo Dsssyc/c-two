@@ -3,7 +3,7 @@
 //! ## Client → Server
 //!
 //! ```text
-//! [1B version=9]
+//! [1B version=10]
 //! [1B prefix_len][prefix UTF-8]
 //! [2B seg_count LE]
 //! [per-segment: [4B size LE][1B name_len][name UTF-8]]
@@ -23,6 +23,8 @@
 //!     [1B crm_ns_len][crm_ns UTF-8]
 //!     [1B crm_name_len][crm_name UTF-8]
 //!     [1B crm_ver_len][crm_ver UTF-8]
+//!     [1B abi_hash_len][abi_hash UTF-8]
+//!     [1B signature_hash_len][signature_hash UTF-8]
 //!     [2B method_count LE]
 //!     [per-method: [1B name_len][method_name UTF-8][2B method_idx LE]]
 //! ]
@@ -32,7 +34,7 @@ use crate::control::EncodeError;
 use crate::frame::DecodeError;
 
 /// Handshake version number.
-pub const HANDSHAKE_VERSION: u8 = 9;
+pub const HANDSHAKE_VERSION: u8 = 10;
 
 // ── Capability flags (2 bytes) ───────────────────────────────────────────
 
@@ -50,7 +52,7 @@ pub const CAP_CHUNKED: u16 = 1 << 2;
 pub const MAX_SEGMENTS: usize = 16;
 pub const MAX_ROUTES: usize = 64;
 pub const MAX_METHODS: usize = 256;
-pub const MAX_HANDSHAKE_NAME_BYTES: usize = u8::MAX as usize;
+const MAX_HANDSHAKE_NAME_BYTES: usize = c2_contract::MAX_WIRE_TEXT_BYTES;
 
 // ── Data types ───────────────────────────────────────────────────────────
 
@@ -68,6 +70,8 @@ pub struct RouteInfo {
     pub crm_ns: String,
     pub crm_name: String,
     pub crm_ver: String,
+    pub abi_hash: String,
+    pub signature_hash: String,
     pub methods: Vec<MethodEntry>,
 }
 
@@ -163,6 +167,8 @@ pub fn encode_server_handshake(
                 reason,
             }
         })?;
+        validate_contract_hash("abi_hash", &route.abi_hash)?;
+        validate_contract_hash("signature_hash", &route.signature_hash)?;
         if route.methods.len() > MAX_METHODS {
             return Err(EncodeError::FieldTooLong {
                 field: "method count",
@@ -182,6 +188,12 @@ pub fn encode_server_handshake(
         let crm_ver_b = route.crm_ver.as_bytes();
         buf.push(crm_ver_b.len() as u8);
         buf.extend_from_slice(crm_ver_b);
+        let abi_hash_b = route.abi_hash.as_bytes();
+        buf.push(abi_hash_b.len() as u8);
+        buf.extend_from_slice(abi_hash_b);
+        let signature_hash_b = route.signature_hash.as_bytes();
+        buf.push(signature_hash_b.len() as u8);
+        buf.extend_from_slice(signature_hash_b);
         buf.extend_from_slice(&(route.methods.len() as u16).to_le_bytes());
         for m in &route.methods {
             validate_name_len("method name", &m.name)?;
@@ -194,7 +206,7 @@ pub fn encode_server_handshake(
     Ok(buf)
 }
 
-pub fn validate_name_len(field: &'static str, value: &str) -> Result<(), EncodeError> {
+fn validate_name_len(field: &'static str, value: &str) -> Result<(), EncodeError> {
     let actual = value.as_bytes().len();
     if actual > MAX_HANDSHAKE_NAME_BYTES {
         return Err(EncodeError::FieldTooLong {
@@ -206,34 +218,17 @@ pub fn validate_name_len(field: &'static str, value: &str) -> Result<(), EncodeE
     Ok(())
 }
 
-pub fn validate_crm_tag(crm_ns: &str, crm_name: &str, crm_ver: &str) -> Result<(), String> {
-    validate_crm_tag_field("crm namespace", crm_ns)?;
-    validate_crm_tag_field("crm name", crm_name)?;
-    validate_crm_tag_field("crm version", crm_ver)?;
-    Ok(())
+fn validate_contract_hash(field: &'static str, value: &str) -> Result<(), EncodeError> {
+    validate_contract_hash_text(field, value)
+        .map_err(|reason| EncodeError::InvalidText { field, reason })
 }
 
-pub fn validate_crm_tag_field(label: &'static str, value: &str) -> Result<(), String> {
-    if value.is_empty() {
-        return Err(format!("{label} cannot be empty"));
-    }
-    if value.as_bytes().len() > MAX_HANDSHAKE_NAME_BYTES {
-        return Err(format!(
-            "{label} cannot exceed {MAX_HANDSHAKE_NAME_BYTES} bytes"
-        ));
-    }
-    if value.trim() != value {
-        return Err(format!(
-            "{label} cannot contain leading or trailing whitespace"
-        ));
-    }
-    if value.chars().any(char::is_control) {
-        return Err(format!("{label} cannot contain control characters"));
-    }
-    if value.contains('/') || value.contains('\\') {
-        return Err(format!("{label} cannot contain path or tag separators"));
-    }
-    Ok(())
+fn validate_contract_hash_text(_field: &'static str, value: &str) -> Result<(), String> {
+    c2_contract::validate_contract_hash(_field, value).map_err(|err| err.to_string())
+}
+
+fn validate_crm_tag(crm_ns: &str, crm_name: &str, crm_ver: &str) -> Result<(), String> {
+    c2_contract::validate_crm_tag(crm_ns, crm_name, crm_ver).map_err(|err| err.to_string())
 }
 
 // ── Decoding (both directions) ───────────────────────────────────────────
@@ -366,6 +361,32 @@ pub fn decode_handshake(buf: &[u8]) -> Result<Handshake, DecodeError> {
             }
         })?;
 
+        check_remaining(buf, off, 1, "abi_hash length")?;
+        let abi_hash_len = buf[off] as usize;
+        off += 1;
+        check_remaining(buf, off, abi_hash_len, "abi_hash")?;
+        let abi_hash = read_str(buf, off, abi_hash_len)?;
+        off += abi_hash_len;
+        validate_contract_hash_text("abi_hash", &abi_hash).map_err(|reason| {
+            DecodeError::InvalidText {
+                field: "abi_hash",
+                reason,
+            }
+        })?;
+
+        check_remaining(buf, off, 1, "signature_hash length")?;
+        let signature_hash_len = buf[off] as usize;
+        off += 1;
+        check_remaining(buf, off, signature_hash_len, "signature_hash")?;
+        let signature_hash = read_str(buf, off, signature_hash_len)?;
+        off += signature_hash_len;
+        validate_contract_hash_text("signature_hash", &signature_hash).map_err(|reason| {
+            DecodeError::InvalidText {
+                field: "signature_hash",
+                reason,
+            }
+        })?;
+
         check_remaining(buf, off, 2, "method count")?;
         let m_count = read_u16(buf, off) as usize;
         off += 2;
@@ -396,6 +417,8 @@ pub fn decode_handshake(buf: &[u8]) -> Result<Handshake, DecodeError> {
             crm_ns,
             crm_name,
             crm_ver,
+            abi_hash,
+            signature_hash,
             methods,
         });
     }

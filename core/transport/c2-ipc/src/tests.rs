@@ -38,7 +38,7 @@ mod client_tests {
     #[test]
     fn encode_v2_inline_reply() {
         // [16B header (flags=RESPONSE|REPLY_V2)] [1B status=OK] [data]
-        let ctrl = encode_reply_control(&ReplyControl::Success);
+        let ctrl = try_encode_reply_control(&ReplyControl::Success).unwrap();
         let data = b"result";
         let mut payload = Vec::new();
         payload.extend_from_slice(&ctrl);
@@ -59,7 +59,7 @@ mod client_tests {
     #[test]
     fn encode_v2_error_reply() {
         let err = b"3:test error".to_vec();
-        let ctrl = encode_reply_control(&ReplyControl::Error(err.clone()));
+        let ctrl = try_encode_reply_control(&ReplyControl::Error(err.clone())).unwrap();
         let frame_bytes =
             frame::encode_frame(42, flags::FLAG_RESPONSE | flags::FLAG_REPLY_V2, &ctrl);
 

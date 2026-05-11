@@ -112,6 +112,8 @@ impl RelayState {
         crm_ns: String,
         crm_name: String,
         crm_ver: String,
+        abi_hash: String,
+        signature_hash: String,
         client: Arc<IpcClient>,
         replacement: Option<OwnerReplacementToken>,
     ) -> RegisterCommitResult {
@@ -132,6 +134,8 @@ impl RelayState {
             crm_ns,
             crm_name,
             crm_ver,
+            abi_hash,
+            signature_hash,
             client,
             replacement,
         }) {
@@ -220,20 +224,16 @@ impl RelayState {
 
     // -- Route-only operations --
 
+    #[cfg(test)]
     pub fn resolve(&self, name: &str) -> Vec<RouteInfo> {
         self.route_table.read().resolve(name)
     }
 
     pub fn resolve_matching(
         &self,
-        name: &str,
-        crm_ns: &str,
-        crm_name: &str,
-        crm_ver: &str,
+        expected: &c2_contract::ExpectedRouteContract,
     ) -> Vec<RouteInfo> {
-        self.route_table
-            .read()
-            .resolve_matching(name, crm_ns, crm_name, crm_ver)
+        self.route_table.read().resolve_matching(expected)
     }
 
     pub fn route_names(&self) -> Vec<String> {
@@ -289,12 +289,15 @@ impl RelayState {
                             expected.server_instance_id.as_deref().unwrap_or(""),
                         )));
                     }
-                    if let Err(err) = client.validate_route_contract(
-                        &route_name,
-                        &expected.crm_ns,
-                        &expected.crm_name,
-                        &expected.crm_ver,
-                    ) {
+                    let expected_contract = c2_contract::ExpectedRouteContract {
+                        route_name: route_name.clone(),
+                        crm_ns: expected.crm_ns.clone(),
+                        crm_name: expected.crm_name.clone(),
+                        crm_ver: expected.crm_ver.clone(),
+                        abi_hash: expected.abi_hash.clone(),
+                        signature_hash: expected.signature_hash.clone(),
+                    };
+                    if let Err(err) = client.validate_route_contract(&expected_contract) {
                         client.close().await;
                         return Err(err);
                     }
@@ -451,11 +454,11 @@ impl RelayState {
         self.route_table.read().full_snapshot()
     }
 
-    pub fn merge_snapshot(&self, sync: FullSync) {
-        self.route_table.write().merge_snapshot(sync);
+    pub fn merge_snapshot(&self, sync: ValidatedFullSync) {
+        self.route_table.write().merge_validated_snapshot(sync);
     }
 
-    pub fn route_digest(&self) -> HashMap<(String, String, bool), u64> {
+    pub fn route_digest(&self) -> HashMap<(String, String, bool), RouteDigestHash> {
         self.route_table.read().route_digest()
     }
 
@@ -506,6 +509,9 @@ mod tests {
     const TEST_CRM_NS: &str = "test.relay";
     const TEST_CRM_NAME: &str = "RelayGrid";
     const TEST_CRM_VER: &str = "0.1.0";
+    const TEST_ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const TEST_SIGNATURE_HASH: &str =
+        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
 
     struct NullDisseminator;
     impl crate::relay::disseminator::Disseminator for NullDisseminator {
@@ -564,6 +570,8 @@ mod tests {
             "test.echo",
             "Echo",
             "0.1.0",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
             client,
         )
     }
@@ -577,6 +585,8 @@ mod tests {
         crm_ns: &str,
         crm_name: &str,
         crm_ver: &str,
+        abi_hash: &str,
+        signature_hash: &str,
         client: Arc<IpcClient>,
     ) -> RouteEntry {
         match state.commit_register_upstream(
@@ -587,6 +597,8 @@ mod tests {
             crm_ns.to_string(),
             crm_name.to_string(),
             crm_ver.to_string(),
+            abi_hash.to_string(),
+            signature_hash.to_string(),
             client,
             None,
         ) {
@@ -666,6 +678,8 @@ mod tests {
             "test.mesh".into(),
             "Grid\nInjected".into(),
             "0.1.0".into(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
             client,
             None,
         );
@@ -689,6 +703,8 @@ mod tests {
             "test.mesh".into(),
             "Grid".into(),
             "0.1.0".into(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
             client,
             None,
         );
@@ -763,6 +779,8 @@ mod tests {
                 crm_ns: "ns".into(),
                 crm_name: "Grid".into(),
                 crm_ver: "0.1.0".into(),
+                abi_hash: TEST_ABI_HASH.into(),
+                signature_hash: TEST_SIGNATURE_HASH.into(),
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -795,6 +813,8 @@ mod tests {
                 crm_ns: "test.ns".into(),
                 crm_name: "Grid".into(),
                 crm_ver: "0.1.0".into(),
+                abi_hash: TEST_ABI_HASH.into(),
+                signature_hash: TEST_SIGNATURE_HASH.into(),
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -856,6 +876,8 @@ mod tests {
                 crm_ns: TEST_CRM_NS.to_string(),
                 crm_name: TEST_CRM_NAME.to_string(),
                 crm_ver: TEST_CRM_VER.to_string(),
+                abi_hash: TEST_ABI_HASH.to_string(),
+                signature_hash: TEST_SIGNATURE_HASH.to_string(),
                 locality: Locality::Local,
                 registered_at: 1000.0,
             });
@@ -897,6 +919,8 @@ mod tests {
             TEST_CRM_NS.to_string(),
             TEST_CRM_NAME.to_string(),
             TEST_CRM_VER.to_string(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
             first,
             None,
         );
@@ -913,6 +937,8 @@ mod tests {
             TEST_CRM_NS.to_string(),
             TEST_CRM_NAME.to_string(),
             TEST_CRM_VER.to_string(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
             second,
             None,
         );
@@ -944,6 +970,8 @@ mod tests {
             TEST_CRM_NS.to_string(),
             TEST_CRM_NAME.to_string(),
             TEST_CRM_VER.to_string(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
             racer,
             None,
         );
@@ -962,6 +990,8 @@ mod tests {
             TEST_CRM_NS.to_string(),
             TEST_CRM_NAME.to_string(),
             TEST_CRM_VER.to_string(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
             candidate,
             None,
         );
@@ -980,7 +1010,19 @@ mod tests {
         let state = RelayState::new(test_config(), null_disseminator());
         let old = Arc::new(IpcClient::new("ipc://old"));
         old.force_connected(true);
-        register_local(&state, "grid", "server-old", "ipc://old", old);
+        register_local_with_contract(
+            &state,
+            "grid",
+            "server-old",
+            "server-old-instance",
+            "ipc://old",
+            TEST_CRM_NS,
+            TEST_CRM_NAME,
+            TEST_CRM_VER,
+            TEST_ABI_HASH,
+            TEST_SIGNATURE_HASH,
+            old,
+        );
         let old_token = state.owner_token("grid").unwrap();
         state.evict_connection("grid");
 
@@ -994,6 +1036,8 @@ mod tests {
             TEST_CRM_NS.to_string(),
             TEST_CRM_NAME.to_string(),
             TEST_CRM_VER.to_string(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
             replacement,
             Some(replacement_token(
                 "grid",
@@ -1041,6 +1085,8 @@ mod tests {
             TEST_CRM_NS.to_string(),
             TEST_CRM_NAME.to_string(),
             TEST_CRM_VER.to_string(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
             stale_replacement,
             Some(replacement_token(
                 "grid",
@@ -1066,7 +1112,19 @@ mod tests {
         let state = RelayState::new(test_config(), null_disseminator());
         let old = Arc::new(IpcClient::new("ipc://old"));
         old.force_connected(true);
-        register_local(&state, "grid", "server-old", "ipc://old", old);
+        register_local_with_contract(
+            &state,
+            "grid",
+            "server-old",
+            "server-old-instance",
+            "ipc://old",
+            TEST_CRM_NS,
+            TEST_CRM_NAME,
+            TEST_CRM_VER,
+            TEST_ABI_HASH,
+            TEST_SIGNATURE_HASH,
+            old,
+        );
         let old_token = state.owner_token("grid").unwrap();
 
         let same_owner = Arc::new(IpcClient::new("ipc://old"));
@@ -1079,6 +1137,8 @@ mod tests {
             TEST_CRM_NS.to_string(),
             TEST_CRM_NAME.to_string(),
             TEST_CRM_VER.to_string(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
             same_owner,
             None,
         );
@@ -1098,6 +1158,8 @@ mod tests {
             TEST_CRM_NS.to_string(),
             TEST_CRM_NAME.to_string(),
             TEST_CRM_VER.to_string(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
             replacement,
             Some(replacement_token(
                 "grid",
@@ -1144,6 +1206,8 @@ mod tests {
             TEST_CRM_NS.to_string(),
             TEST_CRM_NAME.to_string(),
             TEST_CRM_VER.to_string(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
             replacement,
             Some(replacement_token(
                 "grid",
@@ -1171,12 +1235,13 @@ mod tests {
         old.force_connected(true);
         register_local(&state, "grid", "server-old", "ipc://old", old);
 
-        let before_snapshot = serde_json::to_value(state.full_snapshot()).unwrap();
+        let before_snapshot =
+            serde_json::to_value(FullSyncSnapshot::from_internal(state.full_snapshot())).unwrap();
         let before_digest = state.route_digest();
         assert!(state.conn_pool.renew_current_owner_lease("grid"));
 
         assert_eq!(
-            serde_json::to_value(state.full_snapshot()).unwrap(),
+            serde_json::to_value(FullSyncSnapshot::from_internal(state.full_snapshot())).unwrap(),
             before_snapshot
         );
         assert_eq!(state.route_digest(), before_digest);
@@ -1196,6 +1261,8 @@ mod tests {
             "test.old",
             "OldGrid",
             "0.1.0",
+            TEST_ABI_HASH,
+            TEST_SIGNATURE_HASH,
             old,
         );
         state.evict_connection("grid");
@@ -1215,6 +1282,8 @@ mod tests {
             "test.new",
             "NewGrid",
             "0.1.0",
+            TEST_ABI_HASH,
+            TEST_SIGNATURE_HASH,
             new_same_address,
         );
 
@@ -1228,6 +1297,8 @@ mod tests {
             crm_ns: "test.old".into(),
             crm_name: "OldGrid".into(),
             crm_ver: "0.1.0".into(),
+            abi_hash: TEST_ABI_HASH.into(),
+            signature_hash: TEST_SIGNATURE_HASH.into(),
             locality: Locality::Local,
             registered_at: 0.0,
         };
@@ -1265,6 +1336,8 @@ mod tests {
             TEST_CRM_NS.to_string(),
             TEST_CRM_NAME.to_string(),
             TEST_CRM_VER.to_string(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
             replacement,
             Some(replacement_token(
                 "grid",
@@ -1293,7 +1366,19 @@ mod tests {
         let state = RelayState::new(test_config(), null_disseminator());
         let original = Arc::new(IpcClient::new("ipc://grid"));
         original.force_connected(true);
-        register_local(&state, "grid", "server-grid", "ipc://grid", original);
+        register_local_with_contract(
+            &state,
+            "grid",
+            "server-grid",
+            "server-grid-instance",
+            "ipc://grid",
+            TEST_CRM_NS,
+            TEST_CRM_NAME,
+            TEST_CRM_VER,
+            TEST_ABI_HASH,
+            TEST_SIGNATURE_HASH,
+            original,
+        );
         state.evict_connection("grid");
 
         let ignored = Arc::new(IpcClient::new("ipc://grid"));
@@ -1306,6 +1391,8 @@ mod tests {
             TEST_CRM_NS.to_string(),
             TEST_CRM_NAME.to_string(),
             TEST_CRM_VER.to_string(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
             ignored,
             None,
         );
@@ -1315,6 +1402,40 @@ mod tests {
             state.conn_pool.lookup("grid"),
             CachedClient::Evicted { .. }
         ));
+    }
+
+    #[test]
+    fn same_owner_registration_rejects_contract_change_without_new_instance() {
+        let state = RelayState::new(test_config(), null_disseminator());
+        let original = Arc::new(IpcClient::new("ipc://grid"));
+        original.force_connected(true);
+        register_local(&state, "grid", "server-grid", "ipc://grid", original);
+
+        let changed = Arc::new(IpcClient::new("ipc://grid"));
+        changed.force_connected(true);
+        let result = state.commit_register_upstream(
+            "grid".into(),
+            "server-grid".into(),
+            "server-grid-instance".into(),
+            "ipc://grid".into(),
+            "test.other".into(),
+            "OtherGrid".into(),
+            "0.1.0".into(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
+            changed,
+            None,
+        );
+
+        assert!(matches!(
+            result,
+            RegisterCommitResult::Invalid { reason }
+                if reason.contains("CRM contract mismatch")
+        ));
+        let routes = state.resolve("grid");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].crm_ns, "test.echo");
+        assert_eq!(routes[0].crm_name, "Echo");
     }
 
     #[test]
@@ -1351,6 +1472,8 @@ mod tests {
             TEST_CRM_NS.to_string(),
             TEST_CRM_NAME.to_string(),
             TEST_CRM_VER.to_string(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
             replacement,
             None,
         );
@@ -1384,6 +1507,8 @@ mod tests {
             TEST_CRM_NS.to_string(),
             TEST_CRM_NAME.to_string(),
             TEST_CRM_VER.to_string(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
             moved,
             None,
         );
@@ -1420,7 +1545,19 @@ mod tests {
         let state = RelayState::new(test_config(), null_disseminator());
         let original = Arc::new(IpcClient::new("ipc://grid"));
         original.force_connected(true);
-        register_local(&state, "grid", "server-grid", "ipc://grid", original);
+        register_local_with_contract(
+            &state,
+            "grid",
+            "server-grid",
+            "server-grid-instance",
+            "ipc://grid",
+            TEST_CRM_NS,
+            TEST_CRM_NAME,
+            TEST_CRM_VER,
+            TEST_ABI_HASH,
+            TEST_SIGNATURE_HASH,
+            original,
+        );
         state.evict_connection("grid");
 
         let replacement = Arc::new(IpcClient::new("ipc://grid"));
@@ -1433,6 +1570,8 @@ mod tests {
             TEST_CRM_NS.to_string(),
             TEST_CRM_NAME.to_string(),
             TEST_CRM_VER.to_string(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
             replacement,
             None,
         );

@@ -1,7 +1,7 @@
 """Client — discovers and uses the Grid resource via relay.
 
-Connects to the Grid CRM **by name only**. The relay resolves the name
-to the CRM process's IPC address automatically.
+Connects to the Grid CRM through the relay using the routing name plus
+the Grid CRM contract fingerprint.
 
 Run (after starting relay.py and resource.py):
     uv run python examples/python/relay_mesh/client.py
@@ -26,8 +26,8 @@ def main():
     cc.set_relay_anchor(RELAY_URL)
 
     # ── Connect by name ──────────────────────────────────────────────
-    # No IPC address needed — the relay resolves 'grid' to the right
-    # CRM process automatically.
+    # No IPC address needed — the SDK asks the relay for a route matching
+    # both 'grid' and the Grid CRM contract fingerprint.
     grid = cc.connect(Grid, name='grid')
     print(f'Connected to Grid (mode: {grid.client._mode})\n')
 

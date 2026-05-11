@@ -17,11 +17,12 @@ use axum::{
 
 use crate::relay::authority::{
     ControlError, RegisterPreparation, RouteAuthority, attest_ipc_route_contract,
+    read_ipc_route_contract,
 };
 use crate::relay::conn_pool::UpstreamLease;
 use crate::relay::gossip::{broadcast_route_announce, broadcast_route_withdraw};
 use crate::relay::peer_handlers;
-use crate::relay::route_table::{valid_crm_tag, valid_route_name};
+use crate::relay::route_table::valid_route_name;
 use crate::relay::state::{RegisterCommitResult, RelayState, UpstreamAcquireError};
 use crate::relay::types::RouteEntry;
 use c2_ipc::IpcClient;
@@ -30,6 +31,8 @@ const CONTROL_BODY_LIMIT_BYTES: usize = 64 * 1024;
 const EXPECTED_CRM_NS_HEADER: &str = "x-c2-expected-crm-ns";
 const EXPECTED_CRM_NAME_HEADER: &str = "x-c2-expected-crm-name";
 const EXPECTED_CRM_VER_HEADER: &str = "x-c2-expected-crm-ver";
+const EXPECTED_ABI_HASH_HEADER: &str = "x-c2-expected-abi-hash";
+const EXPECTED_SIGNATURE_HASH_HEADER: &str = "x-c2-expected-signature-hash";
 
 enum RequestClient {
     Ready {
@@ -72,37 +75,13 @@ fn duplicate_route_response(name: &str, existing_address: &str) -> Response {
         .into_response()
 }
 
-fn claimed_contract_mismatch_reason(
-    route_name: &str,
-    claimed_crm_ns: &str,
-    claimed_crm_name: &str,
-    claimed_crm_ver: &str,
-    actual_crm_ns: &str,
-    actual_crm_name: &str,
-    actual_crm_ver: &str,
-) -> Option<String> {
-    if (!claimed_crm_ns.is_empty() && claimed_crm_ns != actual_crm_ns)
-        || (!claimed_crm_name.is_empty() && claimed_crm_name != actual_crm_name)
-        || (!claimed_crm_ver.is_empty() && claimed_crm_ver != actual_crm_ver)
-    {
-        return Some(format!(
-            "IPC upstream route '{route_name}' CRM contract mismatch: claimed {claimed_crm_ns}/{claimed_crm_name}/{claimed_crm_ver}, got {actual_crm_ns}/{actual_crm_name}/{actual_crm_ver}",
-        ));
-    }
-    None
-}
-
 #[derive(Debug, Default, serde::Deserialize)]
 struct ResolveQuery {
     crm_ns: Option<String>,
     crm_name: Option<String>,
     crm_ver: Option<String>,
-}
-
-struct ExpectedCrmTag {
-    crm_ns: String,
-    crm_name: String,
-    crm_ver: String,
+    abi_hash: Option<String>,
+    signature_hash: Option<String>,
 }
 
 #[cfg(test)]
@@ -141,7 +120,10 @@ fn run_data_plane_after_precheck_hook(route_name: &str) {
     }
 }
 
-fn expected_crm_from_headers(headers: &HeaderMap) -> Result<Option<ExpectedCrmTag>, Response> {
+fn expected_crm_from_headers(
+    route_name: &str,
+    headers: &HeaderMap,
+) -> Result<c2_contract::ExpectedRouteContract, Response> {
     let crm_ns = headers
         .get(EXPECTED_CRM_NS_HEADER)
         .map(|value| value.to_str().map(str::to_string));
@@ -151,27 +133,54 @@ fn expected_crm_from_headers(headers: &HeaderMap) -> Result<Option<ExpectedCrmTa
     let crm_ver = headers
         .get(EXPECTED_CRM_VER_HEADER)
         .map(|value| value.to_str().map(str::to_string));
+    let abi_hash = headers
+        .get(EXPECTED_ABI_HASH_HEADER)
+        .map(|value| value.to_str().map(str::to_string));
+    let signature_hash = headers
+        .get(EXPECTED_SIGNATURE_HASH_HEADER)
+        .map(|value| value.to_str().map(str::to_string));
 
-    match (crm_ns, crm_name, crm_ver) {
-        (None, None, None) => Ok(None),
-        (Some(Ok(crm_ns)), Some(Ok(crm_name)), Some(Ok(crm_ver))) => {
-            if !valid_crm_tag(&crm_ns, &crm_name, &crm_ver) {
+    match (crm_ns, crm_name, crm_ver, abi_hash, signature_hash) {
+        (None, None, None, None, None) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "InvalidCrmTag",
+                "message": "expected CRM headers and hash headers are required",
+            })),
+        )
+            .into_response()),
+        (
+            Some(Ok(crm_ns)),
+            Some(Ok(crm_name)),
+            Some(Ok(crm_ver)),
+            Some(Ok(abi_hash)),
+            Some(Ok(signature_hash)),
+        ) => {
+            let expected = c2_contract::ExpectedRouteContract {
+                route_name: route_name.to_string(),
+                crm_ns,
+                crm_name,
+                crm_ver,
+                abi_hash,
+                signature_hash,
+            };
+            if let Err(err) = c2_contract::validate_expected_route_contract(&expected) {
                 return Err((
                     StatusCode::BAD_REQUEST,
                     Json(serde_json::json!({
                         "error": "InvalidCrmTag",
-                        "message": "expected CRM headers must be non-empty, control-character-free, and fit the IPC handshake field limit",
+                        "message": err.to_string(),
                     })),
                 )
                     .into_response());
             }
-            Ok(Some(ExpectedCrmTag {
-                crm_ns,
-                crm_name,
-                crm_ver,
-            }))
+            Ok(expected)
         }
-        (Some(Err(_)), _, _) | (_, Some(Err(_)), _) | (_, _, Some(Err(_))) => Err((
+        (Some(Err(_)), _, _, _, _)
+        | (_, Some(Err(_)), _, _, _)
+        | (_, _, Some(Err(_)), _, _)
+        | (_, _, _, Some(Err(_)), _)
+        | (_, _, _, _, Some(Err(_))) => Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": "InvalidCrmTag",
@@ -183,7 +192,7 @@ fn expected_crm_from_headers(headers: &HeaderMap) -> Result<Option<ExpectedCrmTa
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": "InvalidCrmTag",
-                "message": "x-c2-expected-crm-ns, x-c2-expected-crm-name, and x-c2-expected-crm-ver must be supplied together",
+                "message": "expected CRM headers and hash headers must be supplied together",
             })),
         )
             .into_response()),
@@ -202,20 +211,86 @@ fn crm_contract_mismatch_response(route_name: &str) -> Response {
         .into_response()
 }
 
-fn route_matches_expected_crm(route: &RouteEntry, expected: &ExpectedCrmTag) -> bool {
-    route.crm_ns == expected.crm_ns
+fn route_matches_expected_crm(
+    route: &RouteEntry,
+    expected: &c2_contract::ExpectedRouteContract,
+) -> bool {
+    route.name == expected.route_name
+        && route.crm_ns == expected.crm_ns
         && route.crm_name == expected.crm_name
         && route.crm_ver == expected.crm_ver
+        && route.abi_hash == expected.abi_hash
+        && route.signature_hash == expected.signature_hash
+}
+
+fn register_contract_claim_from_body(
+    route_name: &str,
+    body: &serde_json::Value,
+) -> Result<Option<c2_contract::ExpectedRouteContract>, Response> {
+    let crm_ns = register_body_string_field(body, "crm_ns")?;
+    let crm_name = register_body_string_field(body, "crm_name")?;
+    let crm_ver = register_body_string_field(body, "crm_ver")?;
+    let abi_hash = register_body_string_field(body, "abi_hash")?;
+    let signature_hash = register_body_string_field(body, "signature_hash")?;
+
+    match (crm_ns, crm_name, crm_ver, abi_hash, signature_hash) {
+        (None, None, None, None, None) => Ok(None),
+        (Some(crm_ns), Some(crm_name), Some(crm_ver), Some(abi_hash), Some(signature_hash)) => {
+            let claimed = c2_contract::ExpectedRouteContract {
+                route_name: route_name.to_string(),
+                crm_ns: crm_ns.to_string(),
+                crm_name: crm_name.to_string(),
+                crm_ver: crm_ver.to_string(),
+                abi_hash: abi_hash.to_string(),
+                signature_hash: signature_hash.to_string(),
+            };
+            if let Err(err) = c2_contract::validate_expected_route_contract(&claimed) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "InvalidCrmTag",
+                        "message": err.to_string(),
+                    })),
+                )
+                    .into_response());
+            }
+            Ok(Some(claimed))
+        }
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "InvalidCrmTag",
+                "message": "crm_ns, crm_name, crm_ver, abi_hash, and signature_hash must be supplied together",
+            })),
+        )
+            .into_response()),
+    }
+}
+
+fn register_body_string_field<'a>(
+    body: &'a serde_json::Value,
+    field: &'static str,
+) -> Result<Option<&'a str>, Response> {
+    match body.get(field) {
+        Some(value) => value.as_str().map(Some).ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "InvalidCrmTag",
+                    "message": format!("{field} must be a string"),
+                })),
+            )
+                .into_response()
+        }),
+        None => Ok(None),
+    }
 }
 
 fn validate_expected_crm_for_route(
     state: &RelayState,
     route_name: &str,
-    expected: &Option<ExpectedCrmTag>,
+    expected: &c2_contract::ExpectedRouteContract,
 ) -> Result<(), Response> {
-    let Some(expected) = expected else {
-        return Ok(());
-    };
     let Some(route) = state.local_route(route_name) else {
         return Err((
             StatusCode::NOT_FOUND,
@@ -236,11 +311,8 @@ fn validate_expected_crm_for_route(
 fn validate_expected_crm_for_acquired_route(
     route_name: &str,
     route: &RouteEntry,
-    expected: &Option<ExpectedCrmTag>,
+    expected: &c2_contract::ExpectedRouteContract,
 ) -> Result<(), Response> {
-    let Some(expected) = expected else {
-        return Ok(());
-    };
     if route_matches_expected_crm(route, expected) {
         Ok(())
     } else {
@@ -284,7 +356,9 @@ pub fn build_router(state: Arc<RelayState>) -> Router {
 
 /// `POST /_register` — register a new upstream CRM.
 ///
-/// Body: `{"name": "grid", "server_id": "...", "server_instance_id": "...", "address": "ipc://...", "crm_ns": "...", "crm_name": "...", "crm_ver": "..."}`
+/// Body: `{"name": "grid", "server_id": "...", "server_instance_id": "...", "address": "ipc://...", "crm_ns": "...", "crm_name": "...", "crm_ver": "...", "abi_hash": "...", "signature_hash": "..."}`
+/// The CRM contract is attested against the upstream IPC handshake. Optional
+/// claimed contract fields, when present, must match that handshake exactly.
 /// Returns: 201 on success, 409 on duplicate, 502 on connection failure.
 async fn handle_register(
     State(state): State<Arc<RelayState>>,
@@ -308,34 +382,10 @@ async fn handle_register(
             return (StatusCode::BAD_REQUEST, "Missing \"server_instance_id\"").into_response();
         }
     };
-    let crm_ns = body
-        .get("crm_ns")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let crm_name = body
-        .get("crm_name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let crm_ver = body
-        .get("crm_ver")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let claimed_has_crm_tag = !crm_ns.is_empty() || !crm_name.is_empty() || !crm_ver.is_empty();
-    if (claimed_has_crm_tag || state.config().skip_ipc_validation)
-        && !valid_crm_tag(&crm_ns, &crm_name, &crm_ver)
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "InvalidCrmTag",
-                "message": "crm_ns, crm_name, and crm_ver must be non-empty, control-character-free, separator-free, and fit the IPC handshake field limit",
-            })),
-        )
-            .into_response();
-    }
+    let claimed_contract = match register_contract_claim_from_body(&name, &body) {
+        Ok(claim) => claim,
+        Err(response) => return response,
+    };
 
     if let Err(ControlError::InvalidServerInstanceId { reason }) =
         RouteAuthority::new(&state).validate_server_instance_id(&server_instance_id)
@@ -358,26 +408,7 @@ async fn handle_register(
                 evidence: r.evidence,
             })
         }
-        Ok(RegisterPreparation::SameOwner) => {
-            if let Some(existing) = state.local_route(&name) {
-                if let Some(reason) = claimed_contract_mismatch_reason(
-                    &name,
-                    &crm_ns,
-                    &crm_name,
-                    &crm_ver,
-                    &existing.crm_ns,
-                    &existing.crm_name,
-                    &existing.crm_ver,
-                ) {
-                    return (StatusCode::BAD_REQUEST, reason).into_response();
-                }
-            }
-            return (
-                StatusCode::OK,
-                Json(serde_json::json!({"registered": name})),
-            )
-                .into_response();
-        }
+        Ok(RegisterPreparation::SameOwner) => None,
         Ok(RegisterPreparation::DuplicateAlive { existing_address })
         | Err(ControlError::AddressMismatch { existing_address })
         | Err(ControlError::DuplicateRoute { existing_address }) => {
@@ -395,15 +426,8 @@ async fn handle_register(
         }
     };
 
-    // Connect IPC client (or skip if configured for testing)
-    let (client, crm_ns, crm_name, crm_ver) = if state.config().skip_ipc_validation {
-        (
-            Arc::new(IpcClient::new(&address)),
-            crm_ns,
-            crm_name,
-            crm_ver,
-        )
-    } else {
+    // Connect IPC client and attest the registered route contract.
+    let (client, crm_ns, crm_name, crm_ver, abi_hash, signature_hash) = {
         let mut c = IpcClient::new(&address);
         if let Err(e) = c.connect().await {
             return (
@@ -433,33 +457,67 @@ async fn handle_register(
             )
                 .into_response();
         }
-        let contract = match attest_ipc_route_contract(&c, &name, &crm_ns, &crm_name, &crm_ver) {
-            Ok(contract) => contract,
-            Err(ControlError::ContractMismatch { reason }) => {
-                close_client(c);
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({ "error": reason })),
-                )
-                    .into_response();
-            }
-            Err(ControlError::NotFound) => {
-                close_client(c);
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(serde_json::json!({
-                        "error": format!("IPC upstream at {address} does not export route '{name}'"),
-                    })),
-                )
-                    .into_response();
-            }
-            Err(_) => unreachable!("route contract attestation returns only contract errors"),
+        let contract = match claimed_contract.as_ref() {
+            Some(claimed_contract) => match attest_ipc_route_contract(
+                &c,
+                &name,
+                &claimed_contract.crm_ns,
+                &claimed_contract.crm_name,
+                &claimed_contract.crm_ver,
+                &claimed_contract.abi_hash,
+                &claimed_contract.signature_hash,
+            ) {
+                Ok(contract) => contract,
+                Err(ControlError::ContractMismatch { reason }) => {
+                    close_client(c);
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": reason })),
+                    )
+                        .into_response();
+                }
+                Err(ControlError::NotFound) => {
+                    close_client(c);
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": format!("IPC upstream at {address} does not export route '{name}'"),
+                        })),
+                    )
+                        .into_response();
+                }
+                Err(_) => unreachable!("route contract attestation returns only contract errors"),
+            },
+            None => match read_ipc_route_contract(&c, &name) {
+                Ok(contract) => contract,
+                Err(ControlError::NotFound) => {
+                    close_client(c);
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": format!("IPC upstream at {address} does not export route '{name}'"),
+                        })),
+                    )
+                        .into_response();
+                }
+                Err(ControlError::ContractMismatch { reason }) => {
+                    close_client(c);
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": reason })),
+                    )
+                        .into_response();
+                }
+                Err(_) => unreachable!("route contract read returns only contract errors"),
+            },
         };
         (
             Arc::new(c),
             contract.crm_ns,
             contract.crm_name,
             contract.crm_ver,
+            contract.abi_hash,
+            contract.signature_hash,
         )
     };
 
@@ -472,13 +530,19 @@ async fn handle_register(
         crm_ns,
         crm_name,
         crm_ver,
+        abi_hash,
+        signature_hash,
         commit_client,
         replacement,
     ) {
         RegisterCommitResult::Registered { entry } => entry,
         RegisterCommitResult::SameOwner { entry } => {
             close_arc_client(client);
-            entry
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({"registered": entry.name})),
+            )
+                .into_response();
         }
         RegisterCommitResult::Duplicate { existing_address }
         | RegisterCommitResult::ConflictingOwner { existing_address } => {
@@ -595,6 +659,8 @@ async fn handle_list_routes(State(state): State<Arc<RelayState>>) -> impl IntoRe
                 "crm_ns": r.crm_ns,
                 "crm_name": r.crm_name,
                 "crm_ver": r.crm_ver,
+                "abi_hash": r.abi_hash,
+                "signature_hash": r.signature_hash,
             })
         })
         .collect();
@@ -612,7 +678,7 @@ async fn handle_health(State(state): State<Arc<RelayState>>) -> impl IntoRespons
     }))
 }
 
-/// `GET /_resolve/{name}` — resolve a CRM name to available routes.
+/// `GET /_resolve/{name}` — resolve a complete expected CRM route contract.
 async fn handle_resolve(
     Path(name): Path<String>,
     Query(query): Query<ResolveQuery>,
@@ -630,49 +696,47 @@ async fn handle_resolve(
             .into_response();
     }
     let expose_ipc_address = remote_addr.is_some_and(|addr| addr.ip().is_loopback());
-    let expected_crm = match (&query.crm_ns, &query.crm_name, &query.crm_ver) {
-        (Some(crm_ns), Some(crm_name), Some(crm_ver)) => {
-            if !valid_crm_tag(crm_ns, crm_name, crm_ver) {
+    let expected_crm = match (
+        &query.crm_ns,
+        &query.crm_name,
+        &query.crm_ver,
+        &query.abi_hash,
+        &query.signature_hash,
+    ) {
+        (Some(crm_ns), Some(crm_name), Some(crm_ver), Some(abi_hash), Some(signature_hash)) => {
+            let expected = c2_contract::ExpectedRouteContract {
+                route_name: name.clone(),
+                crm_ns: crm_ns.clone(),
+                crm_name: crm_name.clone(),
+                crm_ver: crm_ver.clone(),
+                abi_hash: abi_hash.clone(),
+                signature_hash: signature_hash.clone(),
+            };
+            if let Err(err) = c2_contract::validate_expected_route_contract(&expected) {
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(serde_json::json!({
                         "error": "InvalidCrmTag",
-                        "message": "crm_ns, crm_name, and crm_ver must be non-empty, control-character-free, and fit the IPC handshake field limit",
+                        "message": err.to_string(),
                     })),
                 )
                     .into_response();
             }
-            Some((crm_ns.as_str(), crm_name.as_str(), crm_ver.as_str()))
+            expected
         }
-        (None, None, None) => None,
         _ => {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
                     "error": "InvalidCrmTag",
-                    "message": "crm_ns, crm_name, and crm_ver must be supplied together",
+                    "message": "crm_ns, crm_name, crm_ver, abi_hash, and signature_hash are required for relay resolve",
                 })),
             )
                 .into_response();
         }
     };
-    let mut routes = if let Some((crm_ns, crm_name, crm_ver)) = expected_crm {
-        state.resolve_matching(&name, crm_ns, crm_name, crm_ver)
-    } else {
-        state.resolve(&name)
-    };
+    let mut routes = state.resolve_matching(&expected_crm);
     if routes.is_empty() {
-        if expected_crm.is_some() && !state.resolve(&name).is_empty() {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "CRMContractMismatch",
-                    "name": name,
-                    "message": format!("CRM contract mismatch for route {name}"),
-                })),
-            )
-                .into_response();
-        }
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
@@ -702,7 +766,7 @@ async fn handle_probe(
     State(state): State<Arc<RelayState>>,
     headers: HeaderMap,
 ) -> Response {
-    let expected_crm = match expected_crm_from_headers(&headers) {
+    let expected_crm = match expected_crm_from_headers(&route_name, &headers) {
         Ok(expected) => expected,
         Err(response) => return response,
     };
@@ -751,7 +815,7 @@ async fn call_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let expected_crm = match expected_crm_from_headers(&headers) {
+    let expected_crm = match expected_crm_from_headers(&route_name, &headers) {
         Ok(expected) => expected,
         Err(response) => return response,
     };
@@ -792,17 +856,10 @@ async fn call_handler(
     let client = lease.client();
 
     match client.call(&route_name, &method_name, &body).await {
-        Ok(result) => {
-            let bytes = result
-                .into_bytes_with_pool(client.server_pool_arc(), &client.reassembly_pool_arc())
-                .unwrap_or_default();
-            (
-                StatusCode::OK,
-                [("content-type", "application/octet-stream")],
-                bytes,
-            )
-                .into_response()
-        }
+        Ok(result) => materialized_response_or_error(
+            &route_name,
+            result.into_bytes_with_pool(client.server_pool_arc(), &client.reassembly_pool_arc()),
+        ),
         Err(c2_ipc::IpcError::CrmError(err_bytes)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             [("content-type", "application/octet-stream")],
@@ -833,6 +890,26 @@ async fn call_handler(
             )
                 .into_response()
         }
+    }
+}
+
+fn materialized_response_or_error(route_name: &str, result: Result<Vec<u8>, String>) -> Response {
+    match result {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [("content-type", "application/octet-stream")],
+            bytes,
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "error": "UpstreamResponseUnavailable",
+                "route": route_name,
+                "message": format!("failed to materialize upstream response: {err}"),
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -898,6 +975,21 @@ mod tests {
     const TEST_CRM_NS: &str = "test.relay";
     const TEST_CRM_NAME: &str = "RelayGrid";
     const TEST_CRM_VER: &str = "0.1.0";
+    const TEST_ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const TEST_SIGNATURE_HASH: &str =
+        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+    #[tokio::test]
+    async fn materialized_response_error_is_not_silently_returned_as_empty_success() {
+        let response =
+            materialized_response_or_error("grid", Err("server pool not initialised".to_string()));
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"], "UpstreamResponseUnavailable");
+        assert_eq!(payload["route"], "grid");
+    }
 
     fn test_state() -> Arc<RelayState> {
         test_state_for_client()
@@ -938,6 +1030,24 @@ mod tests {
         status
     }
 
+    async fn post_register_json(state: Arc<RelayState>, body: serde_json::Value) -> StatusCode {
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        status
+    }
+
     async fn post_register_with_crm(
         state: Arc<RelayState>,
         name: &str,
@@ -963,6 +1073,8 @@ mod tests {
                             "crm_ns": crm_ns,
                             "crm_name": crm_name,
                             "crm_ver": crm_ver,
+                            "abi_hash": TEST_ABI_HASH,
+                            "signature_hash": TEST_SIGNATURE_HASH,
                         })
                         .to_string(),
                     ))
@@ -976,11 +1088,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skip_validation_register_rejects_incomplete_crm_tag() {
+    async fn register_rejects_incomplete_claimed_crm_tag_before_ipc_connect() {
         let state = Arc::new(RelayState::new(
             Arc::new(c2_config::RelayConfig {
                 relay_id: "test-relay".into(),
-                skip_ipc_validation: true,
                 ..Default::default()
             }),
             Arc::new(crate::relay::test_support::NoopDisseminator),
@@ -1032,6 +1143,12 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri(format!("/{name}/{method}"))
+                    .header("content-type", "application/octet-stream")
+                    .header("x-c2-expected-crm-ns", "test.echo")
+                    .header("x-c2-expected-crm-name", "Echo")
+                    .header("x-c2-expected-crm-ver", "0.1.0")
+                    .header("x-c2-expected-abi-hash", TEST_ABI_HASH)
+                    .header("x-c2-expected-signature-hash", TEST_SIGNATURE_HASH)
                     .body(Body::from(Vec::new()))
                     .unwrap(),
             )
@@ -1060,6 +1177,8 @@ mod tests {
                     .header("x-c2-expected-crm-ns", crm_ns)
                     .header("x-c2-expected-crm-name", crm_name)
                     .header("x-c2-expected-crm-ver", crm_ver)
+                    .header("x-c2-expected-abi-hash", TEST_ABI_HASH)
+                    .header("x-c2-expected-signature-hash", TEST_SIGNATURE_HASH)
                     .body(Body::from(Vec::new()))
                     .unwrap(),
             )
@@ -1077,6 +1196,11 @@ mod tests {
                 Request::builder()
                     .method("GET")
                     .uri(format!("/_probe/{name}"))
+                    .header("x-c2-expected-crm-ns", "test.echo")
+                    .header("x-c2-expected-crm-name", "Echo")
+                    .header("x-c2-expected-crm-ver", "0.1.0")
+                    .header("x-c2-expected-abi-hash", TEST_ABI_HASH)
+                    .header("x-c2-expected-signature-hash", TEST_SIGNATURE_HASH)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1103,6 +1227,8 @@ mod tests {
                     .header("x-c2-expected-crm-ns", crm_ns)
                     .header("x-c2-expected-crm-name", crm_name)
                     .header("x-c2-expected-crm-ver", crm_ver)
+                    .header("x-c2-expected-abi-hash", TEST_ABI_HASH)
+                    .header("x-c2-expected-signature-hash", TEST_SIGNATURE_HASH)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1113,7 +1239,7 @@ mod tests {
         status
     }
 
-    async fn get_resolve(state: Arc<RelayState>, name: &str) -> StatusCode {
+    async fn get_resolve_without_query(state: Arc<RelayState>, name: &str) -> StatusCode {
         let app = build_router(state);
         let mut request = Request::builder()
             .method("GET")
@@ -1141,7 +1267,7 @@ mod tests {
         let mut request = Request::builder()
             .method("GET")
             .uri(format!(
-                "/_resolve/{name}?crm_ns={crm_ns}&crm_name={crm_name}&crm_ver={crm_ver}"
+                "/_resolve/{name}?crm_ns={crm_ns}&crm_name={crm_name}&crm_ver={crm_ver}&abi_hash={TEST_ABI_HASH}&signature_hash={TEST_SIGNATURE_HASH}"
             ))
             .body(Body::empty())
             .unwrap();
@@ -1190,6 +1316,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_requires_expected_contract_query() {
+        let state = test_state();
+
+        assert_eq!(
+            get_resolve_without_query(state, "grid").await,
+            StatusCode::BAD_REQUEST,
+        );
+    }
+
+    #[tokio::test]
     async fn resolve_rejects_partial_crm_tag_query_instead_of_downgrading_to_name_only() {
         let state = test_state();
 
@@ -1225,7 +1361,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_with_expected_crm_tag_rejects_name_match_with_wrong_crm_name() {
+    async fn resolve_with_expected_contract_hides_name_match_with_wrong_crm_name() {
         let state = test_state();
         let address = format!(
             "ipc://relay_resolve_crm_name_{}_{}",
@@ -1241,7 +1377,7 @@ mod tests {
         assert_eq!(
             get_resolve_with_crm_tag(state.clone(), "grid", "test.echo", "OtherEcho", "0.1.0",)
                 .await,
-            StatusCode::CONFLICT,
+            StatusCode::NOT_FOUND,
         );
         assert_eq!(
             get_resolve_with_crm_tag(state.clone(), "grid", "test.echo", "Echo", "0.1.0").await,
@@ -1249,6 +1385,115 @@ mod tests {
         );
 
         server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn resolve_with_expected_contract_hides_name_match_with_wrong_hash() {
+        let state = test_state();
+        let address = format!(
+            "ipc://relay_resolve_hash_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let server = start_live_server(&address, "server-grid").await;
+
+        assert_eq!(
+            post_register(state.clone(), "grid", "server-grid", &address).await,
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            get_resolve_with_query(
+                state.clone(),
+                "grid",
+                "crm_ns=test.echo&crm_name=Echo&crm_ver=0.1.0&abi_hash=fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210&signature_hash=abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+            )
+            .await,
+            StatusCode::NOT_FOUND,
+        );
+        assert_eq!(
+            get_resolve_with_crm_tag(state.clone(), "grid", "test.echo", "Echo", "0.1.0").await,
+            StatusCode::OK,
+        );
+
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn relay_data_plane_requires_expected_contract_headers() {
+        let state = test_state();
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/grid/ping")
+                    .header("content-type", "application/octet-stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body.contains("expected CRM headers and hash headers are required"),
+            "unexpected body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_probe_requires_expected_contract_headers() {
+        let state = test_state();
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/_probe/grid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body.contains("expected CRM headers and hash headers are required"),
+            "unexpected body: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn data_plane_rejects_partial_expected_hash_headers_before_acquire() {
+        let state = test_state();
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/grid/ping")
+                    .header("content-type", "application/octet-stream")
+                    .header("x-c2-expected-crm-ns", "test.echo")
+                    .header("x-c2-expected-crm-name", "Echo")
+                    .header("x-c2-expected-crm-ver", "0.1.0")
+                    .header("x-c2-expected-abi-hash", TEST_ABI_HASH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body.contains("expected CRM headers and hash headers must be supplied together"),
+            "unexpected body: {body}"
+        );
     }
 
     async fn get_resolve_routes_from(
@@ -1259,7 +1504,9 @@ mod tests {
         let app = build_router(state);
         let mut request = Request::builder()
             .method("GET")
-            .uri(format!("/_resolve/{name}"))
+            .uri(format!(
+                "/_resolve/{name}?crm_ns={TEST_CRM_NS}&crm_name={TEST_CRM_NAME}&crm_ver={TEST_CRM_VER}&abi_hash={TEST_ABI_HASH}&signature_hash={TEST_SIGNATURE_HASH}"
+            ))
             .body(Body::empty())
             .unwrap();
         request.extensions_mut().insert(ConnectInfo(remote_addr));
@@ -1285,6 +1532,8 @@ mod tests {
             TEST_CRM_NS.to_string(),
             TEST_CRM_NAME.to_string(),
             TEST_CRM_VER.to_string(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
             Arc::new(IpcClient::new("ipc://grid")),
             None,
         );
@@ -1315,7 +1564,7 @@ mod tests {
     #[tokio::test]
     async fn register_rejects_invalid_server_id_at_control_boundary() {
         let state = test_state();
-        let too_long = "s".repeat(c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES + 1);
+        let too_long = "s".repeat(c2_contract::MAX_WIRE_TEXT_BYTES + 1);
         assert_eq!(
             post_register(state.clone(), "grid", " ", "ipc://grid").await,
             StatusCode::BAD_REQUEST
@@ -1333,7 +1582,7 @@ mod tests {
     #[tokio::test]
     async fn register_rejects_invalid_server_instance_id_at_control_boundary() {
         let state = test_state();
-        let too_long = "a".repeat(c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES + 1);
+        let too_long = "a".repeat(c2_contract::MAX_WIRE_TEXT_BYTES + 1);
         for server_instance_id in ["../bad", too_long.as_str()] {
             let app = build_router(state.clone());
             let response = app
@@ -1427,6 +1676,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn register_rejects_non_string_contract_claim_fields() {
+        let state = test_state();
+        let address = format!(
+            "ipc://relay_register_non_string_contract_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let server = start_live_server(&address, "server-grid").await;
+
+        let status = post_register_json(
+            state.clone(),
+            serde_json::json!({
+                "name": "grid",
+                "server_id": "server-grid",
+                "server_instance_id": "server-grid-instance",
+                "address": address,
+                "crm_ns": 1,
+                "crm_name": true,
+                "crm_ver": ["0.1.0"],
+                "abi_hash": {"value": TEST_ABI_HASH},
+                "signature_hash": null,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            state.resolve("grid").is_empty(),
+            "relay must not silently ignore malformed claimed CRM contract fields"
+        );
+
+        server.shutdown();
+    }
+
+    #[tokio::test]
     async fn register_rejects_claimed_crm_contract_mismatch() {
         let state = test_state();
         let address = format!(
@@ -1494,9 +1778,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn register_same_owner_without_claim_reattests_ipc_contract() {
+        let state = test_state();
+        let address = format!(
+            "ipc://relay_register_same_owner_unclaimed_contract_mismatch_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let original_client = Arc::new(IpcClient::new(&address));
+        original_client.force_connected(true);
+        match state.commit_register_upstream(
+            "grid".into(),
+            "server-grid".into(),
+            "server-grid-instance".into(),
+            address.clone(),
+            "test.echo".into(),
+            "Echo".into(),
+            "0.1.0".into(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
+            original_client,
+            None,
+        ) {
+            RegisterCommitResult::Registered { .. } => {}
+            _ => panic!("unexpected initial registration result"),
+        }
+        let server = start_live_server_with_identity_and_contracts(
+            &address,
+            "server-grid",
+            "server-grid-instance",
+            &[(
+                "grid",
+                "test.other",
+                "OtherGrid",
+                "0.1.0",
+                TEST_ABI_HASH,
+                TEST_SIGNATURE_HASH,
+            )],
+        )
+        .await;
+
+        assert_eq!(
+            post_register(state.clone(), "grid", "server-grid", &address).await,
+            StatusCode::BAD_REQUEST
+        );
+        let routes = state.resolve("grid");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].crm_ns, "test.echo");
+        assert_eq!(routes[0].crm_name, "Echo");
+
+        server.shutdown();
+    }
+
+    #[tokio::test]
     async fn register_rejects_route_name_that_cannot_fit_wire_control() {
         let state = test_state();
-        let long_name = "x".repeat(c2_wire::control::MAX_CALL_ROUTE_NAME_BYTES + 1);
+        let long_name = "x".repeat(c2_contract::MAX_WIRE_TEXT_BYTES + 1);
 
         assert_eq!(
             post_register(state, &long_name, "server-grid", "ipc://grid").await,
@@ -1523,12 +1860,22 @@ mod tests {
             TEST_CRM_NS.to_string(),
             TEST_CRM_NAME.to_string(),
             TEST_CRM_VER.to_string(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
             stale_client,
             None,
         );
 
         assert_eq!(
-            post_call(state.clone(), "grid", "step").await,
+            post_call_with_expected_crm_tag(
+                state.clone(),
+                "grid",
+                "step",
+                TEST_CRM_NS,
+                TEST_CRM_NAME,
+                TEST_CRM_VER,
+            )
+            .await,
             StatusCode::BAD_GATEWAY
         );
         assert!(state.resolve("grid").is_empty());
@@ -1609,7 +1956,14 @@ mod tests {
             &address,
             "server-grid",
             "server-grid-instance",
-            &[("grid", "test.other", "OtherEcho", "0.1.0")],
+            &[(
+                "grid",
+                "test.other",
+                "OtherEcho",
+                "0.1.0",
+                TEST_ABI_HASH,
+                TEST_SIGNATURE_HASH,
+            )],
         )
         .await;
 
@@ -1628,6 +1982,8 @@ mod tests {
                     .header("x-c2-expected-crm-ns", "test.echo")
                     .header("x-c2-expected-crm-name", "Echo")
                     .header("x-c2-expected-crm-ver", "0.1.0")
+                    .header("x-c2-expected-abi-hash", TEST_ABI_HASH)
+                    .header("x-c2-expected-signature-hash", TEST_SIGNATURE_HASH)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1672,6 +2028,8 @@ mod tests {
                 "test.other".into(),
                 "OtherEcho".into(),
                 "0.1.0".into(),
+                TEST_ABI_HASH.to_string(),
+                TEST_SIGNATURE_HASH.to_string(),
                 new_client,
                 None,
             ) {
@@ -1709,14 +2067,28 @@ mod tests {
             &old_address,
             "server-old",
             "server-old-instance",
-            &[(&route_name, "test.echo", "Echo", "0.1.0")],
+            &[(
+                &route_name,
+                "test.echo",
+                "Echo",
+                "0.1.0",
+                TEST_ABI_HASH,
+                TEST_SIGNATURE_HASH,
+            )],
         )
         .await;
         let new_server = start_live_server_with_identity_and_contracts(
             &new_address,
             "server-new",
             "server-new-instance",
-            &[(&route_name, "test.other", "OtherEcho", "0.1.0")],
+            &[(
+                &route_name,
+                "test.other",
+                "OtherEcho",
+                "0.1.0",
+                TEST_ABI_HASH,
+                TEST_SIGNATURE_HASH,
+            )],
         )
         .await;
 
@@ -1763,14 +2135,28 @@ mod tests {
             &old_address,
             "server-old",
             "server-old-instance",
-            &[(&route_name, "test.echo", "Echo", "0.1.0")],
+            &[(
+                &route_name,
+                "test.echo",
+                "Echo",
+                "0.1.0",
+                TEST_ABI_HASH,
+                TEST_SIGNATURE_HASH,
+            )],
         )
         .await;
         let new_server = start_live_server_with_identity_and_contracts(
             &new_address,
             "server-new",
             "server-new-instance",
-            &[(&route_name, "test.other", "OtherEcho", "0.1.0")],
+            &[(
+                &route_name,
+                "test.other",
+                "OtherEcho",
+                "0.1.0",
+                TEST_ABI_HASH,
+                TEST_SIGNATURE_HASH,
+            )],
         )
         .await;
 
@@ -1886,7 +2272,7 @@ mod tests {
         );
         assert!(state.local_route("grid").is_none());
         assert_eq!(
-            get_resolve(state.clone(), "grid").await,
+            get_resolve_with_crm_tag(state.clone(), "grid", "test.echo", "Echo", "0.1.0").await,
             StatusCode::NOT_FOUND
         );
 
@@ -1915,7 +2301,14 @@ mod tests {
             &address,
             "server-grid",
             "server-grid-restarted",
-            &[("grid", "test.echo", "Echo", "0.1.0")],
+            &[(
+                "grid",
+                "test.echo",
+                "Echo",
+                "0.1.0",
+                TEST_ABI_HASH,
+                TEST_SIGNATURE_HASH,
+            )],
         )
         .await;
 
@@ -1950,7 +2343,14 @@ mod tests {
             &address,
             "server-grid",
             "server-grid-instance",
-            &[("grid", "test.other", "OtherEcho", "0.1.0")],
+            &[(
+                "grid",
+                "test.other",
+                "OtherEcho",
+                "0.1.0",
+                TEST_ABI_HASH,
+                TEST_SIGNATURE_HASH,
+            )],
         )
         .await;
 
@@ -1985,7 +2385,7 @@ mod tests {
         );
         assert!(state.local_route("grid").is_none());
         assert_eq!(
-            get_resolve(state.clone(), "grid").await,
+            get_resolve_with_crm_tag(state.clone(), "grid", "test.echo", "Echo", "0.1.0").await,
             StatusCode::NOT_FOUND
         );
 
@@ -2090,6 +2490,11 @@ mod tests {
                             .method("POST")
                             .uri("/grid/ping")
                             .header("content-type", "application/octet-stream")
+                            .header("x-c2-expected-crm-ns", "test.echo")
+                            .header("x-c2-expected-crm-name", "Echo")
+                            .header("x-c2-expected-crm-ver", "0.1.0")
+                            .header("x-c2-expected-abi-hash", TEST_ABI_HASH)
+                            .header("x-c2-expected-signature-hash", TEST_SIGNATURE_HASH)
                             .body(Body::from(Vec::new()))
                             .unwrap(),
                     )

@@ -6,6 +6,7 @@ description = "Async IPC client for C-Two relay"
 
 [dependencies]
 c2-config = { path = "../../foundation/c2-config" }
+c2-contract = { path = "../../foundation/c2-contract" }
 c2-wire = { path = "../../protocol/c2-wire" }
 c2-mem = { path = "../../foundation/c2-mem" }
 parking_lot = { workspace = true }

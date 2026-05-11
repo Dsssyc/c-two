@@ -15,6 +15,9 @@ from c_two.transport.protocol import (
 )
 from c_two.transport.wire import MethodTable
 
+ABI_HASH = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+SIG_HASH = 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789'
+
 
 def route_info(name: str, methods: list[MethodEntry]) -> RouteInfo:
     return RouteInfo(
@@ -23,6 +26,8 @@ def route_info(name: str, methods: list[MethodEntry]) -> RouteInfo:
         crm_ns='test.wire',
         crm_name='WireRoute',
         crm_ver='0.1.0',
+        abi_hash=ABI_HASH,
+        signature_hash=SIG_HASH,
     )
 
 
@@ -42,6 +47,8 @@ def test_route_info_rejects_invalid_crm_tag():
             crm_ns='test.wire',
             crm_name='Bad\nRoute',
             crm_ver='0.1.0',
+            abi_hash=ABI_HASH,
+            signature_hash=SIG_HASH,
         )
 
 
@@ -104,6 +111,8 @@ class TestHandshake:
             crm_ns="test.hello",
             crm_name="Hello",
             crm_ver="1.2.3",
+            abi_hash=ABI_HASH,
+            signature_hash=SIG_HASH,
             methods=[
                 MethodEntry(name="add", index=0),
                 MethodEntry(name="greeting", index=1),
@@ -128,6 +137,8 @@ class TestHandshake:
         assert r.crm_ns == "test.hello"
         assert r.crm_name == "Hello"
         assert r.crm_ver == "1.2.3"
+        assert r.abi_hash == ABI_HASH
+        assert r.signature_hash == SIG_HASH
         assert len(r.methods) == 2
         assert r.method_by_name("add") == 0
         assert r.method_by_name("greeting") == 1

@@ -23,6 +23,9 @@ from tests.fixtures.ihello import Hello
 from tests.fixtures.hello import HelloImpl
 from tests.fixtures.counter import Counter, CounterImpl
 
+ABI_HASH = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+SIG_HASH = 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789'
+
 
 _IPC_SOCK_DIR = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
 
@@ -119,6 +122,8 @@ class TestServerNameCollision:
                 crm_ns='test.grid',
                 crm_name='Grid',
                 crm_ver='0.1.0',
+                abi_hash=ABI_HASH,
+                signature_hash=SIG_HASH,
                 method_table=MethodTable(),
                 scheduler=FakeScheduler(),
                 methods=[],
@@ -174,6 +179,8 @@ class TestServerNameCollision:
                 crm_ns='test.grid',
                 crm_name='Grid',
                 crm_ver='0.1.0',
+                abi_hash=ABI_HASH,
+                signature_hash=SIG_HASH,
                 method_table=MethodTable(),
                 scheduler=FakeScheduler(),
                 methods=[],
@@ -234,6 +241,8 @@ class TestServerNameCollision:
                 crm_ns='test.grid',
                 crm_name='Grid',
                 crm_ver='0.1.0',
+                abi_hash=ABI_HASH,
+                signature_hash=SIG_HASH,
                 method_table=MethodTable(),
                 scheduler=FakeScheduler(),
                 methods=[],
@@ -299,6 +308,8 @@ class TestServerNameCollision:
                 crm_ns='test.grid',
                 crm_name='Grid',
                 crm_ver='0.1.0',
+                abi_hash=ABI_HASH,
+                signature_hash=SIG_HASH,
                 method_table=MethodTable(),
                 scheduler=FakeScheduler(),
                 methods=[],
@@ -361,6 +372,8 @@ class TestServerNameCollision:
                 crm_ns,
                 crm_name,
                 crm_ver,
+                abi_hash,
+                signature_hash,
             ):  # noqa: ARG002
                 events.append(
                     f'rust_register:{concurrency_mode}:{max_pending}:{max_workers}:{crm_ns}:{crm_name}:{crm_ver}'

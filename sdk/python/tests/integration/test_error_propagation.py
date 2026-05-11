@@ -56,12 +56,8 @@ class ErrorHello(Hello):
 def error_server():
     """Start a server backed by ErrorHello, yield its address, then shut down."""
     address = f'ipc://error_test_{_next_id()}'
-    server = Server(
-        bind_address=address,
-        crm_class=Hello,
-        crm_instance=ErrorHello(),
-        name='hello',
-    )
+    server = Server(bind_address=address)
+    server.register_crm(Hello, ErrorHello(), name='hello')
     server.start()
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:

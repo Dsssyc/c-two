@@ -27,16 +27,17 @@ def _wait_for_ping(address: str, timeout: float = 5.0) -> None:
     raise TimeoutError(f'{address} did not respond to ping')
 
 
+def _hello_server(address: str, *, name: str = 'hello') -> Server:
+    server = Server(bind_address=address)
+    server.register_crm(Hello, HelloImpl(), name=name)
+    return server
+
+
 @pytest.fixture
 def direct_server(monkeypatch):
     monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
     address = f'ipc://{_unique_region()}'
-    server = Server(
-        bind_address=address,
-        crm_class=Hello,
-        crm_instance=HelloImpl(),
-        name='hello',
-    )
+    server = _hello_server(address)
     server.start()
     _wait_for_ping(address)
     yield address, server
@@ -86,12 +87,7 @@ def test_explicit_ipc_connect_ignores_bad_relay_anchor(monkeypatch):
 def test_shutdown_stops_direct_ipc_without_relay(monkeypatch):
     monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
     address = f'ipc://{_unique_region("shutdown")}'
-    server = Server(
-        bind_address=address,
-        crm_class=Hello,
-        crm_instance=HelloImpl(),
-        name='hello',
-    )
+    server = _hello_server(address)
     server.start()
     _wait_for_ping(address)
 
@@ -116,12 +112,7 @@ def test_control_helpers_reject_invalid_addresses():
 def test_server_start_returns_only_after_direct_ipc_ready(monkeypatch):
     monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
     address = f'ipc://{_unique_region("ready")}'
-    server = Server(
-        bind_address=address,
-        crm_class=Hello,
-        crm_instance=HelloImpl(),
-        name='hello',
-    )
+    server = _hello_server(address)
     try:
         server.start(timeout=5.0)
         assert ping(address, timeout=0.5) is True
@@ -132,12 +123,7 @@ def test_server_start_returns_only_after_direct_ipc_ready(monkeypatch):
 def test_server_start_readiness_ignores_bad_relay_env(monkeypatch):
     monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', 'http://127.0.0.1:9')
     address = f'ipc://{_unique_region("ready_bad_relay")}'
-    server = Server(
-        bind_address=address,
-        crm_class=Hello,
-        crm_instance=HelloImpl(),
-        name='hello',
-    )
+    server = _hello_server(address)
     try:
         server.start(timeout=5.0)
         assert ping(address, timeout=0.5) is True
@@ -148,18 +134,8 @@ def test_server_start_readiness_ignores_bad_relay_env(monkeypatch):
 def test_starting_second_server_does_not_unlink_active_socket(monkeypatch):
     monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
     address = f'ipc://{_unique_region("active")}'
-    first = Server(
-        bind_address=address,
-        crm_class=Hello,
-        crm_instance=HelloImpl(),
-        name='hello',
-    )
-    second = Server(
-        bind_address=address,
-        crm_class=Hello,
-        crm_instance=HelloImpl(),
-        name='hello2',
-    )
+    first = _hello_server(address)
+    second = _hello_server(address, name='hello2')
     try:
         first.start(timeout=5.0)
         assert ping(address, timeout=0.5) is True
@@ -180,12 +156,7 @@ def test_starting_second_server_does_not_unlink_active_socket(monkeypatch):
 def test_bridge_shutdown_after_direct_ipc_shutdown_allows_new_server(monkeypatch):
     monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
     address = f'ipc://{_unique_region("external_shutdown")}'
-    server = Server(
-        bind_address=address,
-        crm_class=Hello,
-        crm_instance=HelloImpl(),
-        name='hello',
-    )
+    server = _hello_server(address)
     try:
         server.start(timeout=5.0)
         assert ping(address, timeout=0.5) is True
@@ -201,12 +172,7 @@ def test_bridge_shutdown_after_direct_ipc_shutdown_allows_new_server(monkeypatch
 
         server.shutdown()
 
-        replacement = Server(
-            bind_address=address,
-            crm_class=Hello,
-            crm_instance=HelloImpl(),
-            name='hello',
-        )
+        replacement = _hello_server(address)
         try:
             replacement.start(timeout=5.0)
             assert ping(address, timeout=0.5) is True
@@ -219,12 +185,7 @@ def test_bridge_shutdown_after_direct_ipc_shutdown_allows_new_server(monkeypatch
 def test_same_bridge_can_start_after_normal_shutdown(monkeypatch):
     monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
     address = f'ipc://{_unique_region("restart_same_bridge")}'
-    server = Server(
-        bind_address=address,
-        crm_class=Hello,
-        crm_instance=HelloImpl(),
-        name='hello',
-    )
+    server = _hello_server(address)
     try:
         for _ in range(50):
             server.start(timeout=5.0)
@@ -239,18 +200,8 @@ def test_same_bridge_can_start_after_normal_shutdown(monkeypatch):
 def test_failed_start_can_retry_after_active_socket_released(monkeypatch):
     monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
     address = f'ipc://{_unique_region("retry_failed_start")}'
-    first = Server(
-        bind_address=address,
-        crm_class=Hello,
-        crm_instance=HelloImpl(),
-        name='hello',
-    )
-    second = Server(
-        bind_address=address,
-        crm_class=Hello,
-        crm_instance=HelloImpl(),
-        name='hello2',
-    )
+    first = _hello_server(address)
+    second = _hello_server(address, name='hello2')
     try:
         first.start(timeout=5.0)
         assert ping(address, timeout=0.5) is True

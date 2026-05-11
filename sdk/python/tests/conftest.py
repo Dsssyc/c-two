@@ -173,7 +173,6 @@ def start_c3_relay() -> Iterator[Callable[..., RelayProcess]]:
         actual_port: int,
         relay_id: str | None = None,
         seeds: list[str] | None = None,
-        skip_ipc_validation: bool = False,
         idle_timeout: int | None = None,
     ) -> RelayProcess:
         bind = f'127.0.0.1:{actual_port}'
@@ -183,8 +182,6 @@ def start_c3_relay() -> Iterator[Callable[..., RelayProcess]]:
             args.extend(['--relay-id', relay_id])
         if seeds:
             args.extend(['--seeds', ','.join(seeds)])
-        if skip_ipc_validation:
-            args.append('--skip-ipc-validation')
         if idle_timeout is not None:
             args.extend(['--idle-timeout', str(idle_timeout)])
 
@@ -233,7 +230,6 @@ def start_c3_relay() -> Iterator[Callable[..., RelayProcess]]:
         port: int | None = None,
         relay_id: str | None = None,
         seeds: list[str] | None = None,
-        skip_ipc_validation: bool = False,
         idle_timeout: int | None = None,
     ) -> RelayProcess:
         last_error: AssertionError | None = None
@@ -245,7 +241,6 @@ def start_c3_relay() -> Iterator[Callable[..., RelayProcess]]:
                     actual_port=actual_port,
                     relay_id=relay_id,
                     seeds=seeds,
-                    skip_ipc_validation=skip_ipc_validation,
                     idle_timeout=idle_timeout,
                 )
             except AssertionError as exc:

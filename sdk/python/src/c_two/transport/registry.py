@@ -40,6 +40,7 @@ import threading
 from collections.abc import Mapping
 from typing import TypeVar
 
+from c_two.crm.contract import CRMContract, crm_contract, crm_contract_identity
 from c_two.config.ipc import ClientIPCOverrides, ServerIPCOverrides
 from c_two.config.settings import settings
 from c_two.error import (
@@ -64,42 +65,20 @@ def _is_crm_contract_mismatch(exc: BaseException) -> bool:
     return isinstance(exc, RuntimeError) and "CRM contract mismatch" in str(exc)
 
 
-def _crm_contract_identity(crm_class: type) -> tuple[str, str, str]:
-    crm_ns = getattr(crm_class, '__cc_namespace__', '')
-    crm_name = getattr(crm_class, '__cc_name__', '')
-    crm_ver = getattr(crm_class, '__cc_version__', '')
-    if not crm_ns or not crm_name or not crm_ver:
-        raise ValueError(
-            f'{crm_class.__name__} is not a valid CRM contract class '
-            '(decorate it with @cc.crm).',
-        )
-    return (
-        crm_ns,
-        crm_name,
-        crm_ver,
-    )
-
-
 def _ensure_crm_contract_match(
     *,
     route_name: str,
-    expected: tuple[str, str, str],
-    actual: tuple[str, str, str],
+    expected: CRMContract,
+    actual: CRMContract,
 ) -> None:
-    expected_ns, expected_name, expected_ver = expected
-    actual_ns, actual_name, actual_ver = actual
-    if not expected_ns and not expected_name and not expected_ver:
-        return
-    if (
-        expected_ns == actual_ns
-        and expected_name == actual_name
-        and expected_ver == actual_ver
-    ):
+    if expected == actual:
         return
     raise TypeError(
         f'CRM contract mismatch for route {route_name!r}: '
-        f'expected {expected_ns}/{expected_name}/{expected_ver}, '
-        f'got {actual_ns}/{actual_name}/{actual_ver}',
+        f'expected {expected.crm_ns}/{expected.crm_name}/{expected.crm_ver} '
+        f'abi={expected.abi_hash} signature={expected.signature_hash}, '
+        f'got {actual.crm_ns}/{actual.crm_name}/{actual.crm_ver} '
+        f'abi={actual.abi_hash} signature={actual.signature_hash}',
     )
 
 
@@ -265,7 +244,7 @@ class _ProcessRegistry:
         str
             The *name* string (echoed back for convenience).
         """
-        _crm_contract_identity(crm_class)
+        crm_contract_identity(crm_class)
         with self._lock:
             created_server = False
             try:
@@ -342,7 +321,7 @@ class _ProcessRegistry:
             A CRM instance with ``.client`` set to an
             :class:`CRMProxy`.
         """
-        expected_contract = _crm_contract_identity(crm_class)
+        expected_contract = crm_contract(crm_class)
         with self._lock:
             server = self._server
             local = (
@@ -354,11 +333,11 @@ class _ProcessRegistry:
 
         if address is None and local is not None:
             # Thread preference — same process, no serialization.
-            crm_instance, scheduler, actual_ns, actual_name, actual_ver = local
+            crm_instance, scheduler, actual_contract = local
             _ensure_crm_contract_match(
                 route_name=name,
                 expected=expected_contract,
-                actual=(actual_ns, actual_name, actual_ver),
+                actual=actual_contract,
             )
             proxy = CRMProxy.thread_local(
                 crm_instance,
@@ -367,13 +346,21 @@ class _ProcessRegistry:
             )
         elif address is not None and address.startswith(('http://', 'https://')):
             # HTTP mode — cross-node via relay server.
-            client = self._runtime_session.connect_explicit_relay_http(
-                address,
-                name,
-                expected_contract[0],
-                expected_contract[1],
-                expected_contract[2],
-            )
+            try:
+                client = self._runtime_session.connect_explicit_relay_http(
+                    address,
+                    name,
+                    *expected_contract.native_args(),
+                )
+            except Exception as exc:
+                if _is_crm_contract_mismatch(exc):
+                    raise
+                status = _relay_control_error_status(exc)
+                if status == 404:
+                    raise ResourceNotFound(f"Resource '{name}' not found") from exc
+                if status is not None:
+                    raise ResourceUnavailable(f"Relay error: {status}") from exc
+                raise
             proxy = CRMProxy.http(
                 client,
                 name,
@@ -385,9 +372,7 @@ class _ProcessRegistry:
             client = self._runtime_session.acquire_ipc_client(
                 address,
                 name,
-                expected_contract[0],
-                expected_contract[1],
-                expected_contract[2],
+                *expected_contract.native_args(),
             )
             proxy = CRMProxy.ipc(
                 client,
@@ -400,9 +385,7 @@ class _ProcessRegistry:
             try:
                 client = self._runtime_session.connect_via_relay(
                     name,
-                    expected_contract[0],
-                    expected_contract[1],
-                    expected_contract[2],
+                    *expected_contract.native_args(),
                 )
             except Exception as exc:
                 if _is_crm_contract_mismatch(exc):

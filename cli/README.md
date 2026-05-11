@@ -9,7 +9,6 @@ It starts relay servers and inspects relay registry state for C-Two deployments.
 
 - `c3 relay` starts the HTTP relay used for cross-machine discovery.
 - `c3 registry list-routes` lists resource names registered with a relay.
-- `c3 registry resolve` resolves one resource name through a relay.
 - `c3 registry peers` lists peer relays known by a mesh relay.
 
 ## Build and install for development
@@ -119,12 +118,6 @@ List registered routes:
 
 ```bash
 c3 registry list-routes --relay http://127.0.0.1:8080
-```
-
-Resolve one resource name:
-
-```bash
-c3 registry resolve --relay http://127.0.0.1:8080 grid
 ```
 
 List known mesh peers:

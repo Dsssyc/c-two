@@ -190,6 +190,8 @@ pub struct MethodTable {
     crm_ns: String,
     crm_name: String,
     crm_ver: String,
+    abi_hash: String,
+    signature_hash: String,
     name_to_idx: HashMap<String, u16>,
 }
 
@@ -200,6 +202,8 @@ impl MethodTable {
             route.crm_ns.clone(),
             route.crm_name.clone(),
             route.crm_ver.clone(),
+            route.abi_hash.clone(),
+            route.signature_hash.clone(),
         )
     }
 
@@ -208,6 +212,8 @@ impl MethodTable {
         crm_ns: String,
         crm_name: String,
         crm_ver: String,
+        abi_hash: String,
+        signature_hash: String,
     ) -> Self {
         let mut name_to_idx = HashMap::with_capacity(entries.len());
         for e in entries {
@@ -217,6 +223,8 @@ impl MethodTable {
             crm_ns,
             crm_name,
             crm_ver,
+            abi_hash,
+            signature_hash,
             name_to_idx,
         }
     }
@@ -244,6 +252,14 @@ impl MethodTable {
     /// CRM version advertised for this route in the IPC handshake.
     pub fn crm_ver(&self) -> &str {
         &self.crm_ver
+    }
+
+    pub fn abi_hash(&self) -> &str {
+        &self.abi_hash
+    }
+
+    pub fn signature_hash(&self) -> &str {
+        &self.signature_hash
     }
 }
 
@@ -938,45 +954,53 @@ impl IpcClient {
         self.route_tables.contains_key(name)
     }
 
-    /// Validate that the connected route matches the expected CRM contract.
-    ///
-    /// Empty expected namespace and version mean "no CRM contract expectation",
-    /// which keeps low-level transport probes usable without inventing dummy CRM
-    /// identities.
+    /// Validate that the connected route matches the complete expected route contract.
     pub fn validate_route_contract(
         &self,
-        route_name: &str,
-        expected_crm_ns: &str,
-        expected_crm_name: &str,
-        expected_crm_ver: &str,
+        expected: &c2_contract::ExpectedRouteContract,
     ) -> Result<(), IpcError> {
-        if expected_crm_ns.is_empty() && expected_crm_name.is_empty() && expected_crm_ver.is_empty()
-        {
-            return Ok(());
-        }
+        c2_contract::validate_expected_route_contract(expected)
+            .map_err(|err| IpcError::Handshake(err.to_string()))?;
         let table = self
             .route_tables
-            .get(route_name)
-            .ok_or_else(|| IpcError::RouteNotFound(route_name.to_string()))?;
-        if table.crm_ns() == expected_crm_ns
-            && table.crm_name() == expected_crm_name
-            && table.crm_ver() == expected_crm_ver
+            .get(&expected.route_name)
+            .ok_or_else(|| IpcError::RouteNotFound(expected.route_name.clone()))?;
+        if table.crm_ns() == expected.crm_ns
+            && table.crm_name() == expected.crm_name
+            && table.crm_ver() == expected.crm_ver
+            && table.abi_hash() == expected.abi_hash
+            && table.signature_hash() == expected.signature_hash
         {
             return Ok(());
         }
         Err(IpcError::Handshake(format!(
-            "CRM contract mismatch for route {route_name}: expected {expected_crm_ns}/{expected_crm_name}/{expected_crm_ver}, got {}/{}/{}",
+            "CRM contract mismatch for route {}: expected {}/{}/{} abi_hash={} signature_hash={}, got {}/{}/{} abi_hash={} signature_hash={}",
+            expected.route_name,
+            expected.crm_ns,
+            expected.crm_name,
+            expected.crm_ver,
+            expected.abi_hash,
+            expected.signature_hash,
             table.crm_ns(),
             table.crm_name(),
             table.crm_ver(),
+            table.abi_hash(),
+            table.signature_hash(),
         )))
     }
 
     /// CRM tag advertised by a route, if present.
-    pub fn route_contract(&self, route_name: &str) -> Option<(&str, &str, &str)> {
+    pub fn route_contract(&self, route_name: &str) -> Option<c2_contract::ExpectedRouteContract> {
         self.route_tables
             .get(route_name)
-            .map(|table| (table.crm_ns(), table.crm_name(), table.crm_ver()))
+            .map(|table| c2_contract::ExpectedRouteContract {
+                route_name: route_name.to_string(),
+                crm_ns: table.crm_ns().to_string(),
+                crm_name: table.crm_name().to_string(),
+                crm_ver: table.crm_ver().to_string(),
+                abi_hash: table.abi_hash().to_string(),
+                signature_hash: table.signature_hash().to_string(),
+            })
     }
 
     /// Get all route names.
@@ -1276,6 +1300,8 @@ mod tests {
 
     #[test]
     fn client_validates_route_crm_contract_from_handshake_metadata() {
+        const ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        const SIG_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
         let mut client = IpcClient::new("ipc://contract_projection");
         let mut methods = HashMap::new();
         methods.insert("ping".to_string(), 0);
@@ -1285,19 +1311,42 @@ mod tests {
                 crm_ns: "test.grid".to_string(),
                 crm_name: "Grid".to_string(),
                 crm_ver: "0.1.0".to_string(),
+                abi_hash: ABI_HASH.to_string(),
+                signature_hash: SIG_HASH.to_string(),
                 name_to_idx: methods,
             },
         );
+        let expected = c2_contract::ExpectedRouteContract {
+            route_name: "grid".to_string(),
+            crm_ns: "test.grid".to_string(),
+            crm_name: "Grid".to_string(),
+            crm_ver: "0.1.0".to_string(),
+            abi_hash: ABI_HASH.to_string(),
+            signature_hash: SIG_HASH.to_string(),
+        };
 
         client
-            .validate_route_contract("grid", "test.grid", "Grid", "0.1.0")
+            .validate_route_contract(&expected)
             .expect("matching CRM contract should be accepted");
 
+        let mut mismatched_name = expected.clone();
+        mismatched_name.crm_name = "OtherGrid".to_string();
         let err = client
-            .validate_route_contract("grid", "test.grid", "OtherGrid", "0.1.0")
+            .validate_route_contract(&mismatched_name)
             .expect_err("mismatched CRM name should be rejected");
         assert!(
             err.to_string().contains("CRM contract mismatch"),
+            "unexpected error: {err}"
+        );
+
+        let mut mismatched_hash = expected;
+        mismatched_hash.signature_hash =
+            "1111111111111111111111111111111111111111111111111111111111111111".to_string();
+        let err = client
+            .validate_route_contract(&mismatched_hash)
+            .expect_err("mismatched signature hash should be rejected");
+        assert!(
+            err.to_string().contains("signature_hash"),
             "unexpected error: {err}"
         );
     }

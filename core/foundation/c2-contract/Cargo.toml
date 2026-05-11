@@ -1,0 +1,10 @@
+[package]
+name = "c2-contract"
+edition.workspace = true
+version.workspace = true
+description = "Contract identity validation and hashing for C-Two routes"
+
+[dependencies]
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"

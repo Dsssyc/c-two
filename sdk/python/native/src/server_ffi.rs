@@ -116,7 +116,8 @@ impl CrmCallback for PyCrmCallback {
 /// srv = RustServer("ipc://my_server")
 /// srv.register_route(
 ///     "grid", dispatcher_fn, ["step", "query"],
-///     {0: "read", 1: "write"}, "read_parallel",
+///     {0: "read", 1: "write"}, "read_parallel", None, None,
+///     "example.ns", "Grid", "0.1.0", abi_hash, signature_hash,
 /// )
 /// srv.start()
 /// # ... serve requests ...
@@ -147,6 +148,8 @@ impl PyServer {
         crm_ns: &str,
         crm_name: &str,
         crm_ver: &str,
+        abi_hash: &str,
+        signature_hash: &str,
     ) -> PyResult<BuiltRoute> {
         let mode = parse_concurrency_mode(concurrency_mode)?;
         let limits = SchedulerLimits::try_from_usize(max_pending, max_workers)
@@ -176,14 +179,20 @@ impl PyServer {
             shm_threshold: self.inner.response_shm_threshold(),
             max_payload_size: self.inner.response_max_payload_size(),
         });
-        c2_wire::handshake::validate_crm_tag(crm_ns, crm_name, crm_ver)
-            .map_err(PyValueError::new_err)?;
+        c2_contract::validate_crm_tag(crm_ns, crm_name, crm_ver)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        c2_contract::validate_contract_hash("abi_hash", abi_hash)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        c2_contract::validate_contract_hash("signature_hash", signature_hash)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
         let route = CrmRoute {
             name: name.to_string(),
             crm_ns: crm_ns.to_string(),
             crm_name: crm_name.to_string(),
             crm_ver: crm_ver.to_string(),
+            abi_hash: abi_hash.to_string(),
+            signature_hash: signature_hash.to_string(),
             scheduler: Arc::new(scheduler),
             callback,
             method_names,
@@ -418,7 +427,7 @@ impl PyServer {
     ///
     /// `method_names` lists the CRM method names indexed by method_idx.
     /// `access_map` maps method_idx → "read" or "write".
-    #[pyo3(signature = (name, dispatcher, method_names, access_map, concurrency_mode, max_pending=None, max_workers=None, crm_ns="", crm_name="", crm_ver=""))]
+    #[pyo3(signature = (name, dispatcher, method_names, access_map, concurrency_mode, max_pending, max_workers, crm_ns, crm_name, crm_ver, abi_hash, signature_hash))]
     fn register_route(
         &self,
         py: Python<'_>,
@@ -432,6 +441,8 @@ impl PyServer {
         crm_ns: &str,
         crm_name: &str,
         crm_ver: &str,
+        abi_hash: &str,
+        signature_hash: &str,
     ) -> PyResult<PyRouteConcurrency> {
         let built = self.build_route(
             py,
@@ -445,6 +456,8 @@ impl PyServer {
             crm_ns,
             crm_name,
             crm_ver,
+            abi_hash,
+            signature_hash,
         )?;
         let route_handle = built.route_handle.clone();
         self.register_built_route(py, built.route)?;

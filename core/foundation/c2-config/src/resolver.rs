@@ -134,7 +134,6 @@ pub struct RelayConfigOverrides {
     pub advertise_url: Option<String>,
     pub seeds: Option<Vec<String>>,
     pub idle_timeout_secs: Option<u64>,
-    pub skip_ipc_validation: Option<bool>,
     pub anti_entropy_interval_secs: Option<f64>,
 }
 
@@ -441,9 +440,6 @@ fn resolve_relay_server_config(
     }
     if let Some(v) = overrides.idle_timeout_secs {
         cfg.idle_timeout_secs = validate_millis_timeout("idle_timeout_secs", v)?;
-    }
-    if let Some(v) = overrides.skip_ipc_validation {
-        cfg.skip_ipc_validation = v;
     }
     if let Some(v) = overrides.anti_entropy_interval_secs {
         cfg.anti_entropy_interval = duration_from_secs("anti_entropy_interval_secs", v)?;

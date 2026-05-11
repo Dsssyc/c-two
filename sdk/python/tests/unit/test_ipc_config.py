@@ -320,6 +320,8 @@ def test_relay_resolved_connect_delegates_route_validation_to_runtime_session(mo
             expected_crm_ns: str,
             expected_crm_name: str,
             expected_crm_ver: str,
+            expected_abi_hash: str,
+            expected_signature_hash: str,
         ):
             calls.append((
                 self.relay_anchor_address_override,
@@ -327,6 +329,8 @@ def test_relay_resolved_connect_delegates_route_validation_to_runtime_session(mo
                 expected_crm_ns,
                 expected_crm_name,
                 expected_crm_ver,
+                expected_abi_hash,
+                expected_signature_hash,
             ))
             return FakeRelayAwareClient()
 
@@ -342,9 +346,17 @@ def test_relay_resolved_connect_delegates_route_validation_to_runtime_session(mo
     crm = registry.connect(IUnitConfigCRM, name='unit-route')
 
     assert 'RustClientPool.instance()' not in inspect.getsource(type(registry))
-    assert calls == [
-        ('http://registry-relay.test', 'unit-route', 'unit.config', 'IUnitConfigCRM', '0.1.0'),
-    ]
+    assert len(calls) == 1
+    relay_address, route_name, crm_ns, crm_name, crm_ver, abi_hash, signature_hash = calls[0]
+    assert (relay_address, route_name, crm_ns, crm_name, crm_ver) == (
+        'http://registry-relay.test',
+        'unit-route',
+        'unit.config',
+        'IUnitConfigCRM',
+        '0.1.0',
+    )
+    assert len(abi_hash) == 64
+    assert len(signature_hash) == 64
     assert crm.client._client.__class__ is FakeRelayAwareClient  # noqa: SLF001
 
 
@@ -394,6 +406,8 @@ def test_relay_resolved_connect_maps_native_404_to_resource_not_found(monkeypatc
             expected_crm_ns: str,
             expected_crm_name: str,
             expected_crm_ver: str,
+            expected_abi_hash: str,
+            expected_signature_hash: str,
         ):  # noqa: ARG002
             err = RuntimeError('HTTP 404')
             err.status_code = 404

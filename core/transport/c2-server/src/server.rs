@@ -39,7 +39,7 @@ use c2_wire::buddy::{
     BUDDY_PAYLOAD_SIZE, BuddyPayload, decode_buddy_payload, encode_buddy_payload,
 };
 use c2_wire::chunk::{REPLY_CHUNK_META_SIZE, decode_chunk_header, encode_reply_chunk_meta};
-use c2_wire::control::{ReplyControl, decode_call_control, encode_reply_control};
+use c2_wire::control::{ReplyControl, decode_call_control, try_encode_reply_control};
 use c2_wire::flags::{
     FLAG_BUDDY, FLAG_CHUNK_LAST, FLAG_CHUNKED, FLAG_HANDSHAKE, FLAG_REPLY_V2, FLAG_RESPONSE,
     FLAG_SIGNAL,
@@ -48,7 +48,7 @@ use c2_wire::frame::{self, decode_frame_body, encode_frame};
 pub use c2_wire::handshake::ServerIdentity;
 use c2_wire::handshake::{
     CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX, MAX_METHODS, MAX_ROUTES, MethodEntry, RouteInfo,
-    decode_handshake, encode_server_handshake, validate_name_len,
+    decode_handshake, encode_server_handshake,
 };
 use c2_wire::msg_type::{DISCONNECT_ACK_BYTES, MsgType, PONG_BYTES, SHUTDOWN_ACK_BYTES};
 
@@ -524,7 +524,7 @@ impl Server {
 }
 
 fn validate_route_for_wire(route: &CrmRoute) -> Result<(), ServerError> {
-    validate_name_len("route name", &route.name)
+    c2_contract::validate_named_route_name("route name", &route.name)
         .map_err(|e| ServerError::Protocol(e.to_string()))?;
     if route.method_names.len() > MAX_METHODS {
         return Err(ServerError::Protocol(format!(
@@ -534,11 +534,15 @@ fn validate_route_for_wire(route: &CrmRoute) -> Result<(), ServerError> {
         )));
     }
     for method_name in &route.method_names {
-        validate_name_len("method name", method_name)
+        c2_contract::validate_contract_text_field("method name", method_name)
             .map_err(|e| ServerError::Protocol(e.to_string()))?;
     }
-    c2_wire::handshake::validate_crm_tag(&route.crm_ns, &route.crm_name, &route.crm_ver)
-        .map_err(ServerError::Protocol)?;
+    c2_contract::validate_crm_tag(&route.crm_ns, &route.crm_name, &route.crm_ver)
+        .map_err(|e| ServerError::Protocol(e.to_string()))?;
+    c2_contract::validate_contract_hash("abi_hash", &route.abi_hash)
+        .map_err(|e| ServerError::Protocol(e.to_string()))?;
+    c2_contract::validate_contract_hash("signature_hash", &route.signature_hash)
+        .map_err(|e| ServerError::Protocol(e.to_string()))?;
     Ok(())
 }
 
@@ -551,10 +555,10 @@ fn validate_server_identity(identity: &ServerIdentity) -> Result<(), ServerError
 
 fn validate_identity_wire_len(label: &str, value: &str) -> Result<(), String> {
     let actual = value.len();
-    if actual > c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES {
+    if actual > c2_contract::MAX_WIRE_TEXT_BYTES {
         return Err(format!(
             "{label} cannot exceed {} bytes",
-            c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES
+            c2_contract::MAX_WIRE_TEXT_BYTES
         ));
     }
     Ok(())
@@ -791,6 +795,8 @@ async fn handle_handshake(
             crm_ns: r.crm_ns.clone(),
             crm_name: r.crm_name.clone(),
             crm_ver: r.crm_ver.clone(),
+            abi_hash: r.abi_hash.clone(),
+            signature_hash: r.signature_hash.clone(),
             methods: r
                 .method_names
                 .iter()
@@ -1307,13 +1313,38 @@ async fn dispatch_chunked_call(
                 return;
             }
         };
-        let route_name = finished.route_name.unwrap_or_default();
-        let method_idx = finished.method_idx.unwrap_or(0);
-
+        let c2_wire::chunk::FinishedChunk {
+            handle,
+            route_name,
+            method_idx,
+        } = finished;
         let pool_arc = server.chunk_registry.pool().clone();
         let request = RequestData::Handle {
-            handle: finished.handle,
+            handle,
             pool: pool_arc,
+        };
+        let (route_name, method_idx) = match (route_name, method_idx) {
+            (Some(route_name), Some(method_idx)) => (route_name, method_idx),
+            (route_name, method_idx) => {
+                cleanup_request(request);
+                warn!(
+                    conn_id = conn.conn_id(),
+                    request_id,
+                    has_route_name = route_name.is_some(),
+                    has_method_idx = method_idx.is_some(),
+                    "chunked call missing route metadata"
+                );
+                write_reply(
+                    writer,
+                    request_id,
+                    &ReplyControl::Error(error_wire(
+                        ErrorCode::ResourceInputDeserializing,
+                        "chunked call missing route metadata",
+                    )),
+                )
+                .await;
+                return;
+            }
         };
 
         // FlightGuard: increments on create, decrements on drop.
@@ -1365,7 +1396,9 @@ fn checked_frame_total_len(payload_len: usize, context: &str) -> Result<u32, Str
 }
 
 fn inline_reply_total_len(data_len: usize) -> Result<u32, String> {
-    let ctrl_len = encode_reply_control(&ReplyControl::Success).len();
+    let ctrl_len = try_encode_reply_control(&ReplyControl::Success)
+        .map_err(|err| err.to_string())?
+        .len();
     let payload_len = ctrl_len
         .checked_add(data_len)
         .ok_or_else(|| "inline reply frame length overflow".to_string())?;
@@ -1430,9 +1463,30 @@ impl std::fmt::Display for ResponseSendError {
 }
 
 async fn write_reply(writer: &Arc<Mutex<OwnedWriteHalf>>, request_id: u64, ctrl: &ReplyControl) {
-    let payload = encode_reply_control(ctrl);
+    let payload = match try_encode_reply_control(ctrl) {
+        Ok(payload) => payload,
+        Err(err) => {
+            let fallback = ReplyControl::Error(error_wire(
+                ErrorCode::ResourceFunctionExecuting,
+                err.to_string(),
+            ));
+            match try_encode_reply_control(&fallback) {
+                Ok(payload) => payload,
+                Err(fallback_err) => {
+                    warn!(
+                        request_id,
+                        error = %fallback_err,
+                        "failed to encode fallback error reply"
+                    );
+                    return;
+                }
+            }
+        }
+    };
     let frame = encode_frame(request_id, REPLY_FLAGS, &payload);
-    let _ = writer.lock().await.write_all(&frame).await;
+    if let Err(err) = writer.lock().await.write_all(&frame).await {
+        warn!(request_id, error = %err, "failed to write reply frame");
+    }
 }
 
 /// Write a success reply: control header (STATUS_SUCCESS) + result data.
@@ -1442,7 +1496,8 @@ async fn write_reply_with_data(
     request_id: u64,
     data: &[u8],
 ) -> Result<(), ResponseSendError> {
-    let ctrl_bytes = encode_reply_control(&ReplyControl::Success);
+    let ctrl_bytes = try_encode_reply_control(&ReplyControl::Success)
+        .map_err(|err| ResponseSendError::UserVisible(err.to_string()))?;
     let payload_len = ctrl_bytes.len().checked_add(data.len()).ok_or_else(|| {
         ResponseSendError::UserVisible("inline reply frame length overflow".to_string())
     })?;
@@ -1540,7 +1595,8 @@ async fn write_buddy_reply_with_data(
         is_dedicated: alloc.is_dedicated,
     };
     let buddy_bytes = encode_buddy_payload(&bp);
-    let ctrl_bytes = encode_reply_control(&ReplyControl::Success);
+    let ctrl_bytes = try_encode_reply_control(&ReplyControl::Success)
+        .map_err(|err| BuddyReplyError::Fatal(err.to_string()))?;
 
     let mut payload = Vec::with_capacity(BUDDY_PAYLOAD_SIZE + ctrl_bytes.len());
     payload.extend_from_slice(&buddy_bytes);
@@ -1659,7 +1715,8 @@ async fn send_response_meta(
                 is_dedicated,
             };
             let buddy_bytes = encode_buddy_payload(&bp);
-            let ctrl_bytes = encode_reply_control(&ReplyControl::Success);
+            let ctrl_bytes = try_encode_reply_control(&ReplyControl::Success)
+                .map_err(|err| ResponseSendError::UserVisible(err.to_string()))?;
             let mut payload = Vec::with_capacity(BUDDY_PAYLOAD_SIZE + ctrl_bytes.len());
             payload.extend_from_slice(&buddy_bytes);
             payload.extend_from_slice(&ctrl_bytes);
@@ -1813,7 +1870,7 @@ mod tests {
 
     #[test]
     fn server_new_with_identity_rejects_invalid_instance_id() {
-        let too_long = "a".repeat(c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES + 1);
+        let too_long = "a".repeat(c2_contract::MAX_WIRE_TEXT_BYTES + 1);
         for server_instance_id in ["../bad", "实例", too_long.as_str()] {
             let identity = c2_wire::handshake::ServerIdentity {
                 server_id: "server-explicit".to_string(),
@@ -1835,7 +1892,7 @@ mod tests {
     #[test]
     fn server_new_with_identity_rejects_server_id_too_long_for_wire() {
         let identity = c2_wire::handshake::ServerIdentity {
-            server_id: "s".repeat(c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES + 1),
+            server_id: "s".repeat(c2_contract::MAX_WIRE_TEXT_BYTES + 1),
             server_instance_id: "instance-explicit".to_string(),
         };
 
@@ -2191,6 +2248,9 @@ mod tests {
             crm_ns: "test.grid".into(),
             crm_name: "Grid".into(),
             crm_ver: "0.1.0".into(),
+            abi_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                .into(),
             scheduler: Arc::new(Scheduler::new(
                 ConcurrencyMode::ReadParallel,
                 HashMap::new(),
@@ -2286,7 +2346,7 @@ mod tests {
     #[tokio::test]
     async fn register_route_rejects_wire_invalid_route_name() {
         let s = Arc::new(Server::new("ipc://long_route_test", ServerIpcConfig::default()).unwrap());
-        let route = make_route(&"x".repeat(c2_wire::handshake::MAX_HANDSHAKE_NAME_BYTES + 1));
+        let route = make_route(&"x".repeat(c2_contract::MAX_WIRE_TEXT_BYTES + 1));
 
         let err = s.register_route(route).await.unwrap_err();
 

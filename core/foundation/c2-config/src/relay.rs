@@ -26,8 +26,6 @@ pub struct RelayConfig {
     pub dead_peer_probe_interval: Duration,
     /// Seed retry interval when no peers available.
     pub seed_retry_interval: Duration,
-    /// Skip IPC validation in `/_register`. For testing only.
-    pub skip_ipc_validation: bool,
     /// Whether relay HTTP clients should honor system HTTP proxy variables.
     pub use_proxy: bool,
 }
@@ -45,7 +43,6 @@ impl Default for RelayConfig {
             heartbeat_miss_threshold: 3,
             dead_peer_probe_interval: Duration::from_secs(30),
             seed_retry_interval: Duration::from_secs(10),
-            skip_ipc_validation: false,
             use_proxy: false,
         }
     }

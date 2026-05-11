@@ -352,17 +352,21 @@ impl Drop for PyResponseBuffer {
 /// ```python
 /// from c_two._native import RustClient
 /// client = RustClient("ipc://my_server")
-/// result = client.call("grid", "step", payload)
+/// routes = client.route_names()
 /// client.close()
 /// ```
 #[pyclass(name = "RustClient", frozen)]
 pub struct PyRustClient {
     inner: Arc<SyncClient>,
+    bound_route_name: Option<String>,
 }
 
 impl PyRustClient {
-    pub(crate) fn from_arc(inner: Arc<SyncClient>) -> Self {
-        Self { inner }
+    pub(crate) fn from_arc_bound(inner: Arc<SyncClient>, route_name: String) -> Self {
+        Self {
+            inner,
+            bound_route_name: Some(route_name),
+        }
     }
 }
 
@@ -505,6 +509,7 @@ impl PyRustClient {
         })?;
         Ok(Self {
             inner: Arc::new(client),
+            bound_route_name: None,
         })
     }
 
@@ -517,17 +522,27 @@ impl PyRustClient {
     fn call<'py>(
         &self,
         py: Python<'py>,
-        route_name: &str,
         method_name: &str,
         data: &[u8],
     ) -> PyResult<PyResponseBuffer> {
-        call_sync_client(py, &self.inner, route_name, method_name, data)
+        let Some(bound_route_name) = self.bound_route_name.as_ref() else {
+            return Err(PyRuntimeError::new_err(
+                "RustClient CRM calls require a route-bound client from RuntimeSession.acquire_ipc_client()",
+            ));
+        };
+        call_sync_client(py, &self.inner, bound_route_name, method_name, data)
     }
 
     /// Whether the client is connected.
     #[getter]
     fn is_connected(&self) -> bool {
         self.inner.is_connected()
+    }
+
+    /// Route name validated by the runtime session for CRM calls.
+    #[getter]
+    fn route_name(&self) -> Option<&str> {
+        self.bound_route_name.as_deref()
     }
 
     /// Get all route names advertised by the server.
@@ -540,16 +555,20 @@ impl PyRustClient {
     }
 
     /// CRM tag advertised for a route by the IPC handshake.
-    fn route_contract(&self, route_name: &str) -> Option<(String, String, String)> {
-        self.inner
-            .route_contract(route_name)
-            .map(|(crm_ns, crm_name, crm_ver)| {
-                (
-                    crm_ns.to_string(),
-                    crm_name.to_string(),
-                    crm_ver.to_string(),
-                )
-            })
+    fn route_contract(
+        &self,
+        route_name: &str,
+    ) -> Option<(String, String, String, String, String, String)> {
+        self.inner.route_contract(route_name).map(|contract| {
+            (
+                contract.route_name,
+                contract.crm_ns,
+                contract.crm_name,
+                contract.crm_ver,
+                contract.abi_hash,
+                contract.signature_hash,
+            )
+        })
     }
 
     /// Stable logical server identity advertised by the IPC handshake.
@@ -619,7 +638,10 @@ impl PyRustClientPool {
         let client = py
             .detach(move || pool.acquire(&addr, None))
             .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
-        Ok(PyRustClient { inner: client })
+        Ok(PyRustClient {
+            inner: client,
+            bound_route_name: None,
+        })
     }
 
     /// Release a client reference for the given address.

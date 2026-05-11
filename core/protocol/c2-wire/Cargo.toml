@@ -6,6 +6,7 @@ description = "Wire protocol codec for C-Two IPC frames"
 
 [dependencies]
 c2-config = { path = "../../foundation/c2-config" }
+c2-contract = { path = "../../foundation/c2-contract" }
 c2-mem = { path = "../../foundation/c2-mem" }
 parking_lot = { workspace = true }
 tracing = "0.1"

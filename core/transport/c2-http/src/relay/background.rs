@@ -11,7 +11,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::relay::authority::{RouteAuthority, RouteCommand};
-use crate::relay::peer::{DigestDiffEntry, DigestEntry, PeerEnvelope, PeerMessage};
+use crate::relay::peer::{
+    DigestEntry, PeerEnvelope, PeerMessage, ValidatedDigestDiffEntry, validate_route_state_envelope,
+};
 use crate::relay::state::RelayState;
 use crate::relay::types::*;
 use crate::relay::url::peer_endpoint_url;
@@ -202,34 +204,36 @@ async fn anti_entropy_loop(state: Arc<RelayState>, cancel: CancellationToken) {
         let url = peer_endpoint_url(peer_url, "/_peer/digest");
         if let Ok(resp) = client.post(&url).json(&envelope).send().await {
             if let Ok(resp_env) = resp.json::<PeerEnvelope>().await {
-                if resp_env.sender_relay_id != *peer_id {
+                let Ok(validated) = validate_route_state_envelope(resp_env, Some(peer_id.as_str()))
+                else {
                     continue;
-                }
-                if let PeerMessage::DigestDiff { entries } = resp_env.message {
-                    for diff_entry in entries {
-                        apply_digest_diff(&state, peer_id, diff_entry);
-                    }
+                };
+                let Some(entries) = validated.into_digest_diff_entries() else {
+                    continue;
+                };
+                for diff_entry in entries {
+                    apply_digest_diff(&state, peer_id, diff_entry);
                 }
             }
         }
     }
 }
 
-fn apply_digest_diff(state: &RelayState, peer_id: &str, diff_entry: DigestDiffEntry) {
+fn apply_digest_diff(state: &RelayState, peer_id: &str, diff_entry: ValidatedDigestDiffEntry) {
     match diff_entry {
-        DigestDiffEntry::Active { ref relay_id, .. } if relay_id == peer_id => {
-            if let Ok(entry) = diff_entry.try_into() {
-                let _ = RouteAuthority::new(state).execute(RouteCommand::AnnouncePeer {
-                    sender_relay_id: peer_id.to_string(),
-                    entry,
-                });
-            }
+        ValidatedDigestDiffEntry::Active(active) => {
+            let entry = active.into();
+            let _ = RouteAuthority::new(state).execute(RouteCommand::AnnouncePeer {
+                sender_relay_id: peer_id.to_string(),
+                entry,
+            });
         }
-        DigestDiffEntry::Deleted {
-            name,
-            relay_id,
-            removed_at,
-        } if relay_id == peer_id => {
+        ValidatedDigestDiffEntry::Deleted(deleted) => {
+            let crate::relay::peer::ValidatedDigestDiffDeleted {
+                name,
+                relay_id,
+                removed_at,
+            } = deleted;
             let _ = RouteAuthority::new(state).execute(RouteCommand::WithdrawPeer {
                 sender_relay_id: peer_id.to_string(),
                 name,
@@ -237,7 +241,6 @@ fn apply_digest_diff(state: &RelayState, peer_id: &str, diff_entry: DigestDiffEn
                 removed_at,
             });
         }
-        _ => {}
     }
 }
 
@@ -301,13 +304,16 @@ async fn dead_peer_probe_loop(state: Arc<RelayState>, cancel: CancellationToken)
                 let digest_url = peer_endpoint_url(&url, "/_peer/digest");
                 if let Ok(resp) = client.post(&digest_url).json(&envelope).send().await {
                     if let Ok(resp_env) = resp.json::<PeerEnvelope>().await {
-                        if resp_env.sender_relay_id != relay_id {
+                        let Ok(validated) =
+                            validate_route_state_envelope(resp_env, Some(relay_id.as_str()))
+                        else {
                             continue;
-                        }
-                        if let PeerMessage::DigestDiff { entries } = resp_env.message {
-                            for diff_entry in entries {
-                                apply_digest_diff(&state, &relay_id, diff_entry);
-                            }
+                        };
+                        let Some(entries) = validated.into_digest_diff_entries() else {
+                            continue;
+                        };
+                        for diff_entry in entries {
+                            apply_digest_diff(&state, &relay_id, diff_entry);
                         }
                     }
                 }
@@ -350,7 +356,10 @@ async fn seed_retry_loop(state: Arc<RelayState>, cancel: CancellationToken) {
                 },
             );
             if let Ok(resp) = client.post(&join_url).json(&envelope).send().await {
-                if let Ok(snapshot) = resp.json::<FullSync>().await {
+                if let Ok(envelope) = resp.json::<FullSyncEnvelope>().await {
+                    let Ok(snapshot) = ValidatedFullSync::try_from(envelope) else {
+                        continue;
+                    };
                     state.merge_snapshot(snapshot);
                     let peers = state.list_peers();
                     let announce = PeerEnvelope::new(

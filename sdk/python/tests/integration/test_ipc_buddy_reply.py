@@ -144,9 +144,8 @@ class TestBuddyReply:
         import pickle
         proxy = self._setup_ipc()
         rust_client = proxy.client._client
-        route_name = proxy.client._name
         data = os.urandom(1024 * 1024)  # 1 MB — above SHM threshold
-        response = rust_client.call(route_name, 'echo', pickle.dumps(data))
+        response = rust_client.call('echo', pickle.dumps(data))
         mv = memoryview(response)
         result = pickle.loads(bytes(mv))
         assert result == data
@@ -159,11 +158,10 @@ class TestBuddyReply:
         import pickle
         proxy = self._setup_ipc()
         rust_client = proxy.client._client
-        route_name = proxy.client._name
         import gc
         for _ in range(5):
             data = os.urandom(1024 * 1024)
-            response = rust_client.call(route_name, 'echo', pickle.dumps(data))
+            response = rust_client.call('echo', pickle.dumps(data))
             del response
             gc.collect()
         # Should still work after GC

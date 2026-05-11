@@ -137,6 +137,34 @@ class TestRegisterConnect:
         with pytest.raises(RuntimeError, match='CRM contract mismatch'):
             cc.connect(RenamedHello, name='hello', address=addr)
 
+    def test_validated_ipc_client_is_bound_to_connected_route(self):
+        cc.register(Hello, HelloImpl(), name='hello')
+        cc.register(Counter, CounterImpl(), name='counter')
+        addr = cc.server_address()
+        assert addr is not None
+
+        crm = cc.connect(Hello, name='hello', address=addr)
+        try:
+            assert crm.client._client.route_name == 'hello'  # noqa: SLF001
+        finally:
+            cc.close(crm)
+
+    def test_raw_ipc_client_rejects_unbound_crm_call(self):
+        from c_two._native import RustClientPool
+
+        cc.register(Hello, HelloImpl(), name='hello')
+        addr = cc.server_address()
+        assert addr is not None
+
+        pool = RustClientPool.instance()
+        client = pool.acquire(addr)
+        try:
+            assert 'hello' in client.route_names()
+            with pytest.raises(RuntimeError, match='route-bound client'):
+                client.call('greeting', b'')
+        finally:
+            pool.release(addr)
+
     def test_close_terminates_proxy(self):
         cc.register(Hello, HelloImpl(), name='hello')
         crm = cc.connect(Hello, name='hello')

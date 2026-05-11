@@ -653,8 +653,6 @@ pub struct RegistryArgs {
 pub enum RegistryCommand {
     /// List all registered routes on a relay.
     ListRoutes(RelayOnly),
-    /// Resolve a resource name through a relay.
-    Resolve(ResolveArgs),
     /// List known peer relays.
     Peers(RelayOnly),
 }
@@ -665,17 +663,9 @@ pub struct RelayOnly {
     pub relay: String,
 }
 
-#[derive(Debug, Args)]
-pub struct ResolveArgs {
-    #[arg(long, short = 'r')]
-    pub relay: String,
-    pub name: String,
-}
-
 pub fn run(args: RegistryArgs) -> Result<()> {
     match args.command {
         RegistryCommand::ListRoutes(args) => list_routes(&args.relay),
-        RegistryCommand::Resolve(args) => resolve(&args.relay, &args.name),
         RegistryCommand::Peers(args) => peers(&args.relay),
     }
 }
@@ -719,12 +709,10 @@ fn list_routes(relay: &str) -> Result<()> {
     Ok(())
 }
 
-fn resolve(relay: &str, name: &str) -> Result<()> {
-    let name = utf8_percent_encode(name, NON_ALPHANUMERIC).to_string();
-    let value = get_json(relay, &format!("/_resolve/{name}"))?;
-    println!("{}", serde_json::to_string_pretty(&value)?);
-    Ok(())
-}
+// Do not add a name-only registry lookup helper. Runtime relay resolution is
+// contract-bound and must include the expected CRM tag plus ABI/signature
+// hashes; CLI diagnostics should use list-routes or a separately designed
+// resource-search surface.
 
 fn peers(relay: &str) -> Result<()> {
     let value = get_json(relay, "/_peers")?;

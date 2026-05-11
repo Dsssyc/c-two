@@ -7,11 +7,11 @@ use std::sync::Arc;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict};
+use pyo3::types::PyBytes;
 
 use c2_config::{ConfigResolver, ConfigSources};
 use c2_http::client::{
-    HttpClient, HttpClientPool, HttpError, RelayAwareHttpClient, RelayControlClient, RelayRouteInfo,
+    HttpClient, HttpClientPool, HttpError, RelayAwareHttpClient, RelayControlClient,
 };
 
 // ---------------------------------------------------------------------------
@@ -33,13 +33,12 @@ pyo3::create_exception!(
 // PyRustHttpClient
 // ---------------------------------------------------------------------------
 
-/// A Rust-native HTTP client for CRM calls through a relay server.
+/// A Rust-native HTTP client for relay health and low-level diagnostics.
 ///
 /// ```python
-/// from c_two._native import RustHttpClient
-/// client = RustHttpClient("http://localhost:8080", 30.0, 100)
-/// result = client.call("grid", "step", payload)
-/// client.close()
+/// from c_two._native import RustHttpClientPool
+/// client = RustHttpClientPool.instance().acquire("http://localhost:8080")
+/// assert client.health()
 /// ```
 #[pyclass(name = "RustHttpClient", frozen)]
 pub struct PyRustHttpClient {
@@ -58,22 +57,6 @@ pub(crate) fn acquire_http_client_from_global_pool(
     call_timeout_secs: f64,
 ) -> Result<Arc<HttpClient>, HttpError> {
     HttpClientPool::instance().acquire_with_options(base_url, use_proxy, call_timeout_secs)
-}
-
-pub(crate) fn call_http_client<'py>(
-    py: Python<'py>,
-    inner: &Arc<HttpClient>,
-    route_name: &str,
-    method_name: &str,
-    data: &[u8],
-) -> PyResult<Bound<'py, PyBytes>> {
-    let client = Arc::clone(inner);
-    let route = route_name.to_string();
-    let method = method_name.to_string();
-    let payload = data.to_vec();
-
-    let result = py.detach(move || client.call(&route, &method, &payload));
-    http_call_result_to_py(py, result)
 }
 
 pub(crate) fn call_relay_aware_http_client<'py>(
@@ -128,11 +111,13 @@ impl PyRustHttpClient {
     fn call<'py>(
         &self,
         py: Python<'py>,
-        route_name: &str,
         method_name: &str,
         data: &[u8],
     ) -> PyResult<Bound<'py, PyBytes>> {
-        call_http_client(py, &self.inner, route_name, method_name, data)
+        let _ = (py, method_name, data);
+        Err(PyRuntimeError::new_err(
+            "RustHttpClient CRM calls require a route-bound relay-aware client from RuntimeSession.connect_explicit_relay_http()",
+        ))
     }
 
     /// Health check — GET /health on the relay.
@@ -187,7 +172,7 @@ impl PyRustRelayControlClient {
         })
     }
 
-    #[pyo3(signature = (name, server_id, server_instance_id, ipc_address, crm_ns="", crm_name="", crm_ver=""))]
+    #[pyo3(signature = (name, server_id, server_instance_id, ipc_address, crm_ns, crm_name, crm_ver, abi_hash, signature_hash))]
     fn register(
         &self,
         py: Python<'_>,
@@ -198,6 +183,8 @@ impl PyRustRelayControlClient {
         crm_ns: &str,
         crm_name: &str,
         crm_ver: &str,
+        abi_hash: &str,
+        signature_hash: &str,
     ) -> PyResult<()> {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
@@ -207,6 +194,8 @@ impl PyRustRelayControlClient {
         let crm_ns = crm_ns.to_string();
         let crm_name = crm_name.to_string();
         let crm_ver = crm_ver.to_string();
+        let abi_hash = abi_hash.to_string();
+        let signature_hash = signature_hash.to_string();
         py.detach(move || {
             inner.register(
                 &name,
@@ -216,6 +205,8 @@ impl PyRustRelayControlClient {
                 &crm_ns,
                 &crm_name,
                 &crm_ver,
+                &abi_hash,
+                &signature_hash,
             )
         })
         .map_err(py_http_error)
@@ -229,15 +220,6 @@ impl PyRustRelayControlClient {
             .map_err(py_http_error)
     }
 
-    fn resolve(&self, py: Python<'_>, name: &str) -> PyResult<Vec<Py<PyAny>>> {
-        let inner = Arc::clone(&self.inner);
-        let name = name.to_string();
-        let routes = py
-            .detach(move || inner.resolve(&name))
-            .map_err(py_http_error)?;
-        routes_to_py(py, routes)
-    }
-
     fn invalidate(&self, name: &str) {
         self.inner.invalidate(name);
     }
@@ -245,22 +227,6 @@ impl PyRustRelayControlClient {
     fn clear_cache(&self) {
         self.inner.clear_cache();
     }
-}
-
-fn routes_to_py(py: Python<'_>, routes: Vec<RelayRouteInfo>) -> PyResult<Vec<Py<PyAny>>> {
-    routes
-        .into_iter()
-        .map(|route| {
-            let dict = PyDict::new(py);
-            dict.set_item("name", route.name)?;
-            dict.set_item("relay_url", route.relay_url)?;
-            dict.set_item("ipc_address", route.ipc_address)?;
-            dict.set_item("crm_ns", route.crm_ns)?;
-            dict.set_item("crm_name", route.crm_name)?;
-            dict.set_item("crm_ver", route.crm_ver)?;
-            Ok(dict.into_any().unbind())
-        })
-        .collect()
 }
 
 fn py_http_error(err: HttpError) -> PyErr {

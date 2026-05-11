@@ -34,7 +34,7 @@ def _connect(crm_type: type, name: str):
     return cc.connect(crm_type, name=name, address=address)
 
 
-@cc.transferable
+@cc.transferable(abi_id="c-two.tests.response-allocation.bytes-response.raw-bytes.v1")
 class BytesResponse:
     data: memoryview | bytes
 
@@ -60,7 +60,7 @@ class BytesResponseResource:
         return BytesResponse(b"b" * size)
 
 
-@cc.transferable
+@cc.transferable(abi_id="c-two.tests.response-allocation.memoryview-response.raw-bytes.v1")
 class MemoryViewResponse:
     data: memoryview | bytearray | bytes
 

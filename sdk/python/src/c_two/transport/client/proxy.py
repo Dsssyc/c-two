@@ -8,10 +8,10 @@ Three modes:
 
 - **thread-local**: ``supports_direct_call = True``.  Calls resource methods
   directly via ``call_direct(method_name, args)`` — zero serialization.
-- **ipc**: ``supports_direct_call = False``.  Delegates to a Rust IPC
-  client with routing-name-based ``call()``.
-- **http**: ``supports_direct_call = False``.  Delegates to a Rust-native HTTP
-  call surface for cross-node access via an HTTP relay.
+- **ipc**: ``supports_direct_call = False``.  Delegates to a route-bound Rust
+  IPC client.
+- **http**: ``supports_direct_call = False``.  Delegates to a route-bound
+  relay-aware Rust HTTP call surface.
 
 Usage::
 
@@ -21,17 +21,17 @@ Usage::
     crm.client = proxy
     crm.greeting('World')       # → resource_instance.greeting('World')
 
-    # IPC (cross-process via RustClient):
+    # IPC (cross-process via a route-bound RustClient):
     proxy = CRMProxy.ipc(rust_client, 'hello')
     crm = Hello()
     crm.client = proxy
-    crm.greeting('World')       # → rust_client.call('hello', 'greeting', ...)
+    crm.greeting('World')
 
-    # HTTP (cross-node via a Rust-native HTTP or relay-aware client):
+    # HTTP (cross-node via a route-bound relay-aware client):
     proxy = CRMProxy.http(http_client, 'hello')
     crm = Hello()
     crm.client = proxy
-    crm.greeting('World')       # → http_client.call('hello', 'greeting', ...)
+    crm.greeting('World')
 """
 from __future__ import annotations
 
@@ -40,6 +40,16 @@ from typing import Any, Callable, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..server.scheduler import Scheduler
+
+
+def _require_explicit_route_name(name: str, transport: str) -> str:
+    if not isinstance(name, str):
+        raise TypeError(f'{transport} CRMProxy requires route name as a string')
+    if not name:
+        raise ValueError(
+            f'{transport} CRMProxy requires an explicit non-empty route name',
+        )
+    return name
 
 
 class CRMProxy:
@@ -110,24 +120,20 @@ class CRMProxy:
         """Create an IPC proxy (cross-process via Rust IPC client).
 
         Calls are routed to the CRM registered under *name* on the
-        remote server.  When *name* is empty, auto-discovers the first
-        route from the server handshake.
+        remote server. The native client must already be route-bound by
+        the runtime session.
         """
+        route_name = _require_explicit_route_name(name, 'IPC')
         proxy = object.__new__(cls)
         proxy._mode = 'ipc'
         proxy._crm = None
         proxy._client = client
-        proxy._name = name
+        proxy._name = route_name
         proxy._close_lock = threading.Lock()
         proxy._closed = False
         proxy._on_terminate = on_terminate
         proxy._scheduler = None
         proxy._lease_tracker = lease_tracker
-        # Auto-discover route name when not provided.
-        if not name and hasattr(client, 'route_names'):
-            names = client.route_names()
-            if names:
-                proxy._name = names[0]
         return proxy
 
     @classmethod
@@ -141,14 +147,14 @@ class CRMProxy:
     ) -> CRMProxy:
         """Create an HTTP proxy (cross-node via Rust HTTP client + relay).
 
-        Calls are sent to the relay server as
-        ``POST /{name}/{method_name}`` with the serialized payload.
+        Calls are sent through the route-bound relay-aware native client.
         """
+        route_name = _require_explicit_route_name(name, 'HTTP')
         proxy = object.__new__(cls)
         proxy._mode = 'http'
         proxy._crm = None
         proxy._client = http_client
-        proxy._name = name
+        proxy._name = route_name
         proxy._close_lock = threading.Lock()
         proxy._closed = False
         proxy._on_terminate = on_terminate
@@ -194,9 +200,7 @@ class CRMProxy:
                 raise RuntimeError('Proxy is closed')
         if self._mode in ('ipc', 'http'):
             try:
-                return self._client.call(
-                    self._name, method_name, data or b'',
-                )
+                return self._client.call(method_name, data or b'')
             except Exception as exc:
                 error_bytes = getattr(exc, 'error_bytes', None)
                 if error_bytes is not None:
@@ -234,17 +238,6 @@ class CRMProxy:
         method_idx = self._scheduler.method_idx(method_name)
         with self._scheduler.execution_guard(method_idx):
             return method(*args)
-
-    def relay(self, event_bytes: bytes) -> bytes:
-        """Relay raw wire bytes to the server (IPC mode only)."""
-        with self._close_lock:
-            if self._closed:
-                raise RuntimeError('Proxy is closed')
-        if self._mode == 'ipc':
-            return self._client.relay(event_bytes)
-        raise NotImplementedError(
-            'relay() not available in thread-local mode',
-        )
 
     def terminate(self) -> None:
         """Release the proxy and invoke cleanup callback if set."""

@@ -9,7 +9,7 @@
 //! [1B name_len][route_name UTF-8][2B method_idx LE]
 //! ```
 //!
-//! `name_len=0` means "use connection default route".
+//! `name_len=0` is invalid. CRM calls must carry an explicit route key.
 //!
 //! ## V2 Reply Control
 //!
@@ -62,14 +62,14 @@ pub const STATUS_ERROR: u8 = 0x01;
 /// Reply status: requested route is no longer present on the IPC server.
 pub const STATUS_ROUTE_NOT_FOUND: u8 = 0x02;
 
-pub const MAX_CALL_ROUTE_NAME_BYTES: usize = u8::MAX as usize;
+const MAX_CALL_ROUTE_NAME_BYTES: usize = c2_contract::MAX_WIRE_TEXT_BYTES;
 
 // ── V2 Call Control ──────────────────────────────────────────────────────
 
 /// Decoded v2 call control.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallControl {
-    /// Route name (empty string = default route).
+    /// Explicit route name.
     pub route_name: String,
     /// Method index within the route's method table.
     pub method_idx: u16,
@@ -77,6 +77,7 @@ pub struct CallControl {
 
 /// Encode v2 call control: `[1B name_len][route UTF-8][2B method_idx LE]`.
 pub fn encode_call_control(route_name: &str, method_idx: u16) -> Result<Vec<u8>, EncodeError> {
+    validate_call_route_key("route_name", route_name)?;
     let name_bytes = route_name.as_bytes();
     if name_bytes.len() > MAX_CALL_ROUTE_NAME_BYTES {
         return Err(EncodeError::FieldTooLong {
@@ -101,6 +102,7 @@ pub fn encode_call_control_into(
     route_name: &str,
     method_idx: u16,
 ) -> Result<usize, EncodeError> {
+    validate_call_route_key("route_name", route_name)?;
     let name_bytes = route_name.as_bytes();
     if name_bytes.len() > MAX_CALL_ROUTE_NAME_BYTES {
         return Err(EncodeError::FieldTooLong {
@@ -145,6 +147,12 @@ pub fn decode_call_control(buf: &[u8], offset: usize) -> Result<(CallControl, us
     } else {
         String::new()
     };
+    c2_contract::validate_call_route_key("route_name", &route_name).map_err(|err| {
+        DecodeError::InvalidText {
+            field: "route_name",
+            reason: err.to_string(),
+        }
+    })?;
     let idx_start = name_start + name_len;
     let method_idx = u16::from_le_bytes([buf[idx_start], buf[idx_start + 1]]);
     Ok((
@@ -154,6 +162,13 @@ pub fn decode_call_control(buf: &[u8], offset: usize) -> Result<(CallControl, us
         },
         needed,
     ))
+}
+
+fn validate_call_route_key(field: &'static str, value: &str) -> Result<(), EncodeError> {
+    c2_contract::validate_call_route_key(field, value).map_err(|err| EncodeError::InvalidText {
+        field,
+        reason: err.to_string(),
+    })
 }
 
 // ── V2 Reply Control ─────────────────────────────────────────────────────
@@ -170,25 +185,24 @@ pub enum ReplyControl {
 }
 
 /// Encode v2 reply control.
-pub fn encode_reply_control(ctrl: &ReplyControl) -> Vec<u8> {
+pub fn try_encode_reply_control(ctrl: &ReplyControl) -> Result<Vec<u8>, EncodeError> {
     match ctrl {
-        ReplyControl::Success => {
-            vec![STATUS_SUCCESS]
-        }
+        ReplyControl::Success => Ok(vec![STATUS_SUCCESS]),
         ReplyControl::RouteNotFound(route_name) => {
+            validate_call_route_key("route_name", route_name)?;
             let route_bytes = route_name.as_bytes();
             let mut buf = Vec::with_capacity(1 + 4 + route_bytes.len());
             buf.push(STATUS_ROUTE_NOT_FOUND);
             buf.extend_from_slice(&(route_bytes.len() as u32).to_le_bytes());
             buf.extend_from_slice(route_bytes);
-            buf
+            Ok(buf)
         }
         ReplyControl::Error(err_data) => {
             let mut buf = Vec::with_capacity(1 + 4 + err_data.len());
             buf.push(STATUS_ERROR);
             buf.extend_from_slice(&(err_data.len() as u32).to_le_bytes());
             buf.extend_from_slice(err_data);
-            buf
+            Ok(buf)
         }
     }
 }
@@ -257,6 +271,12 @@ pub fn decode_reply_control(
             let route_name = core::str::from_utf8(&buf[offset + 5..offset + 5 + route_len])
                 .map_err(|_| DecodeError::Utf8Error)?
                 .to_string();
+            c2_contract::validate_call_route_key("route_name", &route_name).map_err(|err| {
+                DecodeError::InvalidText {
+                    field: "route_name",
+                    reason: err.to_string(),
+                }
+            })?;
             Ok((ReplyControl::RouteNotFound(route_name), total))
         }
         _ => Err(DecodeError::InvalidValue {

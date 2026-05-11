@@ -53,28 +53,40 @@ pub struct PyRouteInfo {
     #[pyo3(get)]
     crm_ver: String,
     #[pyo3(get)]
+    abi_hash: String,
+    #[pyo3(get)]
+    signature_hash: String,
+    #[pyo3(get)]
     methods: Vec<Py<PyMethodEntry>>,
 }
 
 #[pymethods]
 impl PyRouteInfo {
     #[new]
-    #[pyo3(signature = (name, methods, crm_ns, crm_name, crm_ver))]
+    #[pyo3(signature = (name, methods, crm_ns, crm_name, crm_ver, abi_hash, signature_hash))]
     fn new(
         name: String,
         methods: Vec<Py<PyMethodEntry>>,
         crm_ns: &str,
         crm_name: &str,
         crm_ver: &str,
+        abi_hash: &str,
+        signature_hash: &str,
     ) -> PyResult<Self> {
-        c2_wire::handshake::validate_crm_tag(crm_ns, crm_name, crm_ver)
-            .map_err(PyValueError::new_err)?;
+        c2_contract::validate_crm_tag(crm_ns, crm_name, crm_ver)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        c2_contract::validate_contract_hash("abi_hash", abi_hash)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        c2_contract::validate_contract_hash("signature_hash", signature_hash)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
         Ok(Self {
             name,
             crm_ns: crm_ns.to_string(),
             crm_name: crm_name.to_string(),
             crm_ver: crm_ver.to_string(),
+            abi_hash: abi_hash.to_string(),
+            signature_hash: signature_hash.to_string(),
             methods,
         })
     }
@@ -105,11 +117,13 @@ impl PyRouteInfo {
 
     fn __repr__(&self) -> String {
         format!(
-            "RouteInfo(name='{}', crm_ns='{}', crm_name='{}', crm_ver='{}', methods=[{}])",
+            "RouteInfo(name='{}', crm_ns='{}', crm_name='{}', crm_ver='{}', abi_hash='{}', signature_hash='{}', methods=[{}])",
             self.name,
             self.crm_ns,
             self.crm_name,
             self.crm_ver,
+            self.abi_hash,
+            self.signature_hash,
             self.methods
                 .iter()
                 .map(|m| {
@@ -230,7 +244,8 @@ fn encode_reply_control(status: u8, error_data: Option<&[u8]>) -> PyResult<Vec<u
         }
         _ => c2_wire::control::ReplyControl::Error(error_data.unwrap_or(&[]).to_vec()),
     };
-    Ok(c2_wire::control::encode_reply_control(&ctrl))
+    c2_wire::control::try_encode_reply_control(&ctrl)
+        .map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
 /// Decode V2 reply control from `data[offset..]`.
@@ -381,6 +396,8 @@ fn encode_server_handshake(
                 crm_ns: r_ref.crm_ns.clone(),
                 crm_name: r_ref.crm_name.clone(),
                 crm_ver: r_ref.crm_ver.clone(),
+                abi_hash: r_ref.abi_hash.clone(),
+                signature_hash: r_ref.signature_hash.clone(),
                 methods,
             }
         })
@@ -426,6 +443,8 @@ fn decode_handshake(py: Python<'_>, payload: &[u8]) -> PyResult<PyHandshake> {
                 crm_ns: route.crm_ns,
                 crm_name: route.crm_name,
                 crm_ver: route.crm_ver,
+                abi_hash: route.abi_hash,
+                signature_hash: route.signature_hash,
                 methods: py_methods?,
             },
         )?);
@@ -451,6 +470,12 @@ fn decode_handshake(py: Python<'_>, payload: &[u8]) -> PyResult<PyHandshake> {
         prefix: hs.prefix,
         server_identity,
     })
+}
+
+#[pyfunction]
+fn contract_descriptor_sha256_hex(payload: &[u8]) -> PyResult<String> {
+    c2_contract::contract_descriptor_sha256_hex(payload)
+        .map_err(|err| PyValueError::new_err(err.to_string()))
 }
 
 // ── Module registration ─────────────────────────────────────────────────
@@ -492,6 +517,7 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(encode_client_handshake, m)?)?;
     m.add_function(wrap_pyfunction!(encode_server_handshake, m)?)?;
     m.add_function(wrap_pyfunction!(decode_handshake, m)?)?;
+    m.add_function(wrap_pyfunction!(contract_descriptor_sha256_hex, m)?)?;
 
     // ── Flag constants (Python names — no _V2 suffix) ───────────────
     m.add("FLAG_SHM", c2_wire::flags::FLAG_SHM)?;

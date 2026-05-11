@@ -26,7 +26,7 @@ from c_two.transport.client.util import _socket_path_from_address
 # Benchmark CRM — Payload wrapper avoids bytes fast-path
 # ---------------------------------------------------------------------------
 
-@cc.transferable
+@cc.transferable(abi_id='c-two.bench.thread-ipc.payload.raw-bytes.v1')
 class Payload:
     data: bytes
 

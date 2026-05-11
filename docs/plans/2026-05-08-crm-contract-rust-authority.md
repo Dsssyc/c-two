@@ -4,6 +4,16 @@
 
 **Status:** Implemented and verified on 2026-05-08.
 
+**2026-05-11 update:** The original slice below covered CRM route identity and
+method-index validity. The later route-fingerprint remediation extends that
+slice with descriptor `abi_hash` and `signature_hash` carriage through Python
+registration/connect, PyO3 runtime/session/server bindings, `RuntimeRouteSpec`,
+`CrmRoute`, IPC handshakes, relay route state, relay registration attestation,
+direct IPC validation, relay-aware resolve/probe/call, and explicit HTTP relay
+connects. Strict cross-language annotation grammar and explicit transferable
+ABI declarations remain future ABI/IDL work and are tracked in
+`docs/superpowers/plans/2026-05-10-thin-sdk-boundary-gap-remediation.md`.
+
 **Goal:** Move language-neutral CRM contract identity and route-method validation into Rust core while keeping language-specific method discovery and Python object invocation in the SDK.
 
 **Architecture:** SDKs extract a CRM contract descriptor from their language-native CRM definition and pass it to Rust during registration/connect. Rust owns canonical route metadata, IPC handshake projection, relay route filtering, direct IPC contract checks, and O(1) method-index validity checks before invoking a language callback. Python keeps only Python binding glue: discovering Python methods, building Python dispatch tables, and invoking Python resource methods.
@@ -23,11 +33,14 @@ This plan implements the first production slice of CRM-as-runtime-protocol:
 - Name-based relay connections filter candidate routes by expected CRM namespace/version in Rust.
 - Python `cc.connect(CRMClass, name=...)` passes expected CRM identity into native runtime for thread-local, direct IPC, and relay-backed connections.
 
-Out of scope for this slice:
+Out of scope for the original 2026-05-08 slice:
 
-- Transferable ABI hashes.
+- Descriptor `abi_hash` / `signature_hash` carriage was not implemented in
+  this slice; it is covered by the 2026-05-11 route-fingerprint remediation
+  update above.
+- Canonical cross-language transferable ABI declarations.
 - Cross-language IDL/codegen.
-- Full method signature compatibility.
+- Strict cross-language method annotation compatibility.
 - Explicit `address="http://..."` contract validation was deferred from this
   slice and is addressed by the follow-up relay CRM attestation hardening plan.
 

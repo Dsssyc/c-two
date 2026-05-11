@@ -9,6 +9,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList};
 use std::sync::Arc;
 
+use c2_contract::ExpectedRouteContract;
 use c2_http::client::RelayAwareHttpClient;
 use c2_ipc::{ClientPool, IpcError, SyncClient};
 use c2_mem::BufferLeaseTracker;
@@ -51,6 +52,7 @@ enum RelayIpcConnectError {
 pub struct PyRelayConnectedClient {
     mode: String,
     target: String,
+    route_name: String,
     inner: RelayConnectedInner,
     closed: Mutex<bool>,
 }
@@ -87,19 +89,18 @@ impl PyRelayConnectedClient {
         &self.target
     }
 
-    fn call<'py>(
-        &self,
-        py: Python<'py>,
-        route_name: &str,
-        method_name: &str,
-        data: &[u8],
-    ) -> PyResult<Py<PyAny>> {
+    #[getter]
+    fn route_name(&self) -> &str {
+        &self.route_name
+    }
+
+    fn call<'py>(&self, py: Python<'py>, method_name: &str, data: &[u8]) -> PyResult<Py<PyAny>> {
         if *self.closed.lock() {
             return Err(PyRuntimeError::new_err("relay connected client is closed"));
         }
         match &self.inner {
             RelayConnectedInner::Ipc { client, .. } => {
-                let response = call_sync_client(py, client, route_name, method_name, data)?;
+                let response = call_sync_client(py, client, &self.route_name, method_name, data)?;
                 Ok(Py::new(py, response)?.into_any())
             }
             RelayConnectedInner::Http { client } => {
@@ -308,7 +309,7 @@ impl PyRuntimeSession {
         Ok(server_obj)
     }
 
-    #[pyo3(signature = (server_bridge, name, dispatcher, method_names, access_map, concurrency_mode, max_pending=None, max_workers=None, crm_ns="", crm_name="", crm_ver="", relay_anchor_address=None))]
+    #[pyo3(signature = (server_bridge, name, dispatcher, method_names, access_map, concurrency_mode, max_pending, max_workers, crm_ns, crm_name, crm_ver, abi_hash, signature_hash, relay_anchor_address=None))]
     fn register_route<'py>(
         &self,
         py: Python<'py>,
@@ -323,6 +324,8 @@ impl PyRuntimeSession {
         crm_ns: &str,
         crm_name: &str,
         crm_ver: &str,
+        abi_hash: &str,
+        signature_hash: &str,
         relay_anchor_address: Option<&str>,
     ) -> PyResult<(
         Bound<'py, PyDict>,
@@ -341,6 +344,8 @@ impl PyRuntimeSession {
             crm_ns,
             crm_name,
             crm_ver,
+            abi_hash,
+            signature_hash,
         )?;
         let mut native_access_map = std::collections::HashMap::new();
         for (key, value) in access_map.iter() {
@@ -362,6 +367,8 @@ impl PyRuntimeSession {
             crm_ns: crm_ns.to_string(),
             crm_name: crm_name.to_string(),
             crm_ver: crm_ver.to_string(),
+            abi_hash: abi_hash.to_string(),
+            signature_hash: signature_hash.to_string(),
             method_names,
             access_map: native_access_map,
             concurrency_mode: parse_concurrency_mode(concurrency_mode)?,
@@ -459,7 +466,7 @@ impl PyRuntimeSession {
         self.inner.clear_relay_projection_cache();
     }
 
-    #[pyo3(signature = (address, route_name="", expected_crm_ns="", expected_crm_name="", expected_crm_ver=""))]
+    #[pyo3(signature = (address, route_name, expected_crm_ns, expected_crm_name, expected_crm_ver, expected_abi_hash, expected_signature_hash))]
     fn acquire_ipc_client(
         &self,
         py: Python<'_>,
@@ -468,6 +475,8 @@ impl PyRuntimeSession {
         expected_crm_ns: &str,
         expected_crm_name: &str,
         expected_crm_ver: &str,
+        expected_abi_hash: &str,
+        expected_signature_hash: &str,
     ) -> PyResult<PyRustClient> {
         let addr = address.to_string();
         let pool = self.pool.inner;
@@ -483,19 +492,20 @@ impl PyRuntimeSession {
         let client = py
             .detach(move || pool.acquire(&addr, Some(&cfg)))
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))?;
-        if !route_name.is_empty() {
-            if let Err(err) = client.validate_route_contract(
-                route_name,
-                expected_crm_ns,
-                expected_crm_name,
-                expected_crm_ver,
-            ) {
-                self.pool.inner.release(address);
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!("{err}")));
-            }
+        let expected = expected_route_contract(
+            route_name,
+            expected_crm_ns,
+            expected_crm_name,
+            expected_crm_ver,
+            expected_abi_hash,
+            expected_signature_hash,
+        )?;
+        if let Err(err) = client.validate_route_contract(&expected) {
+            self.pool.inner.release(address);
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!("{err}")));
         }
         self.inner.mark_client_config_frozen();
-        Ok(PyRustClient::from_arc(client))
+        Ok(PyRustClient::from_arc_bound(client, expected.route_name))
     }
 
     fn release_ipc_client(&self, address: &str) {
@@ -524,7 +534,7 @@ impl PyRuntimeSession {
         Ok(PyRustHttpClient::from_arc(client))
     }
 
-    #[pyo3(signature = (address, route_name, expected_crm_ns="", expected_crm_name="", expected_crm_ver=""))]
+    #[pyo3(signature = (address, route_name, expected_crm_ns, expected_crm_name, expected_crm_ver, expected_abi_hash, expected_signature_hash))]
     fn connect_explicit_relay_http(
         &self,
         py: Python<'_>,
@@ -533,7 +543,18 @@ impl PyRuntimeSession {
         expected_crm_ns: &str,
         expected_crm_name: &str,
         expected_crm_ver: &str,
+        expected_abi_hash: &str,
+        expected_signature_hash: &str,
     ) -> PyResult<PyRelayConnectedClient> {
+        let expected = expected_route_contract(
+            route_name,
+            expected_crm_ns,
+            expected_crm_name,
+            expected_crm_ver,
+            expected_abi_hash,
+            expected_signature_hash,
+        )?;
+        let bound_route_name = expected.route_name.clone();
         let use_proxy = resolve_relay_use_proxy_if_needed(&self.inner, Some(address))?;
         let max_attempts = c2_config::ConfigResolver::resolve_relay_route_max_attempts(
             c2_config::ConfigSources::from_process(),
@@ -544,22 +565,20 @@ impl PyRuntimeSession {
         )
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
         let (client, relay_url) = py
-            .detach(|| {
+            .detach(move || {
                 self.inner.connect_explicit_relay_http_client(
                     address,
-                    route_name,
+                    expected,
                     use_proxy,
                     max_attempts,
                     call_timeout_secs,
-                    expected_crm_ns,
-                    expected_crm_name,
-                    expected_crm_ver,
                 )
             })
             .map_err(runtime_error_to_py)?;
         Ok(PyRelayConnectedClient {
             mode: "http".to_string(),
             target: relay_url,
+            route_name: bound_route_name,
             inner: RelayConnectedInner::Http {
                 client: Arc::new(client),
             },
@@ -579,7 +598,7 @@ impl PyRuntimeSession {
         py.detach(|| shutdown_http_clients_from_global_pool());
     }
 
-    #[pyo3(signature = (route_name, expected_crm_ns="", expected_crm_name="", expected_crm_ver=""))]
+    #[pyo3(signature = (route_name, expected_crm_ns, expected_crm_name, expected_crm_ver, expected_abi_hash, expected_signature_hash))]
     fn connect_via_relay(
         &self,
         py: Python<'_>,
@@ -587,7 +606,17 @@ impl PyRuntimeSession {
         expected_crm_ns: &str,
         expected_crm_name: &str,
         expected_crm_ver: &str,
+        expected_abi_hash: &str,
+        expected_signature_hash: &str,
     ) -> PyResult<PyRelayConnectedClient> {
+        let expected = expected_route_contract(
+            route_name,
+            expected_crm_ns,
+            expected_crm_name,
+            expected_crm_ver,
+            expected_abi_hash,
+            expected_signature_hash,
+        )?;
         let relay_anchor_address = self
             .inner
             .effective_relay_anchor_address()
@@ -604,16 +633,14 @@ impl PyRuntimeSession {
         )
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
+        let expected_for_resolve = expected.clone();
         let target = py
-            .detach(|| {
+            .detach(move || {
                 self.inner.resolve_relay_connection(
-                    route_name,
+                    expected_for_resolve,
                     use_proxy,
                     max_attempts,
                     call_timeout_secs,
-                    expected_crm_ns,
-                    expected_crm_name,
-                    expected_crm_ver,
                 )
             })
             .map_err(runtime_error_to_py)?;
@@ -625,17 +652,15 @@ impl PyRuntimeSession {
             } => {
                 match self.acquire_relay_ipc_client(
                     py,
-                    route_name,
                     &address,
                     &server_id,
                     &server_instance_id,
-                    expected_crm_ns,
-                    expected_crm_name,
-                    expected_crm_ver,
+                    &expected,
                 ) {
                     Ok(client) => Ok(PyRelayConnectedClient {
                         mode: "ipc".to_string(),
                         target: address,
+                        route_name: expected.route_name.clone(),
                         inner: RelayConnectedInner::Ipc {
                             client,
                             pool: self.pool.inner,
@@ -646,19 +671,17 @@ impl PyRuntimeSession {
                     Err(RelayIpcConnectError::ContractMismatch(err)) => Err(err),
                     Err(RelayIpcConnectError::Unavailable) => self.acquire_relay_http_client(
                         py,
-                        route_name,
                         use_proxy,
                         max_attempts,
                         call_timeout_secs,
-                        expected_crm_ns,
-                        expected_crm_name,
-                        expected_crm_ver,
+                        expected,
                     ),
                 }
             }
             RelayResolvedConnection::Http { client, relay_url } => Ok(PyRelayConnectedClient {
                 mode: "http".to_string(),
                 target: relay_url,
+                route_name: expected.route_name.clone(),
                 inner: RelayConnectedInner::Http {
                     client: Arc::new(client),
                 },
@@ -676,13 +699,10 @@ impl PyRuntimeSession {
     fn acquire_relay_ipc_client(
         &self,
         py: Python<'_>,
-        route_name: &str,
         address: &str,
         expected_server_id: &str,
         expected_server_instance_id: &str,
-        expected_crm_ns: &str,
-        expected_crm_name: &str,
-        expected_crm_ver: &str,
+        expected: &ExpectedRouteContract,
     ) -> Result<Arc<SyncClient>, RelayIpcConnectError> {
         let addr = address.to_string();
         let pool = self.pool.inner;
@@ -719,17 +739,12 @@ impl PyRuntimeSession {
         if !client
             .route_names()
             .into_iter()
-            .any(|registered| registered == route_name)
+            .any(|registered| registered == expected.route_name)
         {
             pool.release(&addr);
             return Err(RelayIpcConnectError::Unavailable);
         }
-        if let Err(err) = client.validate_route_contract(
-            route_name,
-            expected_crm_ns,
-            expected_crm_name,
-            expected_crm_ver,
-        ) {
+        if let Err(err) = client.validate_route_contract(expected) {
             pool.release(&addr);
             return Err(RelayIpcConnectError::ContractMismatch(
                 PyRuntimeError::new_err(err.to_string()),
@@ -742,36 +757,53 @@ impl PyRuntimeSession {
     fn acquire_relay_http_client(
         &self,
         py: Python<'_>,
-        route_name: &str,
         use_proxy: bool,
         max_attempts: usize,
         call_timeout_secs: f64,
-        expected_crm_ns: &str,
-        expected_crm_name: &str,
-        expected_crm_ver: &str,
+        expected: ExpectedRouteContract,
     ) -> PyResult<PyRelayConnectedClient> {
+        let bound_route_name = expected.route_name.clone();
         let (client, relay_url) = py
-            .detach(|| {
+            .detach(move || {
                 self.inner.connect_relay_http_client(
-                    route_name,
+                    expected,
                     use_proxy,
                     max_attempts,
                     call_timeout_secs,
-                    expected_crm_ns,
-                    expected_crm_name,
-                    expected_crm_ver,
                 )
             })
             .map_err(runtime_error_to_py)?;
         Ok(PyRelayConnectedClient {
             mode: "http".to_string(),
             target: relay_url,
+            route_name: bound_route_name,
             inner: RelayConnectedInner::Http {
                 client: Arc::new(client),
             },
             closed: Mutex::new(false),
         })
     }
+}
+
+fn expected_route_contract(
+    route_name: &str,
+    crm_ns: &str,
+    crm_name: &str,
+    crm_ver: &str,
+    abi_hash: &str,
+    signature_hash: &str,
+) -> PyResult<ExpectedRouteContract> {
+    let expected = ExpectedRouteContract {
+        route_name: route_name.to_string(),
+        crm_ns: crm_ns.to_string(),
+        crm_name: crm_name.to_string(),
+        crm_ver: crm_ver.to_string(),
+        abi_hash: abi_hash.to_string(),
+        signature_hash: signature_hash.to_string(),
+    };
+    c2_contract::validate_expected_route_contract(&expected)
+        .map_err(|err| PyValueError::new_err(err.to_string()))?;
+    Ok(expected)
 }
 
 fn runtime_error_to_py(err: c2_runtime::RuntimeSessionError) -> PyErr {

@@ -1202,7 +1202,7 @@ class TestFromBufferEndToEnd:
         """An CRM method whose input type has from_buffer gets hold mode."""
         import numpy as np
 
-        @cc.transferable
+        @cc.transferable(abi_id='c-two.tests.unit.transferable.np-data.raw-float64.v1')
         class NpData:
             arr: object  # np.ndarray
 
@@ -1226,7 +1226,7 @@ class TestFromBufferEndToEnd:
 
     def test_icrm_explicit_view_override(self):
         """@cc.transfer(buffer='view') overrides auto-detection."""
-        @cc.transferable
+        @cc.transferable(abi_id='c-two.tests.unit.transferable.buf-data.pickle-int.v1')
         class BufData:
             x: int
             def serialize(d: 'BufData') -> bytes:
@@ -1247,7 +1247,7 @@ class TestFromBufferEndToEnd:
 
     def test_icrm_no_from_buffer_stays_view(self):
         """Without from_buffer, method stays in view mode."""
-        @cc.transferable
+        @cc.transferable(abi_id='c-two.tests.unit.transferable.plain-data.pickle-int.v1')
         class PlainData:
             x: int
             def serialize(d: 'PlainData') -> bytes:
