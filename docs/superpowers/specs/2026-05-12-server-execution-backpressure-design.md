@@ -31,6 +31,11 @@ The relevant current production paths are:
   dispatch path does not use it as a CRM execution admission gate.
 - Python forwards `ConcurrencyConfig.max_workers` and `max_pending` through
   PyO3 into the Rust route scheduler.
+- `RuntimeSession::register_route` currently inserts the route into the native
+  server before relay publication, and relay-registration failure rolls back with
+  a best-effort unregister whose outcome is ignored.
+- PyO3 `RustServer` currently exposes low-level lifecycle methods with bool/unit
+  results and constructs server Tokio runtimes directly.
 
 The design must preserve direct IPC independence, same-process thread-local
 calls, zero-copy request cleanup, and Rust ownership of language-neutral
@@ -246,6 +251,19 @@ This keeps `max_execution_workers` language-neutral for future SDKs and prevents
 the Python PyO3 wrapper from becoming the only implementation that applies the
 server execution thread guardrail.
 
+### I19. Registration Commit Gate
+
+Route registration that depends on relay publication must be a commit-gated
+transaction: a reserved route is not visible to direct IPC lookup, local
+thread-preference lookup, relay resolution, or callback admission until the
+transaction commits. If relay projection or publication fails, the pending
+reservation aborts through the close transaction and the SDK receives a
+structured registration failure carrying the rollback `RouteCloseOutcome`.
+
+This prevents a route from being externally callable during the relay-registration
+window, prevents failed registrations from leaving committed Python local slots,
+and prevents rollback close outcomes from being lost behind ordinary exceptions.
+
 ## Source-To-Sink Matrix
 
 | Invariant | Producer | Storage | Consumer | Network/Wire | FFI/SDK | Test/Support | Legacy/Bypass |
@@ -268,6 +286,7 @@ server execution thread guardrail.
 | I16 direct admin shutdown | `ShutdownClient` signal, `c2_ipc::control::shutdown`, PyO3 `ipc_shutdown`, Python `client.util.shutdown()` | server close transaction plus `CloseOutcomeJournal` record | signal handler, `Server::shutdown`, runtime bridge shutdown reconciliation via one-shot journal consume | IPC signal frame, no relay/CRM wire | bool admin helper reports delivery only unless a structured outcome is exposed | tests send direct IPC shutdown with queued/active calls and consume journal once | raw `Server::shutdown()` must enter close transaction or be private to it; no signal-only lifecycle bypass |
 | I17 FFI lifecycle authority | SDK FFI server handles and native bridge methods | native close transaction outcome and close journal | SDK bridge cleanup and hook gate | no new wire; affects native lifecycle control | no public bool/unit `RustServer.unregister_route` / `RustServer.shutdown`; future SDKs consume the same outcomes | source guards and PyO3 API tests | no low-level lifecycle method can close routes or stop server without `RouteCloseOutcome` / `ShutdownOutcome` |
 | I18 runtime builder | `ServerIpcConfig.max_execution_workers` and `ServerRuntimeOptions` | Rust-core server runtime builder | all SDK server start paths | not wire-visible | PyO3 and future SDKs call shared builder, not Tokio directly | Rust-only builder test and PyO3 projection test | no SDK-owned Tokio builder with hardcoded blocking-pool policy for server callbacks |
+| I19 registration commit gate | `RuntimeSession::register_route` request, `RuntimeRouteSpec`, optional relay publication requirement | `PendingRouteReservation` in `Server`, not the public dispatcher; transaction outcome/error | commit opens dispatcher/admission/local slot; abort runs rollback close transaction | direct IPC lookup and relay resolution cannot observe pending routes | PyO3/Python and future SDKs receive `RegisterFailureOutcome` / `RegistrationRollbackError` with rollback outcome | relay-delay/failure tests race direct IPC calls against registration; source guard rejects pre-commit dispatcher insertion | no `server.register_route(route)` before relay success for relay-backed registration; no committed SDK slot before register success; no exception path that drops rollback outcome |
 
 ## Proposed Architecture
 
@@ -602,6 +621,49 @@ committed local slot for a route whose registration transaction failed, and a
 rollback journal record must be marked consumed with the registration error so a
 later bridge shutdown cannot replay it as a normal route shutdown.
 
+The commit gate has its own source-to-sink path. `Server` must provide a
+`PendingRouteReservation` or equivalent private transaction object whose route
+metadata, callback, method table, and `RouteExecutionHandle` are fully validated
+but not inserted into the public dispatcher and not open for local or remote
+admission. `RuntimeSession::register_route` owns the transaction order:
+
+```text
+validate RuntimeRouteSpec and callback adapter
+reserve pending route in Server
+publish to relay if needed
+commit pending route into dispatcher and open admission
+return RegisterOutcome
+```
+
+If any step after reservation fails, the abort path is:
+
+```text
+close pending route with closed_reason=registration_rollback
+write and consume CloseOutcomeJournal record
+return RegisterFailureOutcome / RegistrationRollbackError
+do not install or retain a Python local slot
+```
+
+The rollback error shape is part of the contract, not logging detail:
+
+```text
+RegisterFailureOutcome:
+  route_name
+  failure_source: validation | relay_projection | relay_register | commit
+  error_message
+  rollback: Option<RouteCloseOutcome>
+```
+
+For PyO3, registration failures after reservation must raise an exception with a
+machine-readable `registration_failure` attribute containing this shape;
+`registration_failure.rollback` is the canonical rollback field. A top-level
+`rollback` attribute may exist as a convenience shortcut, but it cannot replace
+the full failure object. Future SDK FFI layers must expose the same fields in
+their native error model. If failure happens before a route reservation exists,
+`registration_failure.rollback=None` is allowed; after reservation, dropping the
+rollback outcome is a contract failure. The public success path remains
+`RegisterOutcome`.
+
 ### Unregister, Shutdown, And Hook Ordering
 
 `Server::unregister_route` and server shutdown use a native close transaction
@@ -724,91 +786,103 @@ unit return from `shutdown` is not allowed because it cannot prove drain state.
 3. Add Rust-core `ServerRuntimeOptions` / `ServerRuntimeBuilder` and require PyO3
    and future SDK bindings to start IPC servers through it; the builder sets
    Tokio `.max_blocking_threads(max_execution_workers)`.
-4. Add `ServerExecutionScheduler` and migrate route concurrency state into it.
-5. Change `CrmRoute` to store a `RouteExecutionHandle`, make route fields
+4. Remove SDK-owned Tokio runtime construction for server lifecycle paths:
+   server start, register, unregister, shutdown, and close reconciliation must
+   use the Rust-core server/runtime-session driver instead of direct
+   `tokio::runtime::Builder` calls in SDK binding crates.
+5. Add `ServerExecutionScheduler` and migrate route concurrency state into it.
+6. Change `CrmRoute` to store a `RouteExecutionHandle`, make route fields
    private, and add a server-owned registration API that stamps scheduler
    identity/generation onto every registered route.
-6. Make `Dispatcher::register` crate-private or otherwise unreachable from
+7. Make `Dispatcher::register` crate-private or otherwise unreachable from
    external route construction, and require public registration to validate that
    the route handle belongs to the receiving server.
-7. Remove `Scheduler` from the public `c2-server` API; keep only
+8. Remove `Scheduler` from the public `c2-server` API; keep only
    `AccessLevel`, `ConcurrencyMode`, and new execution-handle types public, and
    move those shared enum definitions out of any old scheduler module if needed.
-8. Change `RuntimeSession::register_route` so it no longer accepts externally
+9. Change `RuntimeSession::register_route` so it no longer accepts externally
    constructed `CrmRoute`; route creation must flow through the server-owned
    registration API or an opaque server-created pending-route token.
-9. Make `RuntimeSession::register_route` transactional: pending route token,
-   optional relay publication, commit to dispatcher/open admission, or rollback
-   through `RouteCloseOutcome` with `closed_reason=registration_rollback`; the
-   rollback record is returned/consumed with the registration error and is not
-   hook-eligible.
-10. Update PyO3 `build_route`, runtime session tests, c2-server tests, and relay
-   test support to use the production server-owned registration API instead of
-   direct `CrmRoute { ... }` construction.
-11. Change `RuntimeRouteSpec` validation in `c2-runtime` to read concurrency
-   metadata from `RouteExecutionHandle` snapshots instead of
-   `route.scheduler.snapshot()`.
-12. Replace remote `execute_route_request(... spawn_blocking ...)` with
-   scheduler-owned `execute_remote`.
-13. Move inline and buddy logical-call admission into `handle_connection` before
+10. Add a server-owned `PendingRouteReservation` transaction object. Reservation
+    validates route metadata and allocates the route execution handle, but it is
+    not inserted into the public dispatcher, local slot map, relay projection, or
+    remote admission table until commit.
+11. Make `RuntimeSession::register_route` transactional: pending route
+    reservation, optional relay publication, commit to dispatcher/open admission,
+    or rollback through `RouteCloseOutcome` with
+    `closed_reason=registration_rollback`; the rollback record is
+    returned/consumed with the registration error and is not hook-eligible.
+12. Add `RegisterFailureOutcome` / `RegistrationRollbackError` to the native
+    runtime contract and PyO3 mappings. Failures after reservation must expose
+    `rollback: RouteCloseOutcome` to Python and future SDKs; failures before
+    reservation may expose `rollback=None`.
+13. Update PyO3 `build_route`, runtime session tests, c2-server tests, and relay
+    test support to use the production server-owned registration API instead of
+    direct `CrmRoute { ... }` construction.
+14. Change `RuntimeRouteSpec` validation in `c2-runtime` to read concurrency
+    metadata from `RouteExecutionHandle` snapshots instead of
+    `route.scheduler.snapshot()`.
+15. Replace remote `execute_route_request(... spawn_blocking ...)` with
+    scheduler-owned `execute_remote`.
+16. Move inline and buddy logical-call admission into `handle_connection` before
     per-call `tokio::spawn`; keep chunked incomplete-call limits in
     `ChunkRegistry`, then admit the complete logical call after
     `chunk_registry.finish()`.
-14. Bound chunked frame processing before payload clone/task fan-out, either by
+17. Bound chunked frame processing before payload clone/task fan-out, either by
     processing chunks inline in the connection loop or by acquiring a bounded
     chunk-processing permit tied to `ChunkRegistry` limits.
-15. Implement fair, event-driven promotion across route queues and preserve
+18. Implement fair, event-driven promotion across route queues and preserve
     writer fairness within `read_parallel` routes.
-16. Replace manual connection `flight_inc` / `flight_dec` call paths with an
+19. Replace manual connection `flight_inc` / `flight_dec` call paths with an
     RAII guard plus scheduler cancellation owner that covers queued, cancelled,
     and active calls without waiting for closed-connection queued work to
     receive worker capacity.
-17. Change Python `RouteConcurrency` FFI to wrap the route execution handle and
+20. Change Python `RouteConcurrency` FFI to wrap the route execution handle and
     enter local guards through `ExecutionScope::Local`.
-18. Delete or fully quarantine old `Scheduler::execute` and
+21. Delete or fully quarantine old `Scheduler::execute` and
     `blocking_acquire`; production and test helper callback execution must use
     `ServerExecutionScheduler` / `RouteExecutionHandle`.
-19. Add native `RouteCloseOutcome` close/drain results and forward them through
+22. Add native `RouteCloseOutcome` close/drain results and forward them through
     `UnregisterOutcome.close`, `ShutdownOutcome.route_outcomes`, PyO3, and
     Python `NativeServerBridge`; `removed_routes` alone must not drive hook
     invocation.
-20. Add `CloseOutcomeJournal` on `Server`; every unregister, shutdown,
+23. Add `CloseOutcomeJournal` on `Server`; every unregister, shutdown,
     direct-IPC shutdown, and registration rollback writes one record, and PyO3 /
     `RuntimeSession` expose an atomic one-shot consume/reconcile method. Records
     returned synchronously through `RuntimeSession` are marked consumed before the
     call returns, and Python dedupes hook execution by route close generation.
-21. Add explicit close drain policy and timeout outcomes; timeout or forced
+24. Add explicit close drain policy and timeout outcomes; timeout or forced
     close must return `active_drained=false`, keep native ownership of remaining
     active permits until cleanup, and must not trigger Python shutdown hooks.
-22. Move Python `@on_shutdown` invocation behind `active_drained=true`.
-23. Add snapshot/metrics bindings needed by tests.
-24. Update existing tests that assert `max_workers` reject-fast semantics; keep
+25. Move Python `@on_shutdown` invocation behind `active_drained=true`.
+26. Add snapshot/metrics bindings needed by tests.
+27. Update existing tests that assert `max_workers` reject-fast semantics; keep
     reject-fast tests only for `max_pending`, `max_pending_requests`, and
     explicit nonblocking APIs.
-25. Update Python unit-test fakes (`FakeScheduler`) to model the new route
+28. Update Python unit-test fakes (`FakeScheduler`) to model the new route
     handle API enough to keep local direct-call tests meaningful, including
     closed-route behavior.
-26. Add a Rust-only non-Python `CrmCallback` adapter test proving that
+29. Add a Rust-only non-Python `CrmCallback` adapter test proving that
     language-neutral registration receives the same server execution budgets as
     the PyO3 path.
-27. Update docs and examples so `max_workers` and `max_execution_workers` are
+30. Update docs and examples so `max_workers` and `max_execution_workers` are
     described as queueing worker budgets, not reject-fast capacity checks or
     thread counts.
-28. Change direct IPC `ShutdownClient` handling and raw `Server::shutdown()` so
+31. Change direct IPC `ShutdownClient` handling and raw `Server::shutdown()` so
     they enter the same server close transaction or are private helpers inside
     that transaction; direct `ipc_shutdown()` bool return must not be treated as
     a drain result.
-29. Update `NativeServerBridge.shutdown()` reconciliation so an external direct
+32. Update `NativeServerBridge.shutdown()` reconciliation so an external direct
     IPC shutdown can consume recorded native close outcomes before deciding
     whether Python `@on_shutdown` hooks are allowed to run.
-30. Remove public PyO3 and Python `RouteConcurrency.close()` /
+33. Remove public PyO3 and Python `RouteConcurrency.close()` /
     `RouteConcurrency.shutdown()` methods; local route handles may acquire guards
     and expose snapshots, but route closure must flow through the server close
     transaction that returns `RouteCloseOutcome`.
-31. Remove or outcome-gate public PyO3 `RustServer.unregister_route()` and
+34. Remove or outcome-gate public PyO3 `RustServer.unregister_route()` and
     `RustServer.shutdown()`; no SDK FFI lifecycle method may return bool/unit for
     route/server close.
-32. Remove the failure fallback where `RuntimeSession::shutdown` skips route
+35. Remove the failure fallback where `RuntimeSession::shutdown` skips route
     close because a temporary runtime could not be created and then calls raw
     `Server::shutdown()`; runtime/scheduling failures must surface as explicit
     undrained per-route outcomes or errors.
@@ -865,8 +939,14 @@ Rust core tests:
   `RouteCloseOutcome` with `closed_reason=registration_rollback`, and concurrent
   direct IPC callers either cannot observe the pending route or receive the
   deterministic closed/rollback error.
+- Relay-backed registration with a delayed relay publication does not expose the
+  pending route through direct IPC lookup or dispatcher snapshots before commit.
 - Relay registration rollback does not invoke `@on_shutdown` and cannot leave a
   journal record that is later replayed as a normal drained route shutdown.
+- Native registration failures after pending reservation expose
+  `RegisterFailureOutcome.rollback` with the rollback `RouteCloseOutcome`; tests
+  must assert the rollback outcome is available from the Rust result/error rather
+  than only appearing in native logs or consumed journal state.
 - Rust-only non-Python `CrmCallback` registration is limited by the same global,
   route, pending, and close/drain semantics as the PyO3 path.
 - Rust-only server runtime builder tests prove `max_blocking_threads` is derived
@@ -898,6 +978,10 @@ Python integration tests:
 - PyO3 `_native.RustServer.unregister_route()` and `_native.RustServer.shutdown()`
   are not callable as bool/unit lifecycle bypasses; they are absent or return the
   structured native close outcome used by `RuntimeSession`.
+- Relay-backed registration failure does not install a committed Python local
+  slot, does not become visible through same-process thread-preference lookup,
+  and raises an exception with a machine-readable `registration_failure.rollback`
+  field containing the rollback `RouteCloseOutcome`.
 - `cc.set_server(ipc_overrides={"max_execution_workers": 0})`,
   `C2_IPC_MAX_EXECUTION_WORKERS=0`, and a PyO3 constructor override of `0`
   all fail before server start.
@@ -952,6 +1036,14 @@ Guardrail tests:
 - A Python integration or native-bridge test fails if a
   `registration_rollback` close record can trigger `@on_shutdown`, either during
   the failed `register()` call or during later bridge shutdown reconciliation.
+- A source-level or compile-fail guard fails if relay-backed
+  `RuntimeSession::register_route` inserts into `Dispatcher` / calls
+  `Server::register_route` before relay publication succeeds, except through the
+  private pending-reservation API.
+- A source-level test scans `sdk/python/native` for
+  `tokio::runtime::Builder` and fails unless every occurrence is on a documented
+  allowlist for non-server-lifecycle work. IPC server start, register,
+  unregister, shutdown, and reconciliation paths must have no direct builder use.
 
 ## Migration Notes
 
@@ -984,6 +1076,8 @@ direct IPC shutdown ack: signal delivery only unless paired with structured
 FFI lifecycle methods: absent or outcome-returning; bool/unit close is forbidden
 registration rollback: pending route abort produces RouteCloseOutcome and never
   opens normal route admission or shutdown-hook eligibility
+registration failure: after reservation, the SDK-visible error contains the
+  rollback RouteCloseOutcome
 ```
 
 Connection close semantics after the migration:
@@ -1049,6 +1143,12 @@ response send after connection close: best-effort/error-tolerant cleanup path
   ignore an undrained rollback.
 - Registration rollback records are consumed with the registration failure and
   are never eligible to invoke SDK shutdown hooks.
+- Relay-backed registration has a commit gate: pending reservations are invisible
+  to direct IPC, relay resolution, local slot lookup, and callback admission
+  until commit succeeds.
+- SDK-visible registration failures after reservation expose
+  `RegisterFailureOutcome.rollback` / `RegistrationRollbackError.rollback`, so
+  callers and tests can prove the rollback outcome was not dropped.
 - Eligible queued calls are promoted fairly across routes and cannot starve when
   global and route capacity are available.
 - Existing mixed local/remote concurrency tests are updated to the new queueing
@@ -1061,8 +1161,10 @@ response send after connection close: best-effort/error-tolerant cleanup path
 - `rg "fn unregister_route\\(|fn shutdown\\(" sdk/python/native/src/server_ffi.rs`
   shows no public bool/unit server lifecycle bypass, or shows only outcome-based
   methods.
-- `rg "tokio::runtime::Builder::new_multi_thread" sdk/python/native/src/server_ffi.rs`
-  returns no server runtime builder bypass.
+- `rg "tokio::runtime::Builder" sdk/python/native` returns no server lifecycle
+  runtime-builder bypass outside a documented non-server allowlist; in
+  particular, IPC server start, register, unregister, shutdown, and
+  reconciliation paths do not construct Tokio runtimes directly.
 - Full Python SDK tests and Rust workspace tests pass before implementation is
   considered complete.
 
@@ -1237,3 +1339,18 @@ The fourteenth strict review cycle found and addressed this plan gap:
   from SDK shutdown-hook replay. The spec now requires rollback records to be
   consumed with the registration error and marks `registration_rollback`
   outcomes as never hook-eligible.
+
+The fifteenth strict review cycle found and addressed these plan gaps:
+
+- Registration rollback had close/journal coverage, but the pending reservation
+  and commit gate were not represented as their own source-to-sink path. The spec
+  now adds I19 and requires `PendingRouteReservation` to stay invisible to
+  dispatcher/direct IPC/local-slot lookup until commit.
+- Registration errors said they returned rollback outcomes, but the FFI/SDK error
+  shape was not defined. The spec now requires `RegisterFailureOutcome` /
+  `RegistrationRollbackError` with a machine-readable rollback field after
+  reservation.
+- The runtime-builder acceptance command only checked one `new_multi_thread`
+  occurrence. The spec now requires an allowlist guard over all
+  `tokio::runtime::Builder` occurrences in `sdk/python/native` for server
+  lifecycle paths.
