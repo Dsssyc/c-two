@@ -113,12 +113,14 @@ Settled findings from that session:
 - Non-skip IPC validation now requires the candidate handshake to provide a real
   `server_instance_id`; only skip-validation tests may synthesize an instance.
 - Final relay route replacement remains a Rust authority decision guarded by
-  relay-local route state and `OwnerToken`.
-- The remaining relay robustness gap is not a Python SDK issue. It is a future
-  Rust relay/IPC owner-freshness problem: an old upstream owner can be probed as
-  dead or route-missing, recover externally before candidate commit, and still
-  be replaced if no relay-local owner epoch/lease/fence changed. The follow-up
-  is tracked in `docs/issues/relay-stale-owner-revival-race.md`.
+  relay-local route state, `OwnerToken`, candidate IPC attestation, and an
+  opaque final owner proof created after candidate attestation.
+- The stale pre-attestation evidence reuse gap is closed in Rust relay authority:
+  preliminary owner probes may only allow a candidate IPC attempt, and final
+  commit can consume only a proof produced by the post-attestation final owner
+  probe. This is still a relay-local proof boundary, not a cross-process owner
+  fence; a stronger guarantee that an external owner cannot become live after
+  final proof would require a future IPC owner-fence protocol.
 
 This relay robustness note is not a downshift-ledger candidate. Treat it as a
 separate Rust relay/IPC hardening concern unless it becomes release-blocking.
@@ -182,15 +184,15 @@ Execution plan:
    `serialize`, `deserialize`, or `from_buffer` orchestration into Rust merely
    for symmetry.
 
-2. **Relay stale-owner revival remains a Rust relay/IPC hardening issue.** The
+2. **Relay stale-owner replacement is Rust-owned and now uses final proof.** The
    relay no longer trusts route names alone: candidate upstreams must pass IPC
    identity and route contract attestation, and relay-local replacement commits
-   use owner-token checks. A residual distributed race remains when an old
-   upstream owner is probed as dead or route-missing, recovers externally before
-   candidate commit, and does not create a fresh relay-local owner generation.
-   This is tracked in `docs/issues/relay-stale-owner-revival-race.md`. Future
-   fixes must add Rust-side owner freshness, epoch, lease, or fencing semantics;
-   they must not add SDK-side route replay, retry, or route-name trust.
+   use owner-token, owner-generation, owner-lease-epoch, route-identity, and
+   final-proof checks. The fixed gap was stale pre-attestation evidence reuse:
+   a dead or route-missing observation collected before candidate attestation can
+   no longer authorize final commit. This remains relay-local hardening; future
+   cross-process owner fencing, if needed, must live in Rust relay/IPC state and
+   must not add SDK-side route replay, retry, or route-name trust.
 
 3. **Narrow Python compatibility facades still exist but do not own runtime
    authority.** `NativeServerBridge` still accepts constructor-time CRM
@@ -764,8 +766,10 @@ Every implementation spawned from this reference should preserve:
   server chunk assembly should rely on Python SDK cleanup, receive-loop natural
   exit, or process teardown as the only release path.
 - Relay stale-owner replacement remains Rust-owned and identity-attested:
-  future fixes must add owner freshness/fencing in relay/IPC state, not
-  route-name trust or SDK-side retry/replay behavior.
+  preliminary owner probes cannot authorize commit, final proof is created after
+  candidate IPC identity and route-contract attestation, and any future stronger
+  cross-process owner fencing must live in relay/IPC state rather than SDK-side
+  retry, replay, or route-name trust.
 
 ## Notes For Future SDK Authors
 

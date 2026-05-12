@@ -393,21 +393,11 @@ async fn handle_register(
         return (StatusCode::BAD_REQUEST, reason).into_response();
     }
 
-    let replacement = match RouteAuthority::new(&state)
+    let replacement_candidate = match RouteAuthority::new(&state)
         .prepare_register(&name, &server_id, &server_instance_id, &address)
         .await
     {
-        Ok(RegisterPreparation::Available { replacement }) => {
-            replacement.map(|r| crate::relay::state::OwnerReplacementToken {
-                route_name: r.route_name,
-                server_id: r.server_id,
-                server_instance_id: r.server_instance_id,
-                ipc_address: r.ipc_address,
-                existing_address: r.existing_address,
-                token: r.token,
-                evidence: r.evidence,
-            })
-        }
+        Ok(RegisterPreparation::Available { replacement }) => replacement,
         Ok(RegisterPreparation::SameOwner) => None,
         Ok(RegisterPreparation::DuplicateAlive { existing_address })
         | Err(ControlError::AddressMismatch { existing_address })
@@ -519,6 +509,30 @@ async fn handle_register(
             contract.abi_hash,
             contract.signature_hash,
         )
+    };
+
+    let replacement = match RouteAuthority::new(&state)
+        .confirm_replacement_for_commit(replacement_candidate)
+        .await
+    {
+        Ok(replacement) => replacement,
+        Err(ControlError::DuplicateRoute { existing_address })
+        | Err(ControlError::AddressMismatch { existing_address }) => {
+            close_arc_client(client);
+            return duplicate_route_response(&name, &existing_address);
+        }
+        Err(ControlError::OwnerMismatch) | Err(ControlError::NotFound) => {
+            close_arc_client(client);
+            return (StatusCode::CONFLICT, "Route owner is not replaceable").into_response();
+        }
+        Err(ControlError::InvalidName { reason })
+        | Err(ControlError::InvalidServerId { reason })
+        | Err(ControlError::InvalidServerInstanceId { reason })
+        | Err(ControlError::InvalidAddress { reason })
+        | Err(ControlError::ContractMismatch { reason }) => {
+            close_arc_client(client);
+            return (StatusCode::BAD_REQUEST, reason).into_response();
+        }
     };
 
     let commit_client = client.clone();
@@ -978,6 +992,48 @@ mod tests {
     const TEST_ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const TEST_SIGNATURE_HASH: &str =
         "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+    fn source_between<'a>(source: &'a str, start: &str, end: &str) -> Option<&'a str> {
+        let start_idx = source.find(start)?;
+        let after_start = &source[start_idx..];
+        let end_idx = after_start.find(end)?;
+        Some(&after_start[..end_idx])
+    }
+
+    #[test]
+    fn http_register_final_confirmation_stays_after_candidate_attestation() {
+        let source = include_str!("router.rs");
+        let body = source_between(source, "async fn handle_register", "fn close_arc_client")
+            .expect("handle_register body should be found");
+        let prepare = body
+            .find(".prepare_register(")
+            .expect("HTTP registration must prepare replacement eligibility");
+        let attest = body
+            .find("attest_ipc_route_contract(")
+            .expect("HTTP registration must attest claimed route contracts");
+        let read = body
+            .find("read_ipc_route_contract(")
+            .expect("HTTP registration must read unclaimed route contracts");
+        let confirm = body
+            .find(".confirm_replacement_for_commit(")
+            .expect("HTTP registration must perform final replacement confirmation");
+        let commit = body
+            .find(".commit_register_upstream(")
+            .expect("HTTP registration must commit through RelayState");
+
+        assert!(
+            prepare < attest && prepare < read,
+            "preliminary eligibility must run before candidate route attestation"
+        );
+        assert!(
+            attest < confirm && read < confirm,
+            "final replacement proof must be created after candidate route attestation"
+        );
+        assert!(
+            confirm < commit,
+            "relay commit must consume only post-attestation final proof"
+        );
+    }
 
     #[tokio::test]
     async fn materialized_response_error_is_not_silently_returned_as_empty_success() {
@@ -2218,6 +2274,150 @@ mod tests {
 
         old_server.shutdown();
         new_server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn final_replacement_confirmation_rejects_silent_recovered_owner() {
+        let state = test_state();
+        let old_address = format!(
+            "ipc://relay_final_probe_old_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let candidate_address = format!(
+            "ipc://relay_final_probe_candidate_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+
+        let old_server = start_live_server(&old_address, "server-old").await;
+        assert_eq!(
+            post_register(state.clone(), "grid", "server-old", &old_address).await,
+            StatusCode::CREATED
+        );
+        state.evict_connection("grid");
+        old_server.shutdown();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let preliminary = RouteAuthority::new(&state)
+            .prepare_register(
+                "grid",
+                "server-new",
+                "server-new-instance",
+                &candidate_address,
+            )
+            .await
+            .expect("preliminary replacement should be allowed");
+        let replacement = match preliminary {
+            RegisterPreparation::Available {
+                replacement: Some(replacement),
+            } => replacement,
+            _ => panic!("expected replacement candidate"),
+        };
+
+        let recovered_old = start_live_server(&old_address, "server-old").await;
+        let confirmed = RouteAuthority::new(&state)
+            .confirm_replacement_for_commit(Some(replacement))
+            .await;
+
+        assert!(matches!(
+            confirmed,
+            Err(ControlError::DuplicateRoute { existing_address })
+                if existing_address == old_address
+        ));
+
+        recovered_old.shutdown();
+    }
+
+    #[tokio::test]
+    async fn final_replacement_confirmation_allows_still_dead_owner() {
+        let state = test_state();
+        let old_address = format!(
+            "ipc://relay_final_probe_dead_old_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let candidate_address = format!(
+            "ipc://relay_final_probe_dead_candidate_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+
+        let old_server = start_live_server(&old_address, "server-old").await;
+        assert_eq!(
+            post_register(state.clone(), "grid", "server-old", &old_address).await,
+            StatusCode::CREATED
+        );
+        state.evict_connection("grid");
+        old_server.shutdown();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let preliminary = RouteAuthority::new(&state)
+            .prepare_register(
+                "grid",
+                "server-new",
+                "server-new-instance",
+                &candidate_address,
+            )
+            .await
+            .expect("preliminary replacement should be allowed");
+        let replacement = match preliminary {
+            RegisterPreparation::Available {
+                replacement: Some(replacement),
+            } => replacement,
+            _ => panic!("expected replacement candidate"),
+        };
+
+        let confirmed = RouteAuthority::new(&state)
+            .confirm_replacement_for_commit(Some(replacement))
+            .await
+            .expect("dead owner should confirm replacement");
+
+        assert!(confirmed.is_some());
+    }
+
+    #[tokio::test]
+    async fn final_replacement_confirmation_rejects_silent_recovered_owner_from_command_preparation()
+     {
+        let state = test_state();
+        let old_address = format!(
+            "ipc://relay_final_probe_command_old_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let candidate_address = format!(
+            "ipc://relay_final_probe_command_candidate_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+
+        let old_server = start_live_server(&old_address, "server-old").await;
+        assert_eq!(
+            post_register(state.clone(), "grid", "server-old", &old_address).await,
+            StatusCode::CREATED
+        );
+        state.evict_connection("grid");
+        old_server.shutdown();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let replacement = RouteAuthority::new(&state)
+            .prepare_candidate_registration("grid", "server-new", &candidate_address)
+            .await
+            .expect("preliminary command-loop replacement should be allowed")
+            .expect("expected replacement candidate");
+
+        let recovered_old = start_live_server(&old_address, "server-old").await;
+        let confirmed = RouteAuthority::new(&state)
+            .confirm_replacement_for_commit(Some(replacement))
+            .await;
+
+        assert!(matches!(
+            confirmed,
+            Err(ControlError::DuplicateRoute { existing_address })
+                if existing_address == old_address
+        ));
+
+        recovered_old.shutdown();
     }
 
     #[tokio::test]

@@ -14,15 +14,18 @@ handled by splitting command-loop registration into candidate eligibility,
 candidate IPC attestation, and final commit.
 
 Relay route replacement now fences relay-local time-of-check/time-of-use races
-with a route-identity replacement token, an owner generation, an owner lease
-epoch, and final-probe replacement evidence before committing a candidate
-upstream registration. This prevents an old relay slot or route table entry from
-being silently overwritten after another relay-local state transition.
+with candidate eligibility, candidate IPC attestation, a fresh final owner proof,
+owner generation, owner lease epoch, and connection-slot checks before committing
+a candidate upstream registration. Preliminary stale-owner probes may decide
+whether to spend work dialing a candidate, but they no longer create the proof
+accepted by final commit.
 
-The stale-owner revival gap described below is resolved. A candidate can replace
-an existing owner only when the final owner probe proves `ConfirmedDead` or
-`ConfirmedRouteMissing`, and the captured route identity plus connection-slot
-freshness still match at final commit.
+The stale pre-attestation evidence gap described below is resolved within the
+relay-local proof boundary. A candidate can replace an existing owner only when a
+fresh final owner probe, collected after candidate IPC identity and route
+contract attestation, proves `ConfirmedDead` or `ConfirmedRouteMissing`, and the
+captured route identity plus connection-slot freshness still match at final
+commit.
 
 ## Settled Context From The Bad Session
 
@@ -34,7 +37,7 @@ freshness still match at final commit.
   known identity, attest candidate IPC, then commit.
 - Final replacement commit remains authoritative and rechecks current relay
   route state plus the captured slot pointer, address, owner generation, owner
-  lease epoch, and replacement evidence.
+  lease epoch, and opaque final replacement proof.
 - Regression coverage exists for duplicate live-owner rejection before
   candidate connect, stale-owner replacement after candidate attestation, and
   stale candidate preparation losing a final commit race.
@@ -44,16 +47,18 @@ freshness still match at final commit.
 
 ## Current Behavior
 
-The relay handles stale owner replacement in four layers:
+The relay handles stale owner replacement in five layers:
 
 1. Preflight checks validate the route name, server identity, and current relay
    route state.
 2. If the route belongs to a different owner and the cached owner slot is evicted
-   or disconnected, the relay probes the existing owner before allowing a
-   candidate replacement to proceed.
+   or disconnected, the relay probes the existing owner before allowing the
+   candidate IPC connection attempt.
 3. Candidate registration still has to pass IPC handshake identity validation and
-   route export validation.
-4. Final commit uses `replace_if_owner_token(...)` to ensure the relay-local
+   route contract validation.
+4. After candidate attestation, the relay performs a fresh final owner probe
+   against the captured old endpoint and captured route contract.
+5. Final commit uses `replace_if_owner_token(...)` to ensure the relay-local
    route and cached connection slot still match the stale owner that was probed,
    no request is active, and the old slot is already replaceable.
 
@@ -89,11 +94,15 @@ The implemented behavior closes this sequence:
 The original impact is now bounded by these constraints:
 
 - A transient stale-owner probe cannot by itself authorize replacement; final
-  commit consumes only `ConfirmedDead` or `ConfirmedRouteMissing` evidence.
+  commit consumes only proof created by the post-attestation final owner probe.
 - Calls routed through the relay renew the owner lease when the acquired route
   still matches, invalidating older replacement tokens.
 - This is not a route-name-only trust regression: the replacement candidate still
-  must pass IPC identity and route-export attestation.
+  must pass IPC identity and route-contract attestation, and final proof checks
+  the captured owner identity plus CRM tag and contract hashes.
+- This is a relay-local proof boundary. It does not claim a cross-process
+  guarantee that an external owner cannot become live after final proof without a
+  future IPC owner-fence protocol.
 - This is not a Python SDK ownership issue; the behavior belongs in Rust relay
   authority and transport state.
 
@@ -116,8 +125,9 @@ The relay-local freshness contract is now explicit:
 - Lease duration is derived from `RelayConfig.idle_timeout_secs`. A value of `0`
   disables time-based deadlines, but it does not disable final-probe-based
   replacement when the old owner is proven dead or route-missing.
-- Lease expiry alone is never ownership forfeiture. Replacement requires final
-  owner-probe evidence: `ConfirmedDead` or `ConfirmedRouteMissing`.
+- Lease expiry alone is never ownership forfeiture. Replacement requires opaque
+  final owner proof created after candidate IPC identity and route-contract
+  attestation.
 - A same-owner re-registration or relay-local lease renewal increments the owner
   lease epoch and invalidates previously captured replacement tokens. A reconnect
   that makes the owner authoritative again receives a new owner generation.
@@ -140,8 +150,8 @@ failed validation branch cannot strand the old owner.
 
 The original remediation outline is retained as historical context. The chosen
 contract is relay-local generation plus lease epoch in `ConnectionPool`, with
-final-probe evidence consumed by `replace_if_owner_token(...)`; no cross-process
-owner epoch or Python SDK authority was added.
+post-attestation final owner proof consumed by `replace_if_owner_token(...)`; no
+cross-process owner epoch or Python SDK authority was added.
 
 ### Phase 1: Define Owner Freshness Semantics
 
@@ -149,10 +159,11 @@ The selected freshness contract for relay-owned routes is:
 
 - Relay-issued owner generation stored only in the connection slot.
 - Relay-local owner lease epoch stored only in the connection slot.
-- Final-probe evidence (`ConfirmedDead` or `ConfirmedRouteMissing`) carried to
-  the final commit.
+- Final-probe evidence (`ConfirmedDead` or `ConfirmedRouteMissing`) is attached
+  only after candidate IPC identity and route-contract attestation.
 - Route identity (`route_name`, `server_id`, `server_instance_id`,
-  `ipc_address`) captured with the slot token before candidate attestation.
+  `ipc_address`, CRM tag, ABI hash, and signature hash) is captured with the slot
+  token before candidate attestation.
 
 The mechanism lives in Rust relay state, not in the Python SDK.
 
@@ -161,7 +172,7 @@ The mechanism lives in Rust relay state, not in the Python SDK.
 Replacement commit fails if the current slot has a different generation or lease
 epoch than the one observed during the stale-owner probe. The candidate can
 replace the old owner only when the final stale-owner decision is still valid at
-commit time under the selected freshness model.
+commit time under the selected relay-local freshness model.
 
 ### Phase 3: Add Focused Race Tests
 
@@ -182,7 +193,7 @@ Implemented tests cover:
 ## Related Files
 
 - `core/transport/c2-http/src/relay/authority.rs` - registration preflight,
-  stale-owner probing, and replacement token creation
+  stale-owner probing, and final replacement proof creation
 - `core/transport/c2-http/src/relay/state.rs` - route table, cached owner state,
   and replacement commit checks
 - `core/transport/c2-http/src/relay/server.rs` - command-loop upstream

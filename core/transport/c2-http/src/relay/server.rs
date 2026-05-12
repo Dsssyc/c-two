@@ -420,21 +420,11 @@ impl RelayServer {
                         let _ = reply.send(Err(err));
                         continue;
                     }
-                    let replacement = match RouteAuthority::new(&state)
+                    let replacement_candidate = match RouteAuthority::new(&state)
                         .prepare_candidate_registration(&name, &server_id, &address)
                         .await
                     {
-                        Ok(replacement) => {
-                            replacement.map(|r| crate::relay::state::OwnerReplacementToken {
-                                route_name: r.route_name,
-                                server_id: r.server_id,
-                                server_instance_id: r.server_instance_id,
-                                ipc_address: r.ipc_address,
-                                existing_address: r.existing_address,
-                                token: r.token,
-                                evidence: r.evidence,
-                            })
-                        }
+                        Ok(replacement) => replacement,
                         Err(ControlError::AddressMismatch { .. })
                         | Err(ControlError::DuplicateRoute { .. }) => {
                             let _ = reply.send(Err(RelayControlError::DuplicateRoute { name }));
@@ -515,6 +505,36 @@ impl RelayServer {
                                         ),
                                     };
                                 let client = Arc::new(client);
+                                let replacement = match RouteAuthority::new(&state)
+                                    .confirm_replacement_for_commit(replacement_candidate)
+                                    .await
+                                {
+                                    Ok(replacement) => replacement,
+                                    Err(ControlError::AddressMismatch { .. })
+                                    | Err(ControlError::DuplicateRoute { .. })
+                                    | Err(ControlError::OwnerMismatch)
+                                    | Err(ControlError::NotFound) => {
+                                        let close_client = client.clone();
+                                        tokio::spawn(
+                                            async move { close_client.close_shared().await },
+                                        );
+                                        let _ = reply
+                                            .send(Err(RelayControlError::DuplicateRoute { name }));
+                                        continue;
+                                    }
+                                    Err(ControlError::InvalidName { reason })
+                                    | Err(ControlError::InvalidServerId { reason })
+                                    | Err(ControlError::InvalidServerInstanceId { reason })
+                                    | Err(ControlError::InvalidAddress { reason })
+                                    | Err(ControlError::ContractMismatch { reason }) => {
+                                        let close_client = client.clone();
+                                        tokio::spawn(
+                                            async move { close_client.close_shared().await },
+                                        );
+                                        let _ = reply.send(Err(RelayControlError::Other(reason)));
+                                        continue;
+                                    }
+                                };
                                 match state.commit_register_upstream(
                                     name.clone(),
                                     server_id,
@@ -626,6 +646,52 @@ mod tests {
     #[derive(Default)]
     struct RecordingDisseminator {
         envelopes: Mutex<Vec<PeerEnvelope>>,
+    }
+
+    fn source_between<'a>(source: &'a str, start: &str, end: &str) -> Option<&'a str> {
+        let start_idx = source.find(start)?;
+        let after_start = &source[start_idx..];
+        let end_idx = after_start.find(end)?;
+        Some(&after_start[..end_idx])
+    }
+
+    #[test]
+    fn command_register_final_confirmation_stays_after_candidate_attestation() {
+        let source = include_str!("server.rs");
+        let body = source_between(
+            source,
+            "Command::RegisterUpstream {\n                    name,",
+            "Command::UnregisterUpstream",
+        )
+        .expect("RegisterUpstream command branch should be found");
+        let prepare = body
+            .find(".prepare_candidate_registration(")
+            .expect("command registration must prepare replacement eligibility");
+        let connect = body
+            .find("client.connect().await")
+            .expect("command registration must connect candidate IPC");
+        let read = body
+            .find("read_ipc_route_contract")
+            .expect("command registration must read candidate route contract");
+        let confirm = body
+            .find(".confirm_replacement_for_commit(")
+            .expect("command registration must perform final replacement confirmation");
+        let commit = body
+            .find(".commit_register_upstream(")
+            .expect("command registration must commit through RelayState");
+
+        assert!(
+            prepare < connect && connect < read,
+            "preliminary eligibility must run before candidate IPC and route attestation"
+        );
+        assert!(
+            read < confirm,
+            "final replacement proof must be created after candidate route attestation"
+        );
+        assert!(
+            confirm < commit,
+            "relay commit must consume only post-attestation final proof"
+        );
     }
 
     impl RecordingDisseminator {

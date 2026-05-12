@@ -159,7 +159,7 @@ pub(crate) enum RegisterPreflight {
 
 pub(crate) enum RegisterPreparation {
     Available {
-        replacement: Option<OwnerReplacement>,
+        replacement: Option<OwnerReplacementCandidate>,
     },
     SameOwner,
     DuplicateAlive {
@@ -169,13 +169,18 @@ pub(crate) enum RegisterPreparation {
 
 #[derive(Clone)]
 pub(crate) struct OwnerReplacement {
-    pub route_name: String,
-    pub server_id: String,
-    pub server_instance_id: String,
-    pub ipc_address: String,
-    pub existing_address: String,
-    pub token: OwnerToken,
-    pub evidence: OwnerReplacementEvidence,
+    route_name: String,
+    server_id: String,
+    server_instance_id: String,
+    ipc_address: String,
+    existing_address: String,
+    crm_ns: String,
+    crm_name: String,
+    crm_ver: String,
+    abi_hash: String,
+    signature_hash: String,
+    token: OwnerToken,
+    evidence: OwnerReplacementEvidence,
 }
 
 #[derive(Clone)]
@@ -185,6 +190,11 @@ pub(crate) struct OwnerReplacementCandidate {
     server_instance_id: String,
     ipc_address: String,
     existing_address: String,
+    crm_ns: String,
+    crm_name: String,
+    crm_ver: String,
+    abi_hash: String,
+    signature_hash: String,
     token: OwnerToken,
 }
 
@@ -196,6 +206,11 @@ impl OwnerReplacementCandidate {
             server_instance_id: self.server_instance_id,
             ipc_address: self.ipc_address,
             existing_address: self.existing_address,
+            crm_ns: self.crm_ns,
+            crm_name: self.crm_name,
+            crm_ver: self.crm_ver,
+            abi_hash: self.abi_hash,
+            signature_hash: self.signature_hash,
             token: self.token,
             evidence,
         }
@@ -358,7 +373,7 @@ impl<'a> RouteAuthority<'a> {
         name: &str,
         server_id: &str,
         address: &str,
-    ) -> Result<Option<OwnerReplacement>, ControlError> {
+    ) -> Result<Option<OwnerReplacementCandidate>, ControlError> {
         let mut last_stale_owner = None;
         for _ in 0..3 {
             self.validate_route_name(name)?;
@@ -387,25 +402,13 @@ impl<'a> RouteAuthority<'a> {
                 Err(err) => return Err(err),
             };
 
-            match self
-                .probe_owner(name, &replacement.existing_address, &replacement.token)
-                .await
-            {
+            match self.probe_captured_owner(&replacement).await {
                 OwnerProbe::Alive => {
                     return Err(ControlError::DuplicateRoute {
                         existing_address: replacement.existing_address,
                     });
                 }
-                OwnerProbe::RouteMissing => {
-                    return Ok(Some(
-                        replacement.with_evidence(OwnerReplacementEvidence::ConfirmedRouteMissing),
-                    ));
-                }
-                OwnerProbe::Dead => {
-                    return Ok(Some(
-                        replacement.with_evidence(OwnerReplacementEvidence::ConfirmedDead),
-                    ));
-                }
+                OwnerProbe::RouteMissing | OwnerProbe::Dead => return Ok(Some(replacement)),
                 OwnerProbe::Stale => {
                     last_stale_owner = Some(replacement.existing_address);
                 }
@@ -433,28 +436,15 @@ impl<'a> RouteAuthority<'a> {
                 RegisterPreflight::SameOwner => return Ok(RegisterPreparation::SameOwner),
                 RegisterPreflight::Available {
                     replacement: Some(replacement),
-                } => match self
-                    .probe_owner(name, &replacement.existing_address, &replacement.token)
-                    .await
-                {
+                } => match self.probe_captured_owner(&replacement).await {
                     OwnerProbe::Alive => {
                         return Ok(RegisterPreparation::DuplicateAlive {
                             existing_address: replacement.existing_address,
                         });
                     }
-                    OwnerProbe::RouteMissing => {
+                    OwnerProbe::RouteMissing | OwnerProbe::Dead => {
                         return Ok(RegisterPreparation::Available {
-                            replacement: Some(
-                                replacement
-                                    .with_evidence(OwnerReplacementEvidence::ConfirmedRouteMissing),
-                            ),
-                        });
-                    }
-                    OwnerProbe::Dead => {
-                        return Ok(RegisterPreparation::Available {
-                            replacement: Some(
-                                replacement.with_evidence(OwnerReplacementEvidence::ConfirmedDead),
-                            ),
+                            replacement: Some(replacement),
                         });
                     }
                     OwnerProbe::Stale => {
@@ -466,6 +456,30 @@ impl<'a> RouteAuthority<'a> {
         Ok(RegisterPreparation::DuplicateAlive {
             existing_address: last_stale_owner.unwrap_or_else(|| "<unknown>".to_string()),
         })
+    }
+
+    pub(crate) async fn confirm_replacement_for_commit(
+        &self,
+        replacement: Option<OwnerReplacementCandidate>,
+    ) -> Result<Option<OwnerReplacement>, ControlError> {
+        let Some(replacement) = replacement else {
+            return Ok(None);
+        };
+
+        match self.probe_captured_owner(&replacement).await {
+            OwnerProbe::Alive => Err(ControlError::DuplicateRoute {
+                existing_address: replacement.existing_address,
+            }),
+            OwnerProbe::RouteMissing => Ok(Some(
+                replacement.with_evidence(OwnerReplacementEvidence::ConfirmedRouteMissing),
+            )),
+            OwnerProbe::Dead => Ok(Some(
+                replacement.with_evidence(OwnerReplacementEvidence::ConfirmedDead),
+            )),
+            OwnerProbe::Stale => Err(ControlError::DuplicateRoute {
+                existing_address: replacement.existing_address,
+            }),
+        }
     }
 
     pub(crate) fn execute(
@@ -583,6 +597,11 @@ impl<'a> RouteAuthority<'a> {
                             || token.server_id != existing_server_id
                             || token.server_instance_id != existing_server_instance_id
                             || token.ipc_address != existing_address
+                            || token.crm_ns != existing.crm_ns
+                            || token.crm_name != existing.crm_name
+                            || token.crm_ver != existing.crm_ver
+                            || token.abi_hash != existing.abi_hash
+                            || token.signature_hash != existing.signature_hash
                         {
                             return Err(ControlError::DuplicateRoute { existing_address });
                         }
@@ -662,6 +681,11 @@ impl<'a> RouteAuthority<'a> {
                     server_instance_id: existing.server_instance_id.clone().unwrap_or_default(),
                     ipc_address: existing_address.clone(),
                     existing_address: address,
+                    crm_ns: existing.crm_ns.clone(),
+                    crm_name: existing.crm_name.clone(),
+                    crm_ver: existing.crm_ver.clone(),
+                    abi_hash: existing.abi_hash.clone(),
+                    signature_hash: existing.signature_hash.clone(),
                     token,
                 })
             }
@@ -784,21 +808,31 @@ impl<'a> RouteAuthority<'a> {
             && self.state.peer_is_alive(sender_relay_id)
     }
 
-    async fn probe_owner(
-        &self,
-        name: &str,
-        existing_address: &str,
-        token: &OwnerToken,
-    ) -> OwnerProbe {
-        let mut client = IpcClient::new(existing_address);
+    async fn probe_captured_owner(&self, replacement: &OwnerReplacementCandidate) -> OwnerProbe {
+        let mut client = IpcClient::new(&replacement.existing_address);
         match client.connect().await {
             Ok(()) => {
-                let route_exists = client.route_table(name).is_some();
+                let identity_matches = client.server_id() == Some(replacement.server_id.as_str())
+                    && client.server_instance_id() == Some(replacement.server_instance_id.as_str());
+                let route_matches = identity_matches
+                    && client
+                        .route_contract(&replacement.route_name)
+                        .is_some_and(|contract| {
+                            contract.route_name == replacement.route_name
+                                && contract.crm_ns == replacement.crm_ns
+                                && contract.crm_name == replacement.crm_name
+                                && contract.crm_ver == replacement.crm_ver
+                                && contract.abi_hash == replacement.abi_hash
+                                && contract.signature_hash == replacement.signature_hash
+                        });
                 client.close().await;
 
-                if !route_exists {
+                if !route_matches {
                     OwnerProbe::RouteMissing
-                } else if self.state.matches_owner_token(name, token) {
+                } else if self
+                    .state
+                    .matches_owner_token(&replacement.route_name, &replacement.token)
+                {
                     OwnerProbe::Alive
                 } else {
                     OwnerProbe::Stale
@@ -853,6 +887,78 @@ mod tests {
             }),
             Arc::new(NullDisseminator),
         )
+    }
+
+    fn source_between<'a>(source: &'a str, start: &str, end: &str) -> Option<&'a str> {
+        let start_idx = source.find(start)?;
+        let after_start = &source[start_idx..];
+        let end_idx = after_start.find(end)?;
+        Some(&after_start[..end_idx])
+    }
+
+    #[test]
+    fn preliminary_registration_paths_do_not_attach_replacement_evidence() {
+        let source = include_str!("authority.rs");
+        let prepare_candidate = source_between(
+            source,
+            "pub(crate) async fn prepare_candidate_registration",
+            "pub(crate) async fn prepare_register",
+        )
+        .expect("prepare_candidate_registration body should be found");
+        let prepare_register = source_between(
+            source,
+            "pub(crate) async fn prepare_register",
+            "pub(crate) async fn confirm_replacement_for_commit",
+        )
+        .expect("prepare_register body should be found");
+
+        assert!(
+            !prepare_candidate.contains(".with_evidence("),
+            "preliminary command-loop preparation must not create commit evidence"
+        );
+        assert!(
+            !prepare_candidate.contains("OwnerReplacementEvidence::"),
+            "preliminary command-loop preparation must not name commit evidence"
+        );
+        assert!(
+            !prepare_register.contains(".with_evidence("),
+            "preliminary HTTP preparation must not create commit evidence"
+        );
+        assert!(
+            !prepare_register.contains("OwnerReplacementEvidence::"),
+            "preliminary HTTP preparation must not name commit evidence"
+        );
+    }
+
+    #[test]
+    fn replacement_proof_types_do_not_expose_fields() {
+        let source = include_str!("authority.rs");
+        let owner_replacement = source_between(
+            source,
+            "pub(crate) struct OwnerReplacement {",
+            "pub(crate) struct OwnerReplacementCandidate {",
+        )
+        .expect("OwnerReplacement definition should be found");
+        assert!(
+            !owner_replacement
+                .lines()
+                .skip(1)
+                .any(|line| line.trim_start().starts_with("pub ")),
+            "OwnerReplacement fields must stay private so evidence cannot be constructed outside authority"
+        );
+        let candidate = source_between(
+            source,
+            "pub(crate) struct OwnerReplacementCandidate {",
+            "impl OwnerReplacementCandidate",
+        )
+        .expect("OwnerReplacementCandidate definition should be found");
+        assert!(
+            !candidate
+                .lines()
+                .skip(1)
+                .any(|line| line.trim_start().starts_with("pub ")),
+            "OwnerReplacementCandidate fields must stay private so callers cannot forge captured owner state"
+        );
     }
 
     fn peer_route(name: &str, relay_id: &str) -> RouteEntry {

@@ -38,16 +38,6 @@ fn owner_lease_duration(config: &RelayConfig) -> Option<Duration> {
 }
 
 #[derive(Clone)]
-pub struct OwnerReplacementToken {
-    pub route_name: String,
-    pub server_id: String,
-    pub server_instance_id: String,
-    pub ipc_address: String,
-    pub existing_address: String,
-    pub token: OwnerToken,
-    pub evidence: OwnerReplacementEvidence,
-}
-
 pub enum RegisterCommitResult {
     Registered { entry: RouteEntry },
     SameOwner { entry: RouteEntry },
@@ -115,17 +105,8 @@ impl RelayState {
         abi_hash: String,
         signature_hash: String,
         client: Arc<IpcClient>,
-        replacement: Option<OwnerReplacementToken>,
+        replacement: Option<OwnerReplacement>,
     ) -> RegisterCommitResult {
-        let replacement = replacement.map(|token| OwnerReplacement {
-            route_name: token.route_name,
-            server_id: token.server_id,
-            server_instance_id: token.server_instance_id,
-            ipc_address: token.ipc_address,
-            existing_address: token.existing_address,
-            token: token.token,
-            evidence: token.evidence,
-        });
         match RouteAuthority::new(self).execute(RouteCommand::RegisterLocal {
             name,
             server_id,
@@ -505,6 +486,7 @@ impl RelayState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::relay::authority::RegisterPreparation;
 
     const TEST_CRM_NS: &str = "test.relay";
     const TEST_CRM_NAME: &str = "RelayGrid";
@@ -614,23 +596,69 @@ mod tests {
         }
     }
 
-    fn replacement_token(
-        route_name: &str,
+    async fn confirmed_dead_replacement(
+        state: &RelayState,
+        name: &str,
         server_id: &str,
         server_instance_id: &str,
-        ipc_address: &str,
-        token: OwnerToken,
-        evidence: OwnerReplacementEvidence,
-    ) -> OwnerReplacementToken {
-        OwnerReplacementToken {
-            route_name: route_name.to_string(),
-            server_id: server_id.to_string(),
-            server_instance_id: server_instance_id.to_string(),
-            ipc_address: ipc_address.to_string(),
-            existing_address: ipc_address.to_string(),
-            token,
-            evidence,
-        }
+        address: &str,
+    ) -> OwnerReplacement {
+        let preliminary = RouteAuthority::new(state)
+            .prepare_register(name, server_id, server_instance_id, address)
+            .await
+            .expect("preliminary replacement should be available");
+        let replacement = match preliminary {
+            RegisterPreparation::Available {
+                replacement: Some(replacement),
+            } => replacement,
+            _ => panic!("expected replacement candidate"),
+        };
+        RouteAuthority::new(state)
+            .confirm_replacement_for_commit(Some(replacement))
+            .await
+            .expect("dead owner should confirm replacement")
+            .expect("replacement proof should be present")
+    }
+
+    fn source_between<'a>(source: &'a str, start: &str, end: &str) -> Option<&'a str> {
+        let start_idx = source.find(start)?;
+        let after_start = &source[start_idx..];
+        let end_idx = after_start.find(end)?;
+        Some(&after_start[..end_idx])
+    }
+
+    #[test]
+    fn state_layer_does_not_export_replacement_evidence_token() {
+        let source = include_str!("state.rs");
+        let token_type = concat!("Owner", "Replacement", "Token");
+        let token_argument = concat!("replacement: Option<Owner", "Replacement", "Token>");
+        assert!(
+            !source.contains(token_type),
+            "state.rs must not expose a replacement token that callers can fill with evidence"
+        );
+        assert!(
+            !source.contains(token_argument),
+            "commit_register_upstream must consume opaque OwnerReplacement directly"
+        );
+    }
+
+    #[test]
+    fn state_commit_does_not_reconstruct_replacement_proof() {
+        let source = include_str!("state.rs");
+        let body = source_between(
+            source,
+            "pub fn commit_register_upstream(",
+            "pub fn unregister_upstream(",
+        )
+        .expect("commit_register_upstream body should be found");
+        assert!(
+            !body.contains("OwnerReplacement {"),
+            "state commit must not reconstruct OwnerReplacement from caller-provided fields"
+        );
+        assert!(
+            !body.contains("evidence:"),
+            "state commit must not copy caller-provided evidence into replacement proof"
+        );
     }
 
     fn announce_peer_route(state: &RelayState, entry: RouteEntry) {
@@ -1005,8 +1033,8 @@ mod tests {
         assert_eq!(state.get_address("grid").as_deref(), Some("ipc://racer"));
     }
 
-    #[test]
-    fn replacement_token_can_replace_same_slot_only_while_still_evicted() {
+    #[tokio::test]
+    async fn replacement_proof_can_replace_same_slot_only_while_still_evicted() {
         let state = RelayState::new(test_config(), null_disseminator());
         let old = Arc::new(IpcClient::new("ipc://old"));
         old.force_connected(true);
@@ -1023,8 +1051,10 @@ mod tests {
             TEST_SIGNATURE_HASH,
             old,
         );
-        let old_token = state.owner_token("grid").unwrap();
         state.evict_connection("grid");
+        let replacement_proof =
+            confirmed_dead_replacement(&state, "grid", "server-new", "instance-new", "ipc://new")
+                .await;
 
         let replacement = Arc::new(IpcClient::new("ipc://new"));
         replacement.force_connected(true);
@@ -1039,27 +1069,28 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             replacement,
-            Some(replacement_token(
-                "grid",
-                "server-old",
-                "server-old-instance",
-                "ipc://old",
-                old_token,
-                OwnerReplacementEvidence::ConfirmedDead,
-            )),
+            Some(replacement_proof),
         );
 
         assert!(matches!(result, RegisterCommitResult::Registered { .. }));
         assert_eq!(state.get_address("grid").as_deref(), Some("ipc://new"));
     }
 
-    #[test]
-    fn replacement_token_does_not_match_re_registered_same_address_owner() {
+    #[tokio::test]
+    async fn replacement_proof_does_not_match_re_registered_same_address_owner() {
         let state = RelayState::new(test_config(), null_disseminator());
         let old = Arc::new(IpcClient::new("ipc://same"));
         old.force_connected(true);
         register_local(&state, "grid", "server-old", "ipc://same", old);
-        let old_token = state.owner_token("grid").unwrap();
+        state.evict_connection("grid");
+        let replacement_proof = confirmed_dead_replacement(
+            &state,
+            "grid",
+            "server-racer",
+            "instance-racer",
+            "ipc://replacement",
+        )
+        .await;
         assert!(matches!(
             state.unregister_upstream("grid", "server-old"),
             UnregisterResult::Removed { .. }
@@ -1088,14 +1119,7 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             stale_replacement,
-            Some(replacement_token(
-                "grid",
-                "server-old",
-                "server-old-instance",
-                "ipc://same",
-                old_token,
-                OwnerReplacementEvidence::ConfirmedDead,
-            )),
+            Some(replacement_proof),
         );
 
         assert!(matches!(
@@ -1107,8 +1131,8 @@ mod tests {
         assert_eq!(state.get_address("grid").as_deref(), Some("ipc://same"));
     }
 
-    #[test]
-    fn replacement_token_is_rejected_after_same_owner_lease_renewal() {
+    #[tokio::test]
+    async fn replacement_proof_is_rejected_after_same_owner_lease_renewal() {
         let state = RelayState::new(test_config(), null_disseminator());
         let old = Arc::new(IpcClient::new("ipc://old"));
         old.force_connected(true);
@@ -1125,7 +1149,15 @@ mod tests {
             TEST_SIGNATURE_HASH,
             old,
         );
-        let old_token = state.owner_token("grid").unwrap();
+        state.evict_connection("grid");
+        let replacement_proof = confirmed_dead_replacement(
+            &state,
+            "grid",
+            "server-new",
+            "server-new-instance",
+            "ipc://replacement",
+        )
+        .await;
 
         let same_owner = Arc::new(IpcClient::new("ipc://old"));
         same_owner.force_connected(true);
@@ -1147,7 +1179,6 @@ mod tests {
             RegisterCommitResult::SameOwner { .. }
         ));
 
-        state.evict_connection("grid");
         let replacement = Arc::new(IpcClient::new("ipc://replacement"));
         replacement.force_connected(true);
         let result = state.commit_register_upstream(
@@ -1161,14 +1192,7 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             replacement,
-            Some(replacement_token(
-                "grid",
-                "server-old",
-                "server-old-instance",
-                "ipc://old",
-                old_token,
-                OwnerReplacementEvidence::ConfirmedDead,
-            )),
+            Some(replacement_proof),
         );
 
         assert!(matches!(
@@ -1181,12 +1205,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacement_token_is_rejected_after_successful_upstream_acquire() {
+    async fn replacement_proof_is_rejected_after_successful_upstream_acquire() {
         let state = RelayState::new(test_config(), null_disseminator());
         let old = Arc::new(IpcClient::new("ipc://old"));
         old.force_connected(true);
         register_local(&state, "grid", "server-old", "ipc://old", old);
-        let old_token = state.owner_token("grid").unwrap();
+        state.evict_connection("grid");
+        let replacement_proof = confirmed_dead_replacement(
+            &state,
+            "grid",
+            "server-new",
+            "server-new-instance",
+            "ipc://replacement",
+        )
+        .await;
+        let reconnected = Arc::new(IpcClient::new("ipc://old"));
+        reconnected.force_connected(true);
+        state.reconnect("grid", reconnected);
 
         let (lease, route) = match state.acquire_upstream("grid").await {
             Ok(acquired) => acquired,
@@ -1209,14 +1244,7 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             replacement,
-            Some(replacement_token(
-                "grid",
-                "server-old",
-                "server-old-instance",
-                "ipc://old",
-                old_token,
-                OwnerReplacementEvidence::ConfirmedDead,
-            )),
+            Some(replacement_proof),
         );
 
         assert!(matches!(
@@ -1314,13 +1342,23 @@ mod tests {
     }
 
     #[test]
-    fn replacement_token_cannot_replace_reconnected_owner_slot() {
+    fn replacement_proof_cannot_replace_reconnected_owner_slot() {
         let state = RelayState::new(test_config(), null_disseminator());
         let old = Arc::new(IpcClient::new("ipc://same-slot"));
         old.force_connected(true);
         register_local(&state, "grid", "server-old", "ipc://same-slot", old);
-        let old_token = state.owner_token("grid").unwrap();
         state.evict_connection("grid");
+        let replacement_proof = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(confirmed_dead_replacement(
+                &state,
+                "grid",
+                "server-new",
+                "instance-new",
+                "ipc://replacement",
+            ));
 
         let reconnected_old = Arc::new(IpcClient::new("ipc://same-slot"));
         reconnected_old.force_connected(true);
@@ -1339,14 +1377,7 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             replacement,
-            Some(replacement_token(
-                "grid",
-                "server-old",
-                "server-old-instance",
-                "ipc://same-slot",
-                old_token,
-                OwnerReplacementEvidence::ConfirmedDead,
-            )),
+            Some(replacement_proof),
         );
 
         assert!(matches!(
