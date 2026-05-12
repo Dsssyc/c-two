@@ -1,7 +1,8 @@
 # Thin SDK / Rust Core Boundary Reference
 
 **Date:** 2026-05-04
-**Status:** Architecture reference / implementation backlog
+**Status:** Architecture reference / implemented downshift ledger with future
+hardening notes
 **Scope:** Identify Python SDK runtime state and mechanisms that should move
 down into the Rust core so future language SDKs can stay thin.
 
@@ -54,10 +55,10 @@ C-Two already has the main language-neutral layers in Rust:
 - `core/runtime/c2-runtime`: process runtime session, route transactions,
   client pools, relay projection, and lifecycle outcomes.
 
-The Python SDK is already thinner than earlier versions, but it still owns
-several generic runtime mechanisms that future SDKs would otherwise have to
-reimplement. Those mechanisms should move to Rust without moving Python domain
-logic, CRM decorators, or transferable serialization semantics.
+The Python SDK is already thinner than earlier versions. The downshift ledger
+below records the generic runtime mechanisms that were identified here and have
+now moved to Rust ownership, while keeping Python domain logic, CRM decorators,
+and transferable serialization semantics in the SDK.
 
 ## Keep In Python SDKs
 
@@ -722,7 +723,7 @@ remain future work. The current Python descriptor hash is sufficient to prevent
 same-SDK half-upgrades from binding a route with different method/signature
 shape, but it is not a cross-language IDL contract.
 
-## Suggested Execution Order
+## Historical Execution Order
 
 1. Remote IPC scheduler config, with explicit zero-copy guardrails.
 2. Direct IPC probe/control helpers in `c2-ipc`.
@@ -739,7 +740,7 @@ shape, but it is not a cross-language IDL contract.
 
 Every implementation spawned from this reference should preserve:
 
-- No relay direct IPC cross-process success.
+- No-relay direct IPC cross-process success.
 - Bad relay does not affect explicit `ipc://` connection.
 - Name-only connect without relay fails clearly when the resource is not local.
 - Relay-aware name resolution uses Rust relay-aware HTTP client when configured.

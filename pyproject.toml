@@ -22,6 +22,11 @@ examples = [
     "pandas>=2.2.0",
     "pyarrow>=23.0.1",
 ]
+benchmark = [
+    "numpy>=2.2.4",
+    # Ray does not currently publish a macOS aarch64 CPython 3.14t wheel.
+    "ray>=2.55.0; python_version < '3.14'",
+]
 
 [tool.uv]
 package = false

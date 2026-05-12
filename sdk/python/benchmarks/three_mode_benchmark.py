@@ -32,6 +32,7 @@ import urllib.error
 import urllib.request
 
 import c_two as cc
+from c_two.crm.contract import CRMContract, crm_contract
 from c_two.transport.registry import _ProcessRegistry
 
 # Configurable via CLI --segment-size (bytes)
@@ -53,10 +54,10 @@ class EchoImpl:
 
 @cc.crm(namespace='bench.three_mode_dict', version='0.1.0')
 class DictEcho:
-    def echo(self, data: dict) -> dict: ...
+    def echo(self, data: dict[str, bytes]) -> dict[str, bytes]: ...
 
 class DictEchoImpl:
-    def echo(self, data: dict) -> dict:
+    def echo(self, data: dict[str, bytes]) -> dict[str, bytes]:
         return data
 
 
@@ -131,10 +132,22 @@ def _register_relay_upstream(
     name: str,
     address: str,
     server_id: str,
+    server_instance_id: str,
+    expected: CRMContract,
 ) -> None:
     _post_json(
         f'{relay_url}/_register',
-        {'name': name, 'server_id': server_id, 'address': address},
+        {
+            'name': name,
+            'server_id': server_id,
+            'server_instance_id': server_instance_id,
+            'address': address,
+            'crm_ns': expected.crm_ns,
+            'crm_name': expected.crm_name,
+            'crm_ver': expected.crm_ver,
+            'abi_hash': expected.abi_hash,
+            'signature_hash': expected.signature_hash,
+        },
     )
 
 
@@ -161,6 +174,23 @@ def _best_effort_unregister_local(name: str) -> None:
         cc.unregister(name)
     except Exception as exc:
         print(f'Warning: failed to unregister local route {name!r}: {exc}', file=sys.stderr)
+
+
+def _server_instance_id_for(name: str, address: str, crm_class: type) -> str:
+    expected = crm_contract(crm_class)
+    registry = _ProcessRegistry.get()
+    client = registry._runtime_session.acquire_ipc_client(  # noqa: SLF001
+        address,
+        name,
+        *expected.native_args(),
+    )
+    try:
+        instance_id = client.server_instance_id
+        if not isinstance(instance_id, str) or not instance_id:
+            raise RuntimeError('registered server did not expose server_instance_id')
+        return instance_id
+    finally:
+        registry._runtime_session.release_ipc_client(address)  # noqa: SLF001
 
 
 def _cleanup():
@@ -286,8 +316,17 @@ def bench_relay(payload_size: int) -> float | None:
         if server_id is None:
             raise RuntimeError('registered server did not expose server_id')
         _wait_sock(address)
+        server_instance_id = _server_instance_id_for(route_name, address, Echo)
+        expected = crm_contract(Echo)
 
-        _register_relay_upstream(relay_url, route_name, address, server_id)
+        _register_relay_upstream(
+            relay_url,
+            route_name,
+            address,
+            server_id,
+            server_instance_id,
+            expected,
+        )
         route_registered = True
 
         payload = b'\xAB' * payload_size
