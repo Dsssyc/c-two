@@ -136,6 +136,49 @@ This prevents a connection close from running `wait_idle()` and
 `chunk_registry.cleanup_connection()` while a queued logical call still owns
 request data or still intends to send a response.
 
+### I11. Route Construction Authority
+
+Registered routes must be constructible only through a `c2-server` builder that
+attaches the route to the owning server's `ServerExecutionScheduler`. Downstream
+crates, SDK bindings, and test helpers must not be able to create a routable
+`CrmRoute` by directly filling public fields or by supplying a standalone
+scheduler.
+
+This prevents stale or partial migration paths where production registration,
+PyO3 helpers, relay test support, or Rust tests bypass the global execution
+budget by constructing routes with the old per-route `Scheduler`.
+
+### I12. Close And Drain Semantics
+
+Route unregister and server shutdown must atomically close admission for the
+affected route/server, reject and clean up queued calls that have not started
+callback execution, and keep active callbacks accounted until response or error
+completion.
+
+This prevents unregister/shutdown races where new calls slip in after close,
+queued calls hang forever, or shutdown returns while admitted callback work still
+owns request resources.
+
+### I13. Chunk Assembly Boundary
+
+Incomplete chunked frames are not counted as admitted CRM calls, but their
+buffering and async processing must still be bounded by the existing chunk
+registry limits before payload cloning or task fan-out can grow without bound.
+Only a fully reassembled logical CRM call enters the execution scheduler.
+
+This prevents overload cases where `max_pending_requests` is correct for
+complete calls but chunked traffic creates an independent unbounded work queue
+before the call becomes schedulable.
+
+### I14. Fair Promotion
+
+Queued calls that are eligible for execution must be promoted without
+starvation. Promotion must respect per-route FIFO order, route read/write
+fairness, and a server-wide fair ordering across ready routes.
+
+This prevents a hot route or a stream of newly admitted reads from indefinitely
+delaying older queued work that has available route and global capacity.
+
 ## Source-To-Sink Matrix
 
 | Invariant | Producer | Storage | Consumer | Network/Wire | FFI/SDK | Test/Support | Legacy/Bypass |
@@ -150,6 +193,10 @@ request data or still intends to send a response.
 | I8 cleanup | request materialization in dispatch path | request object until execution result/reject | scheduler rejection, route close, callback completion | IPC SHM/handle/chunked data | PyO3 only sees request after permit | SHM reuse tests after rejection | cleanup must not depend on callback running |
 | I9 no bypass | route registration helpers | direct route construction tests and relay support | production and tests | relay test support starts live IPC servers | all FFI constructors updated | `rg` guardrail for old helper usage | old `Scheduler::execute` removed or test-only gated |
 | I10 connection drain | `Connection::FlightGuard` / in-flight counter | per-connection atomic counter | connection close waits on queued and active calls | IPC connection lifecycle; chunk cleanup after idle | no SDK-owned drain state | tests close connection with queued calls and assert no premature cleanup | manual `flight_inc` / `flight_dec` paths replaced with RAII guard |
+| I11 route construction authority | `Server` route builder from validated route spec | private route fields plus scheduler identity/generation | dispatcher accepts only server-built routes | not wire-visible; affects every IPC route | PyO3 receives opaque route handle, not raw scheduler | relay/Rust test helpers use production builder | `CrmRoute { ... }`, public `scheduler` fields, and exported old `Scheduler` are removed or crate-private |
+| I12 close/drain | unregister, shutdown, connection close | scheduler route/server closed state and queues | admission, queued waiters, active permit drop | IPC close and admin lifecycle | SDK consumes structured unregister/shutdown outcomes | tests for queued, active, and new calls during close | no separate Python close authority or old scheduler close path |
+| I13 chunk assembly | IPC frame reader and `ChunkRegistry` | chunk registry counters, assembler memory, optional bounded chunk-processing semaphore | chunk frame handling before logical call admission | chunked call frames before route callback execution | no SDK-owned chunk queue | chunk overload tests with incomplete frames | no unbounded `tokio::spawn` + payload clone path for chunk frames |
+| I14 fair promotion | scheduler admission order and route queues | per-route FIFO queues plus server ready-route order | permit promotion when capacity changes | affects all IPC call variants after admission | local route waits use same route order | cross-route and read/write starvation tests | no busy sleep, LIFO, or per-route-only wake policy that can starve eligible work |
 
 ## Proposed Architecture
 
@@ -167,6 +214,12 @@ Add `core/transport/c2-server/src/execution.rs` with:
 `Server` owns one `Arc<ServerExecutionScheduler>`. Each `CrmRoute` stores a
 `RouteExecutionHandle` instead of a standalone `Arc<Scheduler>`.
 
+`RouteExecutionHandle` carries an identity for its owning
+`ServerExecutionScheduler`, including a generation value. Public server
+registration rejects any route handle not produced by that server instance. This
+prevents handles from another server, a test-only scheduler, or the retired
+per-route scheduler from being inserted into the dispatcher.
+
 The scheduler holds a single mutex-protected state tree:
 
 ```text
@@ -183,6 +236,7 @@ Per-route state:
   access_map
   max_pending
   max_workers
+  fifo_wait_queue
   pending_local
   pending_remote
   active_local
@@ -196,6 +250,12 @@ Remote calls reserve global pending and route pending at admission time. They
 atomically promote to global active worker and route active state when they
 become runnable. Local calls use the same route state but do not reserve global
 remote worker capacity.
+
+Promotion is event-driven: releasing an execution permit, closing a route, or
+admitting a newly runnable call wakes the scheduler to promote the oldest
+eligible work without busy sleeps. The scheduler must not use a policy that can
+leave an eligible queued call waiting indefinitely while global and route
+capacity are available.
 
 ### Remote Execution Flow
 
@@ -217,10 +277,20 @@ admission before spawning a per-call async task. Buddy SHM data is read only
 after pending admission succeeds, so rejected calls do not materialize large
 request buffers.
 
+The current IPC frame reader still receives the frame body before it can decode
+the call-control envelope; that allocation remains bounded by `max_frame_size`.
+This design's pending budget begins at the decoded logical CRM call boundary and
+must happen before per-call task fan-out, SHM/handle materialization,
+`PyShmBuffer`/memoryview creation, and callback execution.
+
 For chunked calls, incomplete chunks remain governed by the existing chunk
 registry limits (`max_total_chunks`, assembler timeout, reassembly memory). The
 complete logical call enters the execution scheduler only after
 `chunk_registry.finish()` returns route name, method index, and request handle.
+If chunk frames continue to be handled in spawned async tasks, the spawn and
+payload clone must be behind a bounded chunk-processing permit or be replaced by
+inline processing in the connection loop. `max_pending_requests` is not allowed
+to be the only backpressure for incomplete chunk traffic.
 
 If global or route pending capacity is exceeded, the server returns
 `ExecutionAcquireError::Capacity` and releases any owned `RequestData`
@@ -351,6 +421,31 @@ validated fields remain:
 This is a guardrail against SDK-side partial registration where the dispatcher
 route and runtime registration spec disagree.
 
+### Registration Authority And Public API Guardrails
+
+The migration must remove the current ability to construct routable server
+routes by struct literal. `CrmRoute` fields that define callback, method table,
+contract metadata, and execution handle become private. A new
+`CrmRouteBuilder` or `Server::build_route` path accepts a validated route spec,
+callback adapter, and access map, then attaches the resulting route to the
+owning server scheduler.
+
+`Dispatcher::register` becomes `pub(crate)` and is called only after `Server`
+has validated scheduler identity. Public APIs should expose route registration
+through `Server`/`RuntimeSession`, not through arbitrary `Dispatcher` mutation.
+
+The old `Scheduler` type must no longer be part of the public `c2-server` API.
+`AccessLevel` and `ConcurrencyMode` may remain public, but `pub use
+scheduler::Scheduler` and any production import of `Scheduler` are removed. If a
+small amount of old scheduler code is temporarily useful during the migration,
+it must be crate-private or test-only and must not be able to execute CRM
+callbacks.
+
+PyO3 `build_route`, Rust relay test support, and core server test helpers must
+call the same server-owned route builder. They must not construct
+`CrmRoute { ... }`, instantiate a standalone route scheduler, or expose raw
+scheduler objects to Python.
+
 ## Implementation Work Items
 
 1. Add `max_execution_workers` to `c2-config` server defaults, env resolver,
@@ -358,29 +453,44 @@ route and runtime registration spec disagree.
 2. Add Python `ServerIPCOverrides.max_execution_workers` typed facade and pass
    it into `RustServer`.
 3. Add `ServerExecutionScheduler` and migrate route concurrency state into it.
-4. Change `CrmRoute` to store a `RouteExecutionHandle`; update constructors in
-   PyO3, runtime session tests, c2-server tests, and relay test support.
-5. Change `RuntimeRouteSpec` validation in `c2-runtime` to read concurrency
+4. Change `CrmRoute` to store a `RouteExecutionHandle`, make route fields
+   private, and add a server-owned builder that stamps scheduler
+   identity/generation onto every registered route.
+5. Make `Dispatcher::register` crate-private or otherwise unreachable from
+   external route construction, and require public registration to validate that
+   the route handle belongs to the receiving server.
+6. Remove `Scheduler` from the public `c2-server` API; keep only
+   `AccessLevel`, `ConcurrencyMode`, and new execution-handle types public.
+7. Update PyO3 `build_route`, runtime session tests, c2-server tests, and relay
+   test support to use the production route builder instead of direct
+   `CrmRoute { ... }` construction.
+8. Change `RuntimeRouteSpec` validation in `c2-runtime` to read concurrency
    metadata from `RouteExecutionHandle` snapshots instead of
    `route.scheduler.snapshot()`.
-6. Replace remote `execute_route_request(... spawn_blocking ...)` with
+9. Replace remote `execute_route_request(... spawn_blocking ...)` with
    scheduler-owned `execute_remote`.
-7. Move inline and buddy logical-call admission into `handle_connection` before
-   per-call `tokio::spawn`; keep chunked incomplete-call limits in
-   `ChunkRegistry`, then admit the complete logical call after
-   `chunk_registry.finish()`.
-8. Replace manual connection `flight_inc` / `flight_dec` call paths with an
-   RAII guard that covers queued and active calls.
-9. Change Python `RouteConcurrency` FFI to wrap the route execution handle and
-   enter local guards through `ExecutionScope::Local`.
-10. Remove or test-gate old `Scheduler::execute` and any production
-   `blocking_acquire` remote path.
-11. Add snapshot/metrics bindings needed by tests.
-12. Update existing tests that assert `max_workers` reject-fast semantics; keep
-   reject-fast tests only for `max_pending` and explicit nonblocking APIs.
-13. Update Python unit-test fakes (`FakeScheduler`) to model the new route
-    handle API enough to keep local direct-call tests meaningful.
-14. Update docs and examples so `max_workers` is described as a queueing worker
+10. Move inline and buddy logical-call admission into `handle_connection` before
+    per-call `tokio::spawn`; keep chunked incomplete-call limits in
+    `ChunkRegistry`, then admit the complete logical call after
+    `chunk_registry.finish()`.
+11. Bound chunked frame processing before payload clone/task fan-out, either by
+    processing chunks inline in the connection loop or by acquiring a bounded
+    chunk-processing permit tied to `ChunkRegistry` limits.
+12. Implement fair, event-driven promotion across route queues and preserve
+    writer fairness within `read_parallel` routes.
+13. Replace manual connection `flight_inc` / `flight_dec` call paths with an
+    RAII guard that covers queued and active calls.
+14. Change Python `RouteConcurrency` FFI to wrap the route execution handle and
+    enter local guards through `ExecutionScope::Local`.
+15. Remove or test-gate old `Scheduler::execute` and any production
+    `blocking_acquire` remote path.
+16. Add snapshot/metrics bindings needed by tests.
+17. Update existing tests that assert `max_workers` reject-fast semantics; keep
+    reject-fast tests only for `max_pending` and explicit nonblocking APIs.
+18. Update Python unit-test fakes (`FakeScheduler`) to model the new route
+    handle API enough to keep local direct-call tests meaningful, including
+    closed-route behavior.
+19. Update docs and examples so `max_workers` is described as a queueing worker
     budget, not a thread count.
 
 ## Required Tests
@@ -398,10 +508,18 @@ Rust core tests:
   `spawn_blocking`.
 - `read_parallel`: readers run concurrently, writes are exclusive, and waiting
   writers block newly arriving readers.
+- Cross-route fairness: two or more saturated routes with available per-route
+  capacity all make progress under a lower global `max_execution_workers`.
 - Route unregister closes queued calls and rejects new calls.
+- Route unregister with active calls leaves active permits accounted until those
+  calls finish and closes queued waiters with deterministic errors.
 - Connection close waits for queued and active admitted calls before
   per-connection cleanup.
 - SHM request rejection frees the source allocation and allows reuse.
+- Incomplete chunked frame floods are bounded by chunk registry/semaphore limits
+  and cannot create unbounded task fan-out before a logical call is complete.
+- Direct registration through `Dispatcher` or `CrmRoute` struct literals is no
+  longer possible from downstream crates.
 
 Python integration tests:
 
@@ -422,6 +540,10 @@ Guardrail tests:
   used by production registration.
 - A source-level test fails if production inline or buddy call frames spawn a
   per-call task before logical-call admission.
+- A source-level test fails on `pub use scheduler::Scheduler`, `pub scheduler:`,
+  or direct `CrmRoute {` construction outside the route builder module.
+- A source-level test fails if `sdk/python/native` imports the old
+  `c2_server::scheduler::Scheduler`.
 
 ## Migration Notes
 
@@ -449,10 +571,16 @@ dispatch and do not consume remote execution worker capacity.
 - Inline and buddy call frames are admitted before the per-call async task is
   spawned; chunked calls are admitted immediately after final reassembly and
   before callback execution.
+- Incomplete chunked frames are bounded independently of CRM execution pending
+  admission.
 - Tokio `.max_blocking_threads()` is set from `max_execution_workers`.
 - `max_pending_requests` is exercised by server execution tests, not just
   config parsing tests.
 - Connection `wait_idle()` covers queued calls as well as active callbacks.
+- Public route registration cannot accept a route handle from another server or
+  an old standalone scheduler.
+- Eligible queued calls are promoted fairly across routes and cannot starve when
+  global and route capacity are available.
 - Existing mixed local/remote concurrency tests are updated to the new queueing
   semantics and still prove shared route state.
 - All rejected SHM/handle/chunked requests release resources exactly once.
@@ -478,3 +606,30 @@ The first strict review cycle found and addressed these plan gaps:
 - The first draft did not explicitly separate incomplete chunk reassembly from
   complete CRM call execution. The spec now keeps incomplete chunks under
   `ChunkRegistry` limits and admits only the complete logical CRM call.
+
+The second strict review cycle found and addressed these plan gaps:
+
+- Current `CrmRoute` fields are public and `Dispatcher::register` accepts
+  externally constructed routes, which would let SDK bindings or tests bypass
+  the new server-owned scheduler. The spec now adds route construction authority
+  as a first-class invariant and requires private route fields plus a
+  server-owned builder.
+- Current `c2-server` publicly exports the old `Scheduler`, and PyO3 / relay
+  test support directly instantiate it. The spec now requires removing that
+  public export, updating PyO3 and test helpers to use the production builder,
+  and adding source-level guardrails against direct scheduler imports.
+- The earlier wording implied pending admission happened before all frame-body
+  allocation. The spec now states the exact boundary: the frame body remains
+  bounded by `max_frame_size`, while execution pending admission starts at the
+  decoded logical CRM call boundary before task fan-out, SHM materialization,
+  memoryview creation, and callback execution.
+
+The third strict review cycle found and addressed these plan gaps:
+
+- Current chunked call handling spawns async work before a complete CRM call
+  exists. The spec now treats incomplete chunk assembly as a separate bounded
+  source-to-sink path and requires chunk processing to be bounded before payload
+  clone/task fan-out.
+- The earlier queueing design did not state cross-route promotion fairness. The
+  spec now requires event-driven fair promotion across ready routes, in addition
+  to per-route read/write fairness.
