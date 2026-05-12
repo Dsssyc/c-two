@@ -161,6 +161,15 @@ callback execution, and keep active callbacks accounted until response or error
 completion or until an explicit drain timeout reports that active work did not
 finish.
 
+A graceful close is not allowed to report the affected route as drained while
+`active_local + active_remote > 0`. A timed or forced close may return before
+active callbacks finish only by returning an explicit undrained outcome
+(`active_drained=false`, `active_remaining>0`, `drain_timed_out=true` or
+`forced=true`). Remaining active permits stay owned by the native execution
+scheduler/runtime until their final cleanup path releases request resources,
+route counters, and connection ownership. A timed/forced outcome must not run
+SDK shutdown hooks or claim that route cleanup is complete.
+
 This prevents unregister/shutdown races where new calls slip in after close,
 queued calls hang forever, or shutdown returns while admitted callback work still
 owns request resources.
@@ -189,12 +198,28 @@ delaying older queued work that has available route and global capacity.
 
 Python `@on_shutdown` callbacks must run only after Rust reports that the route
 has closed admission, rejected and cleaned all not-started queued calls, and
-drained active callbacks for that route. If a future timeout or forced shutdown
-path is added, the structured native outcome must say the route did not drain
-and Python must not invoke `@on_shutdown` for that route.
+drained active callbacks for that route. `active_drained` means
+`active_local + active_remote == 0`; same-process thread-local calls are part of
+the condition, not a Python-side exception. If a timeout or forced shutdown path
+returns before that condition holds, the structured native outcome must say the
+route did not drain and Python must not invoke `@on_shutdown` for that route.
 
 This prevents shutdown hooks from racing with still-running resource methods on
 the same Python resource object.
+
+### I16. Direct IPC Admin Shutdown Uses Close Transaction
+
+Direct IPC `ShutdownClient` / `ipc_shutdown()` is a real server shutdown entry.
+It must not bypass the same close transaction used by `RuntimeSession` and
+`NativeServerBridge` shutdown paths. The direct admin signal must close server
+admission, cancel queued not-started work, preserve active permit ownership, and
+produce or record the same structured drain outcome. If a legacy bool helper can
+only report signal delivery, it must not be treated as proof that hooks ran or
+that routes drained.
+
+This prevents high-privilege same-host supervisors from stopping the IPC server
+through a path that leaves queued work, active callbacks, route state, or Python
+hooks outside the lifecycle contract.
 
 ## Source-To-Sink Matrix
 
@@ -205,16 +230,17 @@ the same Python resource object.
 | I3 route workers | `ConcurrencyConfig.max_workers` / route spec | route state inside execution scheduler | local and remote route permits | route metadata does not cross wire; route is resolved from handshake table | PyO3 forwards values; route handle exposed to local proxy | current max-worker tests updated from reject-fast to queue semantics | remove scheduler-only post-blocking rejection for remote |
 | I4 route pending | `ConcurrencyConfig.max_pending` / route spec | route state inside execution scheduler | local and remote route admission | not wire-visible | PyO3 forwards values; no SDK-side fallback | route overload tests for local, remote, mixed calls | test fakes must not omit pending accounting |
 | I5 read/write | CRM method access map | route state | permit acquisition and promotion | method index crosses wire | SDK builds access map from CRM metadata | read/write fairness tests | no raw callback invocation without access map |
-| I6 local/remote shared | route registration builds one route handle | route handle cloned into `CrmRoute` and Python local slot | local proxy guard and remote scheduler | remote IPC path resolves route from dispatcher | `RouteConcurrency` wraps same core handle | mixed local/remote tests | no separate Python lock/counter state |
+| I6 local/remote shared | route registration builds one route handle | route handle cloned into `CrmRoute` and Python local slot | local proxy guard and remote scheduler | remote IPC path resolves route from dispatcher | `RouteConcurrency` wraps same core handle for acquire/snapshot only | mixed local/remote tests | no separate Python lock/counter state and no SDK-exposed scheduler close authority |
 | I7 cross-language | `CrmCallback` trait and `CrmRoute` | `c2-server` | all SDK callback adapters | language-neutral IPC request/response data | Python is one adapter; other SDKs can adapt callback | Rust-only callback tests plus Python integration | no Python-specific field in core config |
 | I8 cleanup | request materialization in dispatch path | request object until execution result/reject | scheduler rejection, route close, callback completion | IPC SHM/handle/chunked data | PyO3 only sees request after permit | SHM reuse tests after rejection | cleanup must not depend on callback running |
-| I9 no bypass | server-owned route registration helpers | production, Rust tests, PyO3, and relay support all use the same registration path | production and tests | relay test support starts live IPC servers | all FFI constructors updated | source/compile-fail guardrails for old helper usage | old `Scheduler::execute` removed or test-only gated |
+| I9 no bypass | server-owned route registration helpers | production, Rust tests, PyO3, and relay support all use the same registration path | production and tests | relay test support starts live IPC servers | all FFI constructors updated | source/compile-fail guardrails for old helper usage | old `Scheduler` execution APIs deleted or quarantined so no callback/test helper can import them |
 | I10 connection drain | `Connection::FlightGuard`, request owner id, cancellation token | per-connection atomic counter plus scheduler queued-call index by connection/request | connection close cancels queued not-started calls, waits for active callbacks and cancellation cleanup | IPC connection lifecycle; chunk cleanup after active/cancel idle | no SDK-owned drain state | tests close connection with queued calls and assert queued callback does not run | manual `flight_inc` / `flight_dec` paths replaced with RAII guard; no closed-connection wait for worker capacity |
 | I11 route construction authority | `Server` route registration API from validated route spec | private route fields plus scheduler identity/generation | dispatcher accepts only server-built routes | not wire-visible; affects every IPC route | PyO3 receives opaque route handle, not raw scheduler | relay/Rust test helpers use production server registration API | `CrmRoute { ... }`, public `scheduler` fields, public standalone route builders, and exported old `Scheduler` are removed or crate-private |
-| I12 close/drain | unregister, shutdown, connection close, explicit drain policy | scheduler route/server closed state, active counters, cancellation queues | admission, queued waiter cancellation, active permit drop, drain barrier or timeout outcome | IPC close and admin lifecycle | SDK consumes structured unregister/shutdown outcomes | tests for queued, active, timeout, and new calls during close | no separate Python close authority or old scheduler close path |
+| I12 close/drain | unregister, shutdown, connection close, explicit drain policy | scheduler route/server closed state, active counters, cancellation queues | admission, queued waiter cancellation, active permit drop, drain barrier or timeout outcome | IPC close and admin lifecycle | SDK consumes structured unregister/shutdown outcomes; local wrapper cannot close routes directly | tests for queued, active, timeout, and new calls during close | no separate Python close authority, no `RouteConcurrency.close()`, and no old scheduler close path |
 | I13 chunk assembly | IPC frame reader and `ChunkRegistry` | chunk registry counters, assembler memory, optional bounded chunk-processing semaphore | chunk frame handling before logical call admission | chunked call frames before route callback execution | no SDK-owned chunk queue | chunk overload tests with incomplete frames | no unbounded `tokio::spawn` + payload clone path for chunk frames |
 | I14 fair promotion | scheduler admission order and route queues | per-route FIFO queues plus server ready-route order | permit promotion when capacity changes | affects all IPC call variants after admission | local route waits use same route order | cross-route and read/write starvation tests | no busy sleep, LIFO, or per-route-only wake policy that can starve eligible work |
 | I15 shutdown hooks | native route close/drain outcome | `UnregisterOutcome` / `ShutdownOutcome` drain fields consumed by Python | Python slot removal and `@on_shutdown` invocation | unregister/shutdown control path, not CRM wire | Python invokes hook only after `active_drained=true` | tests with blocked active method and unregister/shutdown | no SDK-side hook invocation based only on route removal |
+| I16 direct admin shutdown | `ShutdownClient` signal, `c2_ipc::control::shutdown`, PyO3 `ipc_shutdown`, Python `client.util.shutdown()` | server close transaction plus recorded drain outcome | signal handler, `Server::shutdown`, runtime bridge shutdown reconciliation | IPC signal frame, no relay/CRM wire | bool admin helper reports delivery only unless a structured outcome is exposed | tests send direct IPC shutdown with queued/active calls | raw `Server::shutdown()` must enter close transaction or be private to it; no signal-only lifecycle bypass |
 
 ## Proposed Architecture
 
@@ -344,6 +370,14 @@ state with remote calls. They do not count against `max_execution_workers`
 because they run on the caller's thread rather than the IPC server's execution
 pool.
 
+The SDK-visible route concurrency wrapper exposes local admission and snapshots
+only. It must not expose `close()` / `shutdown()` as a public Python or PyO3
+method because that would close a route handle without producing
+`RouteCloseOutcome`, cancelling queued remote work, or gating `@on_shutdown`.
+Route closure authority belongs to the native server close transaction; after a
+successful transaction the shared handle is already closed, so Python must not
+perform a second scheduler-only close.
+
 ### Config
 
 Add a server IPC config field:
@@ -364,6 +398,14 @@ clamp(std::thread::available_parallelism(), min = 4, max = 64)
 - `cc.set_server(ipc_overrides={"max_execution_workers": ...})`
 - PyO3 `RustServer` constructor
 
+Every ingress validates the field before server construction:
+
+- absent value uses the Rust default below;
+- explicit values must be `>= 1`;
+- explicit `0`, negative Python values, parse failures, or values that cannot
+  round-trip into the Rust config type are rejected in `c2-config`, PyO3 config
+  parsing, and Python override projection tests.
+
 `RustServer.start_runtime_and_wait()` also sets Tokio
 `.max_blocking_threads(max_execution_workers)` as a guardrail. The primary
 policy remains C-Two's `ServerExecutionScheduler`; Tokio's limit is only a
@@ -382,6 +424,13 @@ available_parallelism()
 Do not derive `max_execution_workers` from the sum of registered route
 `max_workers`. Routes are dynamic and route limits express isolation, not OS
 thread budget.
+
+The default may be based on OS parallelism because it is server-wide and
+language-neutral. It is still capped to a conservative default maximum so a
+machine with many CPUs does not silently allocate hundreds of blocking workers.
+Operators that need a larger budget may opt in explicitly, but that explicit
+override is a capacity decision and must pass validation instead of being
+silently clamped.
 
 ### Error Semantics
 
@@ -484,6 +533,15 @@ small amount of old scheduler code is temporarily useful during the migration,
 it must be crate-private or test-only and must not be able to execute CRM
 callbacks.
 
+The guardrail is intentionally strict: production and tests should not keep the
+old `Scheduler`, `Scheduler::new`, `Scheduler::with_limits`,
+`blocking_acquire`, `Scheduler::execute`, `route.scheduler`, or public
+`scheduler` module paths alive as an allowlisted parallel mechanism. The clean
+cut is to move shared enum definitions such as `AccessLevel` and
+`ConcurrencyMode` into the new execution module or a small neutral types module,
+then delete or fully quarantine the old scheduler code so it cannot be imported
+by PyO3, runtime, relay support, or server tests.
+
 PyO3 `build_route`, Rust relay test support, and core server test helpers must
 call the same server-owned registration API. They must not construct
 `CrmRoute { ... }`, instantiate a standalone route scheduler, or expose raw
@@ -511,15 +569,60 @@ drain_timed_out
 closed_reason
 ```
 
-`RuntimeSession` forwards those fields in `UnregisterOutcome` and
-`ShutdownOutcome`. Python removes local slots and invokes `@on_shutdown` only
-for routes whose native outcome has `active_drained=true`. A route that fails to
-drain is reported explicitly and does not run the shutdown hook.
+For multi-route shutdown, these fields are per-route, not one global flag:
+
+```text
+RouteCloseOutcome:
+  route_name
+  local_removed
+  queued_cancelled
+  active_drained
+  active_remaining
+  drain_timed_out
+  forced
+  closed_reason
+
+UnregisterOutcome:
+  close: RouteCloseOutcome
+  relay_error
+
+ShutdownOutcome:
+  route_outcomes: Vec<RouteCloseOutcome>
+  relay_errors
+  server_was_started
+  ipc_clients_drained
+  http_clients_drained
+```
+
+`removed_routes` may remain as a convenience projection, but it must be derived
+from `route_outcomes` and must not be sufficient for Python hook decisions.
+`RuntimeSession` forwards the full close outcome through PyO3. Python removes
+local slots and invokes `@on_shutdown` only for routes whose native per-route
+outcome has `active_drained=true`. A route that fails to drain is reported
+explicitly and does not run the shutdown hook.
+
+Close transactions must not depend on a best-effort temporary runtime in a way
+that can silently skip route closure. If `RuntimeSession::shutdown` or
+`RuntimeSession::unregister_route` cannot drive the native close transaction
+because runtime construction or scheduling fails, it must return an explicit
+route outcome/error with `local_removed=false`, `active_drained=false`, and an
+error reason. It must not follow that failure by calling a raw signal-only
+`Server::shutdown()` and then reporting ordinary shutdown progress.
+
+Direct IPC admin shutdown must call the same transaction. The current signal
+wire may keep a bool-shaped acknowledgement for compatibility with the admin
+probe helper, but that acknowledgement means only "the signal was delivered or
+the server was already absent." It must not be reused as a drain result. If the
+direct admin path stops the native server before Python sees the structured
+outcome, `NativeServerBridge.shutdown()` must reconcile the recorded native
+outcome before invoking any Python `@on_shutdown` hook; undrained routes remain
+hook-suppressed.
 
 ## Implementation Work Items
 
 1. Add `max_execution_workers` to `c2-config` server defaults, env resolver,
-   override schema, validation, and dict projections.
+   override schema, validation, and dict projections; reject explicit values
+   below `1` at every Rust/PyO3/Python override ingress.
 2. Add Python `ServerIPCOverrides.max_execution_workers` typed facade and pass
    it into `RustServer`.
 3. Add `ServerExecutionScheduler` and migrate route concurrency state into it.
@@ -530,7 +633,8 @@ drain is reported explicitly and does not run the shutdown hook.
    external route construction, and require public registration to validate that
    the route handle belongs to the receiving server.
 6. Remove `Scheduler` from the public `c2-server` API; keep only
-   `AccessLevel`, `ConcurrencyMode`, and new execution-handle types public.
+   `AccessLevel`, `ConcurrencyMode`, and new execution-handle types public, and
+   move those shared enum definitions out of any old scheduler module if needed.
 7. Change `RuntimeSession::register_route` so it no longer accepts externally
    constructed `CrmRoute`; route creation must flow through the server-owned
    registration API or an opaque server-created pending-route token.
@@ -557,13 +661,16 @@ drain is reported explicitly and does not run the shutdown hook.
     receive worker capacity.
 15. Change Python `RouteConcurrency` FFI to wrap the route execution handle and
     enter local guards through `ExecutionScope::Local`.
-16. Remove or test-gate old `Scheduler::execute` and any production
-    `blocking_acquire` remote path.
-17. Add native route close/drain outcomes and forward them through
-    `RuntimeSession`, PyO3, and Python `NativeServerBridge`.
+16. Delete or fully quarantine old `Scheduler::execute` and
+    `blocking_acquire`; production and test helper callback execution must use
+    `ServerExecutionScheduler` / `RouteExecutionHandle`.
+17. Add native `RouteCloseOutcome` close/drain results and forward them through
+    `UnregisterOutcome.close`, `ShutdownOutcome.route_outcomes`, PyO3, and
+    Python `NativeServerBridge`; `removed_routes` alone must not drive hook
+    invocation.
 18. Add explicit close drain policy and timeout outcomes; timeout or forced
-    close must return `active_drained=false` and must not trigger Python
-    shutdown hooks.
+    close must return `active_drained=false`, keep native ownership of remaining
+    active permits until cleanup, and must not trigger Python shutdown hooks.
 19. Move Python `@on_shutdown` invocation behind `active_drained=true`.
 20. Add snapshot/metrics bindings needed by tests.
 21. Update existing tests that assert `max_workers` reject-fast semantics; keep
@@ -578,6 +685,21 @@ drain is reported explicitly and does not run the shutdown hook.
 24. Update docs and examples so `max_workers` and `max_execution_workers` are
     described as queueing worker budgets, not reject-fast capacity checks or
     thread counts.
+25. Change direct IPC `ShutdownClient` handling and raw `Server::shutdown()` so
+    they enter the same server close transaction or are private helpers inside
+    that transaction; direct `ipc_shutdown()` bool return must not be treated as
+    a drain result.
+26. Update `NativeServerBridge.shutdown()` reconciliation so an external direct
+    IPC shutdown can consume recorded native close outcomes before deciding
+    whether Python `@on_shutdown` hooks are allowed to run.
+27. Remove public PyO3 and Python `RouteConcurrency.close()` /
+    `RouteConcurrency.shutdown()` methods; local route handles may acquire guards
+    and expose snapshots, but route closure must flow through the server close
+    transaction that returns `RouteCloseOutcome`.
+28. Remove the failure fallback where `RuntimeSession::shutdown` skips route
+    close because a temporary runtime could not be created and then calls raw
+    `Server::shutdown()`; runtime/scheduling failures must surface as explicit
+    undrained per-route outcomes or errors.
 
 ## Required Tests
 
@@ -606,6 +728,18 @@ Rust core tests:
 - Route unregister with a drain timeout returns `active_drained=false`,
   `drain_timed_out=true`, and does not report the route as safe for SDK
   shutdown hooks.
+- A timed or forced close with active callbacks leaves the active permits owned
+  by native runtime cleanup; after the callback eventually finishes, snapshots no
+  longer report leaked active/pending counters and resources are released once.
+- Direct IPC `ShutdownClient` with queued and active route calls enters the same
+  close transaction: queued calls are cancelled, active calls remain accounted,
+  and the signal-only acknowledgement is not treated as a drain result.
+- Raw `Server::shutdown()` cannot be called as a signal-only bypass from
+  production code; it is either the close transaction itself or a private helper
+  reachable only from that transaction.
+- `RuntimeSession::shutdown` runtime-construction failure produces explicit
+  undrained route outcomes/errors and does not fall through to raw server signal
+  shutdown as if route close had been attempted.
 - Connection close cancels queued not-started calls owned by that connection,
   does not execute their callbacks later, and still waits for active callbacks
   plus cancellation cleanup before per-connection cleanup.
@@ -616,6 +750,8 @@ Rust core tests:
   longer possible from downstream crates.
 - Rust-only non-Python `CrmCallback` registration is limited by the same global,
   route, pending, and close/drain semantics as the PyO3 path.
+- `c2-config` rejects `C2_IPC_MAX_EXECUTION_WORKERS=0` and accepts a positive
+  explicit override without silently deriving it from registered routes.
 
 Python integration tests:
 
@@ -623,8 +759,20 @@ Python integration tests:
   active callbacks across multiple resources.
 - Mixed local and remote calls share route `max_workers`.
 - Local direct calls do not consume server `max_execution_workers`.
-- `@on_shutdown` is not invoked while an active resource method is still running;
-  queued not-started calls are rejected/cleaned before the hook runs.
+- `@on_shutdown` is not invoked while either a local direct call or a remote IPC
+  resource method is still running; queued not-started calls are rejected/cleaned
+  before the hook runs.
+- Direct IPC `client.util.shutdown()` followed by bridge shutdown does not run
+  hooks for undrained routes and does not run hooks twice for drained routes.
+- Shutdown with multiple routes invokes hooks only for the route outcomes whose
+  `active_drained=true`; `removed_routes` without per-route drain fields is not
+  accepted by the Python bridge.
+- Direct calls cannot close a route by calling `RouteConcurrency.close()` or
+  `RouteConcurrency.shutdown()`; those methods are absent from the SDK-visible
+  wrapper and PyO3 class.
+- `cc.set_server(ipc_overrides={"max_execution_workers": 0})`,
+  `C2_IPC_MAX_EXECUTION_WORKERS=0`, and a PyO3 constructor override of `0`
+  all fail before server start.
 - Direct IPC remains relay-independent when `C2_RELAY_ANCHOR_ADDRESS` points to
   an unavailable relay.
 - Existing syntax compatibility tests still pass on Python 3.10.
@@ -644,13 +792,26 @@ Guardrail tests:
 - A source-level test fails if `sdk/python/native` imports the old
   `c2_server::scheduler::Scheduler`.
 - A compile-fail or source allowlist guard fails on `route.scheduler`,
-  `Scheduler::new`, `Scheduler::with_limits`, `blocking_acquire`, and
-  standalone public route builders outside explicitly allowed new execution
-  module unit tests.
+  `Scheduler::new`, `Scheduler::with_limits`, `Scheduler::execute`,
+  `blocking_acquire`, public old `scheduler` module paths, and standalone public
+  route builders in production code, SDK bindings, relay support, and route
+  registration tests. Do not allowlist old `Scheduler` execution tests as an
+  alternate supported path; move needed enum/type tests to the new module.
 - A source-level or compile-fail guard fails if public
   `RuntimeSession::register_route` accepts `CrmRoute` directly.
 - A source-level test fails if Python invokes `_invoke_shutdown` without checking
   a native `active_drained` close outcome for that route.
+- A source-level test fails if Python shutdown hook decisions use
+  `removed_routes` without reading per-route `RouteCloseOutcome.active_drained`.
+- A source-level test fails if direct IPC `ShutdownClient` handling calls a raw
+  signal-only `Server::shutdown()` path that cannot return or record route drain
+  outcomes.
+- A source-level test fails if `sdk/python/native` exposes PyO3
+  `RouteConcurrency.close` / `shutdown` or if the Python scheduler wrapper calls
+  `_native.close()` / `_native.shutdown()` directly.
+- A fault-injection test covers `RuntimeSession::shutdown` when the close-driving
+  runtime/scheduler cannot be created; the result must be an explicit undrained
+  route outcome/error, not raw server signal shutdown.
 
 ## Migration Notes
 
@@ -670,6 +831,17 @@ route max_pending: per-route active + queued local + remote calls
 Thread-local local calls remain zero-serialization direct calls. They still
 enter the route concurrency guard, but they do not route through Rust byte
 dispatch and do not consume remote execution worker capacity.
+
+Shutdown semantics after the migration:
+
+```text
+active_drained: active_local + active_remote == 0
+graceful close: waits until active_drained before reporting hook-safe success
+timed/forced close: returns explicit undrained outcome and leaves active permits
+  owned by native cleanup until they finish
+direct IPC shutdown ack: signal delivery only unless paired with structured
+  native close outcome
+```
 
 Connection close semantics after the migration:
 
@@ -691,17 +863,33 @@ response send after connection close: best-effort/error-tolerant cleanup path
 - `max_execution_workers` saturation queues admitted calls; it is not a normal
   remote dispatch capacity error.
 - Tokio `.max_blocking_threads()` is set from `max_execution_workers`.
+- Explicit `max_execution_workers=0` is rejected by Rust config parsing, PyO3
+  config projection, and Python override entry points; the default uses
+  `available_parallelism().unwrap_or(4).clamp(4, 64)`.
 - `max_pending_requests` is exercised by server execution tests, not just
   config parsing tests.
 - Connection `wait_idle()` covers active callbacks and queued-call cancellation
   cleanup, not closed-connection wait-for-capacity.
 - Connection close cancels queued calls that have not started and does not wait
   for those calls to acquire worker capacity.
-- Python `@on_shutdown` runs only after native close outcomes prove active
-  callbacks for that route have drained.
+- Python `@on_shutdown` runs only after native close outcomes prove local and
+  remote active callbacks for that route have drained.
+- `ShutdownOutcome` exposes per-route close outcomes; `removed_routes` is at
+  most a convenience list and cannot be the source of truth for hook execution.
+- SDK-visible route concurrency handles expose guard acquisition and snapshots
+  only; route close/shutdown cannot be invoked through the local wrapper.
 - Close drain timeout paths are explicit: they return `active_drained=false`,
-  do not invoke Python shutdown hooks, and do not silently detach active
-  callbacks as if shutdown had completed cleanly.
+  do not invoke Python shutdown hooks, and leave remaining active callback
+  ownership with native cleanup instead of silently detaching work as if shutdown
+  had completed cleanly.
+- Top-level `cc.shutdown()`, `NativeServerBridge.shutdown()`,
+  `RuntimeSession::shutdown`, direct IPC `ShutdownClient` / `ipc_shutdown()`, and
+  raw `Server::shutdown()` all enter the close transaction or are explicitly
+  private helpers inside it; none may signal-stop the server while bypassing
+  route close/drain/cancel outcomes.
+- Runtime or scheduling failures while entering a close transaction surface as
+  explicit undrained route outcomes/errors; they cannot silently downgrade into
+  signal-only shutdown.
 - Public route registration cannot accept a route handle from another server, an
   old standalone scheduler, or a public `RuntimeSession::register_route`
   parameter that is an externally constructed `CrmRoute`.
@@ -713,6 +901,7 @@ response send after connection close: best-effort/error-tolerant cleanup path
 - `rg "spawn_blocking" core/transport/c2-server/src` shows callback execution
   only through the new scheduler module, plus unrelated non-callback uses if
   any are documented.
+- `rg "Scheduler::new|Scheduler::with_limits|blocking_acquire|route\\.scheduler|pub use scheduler::Scheduler"` in production, SDK binding, relay support, and registration test paths returns no live bypasses.
 - Full Python SDK tests and Rust workspace tests pass before implementation is
   considered complete.
 
@@ -791,3 +980,51 @@ The fifth strict review cycle found and addressed these plan gaps:
 - Close/drain did not define what happens when active callbacks do not finish.
   The spec now requires an explicit drain policy and timeout outcome; timeout
   paths return `active_drained=false` and cannot trigger Python shutdown hooks.
+
+The sixth strict review cycle found and addressed these plan gaps:
+
+- Direct IPC `ShutdownClient` / `ipc_shutdown()` was not listed as a real
+  shutdown source, even though the current server signal handler can call
+  `Server::shutdown()` directly. The spec now adds direct admin shutdown as its
+  own invariant, source-to-sink row, work item, tests, and acceptance criterion.
+- Close timeout wording still did not define ownership for active callbacks that
+  continue after an undrained result. The spec now requires native runtime
+  ownership of remaining active permits until final cleanup and forbids treating
+  timed/forced close as hook-safe completion.
+- `active_drained` was route-level but did not explicitly include same-process
+  thread-local calls. The spec now defines it as `active_local + active_remote ==
+  0` and requires local active-call shutdown-hook tests.
+- `max_execution_workers` had a default but no ingress validation invariant. The
+  spec now requires explicit values below `1` to be rejected in Rust config,
+  PyO3 config parsing, and Python override entry points.
+- The guardrail for old `Scheduler` usage still allowed old execution tests as a
+  parallel path. The spec now requires deleting or fully quarantining old
+  `Scheduler` execution APIs and moving shared enum/type tests to the new
+  execution module.
+
+The seventh strict review cycle found and addressed these plan gaps:
+
+- The source-to-sink matrix still said old `Scheduler::execute` could be
+  test-only gated, contradicting the clean-cut guardrail. The matrix now requires
+  deletion or full quarantine with no callback/test-helper import path.
+- Shutdown hook gating was described as per-route, but the planned
+  `ShutdownOutcome` shape was not explicit and could still let Python drive hooks
+  from `removed_routes`. The spec now requires `RouteCloseOutcome` entries in
+  unregister and shutdown outcomes and adds guardrails against `removed_routes`
+  as the hook source of truth.
+
+The eighth strict review cycle found and addressed this plan gap:
+
+- Current PyO3 and Python `RouteConcurrency` wrappers expose `close()` /
+  `shutdown()`, which can close the route scheduler without a native
+  `RouteCloseOutcome`. The spec now limits SDK-visible route handles to
+  acquire/snapshot operations and adds work items, tests, and guardrails removing
+  direct route-close authority from the local wrapper.
+
+The ninth strict review cycle found and addressed this plan gap:
+
+- Current `RuntimeSession::shutdown` can skip route unregister when its temporary
+  runtime creation fails and still proceed toward raw server shutdown. The spec
+  now requires runtime/scheduling failures while entering close to become
+  explicit undrained route outcomes/errors, with a fault-injection test, rather
+  than a signal-only shutdown fallback.
