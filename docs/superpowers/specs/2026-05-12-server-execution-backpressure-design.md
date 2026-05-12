@@ -106,6 +106,9 @@ This allows future C++, Go, Fortran, Java, and other SDKs to reuse the same
 server semantics by adapting their language resource methods into
 `CrmCallback`.
 
+The design must include a Rust-only non-Python callback adapter test so this is
+proven mechanically and not only by the Python PyO3 integration path.
+
 ### I8. Request Cleanup On Rejection Or Close
 
 Every rejected, cancelled, or closed remote request must release owned request
@@ -118,30 +121,32 @@ unregister/shutdown races.
 ### I9. No Legacy Bypass
 
 No production or test helper may continue to invoke remote CRM callbacks through
-the old direct `spawn_blocking` + `blocking_acquire` path. Direct route
-construction in tests must use the same execution handles and scheduler
-authority as production route registration.
+the old direct `spawn_blocking` + `blocking_acquire` path. Tests must register
+routes through the same server-owned registration authority as production.
 
 This prevents half-migrations where tests pass through old helpers while real
 IPC uses the new scheduler, or the reverse.
 
-### I10. Connection Drain Covers Queued Work
+### I10. Connection Close Cancels Queued Work
 
 Every remote call that has been admitted or queued must be counted as
 connection in-flight work until it sends a response or is rejected and cleaned
-up. Connection shutdown must wait for queued and active calls before cleaning up
-per-connection chunk and SHM state.
+up. Connection shutdown must cancel queued calls that have not started callback
+execution, wait only for active callbacks plus cancellation cleanup, and then
+clean up per-connection chunk and SHM state.
 
 This prevents a connection close from running `wait_idle()` and
-`chunk_registry.cleanup_connection()` while a queued logical call still owns
-request data or still intends to send a response.
+`chunk_registry.cleanup_connection()` while a logical call still owns request
+data, without forcing a closed connection to wait for queued work to eventually
+receive worker capacity.
 
 ### I11. Route Construction Authority
 
-Registered routes must be constructible only through a `c2-server` builder that
-attaches the route to the owning server's `ServerExecutionScheduler`. Downstream
-crates, SDK bindings, and test helpers must not be able to create a routable
-`CrmRoute` by directly filling public fields or by supplying a standalone
+Registered routes must be constructible only through server-owned `c2-server`
+APIs that attach the route to that concrete server's
+`ServerExecutionScheduler`. Downstream crates, SDK bindings, and test helpers
+must not be able to create a routable `CrmRoute` by directly filling public
+fields, by calling a standalone public builder, or by supplying a standalone
 scheduler.
 
 This prevents stale or partial migration paths where production registration,
@@ -153,7 +158,8 @@ budget by constructing routes with the old per-route `Scheduler`.
 Route unregister and server shutdown must atomically close admission for the
 affected route/server, reject and clean up queued calls that have not started
 callback execution, and keep active callbacks accounted until response or error
-completion.
+completion or until an explicit drain timeout reports that active work did not
+finish.
 
 This prevents unregister/shutdown races where new calls slip in after close,
 queued calls hang forever, or shutdown returns while admitted callback work still
@@ -179,6 +185,17 @@ fairness, and a server-wide fair ordering across ready routes.
 This prevents a hot route or a stream of newly admitted reads from indefinitely
 delaying older queued work that has available route and global capacity.
 
+### I15. Shutdown Hooks After Active Drain
+
+Python `@on_shutdown` callbacks must run only after Rust reports that the route
+has closed admission, rejected and cleaned all not-started queued calls, and
+drained active callbacks for that route. If a future timeout or forced shutdown
+path is added, the structured native outcome must say the route did not drain
+and Python must not invoke `@on_shutdown` for that route.
+
+This prevents shutdown hooks from racing with still-running resource methods on
+the same Python resource object.
+
 ## Source-To-Sink Matrix
 
 | Invariant | Producer | Storage | Consumer | Network/Wire | FFI/SDK | Test/Support | Legacy/Bypass |
@@ -191,12 +208,13 @@ delaying older queued work that has available route and global capacity.
 | I6 local/remote shared | route registration builds one route handle | route handle cloned into `CrmRoute` and Python local slot | local proxy guard and remote scheduler | remote IPC path resolves route from dispatcher | `RouteConcurrency` wraps same core handle | mixed local/remote tests | no separate Python lock/counter state |
 | I7 cross-language | `CrmCallback` trait and `CrmRoute` | `c2-server` | all SDK callback adapters | language-neutral IPC request/response data | Python is one adapter; other SDKs can adapt callback | Rust-only callback tests plus Python integration | no Python-specific field in core config |
 | I8 cleanup | request materialization in dispatch path | request object until execution result/reject | scheduler rejection, route close, callback completion | IPC SHM/handle/chunked data | PyO3 only sees request after permit | SHM reuse tests after rejection | cleanup must not depend on callback running |
-| I9 no bypass | route registration helpers | direct route construction tests and relay support | production and tests | relay test support starts live IPC servers | all FFI constructors updated | `rg` guardrail for old helper usage | old `Scheduler::execute` removed or test-only gated |
-| I10 connection drain | `Connection::FlightGuard` / in-flight counter | per-connection atomic counter | connection close waits on queued and active calls | IPC connection lifecycle; chunk cleanup after idle | no SDK-owned drain state | tests close connection with queued calls and assert no premature cleanup | manual `flight_inc` / `flight_dec` paths replaced with RAII guard |
-| I11 route construction authority | `Server` route builder from validated route spec | private route fields plus scheduler identity/generation | dispatcher accepts only server-built routes | not wire-visible; affects every IPC route | PyO3 receives opaque route handle, not raw scheduler | relay/Rust test helpers use production builder | `CrmRoute { ... }`, public `scheduler` fields, and exported old `Scheduler` are removed or crate-private |
-| I12 close/drain | unregister, shutdown, connection close | scheduler route/server closed state and queues | admission, queued waiters, active permit drop | IPC close and admin lifecycle | SDK consumes structured unregister/shutdown outcomes | tests for queued, active, and new calls during close | no separate Python close authority or old scheduler close path |
+| I9 no bypass | server-owned route registration helpers | production, Rust tests, PyO3, and relay support all use the same registration path | production and tests | relay test support starts live IPC servers | all FFI constructors updated | source/compile-fail guardrails for old helper usage | old `Scheduler::execute` removed or test-only gated |
+| I10 connection drain | `Connection::FlightGuard`, request owner id, cancellation token | per-connection atomic counter plus scheduler queued-call index by connection/request | connection close cancels queued not-started calls, waits for active callbacks and cancellation cleanup | IPC connection lifecycle; chunk cleanup after active/cancel idle | no SDK-owned drain state | tests close connection with queued calls and assert queued callback does not run | manual `flight_inc` / `flight_dec` paths replaced with RAII guard; no closed-connection wait for worker capacity |
+| I11 route construction authority | `Server` route registration API from validated route spec | private route fields plus scheduler identity/generation | dispatcher accepts only server-built routes | not wire-visible; affects every IPC route | PyO3 receives opaque route handle, not raw scheduler | relay/Rust test helpers use production server registration API | `CrmRoute { ... }`, public `scheduler` fields, public standalone route builders, and exported old `Scheduler` are removed or crate-private |
+| I12 close/drain | unregister, shutdown, connection close, explicit drain policy | scheduler route/server closed state, active counters, cancellation queues | admission, queued waiter cancellation, active permit drop, drain barrier or timeout outcome | IPC close and admin lifecycle | SDK consumes structured unregister/shutdown outcomes | tests for queued, active, timeout, and new calls during close | no separate Python close authority or old scheduler close path |
 | I13 chunk assembly | IPC frame reader and `ChunkRegistry` | chunk registry counters, assembler memory, optional bounded chunk-processing semaphore | chunk frame handling before logical call admission | chunked call frames before route callback execution | no SDK-owned chunk queue | chunk overload tests with incomplete frames | no unbounded `tokio::spawn` + payload clone path for chunk frames |
 | I14 fair promotion | scheduler admission order and route queues | per-route FIFO queues plus server ready-route order | permit promotion when capacity changes | affects all IPC call variants after admission | local route waits use same route order | cross-route and read/write starvation tests | no busy sleep, LIFO, or per-route-only wake policy that can starve eligible work |
+| I15 shutdown hooks | native route close/drain outcome | `UnregisterOutcome` / `ShutdownOutcome` drain fields consumed by Python | Python slot removal and `@on_shutdown` invocation | unregister/shutdown control path, not CRM wire | Python invokes hook only after `active_drained=true` | tests with blocked active method and unregister/shutdown | no SDK-side hook invocation based only on route removal |
 
 ## Proposed Architecture
 
@@ -227,11 +245,13 @@ Global state:
   closed
   pending_remote
   active_remote_workers
+  queued_by_connection
   max_pending_requests
   max_execution_workers
 
 Per-route state:
   closed
+  draining
   mode
   access_map
   max_pending
@@ -265,7 +285,7 @@ All remote call variants use the same choke point:
 handle_connection / dispatch_chunked_call
   decode logical route + method index as early as possible
   resolve route and validate method index
-  acquire RemotePendingPermit + FlightGuard
+  acquire RemotePendingPermit + FlightGuard + cancellation owner
   materialize request ownership only after admission where possible
   result = server.execution_scheduler.execute_remote(permit, request, callback)
   send_route_execution_result(...)
@@ -304,6 +324,14 @@ server submit the callback to `spawn_blocking`.
 permit before callback execution decrements global/route pending and releases
 connection in-flight state. Promoting it to `ExecutionPermit` transfers that
 lifecycle until response send or error cleanup finishes.
+
+Each queued remote permit is indexed by `(connection_id, request_id)`. When a
+connection closes, the server cancels all queued permits owned by that
+connection before `wait_idle()` observes idle. Cancelled queued calls release
+request data and do not later promote to callback execution. Active callbacks
+that already hold an `ExecutionPermit` remain accounted until they finish; the
+response path must tolerate the writer being closed and still release all owned
+resources.
 
 ### Local Same-Process Flow
 
@@ -361,7 +389,6 @@ Remote overload errors map to the existing server-side
 `ResourceUnavailable` wire error family with precise messages:
 
 - `server execution capacity exceeded: max_pending_requests=N`
-- `server execution capacity exceeded: max_execution_workers=N`
 - `route concurrency capacity exceeded: max_pending=N`
 - `route closed`
 - `server closing`
@@ -370,6 +397,13 @@ Remote overload errors map to the existing server-side
 a worker budget that queues until route pending or global pending capacity is
 exceeded. `try_acquire` may remain for diagnostics or explicit nonblocking
 local APIs, but production remote dispatch must not use it.
+
+`max_execution_workers` likewise does not have a normal reject-fast overload
+error on the remote path. If global worker capacity is unavailable, the request
+waits in the scheduler until `max_pending_requests`, route `max_pending`,
+connection cancellation, route close, or server close decides its fate.
+`server execution capacity exceeded: max_execution_workers=N` may appear only in
+explicit nonblocking diagnostics, never in production remote CRM dispatch.
 
 ### Metrics And Snapshots
 
@@ -425,14 +459,23 @@ route and runtime registration spec disagree.
 
 The migration must remove the current ability to construct routable server
 routes by struct literal. `CrmRoute` fields that define callback, method table,
-contract metadata, and execution handle become private. A new
-`CrmRouteBuilder` or `Server::build_route` path accepts a validated route spec,
-callback adapter, and access map, then attaches the resulting route to the
-owning server scheduler.
+contract metadata, and execution handle become private. Public route
+registration is exposed as a server-owned API such as
+`Server::register_route_spec(spec, callback)` that validates the route spec,
+callback adapter, and access map, then attaches the resulting route to that
+server's scheduler. A standalone public `CrmRouteBuilder` is not allowed because
+it would recreate an authority bypass unless it were crate-private and callable
+only from `Server`.
 
 `Dispatcher::register` becomes `pub(crate)` and is called only after `Server`
 has validated scheduler identity. Public APIs should expose route registration
 through `Server`/`RuntimeSession`, not through arbitrary `Dispatcher` mutation.
+
+`RuntimeSession::register_route` must also stop accepting an externally
+constructed `CrmRoute`. It should either call the same server-owned registration
+API with `RuntimeRouteSpec` and callback adapter inputs, or accept only an opaque
+server-created pending-route token whose scheduler identity has already been
+stamped by that `Server`.
 
 The old `Scheduler` type must no longer be part of the public `c2-server` API.
 `AccessLevel` and `ConcurrencyMode` may remain public, but `pub use
@@ -442,9 +485,36 @@ it must be crate-private or test-only and must not be able to execute CRM
 callbacks.
 
 PyO3 `build_route`, Rust relay test support, and core server test helpers must
-call the same server-owned route builder. They must not construct
+call the same server-owned registration API. They must not construct
 `CrmRoute { ... }`, instantiate a standalone route scheduler, or expose raw
 scheduler objects to Python.
+
+### Unregister, Shutdown, And Hook Ordering
+
+`Server::unregister_route` and server shutdown use a native close transaction
+with an explicit drain policy:
+
+```text
+close route/server admission
+cancel queued calls that have not started callback execution
+wait for active execution permits to drop, or return timeout outcome
+return structured close outcome
+```
+
+The close outcome includes at least:
+
+```text
+queued_cancelled
+active_drained
+active_remaining
+drain_timed_out
+closed_reason
+```
+
+`RuntimeSession` forwards those fields in `UnregisterOutcome` and
+`ShutdownOutcome`. Python removes local slots and invokes `@on_shutdown` only
+for routes whose native outcome has `active_drained=true`. A route that fails to
+drain is reported explicitly and does not run the shutdown hook.
 
 ## Implementation Work Items
 
@@ -454,44 +524,60 @@ scheduler objects to Python.
    it into `RustServer`.
 3. Add `ServerExecutionScheduler` and migrate route concurrency state into it.
 4. Change `CrmRoute` to store a `RouteExecutionHandle`, make route fields
-   private, and add a server-owned builder that stamps scheduler
+   private, and add a server-owned registration API that stamps scheduler
    identity/generation onto every registered route.
 5. Make `Dispatcher::register` crate-private or otherwise unreachable from
    external route construction, and require public registration to validate that
    the route handle belongs to the receiving server.
 6. Remove `Scheduler` from the public `c2-server` API; keep only
    `AccessLevel`, `ConcurrencyMode`, and new execution-handle types public.
-7. Update PyO3 `build_route`, runtime session tests, c2-server tests, and relay
-   test support to use the production route builder instead of direct
-   `CrmRoute { ... }` construction.
-8. Change `RuntimeRouteSpec` validation in `c2-runtime` to read concurrency
+7. Change `RuntimeSession::register_route` so it no longer accepts externally
+   constructed `CrmRoute`; route creation must flow through the server-owned
+   registration API or an opaque server-created pending-route token.
+8. Update PyO3 `build_route`, runtime session tests, c2-server tests, and relay
+   test support to use the production server-owned registration API instead of
+   direct `CrmRoute { ... }` construction.
+9. Change `RuntimeRouteSpec` validation in `c2-runtime` to read concurrency
    metadata from `RouteExecutionHandle` snapshots instead of
    `route.scheduler.snapshot()`.
-9. Replace remote `execute_route_request(... spawn_blocking ...)` with
+10. Replace remote `execute_route_request(... spawn_blocking ...)` with
    scheduler-owned `execute_remote`.
-10. Move inline and buddy logical-call admission into `handle_connection` before
+11. Move inline and buddy logical-call admission into `handle_connection` before
     per-call `tokio::spawn`; keep chunked incomplete-call limits in
     `ChunkRegistry`, then admit the complete logical call after
     `chunk_registry.finish()`.
-11. Bound chunked frame processing before payload clone/task fan-out, either by
+12. Bound chunked frame processing before payload clone/task fan-out, either by
     processing chunks inline in the connection loop or by acquiring a bounded
     chunk-processing permit tied to `ChunkRegistry` limits.
-12. Implement fair, event-driven promotion across route queues and preserve
+13. Implement fair, event-driven promotion across route queues and preserve
     writer fairness within `read_parallel` routes.
-13. Replace manual connection `flight_inc` / `flight_dec` call paths with an
-    RAII guard that covers queued and active calls.
-14. Change Python `RouteConcurrency` FFI to wrap the route execution handle and
+14. Replace manual connection `flight_inc` / `flight_dec` call paths with an
+    RAII guard plus scheduler cancellation owner that covers queued, cancelled,
+    and active calls without waiting for closed-connection queued work to
+    receive worker capacity.
+15. Change Python `RouteConcurrency` FFI to wrap the route execution handle and
     enter local guards through `ExecutionScope::Local`.
-15. Remove or test-gate old `Scheduler::execute` and any production
+16. Remove or test-gate old `Scheduler::execute` and any production
     `blocking_acquire` remote path.
-16. Add snapshot/metrics bindings needed by tests.
-17. Update existing tests that assert `max_workers` reject-fast semantics; keep
-    reject-fast tests only for `max_pending` and explicit nonblocking APIs.
-18. Update Python unit-test fakes (`FakeScheduler`) to model the new route
+17. Add native route close/drain outcomes and forward them through
+    `RuntimeSession`, PyO3, and Python `NativeServerBridge`.
+18. Add explicit close drain policy and timeout outcomes; timeout or forced
+    close must return `active_drained=false` and must not trigger Python
+    shutdown hooks.
+19. Move Python `@on_shutdown` invocation behind `active_drained=true`.
+20. Add snapshot/metrics bindings needed by tests.
+21. Update existing tests that assert `max_workers` reject-fast semantics; keep
+    reject-fast tests only for `max_pending`, `max_pending_requests`, and
+    explicit nonblocking APIs.
+22. Update Python unit-test fakes (`FakeScheduler`) to model the new route
     handle API enough to keep local direct-call tests meaningful, including
     closed-route behavior.
-19. Update docs and examples so `max_workers` is described as a queueing worker
-    budget, not a thread count.
+23. Add a Rust-only non-Python `CrmCallback` adapter test proving that
+    language-neutral registration receives the same server execution budgets as
+    the PyO3 path.
+24. Update docs and examples so `max_workers` and `max_execution_workers` are
+    described as queueing worker budgets, not reject-fast capacity checks or
+    thread counts.
 
 ## Required Tests
 
@@ -504,6 +590,9 @@ Rust core tests:
   callback execution and releases request resources.
 - Ten routes with `max_workers=10`, server `max_execution_workers=4`: global
   active remote callbacks never exceed four.
+- Server `max_execution_workers=1`, `max_pending_requests>=2`: a second remote
+  call queues instead of returning
+  `server execution capacity exceeded: max_execution_workers=1`.
 - Server `max_pending_requests=8`: ninth remote call is rejected before
   `spawn_blocking`.
 - `read_parallel`: readers run concurrently, writes are exclusive, and waiting
@@ -512,14 +601,21 @@ Rust core tests:
   capacity all make progress under a lower global `max_execution_workers`.
 - Route unregister closes queued calls and rejects new calls.
 - Route unregister with active calls leaves active permits accounted until those
-  calls finish and closes queued waiters with deterministic errors.
-- Connection close waits for queued and active admitted calls before
-  per-connection cleanup.
+  calls finish, closes queued waiters with deterministic errors, and returns
+  `active_drained=true` only after active count reaches zero.
+- Route unregister with a drain timeout returns `active_drained=false`,
+  `drain_timed_out=true`, and does not report the route as safe for SDK
+  shutdown hooks.
+- Connection close cancels queued not-started calls owned by that connection,
+  does not execute their callbacks later, and still waits for active callbacks
+  plus cancellation cleanup before per-connection cleanup.
 - SHM request rejection frees the source allocation and allows reuse.
 - Incomplete chunked frame floods are bounded by chunk registry/semaphore limits
   and cannot create unbounded task fan-out before a logical call is complete.
 - Direct registration through `Dispatcher` or `CrmRoute` struct literals is no
   longer possible from downstream crates.
+- Rust-only non-Python `CrmCallback` registration is limited by the same global,
+  route, pending, and close/drain semantics as the PyO3 path.
 
 Python integration tests:
 
@@ -527,6 +623,8 @@ Python integration tests:
   active callbacks across multiple resources.
 - Mixed local and remote calls share route `max_workers`.
 - Local direct calls do not consume server `max_execution_workers`.
+- `@on_shutdown` is not invoked while an active resource method is still running;
+  queued not-started calls are rejected/cleaned before the hook runs.
 - Direct IPC remains relay-independent when `C2_RELAY_ANCHOR_ADDRESS` points to
   an unavailable relay.
 - Existing syntax compatibility tests still pass on Python 3.10.
@@ -536,14 +634,23 @@ Guardrail tests:
 - A source-level test or lint script fails if production `server.rs` invokes
   `tokio::task::spawn_blocking` for CRM callbacks outside
   `ServerExecutionScheduler`.
-- Test helpers constructing `CrmRoute` must call the same route-handle builder
-  used by production registration.
+- Test helpers registering routes must call the same server-owned registration
+  API used by production registration.
 - A source-level test fails if production inline or buddy call frames spawn a
   per-call task before logical-call admission.
 - A source-level test fails on `pub use scheduler::Scheduler`, `pub scheduler:`,
-  or direct `CrmRoute {` construction outside the route builder module.
+  or direct `CrmRoute {` construction outside the server-owned registration
+  module.
 - A source-level test fails if `sdk/python/native` imports the old
   `c2_server::scheduler::Scheduler`.
+- A compile-fail or source allowlist guard fails on `route.scheduler`,
+  `Scheduler::new`, `Scheduler::with_limits`, `blocking_acquire`, and
+  standalone public route builders outside explicitly allowed new execution
+  module unit tests.
+- A source-level or compile-fail guard fails if public
+  `RuntimeSession::register_route` accepts `CrmRoute` directly.
+- A source-level test fails if Python invokes `_invoke_shutdown` without checking
+  a native `active_drained` close outcome for that route.
 
 ## Migration Notes
 
@@ -564,6 +671,14 @@ Thread-local local calls remain zero-serialization direct calls. They still
 enter the route concurrency guard, but they do not route through Rust byte
 dispatch and do not consume remote execution worker capacity.
 
+Connection close semantics after the migration:
+
+```text
+queued remote calls owned by the closed connection: cancel, clean, never run
+active remote callbacks owned by the closed connection: finish accounting and cleanup
+response send after connection close: best-effort/error-tolerant cleanup path
+```
+
 ## Acceptance Criteria
 
 - No production remote CRM callback can reach `spawn_blocking` before passing
@@ -573,12 +688,23 @@ dispatch and do not consume remote execution worker capacity.
   before callback execution.
 - Incomplete chunked frames are bounded independently of CRM execution pending
   admission.
+- `max_execution_workers` saturation queues admitted calls; it is not a normal
+  remote dispatch capacity error.
 - Tokio `.max_blocking_threads()` is set from `max_execution_workers`.
 - `max_pending_requests` is exercised by server execution tests, not just
   config parsing tests.
-- Connection `wait_idle()` covers queued calls as well as active callbacks.
-- Public route registration cannot accept a route handle from another server or
-  an old standalone scheduler.
+- Connection `wait_idle()` covers active callbacks and queued-call cancellation
+  cleanup, not closed-connection wait-for-capacity.
+- Connection close cancels queued calls that have not started and does not wait
+  for those calls to acquire worker capacity.
+- Python `@on_shutdown` runs only after native close outcomes prove active
+  callbacks for that route have drained.
+- Close drain timeout paths are explicit: they return `active_drained=false`,
+  do not invoke Python shutdown hooks, and do not silently detach active
+  callbacks as if shutdown had completed cleanly.
+- Public route registration cannot accept a route handle from another server, an
+  old standalone scheduler, or a public `RuntimeSession::register_route`
+  parameter that is an externally constructed `CrmRoute`.
 - Eligible queued calls are promoted fairly across routes and cannot starve when
   global and route capacity are available.
 - Existing mixed local/remote concurrency tests are updated to the new queueing
@@ -598,8 +724,9 @@ The first strict review cycle found and addressed these plan gaps:
   task already existed. The spec now requires inline and buddy logical-call
   admission in `handle_connection` before per-call task spawn.
 - The first draft did not state how queued calls interact with
-  `Connection::wait_idle()`. The spec now requires RAII in-flight coverage for
-  queued and active calls.
+  `Connection::wait_idle()`. The spec now requires queued-call cancellation on
+  connection close, active-call in-flight coverage, and cleanup before
+  per-connection chunk/SHM cleanup.
 - The first draft did not mention `RuntimeRouteSpec` validation. The spec now
   requires runtime registration validation to move from old scheduler snapshots
   to route execution snapshots.
@@ -613,11 +740,12 @@ The second strict review cycle found and addressed these plan gaps:
   externally constructed routes, which would let SDK bindings or tests bypass
   the new server-owned scheduler. The spec now adds route construction authority
   as a first-class invariant and requires private route fields plus a
-  server-owned builder.
+  server-owned registration API.
 - Current `c2-server` publicly exports the old `Scheduler`, and PyO3 / relay
   test support directly instantiate it. The spec now requires removing that
-  public export, updating PyO3 and test helpers to use the production builder,
-  and adding source-level guardrails against direct scheduler imports.
+  public export, updating PyO3 and test helpers to use the production
+  server-owned registration API, and adding source-level guardrails against
+  direct scheduler imports.
 - The earlier wording implied pending admission happened before all frame-body
   allocation. The spec now states the exact boundary: the frame body remains
   bounded by `max_frame_size`, while execution pending admission starts at the
@@ -633,3 +761,33 @@ The third strict review cycle found and addressed these plan gaps:
 - The earlier queueing design did not state cross-route promotion fairness. The
   spec now requires event-driven fair promotion across ready routes, in addition
   to per-route read/write fairness.
+
+The fourth strict review cycle found and addressed these plan gaps:
+
+- The earlier connection-drain invariant required waiting for queued calls on a
+  closed connection, which could keep closed-connection work alive until worker
+  capacity became available. The spec now requires cancellation of queued
+  not-started calls on connection close, while active callbacks remain accounted
+  until cleanup.
+- The earlier close/drain wording did not prove that Python `@on_shutdown`
+  hooks run after active callbacks finish. The spec now requires native
+  structured drain outcomes and gates hook invocation on `active_drained=true`.
+- The earlier error semantics listed `max_execution_workers` as a normal remote
+  capacity error even though it is supposed to queue. The spec now restricts that
+  error to explicit nonblocking diagnostics.
+- The earlier route builder wording allowed a standalone public builder. The spec
+  now permits only server-owned route registration authority and requires
+  stronger source/compile-fail guardrails.
+- The earlier cross-language invariant was conceptual. The spec now requires a
+  Rust-only non-Python callback adapter test as mechanical proof.
+
+The fifth strict review cycle found and addressed these plan gaps:
+
+- `RuntimeSession::register_route` was still allowed, by the plan wording, to
+  accept an externally constructed `CrmRoute`. The spec now requires
+  `RuntimeSession` to use the server-owned registration API or an opaque
+  server-created pending-route token, and adds a guardrail against public
+  `CrmRoute` parameters.
+- Close/drain did not define what happens when active callbacks do not finish.
+  The spec now requires an explicit drain policy and timeout outcome; timeout
+  paths return `active_drained=false` and cannot trigger Python shutdown hooks.
