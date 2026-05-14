@@ -283,7 +283,7 @@ class TestUnregisterDrain:
             name='drain_route',
             concurrency=ConcurrencyConfig(
                 mode=ConcurrencyMode.PARALLEL,
-                max_workers=1,
+                max_workers=2,
             ),
         )
         addr = cc.server_address()
@@ -304,14 +304,43 @@ class TestUnregisterDrain:
         t.start()
         assert impl.entered.wait(timeout=1)
 
-        cc.unregister('drain_route')
+        unregister_done = threading.Event()
+        unregister_errors: list[BaseException] = []
 
-        with pytest.raises(Exception):
-            local.probe()
-        with pytest.raises(Exception):
-            remote.probe()
+        def unregister_route():
+            try:
+                cc.unregister('drain_route')
+            except BaseException as exc:
+                unregister_errors.append(exc)
+            finally:
+                unregister_done.set()
 
-        impl.release.set()
-        t.join(timeout=5)
-        assert not t.is_alive()
-        assert not errors
+        def wait_until_rejected(call):
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    call()
+                except Exception:
+                    return
+                time.sleep(0.01)
+            pytest.fail('route continued accepting calls after unregister started')
+
+        unregister_thread = threading.Thread(target=unregister_route)
+        unregister_thread.start()
+        try:
+            wait_until_rejected(local.probe)
+            wait_until_rejected(remote.probe)
+            assert not unregister_done.is_set()
+
+            impl.release.set()
+            t.join(timeout=5)
+            unregister_thread.join(timeout=5)
+
+            assert not t.is_alive()
+            assert not unregister_thread.is_alive()
+            assert not errors
+            assert not unregister_errors
+        finally:
+            impl.release.set()
+            t.join(timeout=5)
+            unregister_thread.join(timeout=5)

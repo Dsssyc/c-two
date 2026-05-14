@@ -408,19 +408,26 @@ impl PyRuntimeSession {
         name: &str,
         relay_anchor_address: Option<&str>,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let server_ref = server_bridge
-            .bind(py)
-            .extract::<PyRef<PyServer>>()
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let relay_use_proxy = resolve_relay_use_proxy_if_needed(&self.inner, relay_anchor_address)?;
-        let outcome = self
-            .inner
-            .unregister_route(
-                &server_ref.inner,
-                name,
-                relay_anchor_address,
-                relay_use_proxy,
-            )
+        let server_inner = {
+            let server_ref = server_bridge
+                .bind(py)
+                .extract::<PyRef<PyServer>>()
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            Arc::clone(&server_ref.inner)
+        };
+        let route_name = name.to_string();
+        let relay_anchor_address = relay_anchor_address.map(str::to_owned);
+        let relay_use_proxy =
+            resolve_relay_use_proxy_if_needed(&self.inner, relay_anchor_address.as_deref())?;
+        let outcome = py
+            .detach(|| {
+                self.inner.unregister_route(
+                    &server_inner,
+                    &route_name,
+                    relay_anchor_address.as_deref(),
+                    relay_use_proxy,
+                )
+            })
             .map_err(runtime_error_to_py)?;
         unregister_outcome_to_dict(py, outcome)
     }
@@ -440,15 +447,18 @@ impl PyRuntimeSession {
             ));
         }
         let timeout = Duration::from_secs_f64(timeout_seconds);
+        let relay_anchor_address = relay_anchor_address.map(str::to_owned);
         let mut relay_cleanup_config_error = None;
-        let relay_use_proxy =
-            match resolve_relay_use_proxy_for_shutdown(&self.inner, relay_anchor_address) {
-                Ok(value) => value,
-                Err(message) => {
-                    relay_cleanup_config_error = Some(message);
-                    false
-                }
-            };
+        let relay_use_proxy = match resolve_relay_use_proxy_for_shutdown(
+            &self.inner,
+            relay_anchor_address.as_deref(),
+        ) {
+            Ok(value) => value,
+            Err(message) => {
+                relay_cleanup_config_error = Some(message);
+                false
+            }
+        };
         let route_names = route_names.unwrap_or_default();
         let server_bridge = match server_bridge {
             Some(server_bridge) => Some(server_bridge),
@@ -459,32 +469,43 @@ impl PyRuntimeSession {
                 .map(|server| server.clone_ref(py)),
         };
         let mut outcome = if let Some(server_bridge) = server_bridge {
+            let server_inner = {
+                let server_ref = server_bridge
+                    .bind(py)
+                    .extract::<PyRef<PyServer>>()
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                Arc::clone(&server_ref.inner)
+            };
+            let mut outcome = py.detach(|| {
+                self.inner.shutdown(
+                    Some(&server_inner),
+                    route_names,
+                    relay_anchor_address.as_deref(),
+                    relay_use_proxy,
+                    relay_cleanup_config_error,
+                    timeout,
+                )
+            });
             let server_ref = server_bridge
                 .bind(py)
                 .extract::<PyRef<PyServer>>()
                 .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            let mut outcome = self.inner.shutdown(
-                Some(&server_ref.inner),
-                route_names,
-                relay_anchor_address,
-                relay_use_proxy,
-                relay_cleanup_config_error.clone(),
-                timeout,
-            );
             outcome.server_was_started = server_ref.runtime_is_running();
             if let Err(err) = server_ref.shutdown_runtime_barrier_blocking(py, timeout) {
                 outcome.runtime_barrier_error = Some(err.to_string());
             }
             outcome
         } else {
-            self.inner.shutdown(
-                None,
-                route_names,
-                relay_anchor_address,
-                relay_use_proxy,
-                relay_cleanup_config_error,
-                timeout,
-            )
+            py.detach(|| {
+                self.inner.shutdown(
+                    None,
+                    route_names,
+                    relay_anchor_address.as_deref(),
+                    relay_use_proxy,
+                    relay_cleanup_config_error,
+                    timeout,
+                )
+            })
         };
         py.detach(|| self.pool.inner.shutdown_all());
         outcome.ipc_clients_drained = true;
