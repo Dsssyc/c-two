@@ -113,6 +113,9 @@ As of 2026-05-14:
   into client request HTTP materialized, relay request-to-IPC streamed, and
   response HTTP materialized. It no longer skips 500MB and 1GB relay rows by a
   hard-coded `<= 100MB` cap.
+- Full local relay benchmark evidence for this path is recorded in
+  `docs/reports/2026-05-14-full-http-relay-benchmark.md`. That run completed
+  all declared relay rows, including 500MB and 1GB.
 - `C2_REMOTE_PAYLOAD_CHUNK_SIZE` is resolved and validated by `c2-config`, not
   Python. The setting is deliberately named `REMOTE` rather than `RELAY`: it
   controls C-Two's protocol-level payload batching for remote data planes. HTTP
