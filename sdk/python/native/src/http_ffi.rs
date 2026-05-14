@@ -172,7 +172,7 @@ impl PyRustRelayControlClient {
         })
     }
 
-    #[pyo3(signature = (name, server_id, server_instance_id, ipc_address, crm_ns, crm_name, crm_ver, abi_hash, signature_hash))]
+    #[pyo3(signature = (name, server_id, server_instance_id, ipc_address, crm_ns, crm_name, crm_ver, abi_hash, signature_hash, max_payload_size))]
     fn register(
         &self,
         py: Python<'_>,
@@ -185,6 +185,7 @@ impl PyRustRelayControlClient {
         crm_ver: &str,
         abi_hash: &str,
         signature_hash: &str,
+        max_payload_size: u64,
     ) -> PyResult<()> {
         let inner = Arc::clone(&self.inner);
         let name = name.to_string();
@@ -207,6 +208,7 @@ impl PyRustRelayControlClient {
                 &crm_ver,
                 &abi_hash,
                 &signature_hash,
+                max_payload_size,
             )
         })
         .map_err(py_http_error)

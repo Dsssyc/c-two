@@ -3,8 +3,8 @@ from __future__ import annotations
 import pytest
 
 import c_two as cc
-from c_two.error import ResourceSerializeOutput
 from c_two.config import settings
+from c_two.error import ClientCallResource, ResourceSerializeOutput
 from c_two.transport.registry import _ProcessRegistry
 
 
@@ -58,6 +58,36 @@ class BytesResponseCRM:
 class BytesResponseResource:
     def payload(self, size: int) -> BytesResponse:
         return BytesResponse(b"b" * size)
+
+
+@cc.transferable(abi_id="c-two.tests.response-allocation.bytes-request.raw-bytes.v1")
+class BytesRequest:
+    data: bytes
+
+    def serialize(value: "BytesRequest") -> bytes:
+        return value.data
+
+    def deserialize(data: memoryview) -> "BytesRequest":
+        return BytesRequest(bytes(data))
+
+    def from_buffer(data: memoryview) -> "BytesRequest":
+        return BytesRequest(bytes(data))
+
+
+@cc.crm(namespace="cc.test.response_allocation_bytes_request", version="0.1.0")
+class BytesEchoCRM:
+    @cc.transfer(input=BytesRequest, output=BytesResponse)
+    def echo(self, payload: BytesRequest) -> BytesResponse:
+        ...
+
+
+class BytesEchoResource:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def echo(self, payload: BytesRequest) -> BytesResponse:
+        self.calls += 1
+        return BytesResponse(payload.data)
 
 
 @cc.transferable(abi_id="c-two.tests.response-allocation.memoryview-response.raw-bytes.v1")
@@ -177,5 +207,30 @@ def test_response_over_max_payload_size_returns_resource_output_error():
         assert "response payload size 8193 exceeds max_payload_size 8192" in str(
             exc_info.value
         )
+    finally:
+        cc.close(client)
+
+
+def test_request_over_max_payload_size_is_rejected_before_resource_execution():
+    settings.shm_threshold = 1024
+    cc.set_server(
+        ipc_overrides={
+            "pool_segment_size": 8192,
+            "max_payload_size": 8192,
+            "max_frame_size": 16384,
+        }
+    )
+    resource = BytesEchoResource()
+    cc.register(
+        BytesEchoCRM,
+        resource,
+        name="request_over_max_payload",
+    )
+    cc.serve(blocking=False)
+    client = _connect(BytesEchoCRM, "request_over_max_payload")
+    try:
+        with pytest.raises(ClientCallResource, match="max_payload_size 8192"):
+            client.echo(BytesRequest(b"x" * 8193))
+        assert resource.calls == 0
     finally:
         cc.close(client)

@@ -279,6 +279,7 @@ mod handshake_tests {
             crm_ver: "0.1.0".into(),
             abi_hash: ABI_HASH.into(),
             signature_hash: SIG_HASH.into(),
+            max_payload_size: 1024,
             methods: methods
                 .iter()
                 .enumerate()
@@ -298,6 +299,7 @@ mod handshake_tests {
             crm_ver: "0.1.0".into(),
             abi_hash: ABI_HASH.into(),
             signature_hash: SIG_HASH.into(),
+            max_payload_size: 1024,
             methods: vec![MethodEntry {
                 name: "get".into(),
                 index: 0,
@@ -409,6 +411,7 @@ mod handshake_tests {
             crm_ver: "0.1.0".into(),
             abi_hash: ABI_HASH.into(),
             signature_hash: SIG_HASH.into(),
+            max_payload_size: 1024,
             methods: vec![MethodEntry {
                 name: "get".into(),
                 index: 0,
@@ -456,6 +459,7 @@ mod handshake_tests {
             crm_ver: "1.2.3".to_string(),
             abi_hash: ABI_HASH.to_string(),
             signature_hash: SIG_HASH.to_string(),
+            max_payload_size: 1024,
             methods: vec![MethodEntry {
                 name: "ping".to_string(),
                 index: 0,
@@ -520,6 +524,7 @@ mod handshake_tests {
                 crm_ver: "0.1.0".into(),
                 abi_hash: ABI_HASH.into(),
                 signature_hash: SIG_HASH.into(),
+                max_payload_size: 1024,
                 methods: vec![
                     MethodEntry {
                         name: "hello".into(),
@@ -542,6 +547,7 @@ mod handshake_tests {
                 crm_ver: "0.1.0".into(),
                 abi_hash: ABI_HASH.into(),
                 signature_hash: SIG_HASH.into(),
+                max_payload_size: 1024,
                 methods: vec![
                     MethodEntry {
                         name: "get".into(),
@@ -586,6 +592,7 @@ mod handshake_tests {
             crm_ver: "0.1.0".into(),
             abi_hash: ABI_HASH.into(),
             signature_hash: SIG_HASH.into(),
+            max_payload_size: 1024,
             methods: vec![],
         }];
 
@@ -603,6 +610,7 @@ mod handshake_tests {
             crm_ver: "0.1.0".into(),
             abi_hash: ABI_HASH.into(),
             signature_hash: SIG_HASH.into(),
+            max_payload_size: 1024,
             methods: vec![],
         }];
 
@@ -617,6 +625,7 @@ mod handshake_tests {
             crm_ver: "0.1.0".into(),
             abi_hash: ABI_HASH.into(),
             signature_hash: SIG_HASH.into(),
+            max_payload_size: 1024,
             methods: vec![],
         }];
 
@@ -631,6 +640,7 @@ mod handshake_tests {
             crm_ver: "x".repeat(c2_contract::MAX_WIRE_TEXT_BYTES + 1),
             abi_hash: ABI_HASH.into(),
             signature_hash: SIG_HASH.into(),
+            max_payload_size: 1024,
             methods: vec![],
         }];
 
@@ -648,6 +658,7 @@ mod handshake_tests {
             crm_ver: "0.1.0".into(),
             abi_hash: ABI_HASH.into(),
             signature_hash: SIG_HASH.into(),
+            max_payload_size: 1024,
             methods: (0..=MAX_METHODS)
                 .map(|i| MethodEntry {
                     name: format!("m{i}"),
@@ -777,7 +788,7 @@ mod cross_lang_tests {
         // v10: client handshake prefix, server identity, then route table
         // with per-route full CRM tag and contract hashes.
         let bytes = hex_to_bytes(
-            "0a00010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696409746573742e67726964044772696405302e312e304030313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566406162636465663031323334353637383961626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383902000568656c6c6f0000036164640100",
+            "0a00010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696409746573742e67726964044772696405302e312e3040303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566303132333435363738396162636465664061626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839000400000000000002000568656c6c6f0000036164640100",
         );
         let hs = decode_handshake(&bytes).unwrap();
         assert_eq!(hs.prefix, "");
@@ -859,6 +870,7 @@ mod cross_lang_tests {
             crm_ver: "0.1.0".into(),
             abi_hash: ABI_HASH.into(),
             signature_hash: SIG_HASH.into(),
+            max_payload_size: 1024,
             methods: vec![
                 MethodEntry {
                     name: "hello".into(),
@@ -885,7 +897,7 @@ mod cross_lang_tests {
         // v10: [0a][00 prefix_len] then segments/caps, identity, and route table
         // with per-route full CRM tag and contract hash metadata.
         let expected = hex_to_bytes(
-            "0a00010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696409746573742e67726964044772696405302e312e304030313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566406162636465663031323334353637383961626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383902000568656c6c6f0000036164640100",
+            "0a00010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696409746573742e67726964044772696405302e312e3040303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566303132333435363738396162636465664061626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839000400000000000002000568656c6c6f0000036164640100",
         );
         assert_eq!(encoded, expected);
     }

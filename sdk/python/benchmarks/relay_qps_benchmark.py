@@ -27,6 +27,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import c_two as cc
+from c_two.config.ipc import _resolve_server_ipc_config
 from c_two.crm.contract import CRMContract, crm_contract
 from c_two.transport.registry import _ProcessRegistry
 from tests.fixtures.hello import HelloImpl
@@ -63,7 +64,7 @@ def _require_external_relay(relay_url: str) -> None:
         raise SystemExit(_relay_help(relay_url)) from exc
 
 
-def _post_json(url: str, payload: dict[str, str], timeout: float = 5.0) -> None:
+def _post_json(url: str, payload: dict[str, object], timeout: float = 5.0) -> None:
     data = json.dumps(payload).encode('utf-8')
     req = urllib.request.Request(
         url,
@@ -83,6 +84,7 @@ def _register_relay_upstream(
     server_id: str,
     server_instance_id: str,
     expected: CRMContract,
+    max_payload_size: int,
 ) -> None:
     _post_json(
         f'{relay_url}/_register',
@@ -96,6 +98,7 @@ def _register_relay_upstream(
             'crm_ver': expected.crm_ver,
             'abi_hash': expected.abi_hash,
             'signature_hash': expected.signature_hash,
+            'max_payload_size': max_payload_size,
         },
     )
 
@@ -208,6 +211,7 @@ def main():
         server_instance_id = _server_instance_id_for(route_name, ipc_addr, Hello)
         expected = crm_contract(Hello)
         expected_header_args = _expected_contract_hey_args(expected)
+        max_payload_size = int(_resolve_server_ipc_config()['max_payload_size'])
 
         _register_relay_upstream(
             relay_url,
@@ -216,6 +220,7 @@ def main():
             server_id,
             server_instance_id,
             expected,
+            max_payload_size,
         )
         route_registered = True
 

@@ -468,6 +468,7 @@ impl RuntimeSession {
                 &spec.crm_ver,
                 &spec.abi_hash,
                 &spec.signature_hash,
+                server.config().max_payload_size,
                 &registration_token,
             ) {
                 rt.block_on(
@@ -538,6 +539,7 @@ impl RuntimeSession {
                 &spec.crm_ver,
                 &spec.abi_hash,
                 &spec.signature_hash,
+                server.config().max_payload_size,
             ) {
                 let local_removed = rt.block_on(server.unregister_route(&spec.name));
                 let relay_cleanup_error = self.relay_cleanup(

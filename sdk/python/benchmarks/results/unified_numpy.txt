@@ -1,9 +1,0 @@
-# Unified NumPy IPC Benchmark — C-Two vs Ray
-# Python 3.12.10  NumPy 2.4.4
-# Ray 2.55.1  C-Two 0.4.10
-       N	Rounds	  C2_pickle_ms	    C2_hold_ms	        Ray_ms	   Ratio
-      1K	   100	        0.1555	        0.0914	        6.8839	   75.3×
-     10K	   100	        0.9233	        0.1166	        7.2432	   62.1×
-    100K	    30	        8.1963	        0.3985	        9.6708	   24.3×
-      1M	    15	      140.1915	        3.7482	       45.7995	   12.2×
-      3M	     5	      577.6699	       11.0482	      151.1746	   13.7×

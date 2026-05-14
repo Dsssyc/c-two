@@ -25,6 +25,7 @@
 //!     [1B crm_ver_len][crm_ver UTF-8]
 //!     [1B abi_hash_len][abi_hash UTF-8]
 //!     [1B signature_hash_len][signature_hash UTF-8]
+//!     [8B max_payload_size LE]
 //!     [2B method_count LE]
 //!     [per-method: [1B name_len][method_name UTF-8][2B method_idx LE]]
 //! ]
@@ -72,6 +73,7 @@ pub struct RouteInfo {
     pub crm_ver: String,
     pub abi_hash: String,
     pub signature_hash: String,
+    pub max_payload_size: u64,
     pub methods: Vec<MethodEntry>,
 }
 
@@ -169,6 +171,12 @@ pub fn encode_server_handshake(
         })?;
         validate_contract_hash("abi_hash", &route.abi_hash)?;
         validate_contract_hash("signature_hash", &route.signature_hash)?;
+        if route.max_payload_size == 0 {
+            return Err(EncodeError::InvalidText {
+                field: "max_payload_size",
+                reason: "must be > 0".to_string(),
+            });
+        }
         if route.methods.len() > MAX_METHODS {
             return Err(EncodeError::FieldTooLong {
                 field: "method count",
@@ -194,6 +202,7 @@ pub fn encode_server_handshake(
         let signature_hash_b = route.signature_hash.as_bytes();
         buf.push(signature_hash_b.len() as u8);
         buf.extend_from_slice(signature_hash_b);
+        buf.extend_from_slice(&route.max_payload_size.to_le_bytes());
         buf.extend_from_slice(&(route.methods.len() as u16).to_le_bytes());
         for m in &route.methods {
             validate_name_len("method name", &m.name)?;
@@ -387,6 +396,16 @@ pub fn decode_handshake(buf: &[u8]) -> Result<Handshake, DecodeError> {
             }
         })?;
 
+        check_remaining(buf, off, 8, "max_payload_size")?;
+        let max_payload_size = read_u64(buf, off);
+        off += 8;
+        if max_payload_size == 0 {
+            return Err(DecodeError::InvalidValue {
+                field: "max_payload_size",
+                value: max_payload_size,
+            });
+        }
+
         check_remaining(buf, off, 2, "method count")?;
         let m_count = read_u16(buf, off) as usize;
         off += 2;
@@ -419,6 +438,7 @@ pub fn decode_handshake(buf: &[u8]) -> Result<Handshake, DecodeError> {
             crm_ver,
             abi_hash,
             signature_hash,
+            max_payload_size,
             methods,
         });
     }
@@ -469,6 +489,20 @@ fn read_u16(buf: &[u8], off: usize) -> u16 {
 #[inline]
 fn read_u32(buf: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+}
+
+#[inline]
+fn read_u64(buf: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes([
+        buf[off],
+        buf[off + 1],
+        buf[off + 2],
+        buf[off + 3],
+        buf[off + 4],
+        buf[off + 5],
+        buf[off + 6],
+        buf[off + 7],
+    ])
 }
 
 #[inline]

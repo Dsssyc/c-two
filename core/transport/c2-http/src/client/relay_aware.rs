@@ -525,6 +525,7 @@ mod tests {
             crm_ver: "0.1.0".to_string(),
             abi_hash: TEST_ABI_HASH.to_string(),
             signature_hash: TEST_SIGNATURE_HASH.to_string(),
+            max_payload_size: 1024,
         }
     }
 

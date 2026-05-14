@@ -5,8 +5,8 @@ use crate::relay::types::{
     valid_route_digest_hash, valid_wire_relay_id,
 };
 
-pub const PROTOCOL_VERSION: u32 = 3;
-pub const ROUTE_HASH_PEER_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
+pub const ROUTE_HASH_PEER_VERSION: u32 = 4;
 
 /// Envelope wrapping every peer-to-peer message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +30,7 @@ pub enum PeerMessage {
         crm_ver: String,
         abi_hash: String,
         signature_hash: String,
+        max_payload_size: u64,
         registered_at: f64,
     },
     /// A CRM route was unregistered.
@@ -76,6 +77,7 @@ pub enum DigestDiffEntry {
         crm_ver: String,
         abi_hash: String,
         signature_hash: String,
+        max_payload_size: u64,
         registered_at: f64,
         hash: RouteDigestHash,
     },
@@ -119,6 +121,7 @@ pub(crate) struct ValidatedDigestDiffActive {
     pub crm_ver: String,
     pub abi_hash: String,
     pub signature_hash: String,
+    pub max_payload_size: u64,
     pub registered_at: f64,
 }
 
@@ -165,6 +168,7 @@ impl From<ValidatedDigestDiffActive> for RouteEntry {
             crm_ver: active.crm_ver,
             abi_hash: active.abi_hash,
             signature_hash: active.signature_hash,
+            max_payload_size: active.max_payload_size,
             locality: Locality::Peer,
             registered_at: active.registered_at,
         }
@@ -210,6 +214,7 @@ pub fn validate_route_state_envelope(
             crm_ver,
             abi_hash,
             signature_hash,
+            max_payload_size,
             registered_at,
         } => {
             if relay_id != &envelope.sender_relay_id
@@ -222,6 +227,7 @@ pub fn validate_route_state_envelope(
                     crm_ver,
                     abi_hash,
                     signature_hash,
+                    *max_payload_size,
                     *registered_at,
                 )
             {
@@ -306,6 +312,7 @@ fn validate_digest_diff_entries(
                 crm_ver,
                 abi_hash,
                 signature_hash,
+                max_payload_size,
                 registered_at,
                 hash,
             } => {
@@ -319,6 +326,7 @@ fn validate_digest_diff_entries(
                         crm_ver,
                         abi_hash,
                         signature_hash,
+                        *max_payload_size,
                         *registered_at,
                     )
                     || hash != &expected_hash
@@ -337,6 +345,7 @@ fn validate_digest_diff_entries(
                         crm_ver: crm_ver.clone(),
                         abi_hash: abi_hash.clone(),
                         signature_hash: signature_hash.clone(),
+                        max_payload_size: *max_payload_size,
                         registered_at: *registered_at,
                     },
                 ));
@@ -381,6 +390,7 @@ pub fn route_digest_hash_for_diff_entry(
             crm_ver,
             abi_hash,
             signature_hash,
+            max_payload_size,
             registered_at,
             ..
         } => {
@@ -393,6 +403,7 @@ pub fn route_digest_hash_for_diff_entry(
                 crm_ver,
                 abi_hash,
                 signature_hash,
+                *max_payload_size,
                 *registered_at,
             ) {
                 return Err(PeerRouteStateError::InvalidDigestDiff {
@@ -408,6 +419,7 @@ pub fn route_digest_hash_for_diff_entry(
                 crm_ver,
                 abi_hash,
                 signature_hash,
+                *max_payload_size,
                 *registered_at,
             ))
         }
@@ -437,6 +449,7 @@ fn valid_active_route_fields(
     crm_ver: &str,
     abi_hash: &str,
     signature_hash: &str,
+    max_payload_size: u64,
     registered_at: f64,
 ) -> bool {
     crate::relay::route_table::valid_route_name(name)
@@ -445,6 +458,7 @@ fn valid_active_route_fields(
         && crate::relay::route_table::valid_crm_tag(crm_ns, crm_name, crm_ver)
         && c2_contract::validate_contract_hash("abi_hash", abi_hash).is_ok()
         && c2_contract::validate_contract_hash("signature_hash", signature_hash).is_ok()
+        && max_payload_size > 0
         && registered_at.is_finite()
 }
 
@@ -497,6 +511,7 @@ mod tests {
                 abi_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
                 signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
                     .into(),
+                max_payload_size: 1024,
                 registered_at: 1000.0,
             },
         );
@@ -525,6 +540,7 @@ mod tests {
                 abi_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
                 signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
                     .into(),
+                max_payload_size: 1024,
                 registered_at: 1000.0,
             },
         );
@@ -548,6 +564,7 @@ mod tests {
             abi_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
             signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
                 .into(),
+            max_payload_size: 1024,
             registered_at: 1000.0,
             hash: String::new(),
         };

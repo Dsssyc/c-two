@@ -17,6 +17,7 @@ import httpx
 
 import c_two as cc
 from c_two.config.settings import settings
+from c_two.config.ipc import _resolve_server_ipc_config
 from c_two.error import ResourceNotFound
 from c_two._native import RustHttpClientPool
 from c_two.crm.contract import crm_contract
@@ -25,6 +26,8 @@ from c_two.transport.registry import _ProcessRegistry
 from tests.fixtures.hello import HelloImpl
 from tests.fixtures.ihello import Hello
 from tests.fixtures.counter import Counter, CounterImpl
+
+DEFAULT_MAX_PAYLOAD_SIZE = int(_resolve_server_ipc_config()['max_payload_size'])
 
 
 def _acquire_http(url: str):
@@ -109,6 +112,7 @@ def relay_stack(start_c3_relay):
                     'server_id': server_id,
                     'server_instance_id': server_instance_id,
                     'address': ipc_addr,
+                    'max_payload_size': DEFAULT_MAX_PAYLOAD_SIZE,
                 },
             )
             assert resp.status_code == 201, resp.text
@@ -324,6 +328,7 @@ class TestCcConnectHttp:
                     'server_id': server_id,
                     'server_instance_id': server_instance_id,
                     'address': ipc_addr,
+                    'max_payload_size': DEFAULT_MAX_PAYLOAD_SIZE,
                 },
             )
             assert resp.status_code == 201, resp.text
@@ -443,6 +448,7 @@ class TestCcConnectHttp:
                         'crm_ver': wrong_contract.crm_ver,
                         'abi_hash': wrong_contract.abi_hash,
                         'signature_hash': wrong_contract.signature_hash,
+                        'max_payload_size': DEFAULT_MAX_PAYLOAD_SIZE,
                     },
                 )
                 assert resp.status_code == 400
@@ -544,6 +550,7 @@ class TestRelayControlPlane:
                     'server_id': server_id,
                     'server_instance_id': server_instance_id,
                     'address': ipc_addr,
+                    'max_payload_size': DEFAULT_MAX_PAYLOAD_SIZE,
                 },
             )
             assert resp.status_code == 201, resp.text
@@ -584,6 +591,7 @@ class TestRelayControlPlane:
                     'server_id': server_id,
                     'server_instance_id': server_instance_id,
                     'address': ipc_addr,
+                    'max_payload_size': DEFAULT_MAX_PAYLOAD_SIZE,
                 },
             )
             assert resp.status_code == 201, resp.text
@@ -596,6 +604,7 @@ class TestRelayControlPlane:
                     'server_id': server_id,
                     'server_instance_id': server_instance_id,
                     'address': ipc_addr,
+                    'max_payload_size': DEFAULT_MAX_PAYLOAD_SIZE,
                 },
             )
             assert resp.status_code == 200
@@ -619,6 +628,7 @@ class TestRelayControlPlane:
                     'server_id': server_id,
                     'server_instance_id': server_instance_id,
                     'address': ipc_addr,
+                    'max_payload_size': DEFAULT_MAX_PAYLOAD_SIZE,
                 },
             )
             resp = http.post(
@@ -672,6 +682,7 @@ class TestRelayControlPlane:
                         'server_id': server_id,
                         'server_instance_id': server_instance_id,
                         'address': ipc_addr,
+                        'max_payload_size': DEFAULT_MAX_PAYLOAD_SIZE,
                     },
                 )
                 assert resp.status_code == 201, resp.text

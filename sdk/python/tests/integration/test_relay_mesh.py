@@ -17,6 +17,7 @@ import urllib.request
 import pytest
 
 import c_two as cc
+from c_two.config.ipc import _resolve_server_ipc_config
 from c_two.config.settings import settings
 from c_two.crm.contract import crm_contract
 from c_two.transport.registry import _ProcessRegistry
@@ -34,6 +35,7 @@ class MeshImpl:
 
 
 MESH_CONTRACT = crm_contract(MeshResource)
+DEFAULT_MAX_PAYLOAD_SIZE = int(_resolve_server_ipc_config()['max_payload_size'])
 
 
 @pytest.fixture(autouse=True)
@@ -71,7 +73,7 @@ def _server_instance_id_for(route_name: str, address: str) -> str:
         registry._runtime_session.release_ipc_client(address)  # noqa: SLF001
 
 
-def _register_body(name: str, server_id: str) -> dict[str, str]:
+def _register_body(name: str, server_id: str) -> dict[str, object]:
     cc.set_server(server_id=server_id)
     cc.register(MeshResource, MeshImpl(), name=name)
     address = cc.server_address()
@@ -84,6 +86,7 @@ def _register_body(name: str, server_id: str) -> dict[str, str]:
         "server_id": server_id,
         "server_instance_id": server_instance_id,
         "address": address,
+        "max_payload_size": DEFAULT_MAX_PAYLOAD_SIZE,
     }
 
 
@@ -208,6 +211,7 @@ class TestSingleRelay:
                 "crm_ver": "0.1.0",
                 "abi_hash": MESH_CONTRACT.abi_hash,
                 "signature_hash": MESH_CONTRACT.signature_hash,
+                "max_payload_size": DEFAULT_MAX_PAYLOAD_SIZE,
             },
         )
 

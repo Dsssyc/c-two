@@ -48,6 +48,7 @@ impl RouteTable {
             || !valid_crm_tag(&entry.crm_ns, &entry.crm_name, &entry.crm_ver)
             || c2_contract::validate_contract_hash("abi_hash", &entry.abi_hash).is_err()
             || c2_contract::validate_contract_hash("signature_hash", &entry.signature_hash).is_err()
+            || entry.max_payload_size == 0
             || !entry.registered_at.is_finite()
         {
             return false;
@@ -676,6 +677,7 @@ impl RouteTable {
                 crm_ver: entry.crm_ver.clone(),
                 abi_hash: entry.abi_hash.clone(),
                 signature_hash: entry.signature_hash.clone(),
+                max_payload_size: entry.max_payload_size,
                 registered_at: entry.registered_at,
                 hash: route_entry_digest_hash(entry),
             })
@@ -864,6 +866,7 @@ mod tests {
             abi_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
             signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
                 .into(),
+            max_payload_size: 1024,
             locality: Locality::Local,
             registered_at: 1000.0,
         }
@@ -883,6 +886,7 @@ mod tests {
             abi_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
             signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
                 .into(),
+            max_payload_size: 1024,
             locality: Locality::Peer,
             registered_at,
         }
@@ -978,7 +982,7 @@ mod tests {
         let active_digest = active_table.route_digest();
         assert_eq!(
             active_digest.get(&("grid".to_string(), "relay-a".to_string(), false)),
-            Some(&"d02ba80719775d3806f1dab6e9e22b47c6bff397411fad18628122577f7f4ef5".to_string())
+            Some(&"041751786968419cef9940d98f60c292ae4a22c92166a51bc55c87f6e0601a18".to_string())
         );
 
         let mut deleted_table = RouteTable::new("relay-a".into());

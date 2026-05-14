@@ -45,6 +45,7 @@ def route_info(name: str, methods: list[MethodEntry]) -> RouteInfo:
         crm_ver='0.1.0',
         abi_hash=ABI_HASH,
         signature_hash=SIG_HASH,
+        max_payload_size=1024,
     )
 
 
@@ -170,6 +171,7 @@ class TestHandshakeBoundsChecking:
         buf += ABI_HASH.encode()
         buf.append(len(SIG_HASH))
         buf += SIG_HASH.encode()
+        buf += struct.pack('<Q', 1024)
         buf += struct.pack('<H', _MAX_HANDSHAKE_METHODS + 1)  # method count
         with pytest.raises(ValueError, match='invalid value|exceeds'):
             decode_handshake(bytes(buf))

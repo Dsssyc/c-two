@@ -35,6 +35,7 @@ pub(crate) struct AttestedRouteContract {
     pub crm_ver: String,
     pub abi_hash: String,
     pub signature_hash: String,
+    pub max_payload_size: u64,
 }
 
 fn existing_contract_mismatch_reason(
@@ -45,25 +46,29 @@ fn existing_contract_mismatch_reason(
     crm_ver: &str,
     abi_hash: &str,
     signature_hash: &str,
+    max_payload_size: u64,
 ) -> Option<String> {
     if existing.crm_ns != crm_ns
         || existing.crm_name != crm_name
         || existing.crm_ver != crm_ver
         || existing.abi_hash != abi_hash
         || existing.signature_hash != signature_hash
+        || existing.max_payload_size != max_payload_size
     {
         return Some(format!(
-            "CRM contract mismatch for route '{route_name}': existing {}/{}/{} hashes={}/{}, got {}/{}/{} hashes={}/{}",
+            "CRM contract mismatch for route '{route_name}': existing {}/{}/{} hashes={}/{} max_payload_size={}, got {}/{}/{} hashes={}/{} max_payload_size={}",
             existing.crm_ns,
             existing.crm_name,
             existing.crm_ver,
             existing.abi_hash,
             existing.signature_hash,
+            existing.max_payload_size,
             crm_ns,
             crm_name,
             crm_ver,
             abi_hash,
-            signature_hash
+            signature_hash,
+            max_payload_size
         ));
     }
     None
@@ -92,6 +97,9 @@ pub(crate) fn read_ipc_route_contract(
         crm_ver: contract.crm_ver,
         abi_hash: contract.abi_hash,
         signature_hash: contract.signature_hash,
+        max_payload_size: client
+            .route_max_payload_size(route_name)
+            .ok_or(ControlError::NotFound)?,
     })
 }
 
@@ -103,6 +111,7 @@ pub(crate) fn attest_ipc_route_contract(
     claimed_crm_ver: &str,
     claimed_abi_hash: &str,
     claimed_signature_hash: &str,
+    claimed_max_payload_size: u64,
 ) -> Result<AttestedRouteContract, ControlError> {
     let contract = client
         .route_contract(route_name)
@@ -140,12 +149,23 @@ pub(crate) fn attest_ipc_route_contract(
             ),
         });
     }
+    let max_payload_size = client
+        .route_max_payload_size(route_name)
+        .ok_or(ControlError::NotFound)?;
+    if claimed_max_payload_size != max_payload_size {
+        return Err(ControlError::ContractMismatch {
+            reason: format!(
+                "IPC upstream route '{route_name}' max_payload_size mismatch: claimed {claimed_max_payload_size}, got {max_payload_size}"
+            ),
+        });
+    }
     Ok(AttestedRouteContract {
         crm_ns: contract.crm_ns,
         crm_name: contract.crm_name,
         crm_ver: contract.crm_ver,
         abi_hash: contract.abi_hash,
         signature_hash: contract.signature_hash,
+        max_payload_size,
     })
 }
 
@@ -158,6 +178,7 @@ pub(crate) async fn attest_ipc_pending_route_contract(
     claimed_crm_ver: &str,
     claimed_abi_hash: &str,
     claimed_signature_hash: &str,
+    claimed_max_payload_size: u64,
 ) -> Result<AttestedRouteContract, ControlError> {
     let contract = match client
         .pending_route_contract(route_name, registration_token)
@@ -181,6 +202,9 @@ pub(crate) async fn attest_ipc_pending_route_contract(
         abi_hash: claimed_abi_hash.to_string(),
         signature_hash: claimed_signature_hash.to_string(),
     };
+    let max_payload_size = client
+        .route_max_payload_size(route_name)
+        .ok_or(ControlError::NotFound)?;
     if c2_contract::validate_expected_route_contract(&claimed).is_err() {
         return Err(ControlError::ContractMismatch {
             reason: format!(
@@ -205,12 +229,20 @@ pub(crate) async fn attest_ipc_pending_route_contract(
             ),
         });
     }
+    if claimed_max_payload_size != max_payload_size {
+        return Err(ControlError::ContractMismatch {
+            reason: format!(
+                "IPC upstream pending route '{route_name}' max_payload_size mismatch: claimed {claimed_max_payload_size}, got {max_payload_size}"
+            ),
+        });
+    }
     Ok(AttestedRouteContract {
         crm_ns: contract.crm_ns,
         crm_name: contract.crm_name,
         crm_ver: contract.crm_ver,
         abi_hash: contract.abi_hash,
         signature_hash: contract.signature_hash,
+        max_payload_size,
     })
 }
 
@@ -244,6 +276,7 @@ pub(crate) struct OwnerReplacement {
     crm_ver: String,
     abi_hash: String,
     signature_hash: String,
+    max_payload_size: u64,
     token: OwnerToken,
     evidence: OwnerReplacementEvidence,
 }
@@ -260,6 +293,7 @@ pub(crate) struct OwnerReplacementCandidate {
     crm_ver: String,
     abi_hash: String,
     signature_hash: String,
+    max_payload_size: u64,
     token: OwnerToken,
 }
 
@@ -276,6 +310,7 @@ impl OwnerReplacementCandidate {
             crm_ver: self.crm_ver,
             abi_hash: self.abi_hash,
             signature_hash: self.signature_hash,
+            max_payload_size: self.max_payload_size,
             token: self.token,
             evidence,
         }
@@ -293,6 +328,7 @@ pub(crate) enum RouteCommand {
         crm_ver: String,
         abi_hash: String,
         signature_hash: String,
+        max_payload_size: u64,
         client: Arc<IpcClient>,
         replacement: Option<OwnerReplacement>,
     },
@@ -562,6 +598,7 @@ impl<'a> RouteAuthority<'a> {
                 crm_ver,
                 abi_hash,
                 signature_hash,
+                max_payload_size,
                 client,
                 replacement,
             } => self.register_local(
@@ -574,6 +611,7 @@ impl<'a> RouteAuthority<'a> {
                 crm_ver,
                 abi_hash,
                 signature_hash,
+                max_payload_size,
                 client,
                 replacement,
             ),
@@ -608,6 +646,7 @@ impl<'a> RouteAuthority<'a> {
         crm_ver: String,
         abi_hash: String,
         signature_hash: String,
+        max_payload_size: u64,
         client: Arc<IpcClient>,
         replacement: Option<OwnerReplacement>,
     ) -> Result<RouteCommandResult, ControlError> {
@@ -626,6 +665,11 @@ impl<'a> RouteAuthority<'a> {
                 reason: err.to_string(),
             }
         })?;
+        if max_payload_size == 0 {
+            return Err(ControlError::ContractMismatch {
+                reason: "max_payload_size must be > 0".to_string(),
+            });
+        }
 
         let mut route_table = self.state.route_table_write();
         if let Some(existing) = route_table.local_route(&name) {
@@ -644,6 +688,7 @@ impl<'a> RouteAuthority<'a> {
                             &crm_ver,
                             &abi_hash,
                             &signature_hash,
+                            max_payload_size,
                         ) {
                             return Err(ControlError::ContractMismatch { reason });
                         }
@@ -667,6 +712,7 @@ impl<'a> RouteAuthority<'a> {
                             || token.crm_ver != existing.crm_ver
                             || token.abi_hash != existing.abi_hash
                             || token.signature_hash != existing.signature_hash
+                            || token.max_payload_size != existing.max_payload_size
                         {
                             return Err(ControlError::DuplicateRoute { existing_address });
                         }
@@ -688,6 +734,7 @@ impl<'a> RouteAuthority<'a> {
             crm_ver,
             abi_hash,
             signature_hash,
+            max_payload_size,
             locality: Locality::Local,
             registered_at: route_table.next_local_timestamp(),
         };
@@ -751,6 +798,7 @@ impl<'a> RouteAuthority<'a> {
                     crm_ver: existing.crm_ver.clone(),
                     abi_hash: existing.abi_hash.clone(),
                     signature_hash: existing.signature_hash.clone(),
+                    max_payload_size: existing.max_payload_size,
                     token,
                 })
             }
@@ -1040,6 +1088,7 @@ mod tests {
             abi_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
             signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
                 .into(),
+            max_payload_size: 1024,
             locality: Locality::Peer,
             registered_at: 1000.0,
         }

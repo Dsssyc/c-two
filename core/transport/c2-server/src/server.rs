@@ -198,6 +198,7 @@ struct PendingRouteInfo {
     registration_token: String,
     contract: c2_contract::ExpectedRouteContract,
     method_names: Vec<String>,
+    max_payload_size: u64,
 }
 
 impl PendingRouteReservation {
@@ -557,6 +558,7 @@ impl Server {
                     signature_hash: route.signature_hash.clone(),
                 },
                 method_names: route.method_names.clone(),
+                max_payload_size: self.config.max_payload_size,
             },
         );
         Ok(PendingRouteReservation {
@@ -1579,6 +1581,7 @@ async fn handle_handshake(
             crm_ver: r.crm_ver.clone(),
             abi_hash: r.abi_hash.clone(),
             signature_hash: r.signature_hash.clone(),
+            max_payload_size: server.config.max_payload_size,
             methods: r
                 .method_names
                 .iter()
@@ -1692,6 +1695,7 @@ async fn handle_ctrl(
                         abi_hash: info.contract.abi_hash,
                         signature_hash: info.contract.signature_hash,
                         method_names: info.method_names,
+                        max_payload_size: info.max_payload_size,
                     },
                 },
                 Err(response) => response,

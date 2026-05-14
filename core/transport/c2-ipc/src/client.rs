@@ -5,10 +5,12 @@
 
 use parking_lot::{Mutex as StdMutex, RwLock};
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
+use futures_util::{Stream, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, oneshot};
@@ -196,6 +198,7 @@ pub struct MethodTable {
     crm_ver: String,
     abi_hash: String,
     signature_hash: String,
+    max_payload_size: u64,
     name_to_idx: HashMap<String, u16>,
 }
 
@@ -208,16 +211,18 @@ impl MethodTable {
             route.crm_ver.clone(),
             route.abi_hash.clone(),
             route.signature_hash.clone(),
+            route.max_payload_size,
         )
     }
 
-    fn from_entries(
+    pub(crate) fn from_entries(
         entries: &[MethodEntry],
         crm_ns: String,
         crm_name: String,
         crm_ver: String,
         abi_hash: String,
         signature_hash: String,
+        max_payload_size: u64,
     ) -> Self {
         let mut name_to_idx = HashMap::with_capacity(entries.len());
         for e in entries {
@@ -229,6 +234,7 @@ impl MethodTable {
             crm_ver,
             abi_hash,
             signature_hash,
+            max_payload_size,
             name_to_idx,
         }
     }
@@ -265,11 +271,102 @@ impl MethodTable {
     pub fn signature_hash(&self) -> &str {
         &self.signature_hash
     }
+
+    pub fn max_payload_size(&self) -> u64 {
+        self.max_payload_size
+    }
 }
 
 // ── Pending call ─────────────────────────────────────────────────────────
 
 type PendingMap = HashMap<u32, oneshot::Sender<Result<ResponseData, IpcError>>>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RequestTransportKind {
+    Inline,
+    Buddy,
+    Chunked,
+}
+
+pub(crate) fn choose_request_transport(
+    config: &ClientIpcConfig,
+    has_pool: bool,
+    data_len: usize,
+) -> RequestTransportKind {
+    let data_len = u64::try_from(data_len).unwrap_or(u64::MAX);
+    if has_pool && data_len > config.shm_threshold && data_len <= u64::from(u32::MAX) {
+        RequestTransportKind::Buddy
+    } else if data_len > config.chunk_size {
+        RequestTransportKind::Chunked
+    } else {
+        RequestTransportKind::Inline
+    }
+}
+
+fn checked_payload_len_usize(data_len: u64) -> Result<usize, IpcError> {
+    usize::try_from(data_len).map_err(|_| {
+        IpcError::Config(format!(
+            "payload size {data_len} exceeds this platform's addressable memory"
+        ))
+    })
+}
+
+pub(crate) fn request_chunk_count(data_len: usize, chunk_size: usize) -> Result<usize, IpcError> {
+    if chunk_size == 0 {
+        return Err(IpcError::Config("chunk_size must be > 0".to_string()));
+    }
+    if data_len == 0 {
+        return Ok(0);
+    }
+    let total_chunks = data_len.div_ceil(chunk_size);
+    if total_chunks > usize::from(u16::MAX) {
+        return Err(IpcError::Config(format!(
+            "request chunk count {total_chunks} exceeds wire limit {}",
+            u16::MAX
+        )));
+    }
+    Ok(total_chunks)
+}
+
+fn stream_error<E: Display>(err: E) -> IpcError {
+    IpcError::Io(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        format!("request body stream error: {err}"),
+    ))
+}
+
+async fn collect_exact_stream<S, B, E>(data_size: usize, chunks: S) -> Result<Vec<u8>, IpcError>
+where
+    S: Stream<Item = Result<B, E>>,
+    B: AsRef<[u8]>,
+    E: Display,
+{
+    let mut data = Vec::with_capacity(data_size);
+    futures_util::pin_mut!(chunks);
+    while let Some(next) = chunks.next().await {
+        let chunk = next.map_err(stream_error)?;
+        let bytes = chunk.as_ref();
+        if bytes.is_empty() {
+            continue;
+        }
+        let next_len = data.len().checked_add(bytes.len()).ok_or_else(|| {
+            IpcError::Config("request body size overflow while collecting stream".into())
+        })?;
+        if next_len > data_size {
+            return Err(IpcError::Config(format!(
+                "request body exceeded declared content length {data_size}"
+            )));
+        }
+        data.extend_from_slice(bytes);
+    }
+    if data.len() != data_size {
+        return Err(IpcError::Config(format!(
+            "request body ended at {} bytes, expected {data_size}",
+            data.len()
+        )));
+    }
+    Ok(data)
+}
 
 // ── IpcClient ────────────────────────────────────────────────────────────
 
@@ -317,6 +414,7 @@ static REASSEMBLY_POOL_GEN: AtomicU64 = AtomicU64::new(0);
 
 /// Monotonic counter so each IpcClient gets a unique conn_id.
 static CLIENT_CONN_COUNTER: AtomicU64 = AtomicU64::new(1);
+static CLIENT_OWN_POOL_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn socket_path_from_address(address: &str) -> (PathBuf, Option<String>) {
     match crate::control::socket_path_from_ipc_address(address) {
@@ -329,6 +427,49 @@ fn socket_path_from_address(address: &str) -> (PathBuf, Option<String>) {
 }
 
 impl IpcClient {
+    fn own_pool_from_config(config: &ClientIpcConfig) -> Option<Arc<StdMutex<MemPool>>> {
+        if !config.pool_enabled {
+            return None;
+        }
+        let pool_config = PoolConfig {
+            segment_size: config.pool_segment_size as usize,
+            max_segments: config.max_pool_segments as usize,
+            ..PoolConfig::default()
+        };
+        let counter = CLIENT_OWN_POOL_COUNTER.fetch_add(1, Ordering::Relaxed) as u32;
+        let prefix = format!("/cc3d{:08x}{:08x}", std::process::id(), counter);
+        Some(Arc::new(StdMutex::new(MemPool::new_with_prefix(
+            pool_config,
+            prefix,
+        ))))
+    }
+
+    fn from_parts(
+        address: &str,
+        pool: Option<Arc<StdMutex<MemPool>>>,
+        config: ClientIpcConfig,
+    ) -> Self {
+        let (socket_path, address_error) = socket_path_from_address(address);
+
+        Self {
+            socket_path,
+            address_error,
+            writer: Arc::new(Mutex::new(None)),
+            pending: Arc::new(StdMutex::new(HashMap::new())),
+            rid_counter: AtomicU32::new(1),
+            route_tables: HashMap::new(),
+            server_segments: Vec::new(),
+            server_identity: None,
+            server_pool: Arc::new(StdMutex::new(None)),
+            recv_handle: Arc::new(StdMutex::new(None)),
+            connected: Arc::new(AtomicBool::new(false)),
+            pool,
+            chunk_registry: Self::make_chunk_registry(&config),
+            conn_id: CLIENT_CONN_COUNTER.fetch_add(1, Ordering::Relaxed),
+            config,
+        }
+    }
+
     fn make_chunk_registry(config: &ClientIpcConfig) -> Arc<ChunkRegistry> {
         let seg_size = config.reassembly_segment_size as usize;
         let max_segs = config.reassembly_max_segments as usize;
@@ -351,25 +492,17 @@ impl IpcClient {
     /// The address should be like `ipc://name` — the socket path is
     /// derived as `/tmp/c_two_ipc/{name}.sock`.
     pub fn new(address: &str) -> Self {
-        let (socket_path, address_error) = socket_path_from_address(address);
+        Self::from_parts(address, None, ClientIpcConfig::default())
+    }
 
-        Self {
-            socket_path,
-            address_error,
-            writer: Arc::new(Mutex::new(None)),
-            pending: Arc::new(StdMutex::new(HashMap::new())),
-            rid_counter: AtomicU32::new(1),
-            route_tables: HashMap::new(),
-            server_segments: Vec::new(),
-            server_identity: None,
-            server_pool: Arc::new(StdMutex::new(None)),
-            recv_handle: Arc::new(StdMutex::new(None)),
-            connected: Arc::new(AtomicBool::new(false)),
-            pool: None,
-            config: ClientIpcConfig::default(),
-            chunk_registry: Self::make_chunk_registry(&ClientIpcConfig::default()),
-            conn_id: CLIENT_CONN_COUNTER.fetch_add(1, Ordering::Relaxed),
-        }
+    /// Create a new IPC client with a config-owned SHM pool when enabled.
+    ///
+    /// This keeps async callers such as the HTTP relay on the canonical
+    /// `IpcClient` API while still allowing large request streams to be written
+    /// directly into client SHM.
+    pub fn with_config(address: &str, config: ClientIpcConfig) -> Self {
+        let pool = Self::own_pool_from_config(&config);
+        Self::from_parts(address, pool, config)
     }
 
     /// Create a new IPC client with a buddy pool for SHM transfers.
@@ -377,25 +510,7 @@ impl IpcClient {
     /// The pool is used for outgoing buddy allocations when data exceeds
     /// `config.shm_threshold`.
     pub fn with_pool(address: &str, pool: Arc<StdMutex<MemPool>>, config: ClientIpcConfig) -> Self {
-        let (socket_path, address_error) = socket_path_from_address(address);
-
-        Self {
-            socket_path,
-            address_error,
-            writer: Arc::new(Mutex::new(None)),
-            pending: Arc::new(StdMutex::new(HashMap::new())),
-            rid_counter: AtomicU32::new(1),
-            route_tables: HashMap::new(),
-            server_segments: Vec::new(),
-            server_identity: None,
-            server_pool: Arc::new(StdMutex::new(None)),
-            recv_handle: Arc::new(StdMutex::new(None)),
-            connected: Arc::new(AtomicBool::new(false)),
-            pool: Some(pool),
-            chunk_registry: Self::make_chunk_registry(&config),
-            conn_id: CLIENT_CONN_COUNTER.fetch_add(1, Ordering::Relaxed),
-            config,
-        }
+        Self::from_parts(address, Some(pool), config)
     }
 
     /// Connect and perform handshake.
@@ -576,65 +691,125 @@ impl IpcClient {
             .map(|identity| identity.server_instance_id.as_str())
     }
 
-    /// Send a CRM call and wait for the response (inline path only).
+    fn method_idx_for(&self, route_name: &str, method_name: &str) -> Result<u16, IpcError> {
+        let table = self
+            .route_tables
+            .get(route_name)
+            .ok_or_else(|| IpcError::Handshake(format!("unknown route: {route_name}")))?;
+        table
+            .index_of(method_name)
+            .ok_or_else(|| IpcError::Handshake(format!("unknown method: {method_name}")))
+    }
+
+    fn ensure_route_payload_size(&self, route_name: &str, data_len: u64) -> Result<(), IpcError> {
+        let table = self
+            .route_tables
+            .get(route_name)
+            .ok_or_else(|| IpcError::Handshake(format!("unknown route: {route_name}")))?;
+        let max_payload_size = table.max_payload_size();
+        if data_len > max_payload_size {
+            return Err(IpcError::Config(format!(
+                "request payload size {data_len} exceeds route '{route_name}' max_payload_size {max_payload_size}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Send a CRM call and wait for the response.
     ///
-    /// This is the primary API for the relay: HTTP handler calls this
-    /// with the route name, method name, and serialized payload.
+    /// This is the canonical semantic call API for direct clients and the
+    /// relay. It selects buddy SHM, chunked, or inline transport from the
+    /// configured IPC policy.
     pub async fn call(
         &self,
         route_name: &str,
         method_name: &str,
         data: &[u8],
     ) -> Result<ResponseData, IpcError> {
-        let table = self
-            .route_tables
-            .get(route_name)
-            .ok_or_else(|| IpcError::Handshake(format!("unknown route: {route_name}")))?;
-        let method_idx = table
-            .index_of(method_name)
-            .ok_or_else(|| IpcError::Handshake(format!("unknown method: {method_name}")))?;
+        let method_idx = self.method_idx_for(route_name, method_name)?;
+        self.ensure_route_payload_size(route_name, u64::try_from(data.len()).unwrap_or(u64::MAX))?;
 
-        self.call_inline(route_name, method_idx, data).await
-    }
-
-    /// Send a CRM call with automatic transport path selection.
-    ///
-    /// Selects the optimal transport based on data size and pool availability:
-    /// - Buddy SHM for data above `config.shm_threshold` (when pool available)
-    /// - Chunked transfer for data above `config.chunk_size`
-    /// - Inline for small payloads
-    pub async fn call_full(
-        &self,
-        route_name: &str,
-        method_name: &str,
-        data: &[u8],
-    ) -> Result<ResponseData, IpcError> {
-        let table = self
-            .route_tables
-            .get(route_name)
-            .ok_or_else(|| IpcError::Handshake(format!("unknown route: {route_name}")))?;
-        let method_idx = table
-            .index_of(method_name)
-            .ok_or_else(|| IpcError::Handshake(format!("unknown method: {method_name}")))?;
-
-        // Try buddy SHM for large payloads when pool is available.
-        if self.pool.is_some() && data.len() > self.config.shm_threshold as usize {
-            match self.call_buddy(route_name, method_idx, data).await {
-                Ok(result) => return Ok(result),
-                Err(IpcError::Handshake(_)) => {
-                    // Pool alloc failed — fall through to chunked/inline.
+        match choose_request_transport(&self.config, self.pool.is_some(), data.len()) {
+            RequestTransportKind::Buddy => {
+                match self.call_buddy(route_name, method_idx, data).await {
+                    Ok(result) => return Ok(result),
+                    Err(IpcError::Handshake(_)) => {
+                        // Pool allocation or SHM setup failed. Fall back through the
+                        // non-SHM policy below rather than failing large relay calls
+                        // that can still use chunked transfer.
+                    }
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
+            }
+            RequestTransportKind::Chunked => {
+                return self.call_chunked(route_name, method_idx, data).await;
+            }
+            RequestTransportKind::Inline => {
+                return self.call_inline(route_name, method_idx, data).await;
             }
         }
 
-        // Use chunked transfer for data exceeding chunk size.
-        if data.len() > self.config.chunk_size as usize {
-            return self.call_chunked(route_name, method_idx, data).await;
+        match choose_request_transport(&self.config, false, data.len()) {
+            RequestTransportKind::Chunked => self.call_chunked(route_name, method_idx, data).await,
+            RequestTransportKind::Inline | RequestTransportKind::Buddy => {
+                self.call_inline(route_name, method_idx, data).await
+            }
+        }
+    }
+
+    /// Send a CRM call from a body stream with a known total payload size.
+    ///
+    /// This shares the same transport selector as [`IpcClient::call`] but does
+    /// not require the caller to materialize a large request body first. When a
+    /// client-side SHM pool is available the payload is copied directly into a
+    /// pre-allocated buddy/dedicated block as chunks arrive; otherwise the
+    /// chunked IPC path keeps only one IPC chunk-sized buffer in memory.
+    pub async fn call_sized_stream<S, B, E>(
+        &self,
+        route_name: &str,
+        method_name: &str,
+        data_len: u64,
+        chunks: S,
+    ) -> Result<ResponseData, IpcError>
+    where
+        S: Stream<Item = Result<B, E>>,
+        B: AsRef<[u8]>,
+        E: Display,
+    {
+        let method_idx = self.method_idx_for(route_name, method_name)?;
+        self.ensure_route_payload_size(route_name, data_len)?;
+        let data_len = checked_payload_len_usize(data_len)?;
+        if data_len == 0 {
+            return self.call_inline(route_name, method_idx, &[]).await;
         }
 
-        // Default: inline.
-        self.call_inline(route_name, method_idx, data).await
+        match choose_request_transport(&self.config, self.pool.is_some(), data_len) {
+            RequestTransportKind::Buddy => {
+                if let Some(alloc) = self.try_alloc_request_block(data_len)? {
+                    return self
+                        .call_buddy_stream(route_name, method_idx, alloc, data_len, chunks)
+                        .await;
+                }
+                match choose_request_transport(&self.config, false, data_len) {
+                    RequestTransportKind::Chunked => {
+                        self.call_chunked_stream(route_name, method_idx, data_len, chunks)
+                            .await
+                    }
+                    RequestTransportKind::Inline | RequestTransportKind::Buddy => {
+                        let data = collect_exact_stream(data_len, chunks).await?;
+                        self.call_inline(route_name, method_idx, &data).await
+                    }
+                }
+            }
+            RequestTransportKind::Chunked => {
+                self.call_chunked_stream(route_name, method_idx, data_len, chunks)
+                    .await
+            }
+            RequestTransportKind::Inline => {
+                let data = collect_exact_stream(data_len, chunks).await?;
+                self.call_inline(route_name, method_idx, &data).await
+            }
+        }
     }
 
     /// Inline call path — sends call control + data in a single frame.
@@ -714,6 +889,13 @@ impl IpcClient {
         method_idx: u16,
         data: &[u8],
     ) -> Result<ResponseData, IpcError> {
+        if data.len() > u32::MAX as usize {
+            return Err(IpcError::Config(format!(
+                "buddy request payload size {} exceeds wire limit {}",
+                data.len(),
+                u32::MAX
+            )));
+        }
         let pool_arc = self.pool.as_ref().unwrap();
 
         // Allocate and write data to SHM.
@@ -802,6 +984,99 @@ impl IpcClient {
         }
     }
 
+    fn try_alloc_request_block(
+        &self,
+        data_size: usize,
+    ) -> Result<Option<PoolAllocation>, IpcError> {
+        if data_size > u32::MAX as usize {
+            return Ok(None);
+        }
+        let Some(pool_arc) = self.pool.as_ref() else {
+            return Ok(None);
+        };
+        let alloc = pool_arc.lock().alloc(data_size).ok();
+        Ok(alloc)
+    }
+
+    fn free_request_block(&self, alloc: &PoolAllocation) {
+        if let Some(pool_arc) = self.pool.as_ref() {
+            let mut pool = pool_arc.lock();
+            let _ = pool.free(alloc);
+        }
+    }
+
+    async fn call_buddy_stream<S, B, E>(
+        &self,
+        route_name: &str,
+        method_idx: u16,
+        alloc: PoolAllocation,
+        data_size: usize,
+        chunks: S,
+    ) -> Result<ResponseData, IpcError>
+    where
+        S: Stream<Item = Result<B, E>>,
+        B: AsRef<[u8]>,
+        E: Display,
+    {
+        let Some(pool_arc) = self.pool.as_ref() else {
+            self.free_request_block(&alloc);
+            return Err(IpcError::Pool("no client pool".into()));
+        };
+
+        let mut written = 0usize;
+        futures_util::pin_mut!(chunks);
+        while let Some(next) = chunks.next().await {
+            let chunk = match next {
+                Ok(chunk) => chunk,
+                Err(err) => {
+                    self.free_request_block(&alloc);
+                    return Err(stream_error(err));
+                }
+            };
+            let data = chunk.as_ref();
+            if data.is_empty() {
+                continue;
+            }
+            let Some(next_written) = written.checked_add(data.len()) else {
+                self.free_request_block(&alloc);
+                return Err(IpcError::Config(
+                    "request body size overflow while streaming to SHM".into(),
+                ));
+            };
+            if next_written > data_size {
+                self.free_request_block(&alloc);
+                return Err(IpcError::Config(format!(
+                    "request body exceeded declared content length {data_size}"
+                )));
+            }
+            {
+                let pool = pool_arc.lock();
+                let ptr = match pool.data_ptr(&alloc) {
+                    Ok(ptr) => ptr,
+                    Err(err) => {
+                        drop(pool);
+                        self.free_request_block(&alloc);
+                        return Err(IpcError::Handshake(format!("buddy data_ptr failed: {err}")));
+                    }
+                };
+                unsafe {
+                    std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.add(written), data.len());
+                }
+            }
+            written = next_written;
+        }
+
+        if written != data_size {
+            self.free_request_block(&alloc);
+            return Err(IpcError::Config(format!(
+                "request body ended at {written} bytes, expected {data_size}"
+            )));
+        }
+
+        self.call_with_prealloc(route_name, method_idx, &alloc, data_size)
+            .await
+    }
+
     /// Buddy SHM call path with pre-allocated data — sends buddy frame for
     /// data that was already written to the client's SHM pool.
     ///
@@ -814,6 +1089,13 @@ impl IpcClient {
         alloc: &PoolAllocation,
         data_size: usize,
     ) -> Result<ResponseData, IpcError> {
+        if data_size > u32::MAX as usize {
+            self.free_prealloc(alloc);
+            return Err(IpcError::Config(format!(
+                "buddy request payload size {data_size} exceeds wire limit {}",
+                u32::MAX
+            )));
+        }
         // Build buddy payload from pre-allocated coordinates.
         let bp = BuddyPayload {
             seg_idx: alloc.seg_idx as u16,
@@ -824,7 +1106,13 @@ impl IpcClient {
         let buddy_bytes = encode_buddy_payload(&bp);
 
         // Build call control.
-        let ctrl = encode_call_control(route_name, method_idx)?;
+        let ctrl = match encode_call_control(route_name, method_idx) {
+            Ok(ctrl) => ctrl,
+            Err(err) => {
+                self.free_prealloc(alloc);
+                return Err(err.into());
+            }
+        };
 
         // Assemble frame payload: [11B buddy][call_control]
         let payload_len = buddy_bytes.len() + ctrl.len();
@@ -855,10 +1143,7 @@ impl IpcClient {
         if let Err(e) = send_result {
             // Send failed — server never saw the allocation. Free it.
             // This matches call_buddy() behavior.
-            if let Some(ref pool_arc) = self.pool {
-                let mut pool = pool_arc.lock();
-                let _ = pool.free(alloc);
-            }
+            self.free_prealloc(alloc);
             self.pending.lock().remove(&rid);
             return Err(e);
         }
@@ -870,14 +1155,18 @@ impl IpcClient {
         match rx.await {
             Ok(result) => {
                 if alloc.is_dedicated {
-                    if let Some(ref pool_arc) = self.pool {
-                        let mut pool = pool_arc.lock();
-                        let _ = pool.free(alloc);
-                    }
+                    self.free_prealloc(alloc);
                 }
                 result
             }
             Err(_) => Err(IpcError::Closed),
+        }
+    }
+
+    pub(crate) fn free_prealloc(&self, alloc: &PoolAllocation) {
+        if let Some(ref pool_arc) = self.pool {
+            let mut pool = pool_arc.lock();
+            let _ = pool.free(alloc);
         }
     }
 
@@ -889,7 +1178,7 @@ impl IpcClient {
         data: &[u8],
     ) -> Result<ResponseData, IpcError> {
         let chunk_size = self.config.chunk_size as usize;
-        let total_chunks = (data.len() + chunk_size - 1) / chunk_size;
+        let total_chunks = request_chunk_count(data.len(), chunk_size)?;
 
         let rid = self.rid_counter.fetch_add(1, Ordering::Relaxed);
 
@@ -946,6 +1235,196 @@ impl IpcClient {
             Ok(result) => result,
             Err(_) => Err(IpcError::Closed),
         }
+    }
+
+    async fn call_chunked_stream<S, B, E>(
+        &self,
+        route_name: &str,
+        method_idx: u16,
+        data_size: usize,
+        chunks: S,
+    ) -> Result<ResponseData, IpcError>
+    where
+        S: Stream<Item = Result<B, E>>,
+        B: AsRef<[u8]>,
+        E: Display,
+    {
+        let chunk_size = self.config.chunk_size as usize;
+        let total_chunks = request_chunk_count(data_size, chunk_size)?;
+        if total_chunks == 0 {
+            return self.call_inline(route_name, method_idx, &[]).await;
+        }
+
+        let rid = self.rid_counter.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        {
+            self.pending.lock().insert(rid, tx);
+        }
+
+        let ctrl = encode_call_control(route_name, method_idx)?;
+        let send_result = self
+            .send_chunked_stream_frames(rid, total_chunks, chunk_size, data_size, &ctrl, chunks)
+            .await;
+        if let Err(err) = send_result {
+            self.pending.lock().remove(&rid);
+            return Err(err);
+        }
+
+        match rx.await {
+            Ok(result) => result,
+            Err(_) => Err(IpcError::Closed),
+        }
+    }
+
+    async fn send_chunked_stream_frames<S, B, E>(
+        &self,
+        rid: u32,
+        total_chunks: usize,
+        chunk_size: usize,
+        data_size: usize,
+        ctrl: &[u8],
+        chunks: S,
+    ) -> Result<(), IpcError>
+    where
+        S: Stream<Item = Result<B, E>>,
+        B: AsRef<[u8]>,
+        E: Display,
+    {
+        let mut written = 0usize;
+        let mut chunk_idx = 0usize;
+        let mut sent_or_attempted = false;
+        let mut pending_chunk = Vec::with_capacity(chunk_size.min(data_size));
+        futures_util::pin_mut!(chunks);
+
+        while let Some(next) = chunks.next().await {
+            let chunk = match next {
+                Ok(chunk) => chunk,
+                Err(err) => {
+                    if sent_or_attempted {
+                        self.close_shared().await;
+                    }
+                    return Err(stream_error(err));
+                }
+            };
+            let mut data = chunk.as_ref();
+            if data.is_empty() {
+                continue;
+            }
+            let Some(next_written) = written.checked_add(data.len()) else {
+                if sent_or_attempted {
+                    self.close_shared().await;
+                }
+                return Err(IpcError::Config(
+                    "request body size overflow while streaming chunks".into(),
+                ));
+            };
+            if next_written > data_size {
+                if sent_or_attempted {
+                    self.close_shared().await;
+                }
+                return Err(IpcError::Config(format!(
+                    "request body exceeded declared content length {data_size}"
+                )));
+            }
+
+            while !data.is_empty() {
+                let remaining = chunk_size - pending_chunk.len();
+                let take = remaining.min(data.len());
+                pending_chunk.extend_from_slice(&data[..take]);
+                data = &data[take..];
+
+                if pending_chunk.len() == chunk_size {
+                    let is_last = chunk_idx + 1 == total_chunks;
+                    sent_or_attempted = true;
+                    if let Err(err) = self
+                        .write_chunk_frame(
+                            rid,
+                            chunk_idx,
+                            total_chunks,
+                            if chunk_idx == 0 { Some(ctrl) } else { None },
+                            &pending_chunk,
+                            is_last,
+                        )
+                        .await
+                    {
+                        self.close_shared().await;
+                        return Err(err);
+                    }
+                    pending_chunk.clear();
+                    chunk_idx += 1;
+                }
+            }
+
+            written = next_written;
+        }
+
+        if written != data_size {
+            if sent_or_attempted {
+                self.close_shared().await;
+            }
+            return Err(IpcError::Config(format!(
+                "request body ended at {written} bytes, expected {data_size}"
+            )));
+        }
+
+        if !pending_chunk.is_empty() {
+            let is_last = chunk_idx + 1 == total_chunks;
+            sent_or_attempted = true;
+            if let Err(err) = self
+                .write_chunk_frame(
+                    rid,
+                    chunk_idx,
+                    total_chunks,
+                    if chunk_idx == 0 { Some(ctrl) } else { None },
+                    &pending_chunk,
+                    is_last,
+                )
+                .await
+            {
+                self.close_shared().await;
+                return Err(err);
+            }
+            chunk_idx += 1;
+        }
+
+        if chunk_idx != total_chunks {
+            if sent_or_attempted {
+                self.close_shared().await;
+            }
+            return Err(IpcError::Config(format!(
+                "request stream emitted {chunk_idx} chunks, expected {total_chunks}"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn write_chunk_frame(
+        &self,
+        rid: u32,
+        chunk_idx: usize,
+        total_chunks: usize,
+        ctrl: Option<&[u8]>,
+        chunk_data: &[u8],
+        is_last: bool,
+    ) -> Result<(), IpcError> {
+        let mut frame_flags = flags::FLAG_CALL_V2 | flags::FLAG_CHUNKED;
+        if is_last {
+            frame_flags |= flags::FLAG_CHUNK_LAST;
+        }
+        let chunk_hdr = encode_chunk_header(chunk_idx as u16, total_chunks as u16);
+        let payload_len = chunk_hdr.len() + ctrl.map_or(0, <[u8]>::len) + chunk_data.len();
+        let mut payload = Vec::with_capacity(payload_len);
+        payload.extend_from_slice(&chunk_hdr);
+        if let Some(ctrl) = ctrl {
+            payload.extend_from_slice(ctrl);
+        }
+        payload.extend_from_slice(chunk_data);
+
+        let frame_bytes = frame::encode_frame(rid as u64, frame_flags, &payload);
+        let mut writer_guard = self.writer.lock().await;
+        let writer = writer_guard.as_mut().ok_or(IpcError::Closed)?;
+        writer.write_all(&frame_bytes).await?;
+        Ok(())
     }
 
     /// Get the method table for a route.
@@ -1007,6 +1486,13 @@ impl IpcClient {
             })
     }
 
+    /// Maximum logical payload size advertised by a route, if present.
+    pub fn route_max_payload_size(&self, route_name: &str) -> Option<u64> {
+        self.route_tables
+            .get(route_name)
+            .map(MethodTable::max_payload_size)
+    }
+
     pub async fn pending_route_contract(
         &mut self,
         route_name: &str,
@@ -1065,6 +1551,7 @@ impl IpcClient {
                         contract.crm_ver.clone(),
                         contract.abi_hash.clone(),
                         contract.signature_hash.clone(),
+                        contract.max_payload_size,
                     ),
                 );
                 Ok(c2_contract::ExpectedRouteContract {
@@ -1404,6 +1891,7 @@ mod tests {
                 crm_ver: "0.1.0".to_string(),
                 abi_hash: ABI_HASH.to_string(),
                 signature_hash: SIG_HASH.to_string(),
+                max_payload_size: 1024,
                 name_to_idx: methods,
             },
         );
@@ -1440,6 +1928,103 @@ mod tests {
             err.to_string().contains("signature_hash"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn client_rejects_request_over_route_payload_limit_before_transport() {
+        const ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        const SIG_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let mut client = IpcClient::new("ipc://payload_limit");
+        let mut methods = HashMap::new();
+        methods.insert("ping".to_string(), 0);
+        client.route_tables.insert(
+            "grid".to_string(),
+            MethodTable {
+                crm_ns: "test.grid".to_string(),
+                crm_name: "Grid".to_string(),
+                crm_ver: "0.1.0".to_string(),
+                abi_hash: ABI_HASH.to_string(),
+                signature_hash: SIG_HASH.to_string(),
+                max_payload_size: 4,
+                name_to_idx: methods,
+            },
+        );
+
+        let err = client
+            .call("grid", "ping", b"12345")
+            .await
+            .expect_err("oversized direct call should be rejected before writer access");
+        assert!(
+            matches!(err, IpcError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        assert!(err.to_string().contains("max_payload_size"));
+
+        let stream = futures_util::stream::once(async {
+            panic!("oversized sized stream should not be polled");
+            #[allow(unreachable_code)]
+            Ok::<&'static [u8], std::io::Error>(b"12345")
+        });
+        let err = client
+            .call_sized_stream("grid", "ping", 5, stream)
+            .await
+            .expect_err("oversized streaming call should be rejected before body polling");
+        assert!(
+            matches!(err, IpcError::Config(_)),
+            "unexpected error: {err:?}"
+        );
+        assert!(err.to_string().contains("max_payload_size"));
+    }
+
+    #[tokio::test]
+    async fn sized_stream_releases_preallocated_pool_on_length_mismatch() {
+        const ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        const SIG_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let cfg = ClientIpcConfig {
+            shm_threshold: 10,
+            base: c2_config::BaseIpcConfig {
+                pool_segment_size: 65_536,
+                max_pool_segments: 1,
+                ..c2_config::BaseIpcConfig::default()
+            },
+        };
+        let mut client = IpcClient::with_config("ipc://stream_length_mismatch", cfg);
+        let mut methods = HashMap::new();
+        methods.insert("ping".to_string(), 0);
+        client.route_tables.insert(
+            "grid".to_string(),
+            MethodTable {
+                crm_ns: "test.grid".to_string(),
+                crm_name: "Grid".to_string(),
+                crm_ver: "0.1.0".to_string(),
+                abi_hash: ABI_HASH.to_string(),
+                signature_hash: SIG_HASH.to_string(),
+                max_payload_size: 1024,
+                name_to_idx: methods,
+            },
+        );
+
+        let short_stream =
+            futures_util::stream::iter(vec![Ok::<Vec<u8>, std::io::Error>(vec![1; 100])]);
+        let err = client
+            .call_sized_stream("grid", "ping", 200, short_stream)
+            .await
+            .expect_err("short stream should fail before sending a frame");
+        assert!(err.to_string().contains("expected 200"));
+
+        let pool = client.pool.as_ref().expect("pool should be enabled");
+        assert_eq!(pool.lock().stats().alloc_count, 0);
+
+        let long_stream = futures_util::stream::iter(vec![
+            Ok::<Vec<u8>, std::io::Error>(vec![1; 150]),
+            Ok::<Vec<u8>, std::io::Error>(vec![2; 51]),
+        ]);
+        let err = client
+            .call_sized_stream("grid", "ping", 200, long_stream)
+            .await
+            .expect_err("long stream should fail before sending a frame");
+        assert!(err.to_string().contains("exceeded declared content length"));
+        assert_eq!(pool.lock().stats().alloc_count, 0);
     }
 
     #[tokio::test]

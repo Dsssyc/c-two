@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use c2_config::RelayConfig;
-use c2_ipc::IpcClient;
+use c2_ipc::{ClientIpcConfig, IpcClient};
 use parking_lot::RwLock;
 use parking_lot::RwLockWriteGuard;
 
@@ -104,6 +104,7 @@ impl RelayState {
         crm_ver: String,
         abi_hash: String,
         signature_hash: String,
+        max_payload_size: u64,
         client: Arc<IpcClient>,
         replacement: Option<OwnerReplacement>,
     ) -> RegisterCommitResult {
@@ -117,6 +118,7 @@ impl RelayState {
             crm_ver,
             abi_hash,
             signature_hash,
+            max_payload_size,
             client,
             replacement,
         }) {
@@ -255,7 +257,8 @@ impl RelayState {
                             expected.ipc_address
                         )));
                     }
-                    let mut client = IpcClient::new(&address);
+                    let mut client =
+                        IpcClient::with_config(&address, ClientIpcConfig::default());
                     client.connect().await?;
                     if client.server_id() != expected.server_id.as_deref()
                         || client.server_instance_id() != expected.server_instance_id.as_deref()
@@ -581,6 +584,7 @@ mod tests {
             crm_ver.to_string(),
             abi_hash.to_string(),
             signature_hash.to_string(),
+            1024,
             client,
             None,
         ) {
@@ -708,6 +712,7 @@ mod tests {
             "0.1.0".into(),
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
+            1024,
             client,
             None,
         );
@@ -733,6 +738,7 @@ mod tests {
             "0.1.0".into(),
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
+            1024,
             client,
             None,
         );
@@ -809,6 +815,7 @@ mod tests {
                 crm_ver: "0.1.0".into(),
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
+                max_payload_size: 1024,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -843,6 +850,7 @@ mod tests {
                 crm_ver: "0.1.0".into(),
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
+                max_payload_size: 1024,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -906,6 +914,7 @@ mod tests {
                 crm_ver: TEST_CRM_VER.to_string(),
                 abi_hash: TEST_ABI_HASH.to_string(),
                 signature_hash: TEST_SIGNATURE_HASH.to_string(),
+                max_payload_size: 1024,
                 locality: Locality::Local,
                 registered_at: 1000.0,
             });
@@ -949,6 +958,7 @@ mod tests {
             TEST_CRM_VER.to_string(),
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
+            1024,
             first,
             None,
         );
@@ -967,6 +977,7 @@ mod tests {
             TEST_CRM_VER.to_string(),
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
+            1024,
             second,
             None,
         );
@@ -1000,6 +1011,7 @@ mod tests {
             TEST_CRM_VER.to_string(),
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
+            1024,
             racer,
             None,
         );
@@ -1020,6 +1032,7 @@ mod tests {
             TEST_CRM_VER.to_string(),
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
+            1024,
             candidate,
             None,
         );
@@ -1068,6 +1081,7 @@ mod tests {
             TEST_CRM_VER.to_string(),
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
+            1024,
             replacement,
             Some(replacement_proof),
         );
@@ -1118,6 +1132,7 @@ mod tests {
             TEST_CRM_VER.to_string(),
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
+            1024,
             stale_replacement,
             Some(replacement_proof),
         );
@@ -1171,6 +1186,7 @@ mod tests {
             TEST_CRM_VER.to_string(),
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
+            1024,
             same_owner,
             None,
         );
@@ -1191,6 +1207,7 @@ mod tests {
             TEST_CRM_VER.to_string(),
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
+            1024,
             replacement,
             Some(replacement_proof),
         );
@@ -1243,6 +1260,7 @@ mod tests {
             TEST_CRM_VER.to_string(),
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
+            1024,
             replacement,
             Some(replacement_proof),
         );
@@ -1327,6 +1345,7 @@ mod tests {
             crm_ver: "0.1.0".into(),
             abi_hash: TEST_ABI_HASH.into(),
             signature_hash: TEST_SIGNATURE_HASH.into(),
+            max_payload_size: 1024,
             locality: Locality::Local,
             registered_at: 0.0,
         };
@@ -1376,6 +1395,7 @@ mod tests {
             TEST_CRM_VER.to_string(),
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
+            1024,
             replacement,
             Some(replacement_proof),
         );
@@ -1424,6 +1444,7 @@ mod tests {
             TEST_CRM_VER.to_string(),
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
+            1024,
             ignored,
             None,
         );
@@ -1454,6 +1475,7 @@ mod tests {
             "0.1.0".into(),
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
+            1024,
             changed,
             None,
         );
@@ -1505,6 +1527,7 @@ mod tests {
             TEST_CRM_VER.to_string(),
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
+            1024,
             replacement,
             None,
         );
@@ -1540,6 +1563,7 @@ mod tests {
             TEST_CRM_VER.to_string(),
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
+            1024,
             moved,
             None,
         );
@@ -1603,6 +1627,7 @@ mod tests {
             TEST_CRM_VER.to_string(),
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
+            1024,
             replacement,
             None,
         );

@@ -24,6 +24,7 @@ pub struct RouteEntry {
     pub crm_ver: String,
     pub abi_hash: String,
     pub signature_hash: String,
+    pub max_payload_size: u64,
     pub locality: Locality,
     pub registered_at: f64,
 }
@@ -56,6 +57,7 @@ pub struct RouteInfo {
     pub crm_ver: String,
     pub abi_hash: String,
     pub signature_hash: String,
+    pub max_payload_size: u64,
 }
 
 impl RouteEntry {
@@ -85,6 +87,7 @@ impl RouteEntry {
             crm_ver: self.crm_ver.clone(),
             abi_hash: self.abi_hash.clone(),
             signature_hash: self.signature_hash.clone(),
+            max_payload_size: self.max_payload_size,
         }
     }
 }
@@ -100,6 +103,7 @@ pub(crate) fn local_route_matches(entry: &RouteEntry, expected: &RouteEntry) -> 
         && entry.crm_ver == expected.crm_ver
         && entry.abi_hash == expected.abi_hash
         && entry.signature_hash == expected.signature_hash
+        && entry.max_payload_size == expected.max_payload_size
         && entry.locality == Locality::Local
         && expected.locality == Locality::Local
 }
@@ -166,6 +170,7 @@ pub struct FullSyncRoute {
     pub crm_ver: String,
     pub abi_hash: String,
     pub signature_hash: String,
+    pub max_payload_size: u64,
     pub registered_at: f64,
     pub hash: RouteDigestHash,
 }
@@ -221,6 +226,7 @@ impl FullSyncRoute {
             crm_ver: entry.crm_ver.clone(),
             abi_hash: entry.abi_hash.clone(),
             signature_hash: entry.signature_hash.clone(),
+            max_payload_size: entry.max_payload_size,
             registered_at: entry.registered_at,
             hash: route_entry_digest_hash(entry),
         }
@@ -239,6 +245,7 @@ impl FullSyncRoute {
             crm_ver: self.crm_ver.clone(),
             abi_hash: self.abi_hash.clone(),
             signature_hash: self.signature_hash.clone(),
+            max_payload_size: self.max_payload_size,
             locality: Locality::Peer,
             registered_at: self.registered_at,
         }
@@ -350,6 +357,7 @@ fn valid_full_sync_route(route: &FullSyncRoute) -> bool {
         && crate::relay::route_table::valid_crm_tag(&route.crm_ns, &route.crm_name, &route.crm_ver)
         && c2_contract::validate_contract_hash("abi_hash", &route.abi_hash).is_ok()
         && c2_contract::validate_contract_hash("signature_hash", &route.signature_hash).is_ok()
+        && route.max_payload_size > 0
         && route.registered_at.is_finite()
         && valid_route_digest_hash(&route.hash)
 }
@@ -382,6 +390,7 @@ pub(crate) fn route_entry_digest_hash(entry: &RouteEntry) -> RouteDigestHash {
         &entry.crm_ver,
         &entry.abi_hash,
         &entry.signature_hash,
+        entry.max_payload_size,
         entry.registered_at,
     )
 }
@@ -400,6 +409,7 @@ pub(crate) fn active_route_digest_hash(
     crm_ver: &str,
     abi_hash: &str,
     signature_hash: &str,
+    max_payload_size: u64,
     registered_at: f64,
 ) -> RouteDigestHash {
     stable_route_digest_hash(&[
@@ -412,6 +422,7 @@ pub(crate) fn active_route_digest_hash(
         crm_ver,
         abi_hash,
         signature_hash,
+        &max_payload_size.to_string(),
         &registered_at.to_bits().to_string(),
     ])
 }
@@ -457,6 +468,7 @@ mod tests {
             crm_ver: "0.1.0".to_string(),
             abi_hash: ABI_HASH.to_string(),
             signature_hash: SIGNATURE_HASH.to_string(),
+            max_payload_size: 1024,
             locality: Locality::Local,
             registered_at: 1000.0,
         }

@@ -21,6 +21,7 @@ pub struct PendingRouteAttestation {
     pub abi_hash: String,
     pub signature_hash: String,
     pub method_names: Vec<String>,
+    pub max_payload_size: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +125,9 @@ fn validate_attested_contract(contract: &PendingRouteAttestation) -> Result<(), 
         signature_hash: contract.signature_hash.clone(),
     };
     c2_contract::validate_expected_route_contract(&expected).map_err(|err| err.to_string())?;
+    if contract.max_payload_size == 0 {
+        return Err("max_payload_size must be > 0".to_string());
+    }
     if contract.method_names.len() > crate::handshake::MAX_METHODS {
         return Err(format!(
             "method count is too large: {} > {}",
@@ -155,6 +159,7 @@ mod tests {
             signature_hash: "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
                 .to_string(),
             method_names: vec!["ping".to_string()],
+            max_payload_size: 1024,
         }
     }
 
@@ -210,7 +215,8 @@ mod tests {
             "\"crm_ver\":\"0.1.0\",",
             "\"abi_hash\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",",
             "\"signature_hash\":\"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210\",",
-            "\"method_names\":[\"ping\"]",
+            "\"method_names\":[\"ping\"],",
+            "\"max_payload_size\":1024",
             "}}",
         )
         .as_bytes()

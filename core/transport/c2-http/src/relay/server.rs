@@ -24,7 +24,7 @@ use crate::relay::router;
 use crate::relay::state::{RegisterCommitResult, RelayState, UnregisterResult};
 use crate::relay::url::peer_endpoint_url;
 use c2_config::RelayConfig;
-use c2_ipc::IpcClient;
+use c2_ipc::{ClientIpcConfig, IpcClient};
 
 /// Errors from the relay control API.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -444,7 +444,8 @@ impl RelayServer {
                         }
                     };
                     let result = {
-                        let mut client = IpcClient::new(&address);
+                        let mut client =
+                            IpcClient::with_config(&address, ClientIpcConfig::default());
                         match client.connect().await {
                             Ok(()) => {
                                 let server_identity_matches =
@@ -545,6 +546,7 @@ impl RelayServer {
                                     contract.crm_ver,
                                     contract.abi_hash,
                                     contract.signature_hash,
+                                    contract.max_payload_size,
                                     client.clone(),
                                     replacement,
                                 ) {
@@ -1021,6 +1023,7 @@ mod tests {
             "0.1.0".into(),
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
+            1024,
             original_client,
             None,
         ) {

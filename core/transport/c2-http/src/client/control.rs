@@ -59,6 +59,7 @@ struct RegisterRequest<'a> {
     crm_ver: &'a str,
     abi_hash: &'a str,
     signature_hash: &'a str,
+    max_payload_size: u64,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -83,6 +84,7 @@ pub struct RelayRouteInfo {
     pub crm_ver: String,
     pub abi_hash: String,
     pub signature_hash: String,
+    pub max_payload_size: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +152,7 @@ impl RelayControlClient {
         crm_ver: &str,
         abi_hash: &str,
         signature_hash: &str,
+        max_payload_size: u64,
     ) -> Result<(), HttpError> {
         let request = RegisterRequest {
             name,
@@ -163,6 +166,7 @@ impl RelayControlClient {
             crm_ver,
             abi_hash,
             signature_hash,
+            max_payload_size,
         };
         runtime().handle().block_on(self.post_json_with_retry(
             "/_register",
@@ -184,6 +188,7 @@ impl RelayControlClient {
         crm_ver: &str,
         abi_hash: &str,
         signature_hash: &str,
+        max_payload_size: u64,
         registration_token: &str,
     ) -> Result<(), HttpError> {
         let request = RegisterRequest {
@@ -198,6 +203,7 @@ impl RelayControlClient {
             crm_ver,
             abi_hash,
             signature_hash,
+            max_payload_size,
         };
         runtime()
             .handle()
@@ -454,6 +460,7 @@ mod tests {
                         .into(),
                     signature_hash:
                         "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".into(),
+                    max_payload_size: 1024,
                 }],
                 inserted_at: Instant::now(),
             },

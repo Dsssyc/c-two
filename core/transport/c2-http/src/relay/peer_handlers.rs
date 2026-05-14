@@ -85,6 +85,7 @@ pub async fn handle_peer_announce(
             crm_ver,
             abi_hash,
             signature_hash,
+            max_payload_size,
             registered_at,
         } => {
             // Peer wire data never carries owner-private fields; keep peer
@@ -103,6 +104,7 @@ pub async fn handle_peer_announce(
                     crm_ver,
                     abi_hash,
                     signature_hash,
+                    max_payload_size,
                     locality: Locality::Peer,
                     registered_at,
                 },
@@ -434,6 +436,7 @@ mod tests {
             crm_ver: "0.1.0".into(),
             abi_hash: TEST_ABI_HASH.into(),
             signature_hash: TEST_SIGNATURE_HASH.into(),
+            max_payload_size: 1024,
             registered_at: 1000.0,
             hash: String::new(),
         };
@@ -486,6 +489,7 @@ mod tests {
                 crm_ver: "0.1.0".into(),
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
+                max_payload_size: 1024,
                 registered_at: 1000.0,
             },
         );
@@ -513,6 +517,7 @@ mod tests {
                 crm_ver: "0.1.0".into(),
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
+                max_payload_size: 1024,
                 registered_at: 1000.0,
             },
         );
@@ -541,6 +546,7 @@ mod tests {
                 crm_ver: "0.1.0".into(),
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
+                max_payload_size: 1024,
                 registered_at: 1000.0,
             },
         );
@@ -581,6 +587,7 @@ mod tests {
                     crm_ver: crm_ver.into(),
                     abi_hash: TEST_ABI_HASH.into(),
                     signature_hash: TEST_SIGNATURE_HASH.into(),
+                    max_payload_size: 1024,
                     registered_at: 1000.0,
                 },
             );
@@ -612,6 +619,7 @@ mod tests {
                 crm_ver: "0.1.0".into(),
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
+                max_payload_size: 1024,
                 registered_at: 1000.0,
             },
         );
@@ -641,6 +649,7 @@ mod tests {
                 crm_ver: "0.1.0".into(),
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
+                max_payload_size: 1024,
                 registered_at: 1000.0,
             },
         );
@@ -700,6 +709,7 @@ mod tests {
                 crm_ver: "0.1.0".into(),
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
+                max_payload_size: 1024,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -795,6 +805,7 @@ mod tests {
                 crm_ver: "0.1.0".into(),
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
+                max_payload_size: 1024,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -834,6 +845,7 @@ mod tests {
                 crm_ver: "0.1.0".into(),
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
+                max_payload_size: 1024,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -900,6 +912,7 @@ mod tests {
                 crm_ver: "0.1.0".into(),
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
+                max_payload_size: 1024,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -938,6 +951,7 @@ mod tests {
                 crm_ver: "0.1.0".into(),
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
+                max_payload_size: 1024,
                 locality: Locality::Local,
                 registered_at: 1000.0,
             });
@@ -1052,6 +1066,7 @@ mod tests {
                     crm_ver: "0.1.0".into(),
                     abi_hash: TEST_ABI_HASH.into(),
                     signature_hash: TEST_SIGNATURE_HASH.into(),
+                    max_payload_size: 1024,
                     registered_at: 1000.0,
                     hash: test_hash(),
                 }],
@@ -1135,6 +1150,7 @@ mod tests {
                 crm_ver: "0.1.0".into(),
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
+                max_payload_size: 1024,
                 locality: Locality::Local,
                 registered_at: 1000.0,
             });
@@ -1153,6 +1169,7 @@ mod tests {
                 crm_ver: "0.1.0".into(),
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
+                max_payload_size: 1024,
                 locality: Locality::Peer,
                 registered_at: 1001.0,
             },
@@ -1261,6 +1278,7 @@ mod tests {
                 crm_ver: "0.1.0".into(),
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
+                max_payload_size: 1024,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -1297,6 +1315,7 @@ mod tests {
                 crm_ver: "0.1.0".into(),
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
+                max_payload_size: 1024,
                 locality: Locality::Local,
                 registered_at: 1000.0,
             });
@@ -1330,6 +1349,7 @@ mod tests {
                 crm_ver: "0.1.0".into(),
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
+                max_payload_size: 1024,
                 locality: Locality::Local,
                 registered_at: 1000.0,
             });

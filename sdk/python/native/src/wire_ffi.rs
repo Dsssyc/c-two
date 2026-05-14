@@ -57,13 +57,15 @@ pub struct PyRouteInfo {
     #[pyo3(get)]
     signature_hash: String,
     #[pyo3(get)]
+    max_payload_size: u64,
+    #[pyo3(get)]
     methods: Vec<Py<PyMethodEntry>>,
 }
 
 #[pymethods]
 impl PyRouteInfo {
     #[new]
-    #[pyo3(signature = (name, methods, crm_ns, crm_name, crm_ver, abi_hash, signature_hash))]
+    #[pyo3(signature = (name, methods, crm_ns, crm_name, crm_ver, abi_hash, signature_hash, max_payload_size))]
     fn new(
         name: String,
         methods: Vec<Py<PyMethodEntry>>,
@@ -72,6 +74,7 @@ impl PyRouteInfo {
         crm_ver: &str,
         abi_hash: &str,
         signature_hash: &str,
+        max_payload_size: u64,
     ) -> PyResult<Self> {
         c2_contract::validate_crm_tag(crm_ns, crm_name, crm_ver)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
@@ -79,6 +82,9 @@ impl PyRouteInfo {
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         c2_contract::validate_contract_hash("signature_hash", signature_hash)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        if max_payload_size == 0 {
+            return Err(PyValueError::new_err("max_payload_size must be > 0"));
+        }
 
         Ok(Self {
             name,
@@ -87,6 +93,7 @@ impl PyRouteInfo {
             crm_ver: crm_ver.to_string(),
             abi_hash: abi_hash.to_string(),
             signature_hash: signature_hash.to_string(),
+            max_payload_size,
             methods,
         })
     }
@@ -117,13 +124,14 @@ impl PyRouteInfo {
 
     fn __repr__(&self) -> String {
         format!(
-            "RouteInfo(name='{}', crm_ns='{}', crm_name='{}', crm_ver='{}', abi_hash='{}', signature_hash='{}', methods=[{}])",
+            "RouteInfo(name='{}', crm_ns='{}', crm_name='{}', crm_ver='{}', abi_hash='{}', signature_hash='{}', max_payload_size={}, methods=[{}])",
             self.name,
             self.crm_ns,
             self.crm_name,
             self.crm_ver,
             self.abi_hash,
             self.signature_hash,
+            self.max_payload_size,
             self.methods
                 .iter()
                 .map(|m| {
@@ -398,6 +406,7 @@ fn encode_server_handshake(
                 crm_ver: r_ref.crm_ver.clone(),
                 abi_hash: r_ref.abi_hash.clone(),
                 signature_hash: r_ref.signature_hash.clone(),
+                max_payload_size: r_ref.max_payload_size,
                 methods,
             }
         })
@@ -445,6 +454,7 @@ fn decode_handshake(py: Python<'_>, payload: &[u8]) -> PyResult<PyHandshake> {
                 crm_ver: route.crm_ver,
                 abi_hash: route.abi_hash,
                 signature_hash: route.signature_hash,
+                max_payload_size: route.max_payload_size,
                 methods: py_methods?,
             },
         )?);

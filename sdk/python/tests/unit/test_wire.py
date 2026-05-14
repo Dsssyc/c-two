@@ -28,6 +28,7 @@ def route_info(name: str, methods: list[MethodEntry]) -> RouteInfo:
         crm_ver='0.1.0',
         abi_hash=ABI_HASH,
         signature_hash=SIG_HASH,
+        max_payload_size=1024,
     )
 
 
@@ -49,6 +50,21 @@ def test_route_info_rejects_invalid_crm_tag():
             crm_ver='0.1.0',
             abi_hash=ABI_HASH,
             signature_hash=SIG_HASH,
+            max_payload_size=1024,
+        )
+
+
+def test_route_info_rejects_zero_max_payload_size():
+    with pytest.raises(ValueError, match='max_payload_size'):
+        RouteInfo(
+            name='grid',
+            methods=[MethodEntry(name='get', index=0)],
+            crm_ns='test.wire',
+            crm_name='WireRoute',
+            crm_ver='0.1.0',
+            abi_hash=ABI_HASH,
+            signature_hash=SIG_HASH,
+            max_payload_size=0,
         )
 
 
@@ -113,6 +129,7 @@ class TestHandshake:
             crm_ver="1.2.3",
             abi_hash=ABI_HASH,
             signature_hash=SIG_HASH,
+            max_payload_size=2048,
             methods=[
                 MethodEntry(name="add", index=0),
                 MethodEntry(name="greeting", index=1),
@@ -139,6 +156,7 @@ class TestHandshake:
         assert r.crm_ver == "1.2.3"
         assert r.abi_hash == ABI_HASH
         assert r.signature_hash == SIG_HASH
+        assert r.max_payload_size == 2048
         assert len(r.methods) == 2
         assert r.method_by_name("add") == 0
         assert r.method_by_name("greeting") == 1

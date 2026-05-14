@@ -415,7 +415,7 @@ pub(crate) fn call_sync_client<'py>(
                 };
             }
             Err(_) => {
-                // Pool alloc failed — fall through to inline path.
+                // Pool alloc failed; fall through to canonical IPC selection.
             }
         }
     }

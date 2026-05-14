@@ -8,13 +8,14 @@ use std::time::{Duration, Instant};
 
 use axum::{
     Json, Router,
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, Path, Query, State},
     http::request::Parts,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use futures::StreamExt;
 
 use crate::relay::authority::{
     ControlError, RegisterPreparation, RouteAuthority, attest_ipc_pending_route_contract,
@@ -26,7 +27,7 @@ use crate::relay::peer_handlers;
 use crate::relay::route_table::valid_route_name;
 use crate::relay::state::{RegisterCommitResult, RelayState, UpstreamAcquireError};
 use crate::relay::types::RouteEntry;
-use c2_ipc::IpcClient;
+use c2_ipc::{ClientIpcConfig, IpcClient};
 
 const CONTROL_BODY_LIMIT_BYTES: usize = 64 * 1024;
 const EXPECTED_CRM_NS_HEADER: &str = "x-c2-expected-crm-ns";
@@ -34,6 +35,7 @@ const EXPECTED_CRM_NAME_HEADER: &str = "x-c2-expected-crm-name";
 const EXPECTED_CRM_VER_HEADER: &str = "x-c2-expected-crm-ver";
 const EXPECTED_ABI_HASH_HEADER: &str = "x-c2-expected-abi-hash";
 const EXPECTED_SIGNATURE_HASH_HEADER: &str = "x-c2-expected-signature-hash";
+const UNKNOWN_LENGTH_BODY_LIMIT_BYTES: u64 = 64 * 1024;
 
 enum RequestClient {
     Ready {
@@ -71,6 +73,73 @@ fn duplicate_route_response(name: &str, existing_address: &str) -> Response {
             "error": "DuplicateRoute",
             "name": name,
             "existing_address": existing_address,
+        })),
+    )
+        .into_response()
+}
+
+fn content_length_from_headers(headers: &HeaderMap) -> Result<Option<u64>, Response> {
+    let mut values = headers.get_all(header::CONTENT_LENGTH).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "InvalidContentLength",
+                "message": "Content-Length must appear at most once",
+            })),
+        )
+            .into_response());
+    }
+    let raw = value.to_str().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "InvalidContentLength",
+                "message": "Content-Length must be an ASCII unsigned integer",
+            })),
+        )
+            .into_response()
+    })?;
+    let content_length = raw.parse::<u64>().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "InvalidContentLength",
+                "message": "Content-Length must be an unsigned integer",
+            })),
+        )
+            .into_response()
+    })?;
+    Ok(Some(content_length))
+}
+
+fn payload_too_large_response(
+    route_name: &str,
+    content_length: u64,
+    max_payload_size: u64,
+) -> Response {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        Json(serde_json::json!({
+            "error": "PayloadTooLarge",
+            "route": route_name,
+            "content_length": content_length,
+            "max_payload_size": max_payload_size,
+        })),
+    )
+        .into_response()
+}
+
+fn unknown_length_too_large_response(route_name: &str, limit: u64) -> Response {
+    (
+        StatusCode::LENGTH_REQUIRED,
+        Json(serde_json::json!({
+            "error": "ContentLengthRequired",
+            "route": route_name,
+            "message": format!("streaming relay calls larger than {limit} bytes require Content-Length"),
         })),
     )
         .into_response()
@@ -272,7 +341,7 @@ async fn connect_ipc_for_register(address: &str) -> Result<IpcClient, String> {
     let started = Instant::now();
     let timeout = Duration::from_millis(500);
     loop {
-        let mut client = IpcClient::new(address);
+        let mut client = IpcClient::with_config(address, ClientIpcConfig::default());
         match client.connect().await {
             Ok(()) => return Ok(client),
             Err(err) => {
@@ -324,11 +393,35 @@ fn register_body_bool_field(
     }
 }
 
+fn register_body_u64_field(body: &serde_json::Value, field: &'static str) -> Result<u64, Response> {
+    match body.get(field) {
+        Some(value) => match value.as_u64() {
+            Some(value) if value > 0 => Ok(value),
+            _ => Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "InvalidRegisterRequest",
+                    "message": format!("{field} must be a positive integer"),
+                })),
+            )
+                .into_response()),
+        },
+        None => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "InvalidRegisterRequest",
+                "message": format!("Missing \"{field}\""),
+            })),
+        )
+            .into_response()),
+    }
+}
+
 fn validate_expected_crm_for_route(
     state: &RelayState,
     route_name: &str,
     expected: &c2_contract::ExpectedRouteContract,
-) -> Result<(), Response> {
+) -> Result<RouteEntry, Response> {
     let Some(route) = state.local_route(route_name) else {
         return Err((
             StatusCode::NOT_FOUND,
@@ -340,7 +433,7 @@ fn validate_expected_crm_for_route(
             .into_response());
     };
     if route_matches_expected_crm(&route, expected) {
-        Ok(())
+        Ok(route)
     } else {
         Err(crm_contract_mismatch_response(route_name))
     }
@@ -394,7 +487,7 @@ pub fn build_router(state: Arc<RelayState>) -> Router {
 
 /// `POST /_register` — register a new upstream CRM.
 ///
-/// Body: `{"name": "grid", "server_id": "...", "server_instance_id": "...", "address": "ipc://...", "crm_ns": "...", "crm_name": "...", "crm_ver": "...", "abi_hash": "...", "signature_hash": "..."}`
+/// Body: `{"name": "grid", "server_id": "...", "server_instance_id": "...", "address": "ipc://...", "max_payload_size": 17179869184, "crm_ns": "...", "crm_name": "...", "crm_ver": "...", "abi_hash": "...", "signature_hash": "..."}`
 /// The CRM contract is attested against the upstream IPC handshake. Optional
 /// claimed contract fields, when present, must match that handshake exactly.
 /// Returns: 201 on success, 409 on duplicate, 502 on connection failure.
@@ -429,6 +522,10 @@ async fn handle_register(
         Err(response) => return response,
     };
     let prepare_only = match register_body_bool_field(&body, "prepare_only") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let max_payload_size = match register_body_u64_field(&body, "max_payload_size") {
         Ok(value) => value,
         Err(response) => return response,
     };
@@ -473,7 +570,7 @@ async fn handle_register(
     };
 
     // Connect IPC client and attest the registered route contract.
-    let (client, crm_ns, crm_name, crm_ver, abi_hash, signature_hash) = {
+    let (client, crm_ns, crm_name, crm_ver, abi_hash, signature_hash, max_payload_size) = {
         let mut c = match connect_ipc_for_register(&address).await {
             Ok(client) => client,
             Err(e) => {
@@ -507,6 +604,7 @@ async fn handle_register(
                         &claimed_contract.crm_ver,
                         &claimed_contract.abi_hash,
                         &claimed_contract.signature_hash,
+                        max_payload_size,
                     ) {
                         Ok(contract) => contract,
                         Err(ControlError::ContractMismatch { reason }) => {
@@ -563,6 +661,7 @@ async fn handle_register(
                         &claimed_contract.crm_ver,
                         &claimed_contract.abi_hash,
                         &claimed_contract.signature_hash,
+                        max_payload_size,
                     )
                     .await
                     {
@@ -614,6 +713,19 @@ async fn handle_register(
                 Err(_) => unreachable!("route contract read returns only contract errors"),
             },
         };
+        if contract.max_payload_size != max_payload_size {
+            close_client(c);
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "IPC upstream route '{name}' max_payload_size mismatch: claimed {max_payload_size}, got {}",
+                        contract.max_payload_size
+                    ),
+                })),
+            )
+                .into_response();
+        }
         (
             Arc::new(c),
             contract.crm_ns,
@@ -621,6 +733,7 @@ async fn handle_register(
             contract.crm_ver,
             contract.abi_hash,
             contract.signature_hash,
+            contract.max_payload_size,
         )
     };
 
@@ -671,6 +784,7 @@ async fn handle_register(
         crm_ver,
         abi_hash,
         signature_hash,
+        max_payload_size,
         commit_client,
         replacement,
     ) {
@@ -899,6 +1013,52 @@ async fn handle_peers(State(state): State<Arc<RelayState>>) -> impl IntoResponse
     Json(state.list_peers()).into_response()
 }
 
+async fn read_unknown_length_body(
+    route_name: &str,
+    body: Body,
+    max_payload_size: u64,
+) -> Result<Vec<u8>, Response> {
+    let limit = UNKNOWN_LENGTH_BODY_LIMIT_BYTES.min(max_payload_size);
+    let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
+    let mut data = Vec::new();
+    let mut stream = body.into_data_stream();
+
+    while let Some(next) = stream.next().await {
+        let chunk = next.map_err(|err| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "RequestBodyReadError",
+                    "route": route_name,
+                    "message": err.to_string(),
+                })),
+            )
+                .into_response()
+        })?;
+        if chunk.is_empty() {
+            continue;
+        }
+        let next_len = data
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| payload_too_large_response(route_name, u64::MAX, max_payload_size))?;
+        let next_len_u64 = u64::try_from(next_len).unwrap_or(u64::MAX);
+        if next_len_u64 > max_payload_size {
+            return Err(payload_too_large_response(
+                route_name,
+                next_len_u64,
+                max_payload_size,
+            ));
+        }
+        if next_len > limit_usize {
+            return Err(unknown_length_too_large_response(route_name, limit));
+        }
+        data.extend_from_slice(&chunk);
+    }
+
+    Ok(data)
+}
+
 /// `GET /_probe/{name}` — verify that a route's local upstream is reachable.
 async fn handle_probe(
     Path(route_name): Path<String>,
@@ -909,8 +1069,9 @@ async fn handle_probe(
         Ok(expected) => expected,
         Err(response) => return response,
     };
-    if let Err(response) = validate_expected_crm_for_route(&state, &route_name, &expected_crm) {
-        return response;
+    match validate_expected_crm_for_route(&state, &route_name, &expected_crm) {
+        Ok(_) => {}
+        Err(response) => return response,
     }
     #[cfg(test)]
     run_data_plane_after_precheck_hook(&route_name);
@@ -952,14 +1113,29 @@ async fn call_handler(
     State(state): State<Arc<RelayState>>,
     Path((route_name, method_name)): Path<(String, String)>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     let expected_crm = match expected_crm_from_headers(&route_name, &headers) {
         Ok(expected) => expected,
         Err(response) => return response,
     };
-    if let Err(response) = validate_expected_crm_for_route(&state, &route_name, &expected_crm) {
-        return response;
+    let advertised_route = match validate_expected_crm_for_route(&state, &route_name, &expected_crm)
+    {
+        Ok(route) => route,
+        Err(response) => return response,
+    };
+    let content_length = match content_length_from_headers(&headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Some(content_length) = content_length {
+        if content_length > advertised_route.max_payload_size {
+            return payload_too_large_response(
+                &route_name,
+                content_length,
+                advertised_route.max_payload_size,
+            );
+        }
     }
     #[cfg(test)]
     run_data_plane_after_precheck_hook(&route_name);
@@ -992,9 +1168,45 @@ async fn call_handler(
         drop(lease);
         return response;
     }
+    if let Some(content_length) = content_length {
+        if content_length > acquired_route.max_payload_size {
+            drop(lease);
+            return payload_too_large_response(
+                &route_name,
+                content_length,
+                acquired_route.max_payload_size,
+            );
+        }
+    }
     let client = lease.client();
 
-    match client.call(&route_name, &method_name, &body).await {
+    let call_result = match content_length {
+        Some(content_length) => {
+            client
+                .call_sized_stream(
+                    &route_name,
+                    &method_name,
+                    content_length,
+                    body.into_data_stream(),
+                )
+                .await
+        }
+        None => {
+            let body =
+                match read_unknown_length_body(&route_name, body, acquired_route.max_payload_size)
+                    .await
+                {
+                    Ok(body) => body,
+                    Err(response) => {
+                        drop(lease);
+                        return response;
+                    }
+                };
+            client.call(&route_name, &method_name, &body).await
+        }
+    };
+
+    match call_result {
         Ok(result) => materialized_response_or_error(
             &route_name,
             result.into_bytes_with_pool(client.server_pool_arc(), &client.reassembly_pool_arc()),
@@ -1100,7 +1312,11 @@ mod tests {
     use axum::body::{Body, to_bytes};
     use axum::extract::ConnectInfo;
     use axum::http::{Request, StatusCode};
-    use c2_ipc::IpcClient;
+    use c2_ipc::{ClientIpcConfig, IpcClient};
+    use c2_server::{
+        ConcurrencyMode, CrmCallback, CrmError, RequestData, ResponseMeta, RouteBuildSpec,
+        SchedulerLimits, Server, ServerIdentity, ServerIpcConfig,
+    };
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
     use tower::ServiceExt;
@@ -1118,6 +1334,80 @@ mod tests {
     const TEST_ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const TEST_SIGNATURE_HASH: &str =
         "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+    struct RequestKindCallback;
+
+    impl CrmCallback for RequestKindCallback {
+        fn invoke(
+            &self,
+            _route_name: &str,
+            _method_idx: u16,
+            request: RequestData,
+            _response_pool: Arc<parking_lot::RwLock<c2_mem::MemPool>>,
+        ) -> Result<ResponseMeta, CrmError> {
+            let marker = match request {
+                RequestData::Inline(_) => "inline",
+                RequestData::Shm {
+                    pool,
+                    seg_idx,
+                    offset,
+                    data_size,
+                    is_dedicated,
+                } => {
+                    let mut pool = pool.write();
+                    let _ = pool.free_at(seg_idx as u32, offset, data_size, is_dedicated);
+                    "shm"
+                }
+                RequestData::Handle { handle, pool } => {
+                    pool.write().release_handle(handle);
+                    "handle"
+                }
+            };
+            Ok(ResponseMeta::Inline(marker.as_bytes().to_vec()))
+        }
+    }
+
+    async fn start_request_kind_server(address: &str, server_id: &str) -> Arc<Server> {
+        let server = Arc::new(
+            Server::new_with_identity(
+                address,
+                ServerIpcConfig::default(),
+                ServerIdentity {
+                    server_id: server_id.to_string(),
+                    server_instance_id: format!("{server_id}-instance"),
+                },
+            )
+            .unwrap(),
+        );
+        let route = server
+            .build_route(
+                RouteBuildSpec {
+                    name: "grid".into(),
+                    crm_ns: "test.echo".into(),
+                    crm_name: "Echo".into(),
+                    crm_ver: "0.1.0".into(),
+                    abi_hash: TEST_ABI_HASH.into(),
+                    signature_hash: TEST_SIGNATURE_HASH.into(),
+                    method_names: vec!["ping".into()],
+                    access_map: std::collections::HashMap::new(),
+                    concurrency_mode: ConcurrencyMode::ReadParallel,
+                    limits: SchedulerLimits::default(),
+                },
+                Arc::new(RequestKindCallback),
+            )
+            .unwrap();
+        let reservation = server.reserve_route(route).await.unwrap();
+        server.commit_reserved_route(reservation).await.unwrap();
+        let run_server = server.clone();
+        tokio::spawn(async move {
+            let _ = run_server.run().await;
+        });
+        server
+            .wait_until_responsive(std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        server
+    }
 
     fn source_between<'a>(source: &'a str, start: &str, end: &str) -> Option<&'a str> {
         let start_idx = source.find(start)?;
@@ -1161,6 +1451,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn relay_data_plane_uses_canonical_ipc_call_api() {
+        let source = include_str!("router.rs");
+        let body = source_between(
+            source,
+            "async fn call_handler",
+            "fn materialized_response_or_error",
+        )
+        .expect("call_handler body should be found");
+
+        for forbidden in [".call_full(", ".call_inline("] {
+            assert!(
+                !body.contains(forbidden),
+                "relay data-plane must not call IPC bypass API: {forbidden}"
+            );
+        }
+        assert!(
+            !body.contains("to_bytes("),
+            "relay data-plane must not materialize request bodies before IPC forwarding"
+        );
+        assert!(
+            body.contains(".call_sized_stream("),
+            "relay data-plane must use sized streaming for Content-Length requests"
+        );
+        assert!(
+            body.contains(".call(&route_name, &method_name,"),
+            "relay data-plane must keep canonical IpcClient::call for bounded unknown-length fallback"
+        );
+    }
+
     #[tokio::test]
     async fn materialized_response_error_is_not_silently_returned_as_empty_success() {
         let response =
@@ -1184,6 +1504,7 @@ mod tests {
                 "server_id": server_id,
                 "server_instance_id": format!("{server_id}-instance"),
                 "address": address,
+                "max_payload_size": ServerIpcConfig::default().max_payload_size,
             })
             .to_string(),
         )
@@ -1757,6 +2078,7 @@ mod tests {
             TEST_CRM_VER.to_string(),
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
+            1024,
             Arc::new(IpcClient::new("ipc://grid")),
             None,
         );
@@ -1820,6 +2142,7 @@ mod tests {
                                 "server_id": "server-grid",
                                 "server_instance_id": server_instance_id,
                                 "address": "ipc://grid",
+                                "max_payload_size": ServerIpcConfig::default().max_payload_size,
                             })
                             .to_string(),
                         ))
@@ -1974,6 +2297,7 @@ mod tests {
                 "address": address,
                 "registration_token": registration_token,
                 "prepare_only": true,
+                "max_payload_size": ServerIpcConfig::default().max_payload_size,
                 "crm_ns": "test.echo",
                 "crm_name": "Echo",
                 "crm_ver": "0.1.0",
@@ -2143,6 +2467,7 @@ mod tests {
             "0.1.0".into(),
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
+            1024,
             original_client,
             None,
         ) {
@@ -2208,6 +2533,7 @@ mod tests {
             TEST_CRM_VER.to_string(),
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
+            1024,
             stale_client,
             None,
         );
@@ -2288,6 +2614,155 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(body.len(), payload.len());
+    }
+
+    #[tokio::test]
+    async fn relay_rejects_oversized_content_length_before_polling_body() {
+        let state = test_state();
+        state.with_route_table_mut(|rt| {
+            assert!(rt.register_route(RouteEntry {
+                name: "grid".into(),
+                relay_id: "test-relay".into(),
+                relay_url: "http://localhost:9999".into(),
+                server_id: Some("server-grid".into()),
+                server_instance_id: Some("server-grid-instance".into()),
+                ipc_address: Some("ipc://grid".into()),
+                crm_ns: "test.echo".into(),
+                crm_name: "Echo".into(),
+                crm_ver: "0.1.0".into(),
+                abi_hash: TEST_ABI_HASH.into(),
+                signature_hash: TEST_SIGNATURE_HASH.into(),
+                max_payload_size: 4,
+                locality: crate::relay::types::Locality::Local,
+                registered_at: 1000.0,
+            }));
+        });
+        let app = build_router(state);
+        let stream = futures::stream::once(async {
+            panic!("oversized relay request body should not be polled");
+            #[allow(unreachable_code)]
+            Ok::<Bytes, std::io::Error>(Bytes::new())
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/grid/ping")
+                    .header("content-type", "application/octet-stream")
+                    .header("content-length", "5")
+                    .header("x-c2-expected-crm-ns", "test.echo")
+                    .header("x-c2-expected-crm-name", "Echo")
+                    .header("x-c2-expected-crm-ver", "0.1.0")
+                    .header("x-c2-expected-abi-hash", TEST_ABI_HASH)
+                    .header("x-c2-expected-signature-hash", TEST_SIGNATURE_HASH)
+                    .body(Body::from_stream(stream))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"], "PayloadTooLarge");
+        assert_eq!(payload["content_length"], 5);
+        assert_eq!(payload["max_payload_size"], 4);
+    }
+
+    #[tokio::test]
+    async fn relay_rejects_duplicate_content_length_before_polling_body() {
+        let state = test_state();
+        state.with_route_table_mut(|rt| {
+            assert!(rt.register_route(RouteEntry {
+                name: "grid".into(),
+                relay_id: "test-relay".into(),
+                relay_url: "http://localhost:9999".into(),
+                server_id: Some("server-grid".into()),
+                server_instance_id: Some("server-grid-instance".into()),
+                ipc_address: Some("ipc://grid".into()),
+                crm_ns: "test.echo".into(),
+                crm_name: "Echo".into(),
+                crm_ver: "0.1.0".into(),
+                abi_hash: TEST_ABI_HASH.into(),
+                signature_hash: TEST_SIGNATURE_HASH.into(),
+                max_payload_size: 1024,
+                locality: crate::relay::types::Locality::Local,
+                registered_at: 1000.0,
+            }));
+        });
+        let app = build_router(state);
+        let stream = futures::stream::once(async {
+            panic!("invalid content-length request body should not be polled");
+            #[allow(unreachable_code)]
+            Ok::<Bytes, std::io::Error>(Bytes::new())
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/grid/ping")
+                    .header("content-type", "application/octet-stream")
+                    .header("content-length", "5")
+                    .header("content-length", "5")
+                    .header("x-c2-expected-crm-ns", "test.echo")
+                    .header("x-c2-expected-crm-name", "Echo")
+                    .header("x-c2-expected-crm-ver", "0.1.0")
+                    .header("x-c2-expected-abi-hash", TEST_ABI_HASH)
+                    .header("x-c2-expected-signature-hash", TEST_SIGNATURE_HASH)
+                    .body(Body::from_stream(stream))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"], "InvalidContentLength");
+    }
+
+    #[tokio::test]
+    async fn relay_large_payload_uses_canonical_shm_ipc_request_path() {
+        let state = test_state();
+        let address = format!(
+            "ipc://relay_large_payload_chunked_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let server = start_request_kind_server(&address, "server-grid").await;
+        assert_eq!(
+            post_register(state.clone(), "grid", "server-grid", &address).await,
+            StatusCode::CREATED
+        );
+
+        let payload = vec![b'x'; ClientIpcConfig::default().chunk_size as usize + 1];
+        let content_length = payload.len().to_string();
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/grid/ping")
+                    .header("content-type", "application/octet-stream")
+                    .header("content-length", content_length)
+                    .header("x-c2-expected-crm-ns", "test.echo")
+                    .header("x-c2-expected-crm-name", "Echo")
+                    .header("x-c2-expected-crm-ver", "0.1.0")
+                    .header("x-c2-expected-abi-hash", TEST_ABI_HASH)
+                    .header("x-c2-expected-signature-hash", TEST_SIGNATURE_HASH)
+                    .body(Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"shm");
+
+        shutdown_live_server(&server).await;
     }
 
     #[tokio::test]
@@ -2376,6 +2851,7 @@ mod tests {
                 "0.1.0".into(),
                 TEST_ABI_HASH.to_string(),
                 TEST_SIGNATURE_HASH.to_string(),
+                1024,
                 new_client,
                 None,
             ) {

@@ -7,9 +7,10 @@
 //!
 //! ```text
 //! HTTP handler
-//!     → IpcClient::call(route, method_idx, payload)
-//!         → send_task:  serialize frame → write UDS
-//!         → recv_task:  read UDS → match request_id → oneshot → caller
+//!     -> IpcClient::call(route, method, payload)
+//!         -> select inline / buddy SHM / chunked request transport
+//!         -> send_task:  serialize frame -> write UDS
+//!         -> recv_task:  read UDS -> match request_id -> oneshot -> caller
 //! ```
 
 pub mod client;
