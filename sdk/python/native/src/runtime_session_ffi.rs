@@ -129,12 +129,13 @@ pub struct PyRuntimeSession {
 #[pymethods]
 impl PyRuntimeSession {
     #[new]
-    #[pyo3(signature = (server_id=None, server_ipc_overrides=None, client_ipc_overrides=None, shm_threshold=None, use_process_relay_anchor=true))]
+    #[pyo3(signature = (server_id=None, server_ipc_overrides=None, client_ipc_overrides=None, shm_threshold=None, remote_payload_chunk_size=None, use_process_relay_anchor=true))]
     fn new(
         server_id: Option<String>,
         server_ipc_overrides: Option<&Bound<'_, PyAny>>,
         client_ipc_overrides: Option<&Bound<'_, PyAny>>,
         shm_threshold: Option<u64>,
+        remote_payload_chunk_size: Option<u64>,
         use_process_relay_anchor: bool,
     ) -> PyResult<Self> {
         let server_ipc_overrides = match server_ipc_overrides {
@@ -150,6 +151,7 @@ impl PyRuntimeSession {
             server_ipc_overrides,
             client_ipc_overrides,
             shm_threshold,
+            remote_payload_chunk_size,
             relay_anchor_address: None,
             use_process_relay_anchor,
         })
@@ -244,6 +246,11 @@ impl PyRuntimeSession {
         self.inner
             .effective_relay_anchor_address()
             .map_err(runtime_error_to_py)
+    }
+
+    #[getter]
+    fn remote_payload_chunk_size_override(&self) -> Option<u64> {
+        self.inner.remote_payload_chunk_size_override()
     }
 
     #[getter]
@@ -548,6 +555,7 @@ impl PyRuntimeSession {
 
     fn acquire_http_client(&self, py: Python<'_>, address: &str) -> PyResult<PyRustHttpClient> {
         let addr = address.to_string();
+        let remote_payload_chunk_size_override = self.inner.remote_payload_chunk_size_override();
         let client = py
             .detach(move || {
                 let use_proxy = c2_config::ConfigResolver::resolve_relay_use_proxy(
@@ -558,7 +566,18 @@ impl PyRuntimeSession {
                     c2_config::ConfigSources::from_process(),
                 )
                 .map_err(|e| c2_http::client::HttpError::Transport(e.to_string()))?;
-                acquire_http_client_from_global_pool(&addr, use_proxy, call_timeout_secs)
+                let remote_payload_chunk_size =
+                    c2_config::ConfigResolver::resolve_remote_payload_chunk_size(
+                        remote_payload_chunk_size_override,
+                        c2_config::ConfigSources::from_process(),
+                    )
+                    .map_err(|e| c2_http::client::HttpError::Transport(e.to_string()))?;
+                acquire_http_client_from_global_pool(
+                    &addr,
+                    use_proxy,
+                    call_timeout_secs,
+                    remote_payload_chunk_size,
+                )
             })
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))?;
         Ok(PyRustHttpClient::from_arc(client))
@@ -594,6 +613,7 @@ impl PyRuntimeSession {
             c2_config::ConfigSources::from_process(),
         )
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let remote_payload_chunk_size = resolve_remote_payload_chunk_size_for_session(&self.inner)?;
         let (client, relay_url) = py
             .detach(move || {
                 self.inner.connect_explicit_relay_http_client(
@@ -602,6 +622,7 @@ impl PyRuntimeSession {
                     use_proxy,
                     max_attempts,
                     call_timeout_secs,
+                    remote_payload_chunk_size,
                 )
             })
             .map_err(runtime_error_to_py)?;
@@ -662,6 +683,7 @@ impl PyRuntimeSession {
             c2_config::ConfigSources::from_process(),
         )
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let remote_payload_chunk_size = resolve_remote_payload_chunk_size_for_session(&self.inner)?;
 
         let expected_for_resolve = expected.clone();
         let target = py
@@ -671,6 +693,7 @@ impl PyRuntimeSession {
                     use_proxy,
                     max_attempts,
                     call_timeout_secs,
+                    remote_payload_chunk_size,
                 )
             })
             .map_err(runtime_error_to_py)?;
@@ -704,6 +727,7 @@ impl PyRuntimeSession {
                         use_proxy,
                         max_attempts,
                         call_timeout_secs,
+                        remote_payload_chunk_size,
                         expected,
                     ),
                 }
@@ -790,6 +814,7 @@ impl PyRuntimeSession {
         use_proxy: bool,
         max_attempts: usize,
         call_timeout_secs: f64,
+        remote_payload_chunk_size: u64,
         expected: ExpectedRouteContract,
     ) -> PyResult<PyRelayConnectedClient> {
         let bound_route_name = expected.route_name.clone();
@@ -800,6 +825,7 @@ impl PyRuntimeSession {
                     use_proxy,
                     max_attempts,
                     call_timeout_secs,
+                    remote_payload_chunk_size,
                 )
             })
             .map_err(runtime_error_to_py)?;
@@ -924,6 +950,14 @@ fn resolve_relay_use_proxy_if_needed(
     }
     c2_config::ConfigResolver::resolve_relay_use_proxy(c2_config::ConfigSources::from_process())
         .map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
+fn resolve_remote_payload_chunk_size_for_session(session: &RuntimeSession) -> PyResult<u64> {
+    c2_config::ConfigResolver::resolve_remote_payload_chunk_size(
+        session.remote_payload_chunk_size_override(),
+        c2_config::ConfigSources::from_process(),
+    )
+    .map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
 fn resolve_relay_use_proxy_for_shutdown(

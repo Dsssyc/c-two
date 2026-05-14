@@ -86,6 +86,10 @@ pub fn run(args: RelayArgs) -> Result<()> {
         println!("advertise_url={}", config.effective_advertise_url());
         println!("idle_timeout={}", config.idle_timeout_secs);
         println!("relay_use_proxy={}", config.use_proxy);
+        println!(
+            "remote_payload_chunk_size={}",
+            config.remote_payload_chunk_size
+        );
         for seed in &config.seeds {
             println!("seed={seed}");
         }

@@ -49,6 +49,7 @@ pub struct RuntimeSessionOptions {
     pub server_ipc_overrides: Option<ServerIpcConfigOverrides>,
     pub client_ipc_overrides: Option<ClientIpcConfigOverrides>,
     pub shm_threshold: Option<u64>,
+    pub remote_payload_chunk_size: Option<u64>,
     pub relay_anchor_address: Option<String>,
     pub use_process_relay_anchor: bool,
 }
@@ -60,6 +61,7 @@ impl Default for RuntimeSessionOptions {
             server_ipc_overrides: None,
             client_ipc_overrides: None,
             shm_threshold: None,
+            remote_payload_chunk_size: None,
             relay_anchor_address: None,
             use_process_relay_anchor: true,
         }
@@ -172,6 +174,7 @@ struct RuntimeSessionState {
     server_ipc_overrides: Option<ServerIpcConfigOverrides>,
     client_ipc_overrides: Option<ClientIpcConfigOverrides>,
     shm_threshold: Option<u64>,
+    remote_payload_chunk_size: Option<u64>,
     client_config_frozen: bool,
     identity: Option<RuntimeIdentity>,
     relay_anchor_address_override: Option<String>,
@@ -211,6 +214,7 @@ impl RuntimeSession {
                 server_ipc_overrides: options.server_ipc_overrides,
                 client_ipc_overrides: options.client_ipc_overrides,
                 shm_threshold: options.shm_threshold,
+                remote_payload_chunk_size: options.remote_payload_chunk_size,
                 client_config_frozen: false,
                 identity: None,
                 relay_anchor_address_override: options
@@ -301,6 +305,10 @@ impl RuntimeSession {
 
     pub fn shm_threshold_override(&self) -> Option<u64> {
         self.state.lock().shm_threshold
+    }
+
+    pub fn remote_payload_chunk_size_override(&self) -> Option<u64> {
+        self.state.lock().remote_payload_chunk_size
     }
 
     pub fn client_config_frozen(&self) -> bool {
@@ -788,6 +796,7 @@ impl RuntimeSession {
         relay_use_proxy: bool,
         max_attempts: usize,
         call_timeout_secs: f64,
+        remote_payload_chunk_size: u64,
     ) -> Result<RelayResolvedConnection, RuntimeSessionError> {
         let projection = self.relay_projection(relay_use_proxy)?;
         let client = RelayAwareHttpClient::new_with_control(
@@ -797,6 +806,7 @@ impl RuntimeSession {
             RelayAwareClientConfig {
                 max_attempts,
                 call_timeout_secs,
+                remote_payload_chunk_size,
             },
         )
         .map_err(runtime_http_error)?;
@@ -818,6 +828,7 @@ impl RuntimeSession {
         relay_use_proxy: bool,
         max_attempts: usize,
         call_timeout_secs: f64,
+        remote_payload_chunk_size: u64,
     ) -> Result<(RelayAwareHttpClient, String), RuntimeSessionError> {
         let projection = self.relay_projection(relay_use_proxy)?;
         let client = RelayAwareHttpClient::new_with_control(
@@ -827,6 +838,7 @@ impl RuntimeSession {
             RelayAwareClientConfig {
                 max_attempts,
                 call_timeout_secs,
+                remote_payload_chunk_size,
             },
         )
         .map_err(runtime_http_error)?;
@@ -843,6 +855,7 @@ impl RuntimeSession {
         relay_use_proxy: bool,
         max_attempts: usize,
         call_timeout_secs: f64,
+        remote_payload_chunk_size: u64,
     ) -> Result<(RelayAwareHttpClient, String), RuntimeSessionError> {
         let client = RelayAwareHttpClient::new(
             relay_url,
@@ -851,6 +864,7 @@ impl RuntimeSession {
             RelayAwareClientConfig {
                 max_attempts,
                 call_timeout_secs,
+                remote_payload_chunk_size,
             },
         )
         .map_err(runtime_http_error)?;
@@ -1110,6 +1124,7 @@ mod tests {
             server_ipc_overrides: None,
             client_ipc_overrides: None,
             shm_threshold: None,
+            remote_payload_chunk_size: None,
             relay_anchor_address: None,
             use_process_relay_anchor: true,
         })
@@ -1136,6 +1151,7 @@ mod tests {
                 server_ipc_overrides: None,
                 client_ipc_overrides: None,
                 shm_threshold: None,
+                remote_payload_chunk_size: None,
                 relay_anchor_address: None,
                 use_process_relay_anchor: true,
             })
@@ -1168,6 +1184,7 @@ mod tests {
             server_ipc_overrides: None,
             client_ipc_overrides: None,
             shm_threshold: None,
+            remote_payload_chunk_size: None,
             relay_anchor_address: None,
             use_process_relay_anchor: true,
         })
@@ -1196,6 +1213,7 @@ mod tests {
             server_ipc_overrides: Some(overrides),
             client_ipc_overrides: None,
             shm_threshold: None,
+            remote_payload_chunk_size: None,
             relay_anchor_address: None,
             use_process_relay_anchor: true,
         })
@@ -1219,6 +1237,7 @@ mod tests {
             server_ipc_overrides: None,
             client_ipc_overrides: Some(overrides),
             shm_threshold: None,
+            remote_payload_chunk_size: None,
             relay_anchor_address: None,
             use_process_relay_anchor: true,
         })

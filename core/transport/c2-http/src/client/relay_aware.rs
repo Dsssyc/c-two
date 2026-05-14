@@ -21,6 +21,7 @@ struct RelayErrorBody {
 pub struct RelayAwareClientConfig {
     pub max_attempts: usize,
     pub call_timeout_secs: f64,
+    pub remote_payload_chunk_size: u64,
 }
 
 impl Default for RelayAwareClientConfig {
@@ -28,6 +29,7 @@ impl Default for RelayAwareClientConfig {
         Self {
             max_attempts: 3,
             call_timeout_secs: 300.0,
+            remote_payload_chunk_size: c2_config::DEFAULT_REMOTE_PAYLOAD_CHUNK_SIZE,
         }
     }
 }
@@ -188,6 +190,7 @@ impl RelayAwareHttpClient {
                     &relay_url,
                     self.use_proxy,
                     self.config.call_timeout_secs,
+                    self.config.remote_payload_chunk_size,
                 ) {
                     Ok(client) => RelayPoolGuard {
                         pool: self.pool,
@@ -271,6 +274,7 @@ impl RelayAwareHttpClient {
                     &relay_url,
                     self.use_proxy,
                     self.config.call_timeout_secs,
+                    self.config.remote_payload_chunk_size,
                 ) {
                     Ok(client) => RelayPoolGuard {
                         pool: self.pool,

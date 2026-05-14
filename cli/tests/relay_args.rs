@@ -156,6 +156,27 @@ fn relay_dry_run_loads_proxy_policy_from_env_file() {
 }
 
 #[test]
+fn relay_dry_run_loads_remote_payload_chunk_size_from_env_file() {
+    let tempdir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tempdir.path().join(".env"),
+        "C2_REMOTE_PAYLOAD_CHUNK_SIZE=2097152\n",
+    )
+    .unwrap();
+
+    let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.current_dir(tempdir.path())
+        .env_remove("C2_REMOTE_PAYLOAD_CHUNK_SIZE")
+        .env_remove("C2_ENV_FILE")
+        .args(["relay", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "remote_payload_chunk_size=2097152",
+        ));
+}
+
+#[test]
 fn relay_process_env_overrides_env_file() {
     let tempdir = tempfile::tempdir().unwrap();
     std::fs::write(

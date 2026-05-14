@@ -54,13 +54,18 @@ from .server.native import NativeServerBridge as Server
 
 CRM = TypeVar('CRM')
 log = logging.getLogger(__name__)
+_UNSET = object()
 
 
 def _runtime_session_kwargs_from_settings() -> dict[str, int]:
+    kwargs: dict[str, int] = {}
     shm_overrides = settings._shm_overrides()  # noqa: SLF001
-    if 'shm_threshold' not in shm_overrides:
-        return {}
-    return {'shm_threshold': shm_overrides['shm_threshold']}
+    if 'shm_threshold' in shm_overrides:
+        kwargs['shm_threshold'] = shm_overrides['shm_threshold']
+    remote_chunk_size = settings._remote_payload_chunk_size_override()  # noqa: SLF001
+    if remote_chunk_size is not None:
+        kwargs['remote_payload_chunk_size'] = remote_chunk_size
+    return kwargs
 
 
 def _relay_control_error_status(exc: BaseException) -> int | None:
@@ -149,7 +154,12 @@ class _ProcessRegistry:
         settings.relay_anchor_address = address
         self._runtime_session.set_relay_anchor_address(settings._relay_anchor_address)  # noqa: SLF001
 
-    def set_transport_policy(self, *, shm_threshold: int | None = None) -> None:
+    def set_transport_policy(
+        self,
+        *,
+        shm_threshold: int | None | object = _UNSET,
+        remote_payload_chunk_size: int | None | object = _UNSET,
+    ) -> None:
         """Set process transport policy. Must be called before use."""
         with self._lock:
             if self._server is not None or self._runtime_session.client_config_frozen:
@@ -161,7 +171,11 @@ class _ProcessRegistry:
                     stacklevel=3,
                 )
                 return
-            settings.shm_threshold = shm_threshold
+            if shm_threshold is not _UNSET:
+                settings.shm_threshold = shm_threshold  # type: ignore[assignment]
+            if remote_payload_chunk_size is not _UNSET:
+                settings.remote_payload_chunk_size = remote_payload_chunk_size  # type: ignore[assignment]
+            runtime_session_kwargs = _runtime_session_kwargs_from_settings()
             runtime_session = self._runtime_session.__class__(
                 server_id=(
                     self._runtime_session.server_id
@@ -169,7 +183,7 @@ class _ProcessRegistry:
                 ),
                 server_ipc_overrides=self._runtime_session.server_ipc_overrides,
                 client_ipc_overrides=self._runtime_session.client_ipc_overrides,
-                shm_threshold=shm_threshold,
+                **runtime_session_kwargs,
             )
             runtime_session.set_relay_anchor_address(settings._relay_anchor_address)  # noqa: SLF001
             self._runtime_session = runtime_session
@@ -649,9 +663,16 @@ class _ProcessRegistry:
 # Module-level API (delegates to singleton)
 # ------------------------------------------------------------------
 
-def set_transport_policy(*, shm_threshold: int | None = None) -> None:
+def set_transport_policy(
+    *,
+    shm_threshold: int | None | object = _UNSET,
+    remote_payload_chunk_size: int | None | object = _UNSET,
+) -> None:
     """Set process transport policy. Call before register()/connect()."""
-    _ProcessRegistry.get().set_transport_policy(shm_threshold=shm_threshold)
+    _ProcessRegistry.get().set_transport_policy(
+        shm_threshold=shm_threshold,
+        remote_payload_chunk_size=remote_payload_chunk_size,
+    )
 
 
 def set_server(

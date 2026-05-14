@@ -28,6 +28,12 @@ pub struct RelayConfig {
     pub seed_retry_interval: Duration,
     /// Whether relay HTTP clients should honor system HTTP proxy variables.
     pub use_proxy: bool,
+    /// Target maximum payload chunk size for remote transport streams.
+    ///
+    /// This controls C-Two's protocol-independent remote payload batching. It
+    /// does not guarantee concrete TCP packets, HTTP/1 chunks, or HTTP/2 DATA
+    /// frames have the same size.
+    pub remote_payload_chunk_size: u64,
 }
 
 impl Default for RelayConfig {
@@ -44,6 +50,7 @@ impl Default for RelayConfig {
             dead_peer_probe_interval: Duration::from_secs(30),
             seed_retry_interval: Duration::from_secs(10),
             use_proxy: false,
+            remote_payload_chunk_size: crate::DEFAULT_REMOTE_PAYLOAD_CHUNK_SIZE,
         }
     }
 }
@@ -54,6 +61,8 @@ impl RelayConfig {
         if self.idle_timeout_secs != 0 && self.idle_timeout_secs.checked_mul(1000).is_none() {
             return Err("idle_timeout_secs must fit in milliseconds".into());
         }
+        crate::validate_remote_payload_chunk_size(self.remote_payload_chunk_size)
+            .map_err(|reason| format!("remote_payload_chunk_size {reason}"))?;
         Ok(())
     }
 
@@ -160,6 +169,19 @@ mod tests {
             .expect_err("relay config should reject invalid relay_id");
 
         assert!(err.contains("relay_id"));
+    }
+
+    #[test]
+    fn relay_config_rejects_invalid_remote_payload_chunk_size() {
+        let mut config = RelayConfig::default();
+        config.remote_payload_chunk_size = 0;
+
+        let err = config
+            .validate()
+            .expect_err("zero remote chunk size should fail");
+
+        assert!(err.contains("remote_payload_chunk_size"));
+        assert!(err.contains("> 0"));
     }
 
     #[test]

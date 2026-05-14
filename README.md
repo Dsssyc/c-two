@@ -209,10 +209,13 @@ Relay-aware clients preflight routes before the first call and re-resolve
 structured stale-route responses; set `C2_RELAY_ROUTE_MAX_ATTEMPTS` to tune the
 maximum route acquisition attempts (default `3`, valid range `1..=32`, `0` is
 treated as `1`). Set `C2_RELAY_CALL_TIMEOUT` to tune CRM call timeout seconds
-(default `300`; `0` disables the reqwest total timeout). Ambiguous data-plane
-failures are not replayed. Relay resolve, probe, and call paths reject
-name-only lookups and CRM contract mismatches instead of falling back to an
-untyped route with the same name.
+(default `300`; `0` disables the reqwest total timeout). Set
+`C2_REMOTE_PAYLOAD_CHUNK_SIZE` to tune C-Two remote payload batching for relay
+HTTP and future remote protocols (default `1048576`; max `134217728`). This is
+not a TCP packet, HTTP/1 chunk, or HTTP/2 DATA frame guarantee. Ambiguous
+data-plane failures are not replayed. Relay resolve, probe, and call paths
+reject name-only lookups and CRM contract mismatches instead of falling back to
+an untyped route with the same name.
 
 ```bash
 # Start a relay anywhere reachable on your network

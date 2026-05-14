@@ -1210,6 +1210,7 @@ async fn call_handler(
         Ok(result) => materialized_response_or_error(
             &route_name,
             result.into_bytes_with_pool(client.server_pool_arc(), &client.reassembly_pool_arc()),
+            state.config().remote_payload_chunk_size,
         ),
         Err(c2_ipc::IpcError::CrmError(err_bytes)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1244,14 +1245,30 @@ async fn call_handler(
     }
 }
 
-fn materialized_response_or_error(route_name: &str, result: Result<Vec<u8>, String>) -> Response {
+fn materialized_response_or_error(
+    route_name: &str,
+    result: Result<Vec<u8>, String>,
+    remote_payload_chunk_size: u64,
+) -> Response {
     match result {
-        Ok(bytes) => (
-            StatusCode::OK,
-            [("content-type", "application/octet-stream")],
-            bytes,
-        )
-            .into_response(),
+        Ok(bytes) => match crate::payload::axum_body_from_payload(bytes, remote_payload_chunk_size)
+        {
+            Ok(body) => (
+                StatusCode::OK,
+                [("content-type", "application/octet-stream")],
+                body,
+            )
+                .into_response(),
+            Err(err) => (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "error": "RelayRemotePayloadChunkConfigInvalid",
+                    "route": route_name,
+                    "message": err.to_string(),
+                })),
+            )
+                .into_response(),
+        },
         Err(err) => (
             StatusCode::BAD_GATEWAY,
             Json(serde_json::json!({
@@ -1317,6 +1334,7 @@ mod tests {
         ConcurrencyMode, CrmCallback, CrmError, RequestData, ResponseMeta, RouteBuildSpec,
         SchedulerLimits, Server, ServerIdentity, ServerIpcConfig,
     };
+    use futures::StreamExt;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
     use tower::ServiceExt;
@@ -1483,8 +1501,11 @@ mod tests {
 
     #[tokio::test]
     async fn materialized_response_error_is_not_silently_returned_as_empty_success() {
-        let response =
-            materialized_response_or_error("grid", Err("server pool not initialised".to_string()));
+        let response = materialized_response_or_error(
+            "grid",
+            Err("server pool not initialised".to_string()),
+            c2_config::DEFAULT_REMOTE_PAYLOAD_CHUNK_SIZE,
+        );
 
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
@@ -2724,6 +2745,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relay_rejects_large_unknown_length_body_with_small_bound() {
+        let state = test_state();
+        let address = format!(
+            "ipc://relay_unknown_length_large_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let server = start_request_kind_server(&address, "server-grid").await;
+        assert_eq!(
+            post_register(state.clone(), "grid", "server-grid", &address).await,
+            StatusCode::CREATED
+        );
+
+        let stream = futures::stream::iter([
+            Ok::<Bytes, std::io::Error>(Bytes::from(vec![b'a'; 32 * 1024])),
+            Ok::<Bytes, std::io::Error>(Bytes::from(vec![b'b'; 32 * 1024])),
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"c")),
+        ]);
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/grid/ping")
+                    .header("content-type", "application/octet-stream")
+                    .header("x-c2-expected-crm-ns", "test.echo")
+                    .header("x-c2-expected-crm-name", "Echo")
+                    .header("x-c2-expected-crm-ver", "0.1.0")
+                    .header("x-c2-expected-abi-hash", TEST_ABI_HASH)
+                    .header("x-c2-expected-signature-hash", TEST_SIGNATURE_HASH)
+                    .body(Body::from_stream(stream))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::LENGTH_REQUIRED);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"], "ContentLengthRequired");
+
+        shutdown_live_server(&server).await;
+    }
+
+    #[tokio::test]
     async fn relay_large_payload_uses_canonical_shm_ipc_request_path() {
         let state = test_state();
         let address = format!(
@@ -2763,6 +2829,23 @@ mod tests {
         assert_eq!(&body[..], b"shm");
 
         shutdown_live_server(&server).await;
+    }
+
+    #[tokio::test]
+    async fn materialized_relay_response_uses_remote_payload_chunk_size() {
+        let response = materialized_response_or_error("grid", Ok(b"abcdefg".to_vec()), 3);
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut stream = response.into_body().into_data_stream();
+        let mut chunks = Vec::new();
+        while let Some(next) = stream.next().await {
+            chunks.push(next.expect("body chunk").to_vec());
+        }
+
+        assert_eq!(
+            chunks,
+            vec![b"abc".to_vec(), b"def".to_vec(), b"g".to_vec()]
+        );
     }
 
     #[tokio::test]

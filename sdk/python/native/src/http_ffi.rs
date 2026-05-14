@@ -55,8 +55,14 @@ pub(crate) fn acquire_http_client_from_global_pool(
     base_url: &str,
     use_proxy: bool,
     call_timeout_secs: f64,
+    remote_payload_chunk_size: u64,
 ) -> Result<Arc<HttpClient>, HttpError> {
-    HttpClientPool::instance().acquire_with_options(base_url, use_proxy, call_timeout_secs)
+    HttpClientPool::instance().acquire_with_options(
+        base_url,
+        use_proxy,
+        call_timeout_secs,
+        remote_payload_chunk_size,
+    )
 }
 
 pub(crate) fn call_relay_aware_http_client<'py>(
@@ -268,7 +274,17 @@ impl PyRustHttpClientPool {
                 let call_timeout_secs =
                     ConfigResolver::resolve_relay_call_timeout_secs(ConfigSources::from_process())
                         .map_err(|e| HttpError::Transport(e.to_string()))?;
-                pool.acquire_with_options(&url, use_proxy, call_timeout_secs)
+                let remote_payload_chunk_size = ConfigResolver::resolve_remote_payload_chunk_size(
+                    None,
+                    ConfigSources::from_process(),
+                )
+                .map_err(|e| HttpError::Transport(e.to_string()))?;
+                pool.acquire_with_options(
+                    &url,
+                    use_proxy,
+                    call_timeout_secs,
+                    remote_payload_chunk_size,
+                )
             })
             .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
         Ok(PyRustHttpClient { inner: client })

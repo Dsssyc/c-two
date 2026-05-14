@@ -3,8 +3,9 @@
 **Date:** 2026-05-14
 **Status:** Phase 1 and Phase 2 request path implemented. Phase 3 benchmark
 truthfulness and large-relay row enablement implemented with explicit
-request/response materialization labels; full HTTP response streaming remains a
-future optimization.
+request/response materialization labels. Remote payload chunk sizing is a
+Rust-core transport policy shared by relay HTTP today and future remote
+protocols; full HTTP response streaming remains a future optimization.
 
 ## Scope
 
@@ -13,6 +14,8 @@ This document covers the relay data-plane path for large CRM payloads:
 - Python SDK serialized call payloads entering Rust through PyO3.
 - Relay-aware HTTP clients sending CRM calls through `c2-http`.
 - The Rust relay receiving HTTP CRM calls and forwarding them to upstream IPC.
+- Protocol-neutral remote payload batching policy used by relay HTTP today and
+  intended for future long-lived TCP or HTTP/2 remote data planes.
 - `c2-ipc` request transport selection across inline, buddy SHM, preallocated
   SHM, and chunked fallback.
 - Benchmark labeling and guardrails for relay large-payload results.
@@ -110,6 +113,16 @@ As of 2026-05-14:
   into client request HTTP materialized, relay request-to-IPC streamed, and
   response HTTP materialized. It no longer skips 500MB and 1GB relay rows by a
   hard-coded `<= 100MB` cap.
+- `C2_REMOTE_PAYLOAD_CHUNK_SIZE` is resolved and validated by `c2-config`, not
+  Python. The setting is deliberately named `REMOTE` rather than `RELAY`: it
+  controls C-Two's protocol-level payload batching for remote data planes. HTTP
+  relay uses it for outbound request bodies and materialized response-body
+  streaming today; future TCP or HTTP/2 remote transports must consume the same
+  resolved config instead of adding protocol-specific chunk variables.
+- `C2_IPC_CHUNK_SIZE` remains IPC wire chunking and reassembly policy.
+  `C2_REMOTE_PAYLOAD_CHUNK_SIZE` is a separate remote transport body batching
+  policy. Neither variable promises kernel TCP packet sizes, HTTP/1 chunk
+  boundaries, or HTTP/2 DATA frame sizes.
 
 ## Decisions
 
@@ -297,6 +310,13 @@ benchmark labels explicit enough to say that responses are still materialized.
     - Prevents a request-side optimization from being reported as full
       bidirectional streaming.
 
+13. **Remote chunk policy invariant**
+    - Remote payload chunk size is generated, validated, stored, and forwarded
+      through Rust `c2-config` / runtime / transport state under
+      `C2_REMOTE_PAYLOAD_CHUNK_SIZE`.
+    - Prevents HTTP relay, future TCP, future HTTP/2, or individual SDKs from
+      growing divergent chunk-size knobs or Python-only defaults.
+
 ## Source-To-Sink Matrix
 
 | Invariant | Producer | Storage | Consumer | Network / Wire | FFI / SDK | Test / Support | Legacy / Bypass risk |
@@ -313,6 +333,7 @@ benchmark labels explicit enough to say that responses are still materialized.
 | Route payload capability | IPC server config or attestation | owning relay route state | relay data-plane pre-body validator | IPC registration/attestation; optionally resolve metadata | all SDKs observe via Rust route resolution | registration, mesh, and data-plane tests | relay falls back to unrelated default |
 | IPC ownership boundary | `c2-ipc` prepared/streaming call API | IPC client pool and pending map | relay streaming bridge | IPC request frames | PyO3 direct IPC and relay share ownership model | failure-injection tests | `c2-http` writes `MemPool` directly |
 | Response-path honesty | `ResponseData` from upstream IPC | server pool, reassembly pool, HTTP body | relay HTTP response | IPC response to HTTP response | HTTP FFI materializes today | benchmark path counters | request streaming label hides response copy |
+| Remote chunk policy | `c2-config` resolver from explicit override / env / default | `ResolvedRuntimeConfig`, `ResolvedRelayClientConfig`, `RelayConfig`, HTTP client pool entry | relay-aware HTTP client, explicit HTTP client, relay response materializer, future remote transports | HTTP body stream today; future TCP / HTTP2 payload batches | PyO3 only forwards native-resolved value; SDK code may expose typed override | Rust config tests, HTTP pool mismatch test, relay response chunk test, Python resolver test | protocol-specific env vars, Python-only tables, HTTP pool reuse across mismatched chunk policy |
 
 Mesh note: Phase 2 enforcement can be local to the owning relay data-plane
 handler. If route payload capabilities are exposed to clients or used for route
@@ -396,11 +417,30 @@ update and review these linked surfaces together.
 
 ### `core/transport/c2-http/src/client/client.rs`
 
-- Current `.body(data.to_vec())` is materialized and replayable.
-- Phase 1 may leave this as-is.
-- Phase 2 should introduce a request body abstraction only if retry semantics
-  remain explicit: either the body source is replayable, or stale-route retry is
-  disabled after streaming begins.
+- Request body construction uses `C2_REMOTE_PAYLOAD_CHUNK_SIZE` through the
+  Rust `RelayAwareClientConfig` / `HttpClient` policy, not a hard-coded HTTP
+  constant.
+- Current outbound client payloads are still replayable because the SDK passes
+  serialized bytes; chunking changes HTTP body batching, not the SDK call
+  semantic.
+- Phase 3 response streaming must not break stale-route retry behavior.
+- If a streaming request body abstraction is introduced, route retry and
+  fallback must check replayability before each attempt.
+
+### `core/foundation/c2-config` remote payload policy
+
+- `C2_REMOTE_PAYLOAD_CHUNK_SIZE` is the single env key for remote payload body
+  batching.
+- Default: `1048576` bytes.
+- Hard maximum: `134217728` bytes.
+- Zero is invalid.
+- The validator and constants belong to a protocol-neutral config module. Relay
+  config may store the resolved value, but must not be the authority for the
+  setting.
+- Future TCP / HTTP2 remote transports must accept this resolved value through
+  Rust runtime or transport config. They must not introduce
+  `C2_TCP_CHUNK_SIZE`, `C2_HTTP2_CHUNK_SIZE`, or SDK-specific defaults unless a
+  separate lower-level protocol knob is explicitly justified and documented.
 
 ### `core/transport/c2-http/src/client/relay_aware.rs`
 

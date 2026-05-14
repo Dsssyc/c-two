@@ -7,6 +7,7 @@ mod identity;
 mod ipc;
 mod pool;
 mod relay;
+mod remote;
 mod resolver;
 
 pub use identity::{validate_ipc_region_id, validate_relay_id, validate_server_id};
@@ -16,6 +17,10 @@ pub use ipc::{
 };
 pub use pool::PoolConfig;
 pub use relay::RelayConfig;
+pub use remote::{
+    DEFAULT_REMOTE_PAYLOAD_CHUNK_SIZE, MAX_REMOTE_PAYLOAD_CHUNK_SIZE,
+    validate_remote_payload_chunk_size,
+};
 pub use resolver::{
     ClientIpcConfigOverrides, ConfigResolver, ConfigSources, EnvFilePolicy, EnvMap,
     RelayConfigOverrides, ResolvedRelayClientConfig, ResolvedRelayConfig, ResolvedRuntimeConfig,

@@ -29,6 +29,13 @@ fn resolve_shm_threshold(global_overrides: Option<&Bound<'_, PyDict>>) -> PyResu
 }
 
 #[pyfunction]
+#[pyo3(signature = (override_value=None))]
+fn resolve_remote_payload_chunk_size(override_value: Option<u64>) -> PyResult<u64> {
+    ConfigResolver::resolve_remote_payload_chunk_size(override_value, ConfigSources::from_process())
+        .map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
+#[pyfunction]
 #[pyo3(signature = (overrides=None, global_overrides=None))]
 fn resolve_server_ipc_config(
     py: Python<'_>,
@@ -425,6 +432,7 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(resolve_relay_anchor_address, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_relay_use_proxy, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_shm_threshold, m)?)?;
+    m.add_function(wrap_pyfunction!(resolve_remote_payload_chunk_size, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_server_ipc_config, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_client_ipc_config, m)?)?;
     m.add_function(wrap_pyfunction!(validate_server_id, m)?)?;

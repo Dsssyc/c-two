@@ -34,9 +34,11 @@ def _reset_registry_and_settings(monkeypatch):
     _ProcessRegistry.reset()
     settings.relay_anchor_address = None
     settings.shm_threshold = None
+    settings.remote_payload_chunk_size = None
     monkeypatch.setenv('C2_ENV_FILE', '')
     for key in (
         'C2_SHM_THRESHOLD',
+        'C2_REMOTE_PAYLOAD_CHUNK_SIZE',
         'C2_IPC_POOL_SEGMENT_SIZE',
         'C2_IPC_REASSEMBLY_SEGMENT_SIZE',
         'C2_RELAY_ANCHOR_ADDRESS',
@@ -49,6 +51,7 @@ def _reset_registry_and_settings(monkeypatch):
     _ProcessRegistry.reset()
     settings.relay_anchor_address = None
     settings.shm_threshold = None
+    settings.remote_payload_chunk_size = None
 
 
 def test_public_config_exports_only_override_schemas():
@@ -123,6 +126,51 @@ def test_transport_policy_override_beats_env(monkeypatch):
         assert server._config['shm_threshold'] == 16384  # noqa: SLF001
     finally:
         server.shutdown()
+
+
+def test_remote_payload_chunk_size_resolves_from_env_and_policy(monkeypatch):
+    monkeypatch.setenv('C2_REMOTE_PAYLOAD_CHUNK_SIZE', '2097152')
+
+    from c_two._native import resolve_remote_payload_chunk_size
+
+    assert resolve_remote_payload_chunk_size() == 2_097_152
+    assert settings.remote_payload_chunk_size == 2_097_152
+
+    cc.set_transport_policy(remote_payload_chunk_size=1_048_576)
+    registry = _ProcessRegistry.get()
+
+    assert settings.remote_payload_chunk_size == 1_048_576
+    assert registry._runtime_session.remote_payload_chunk_size_override == 1_048_576  # noqa: SLF001
+
+
+def test_transport_policy_updates_preserve_unspecified_overrides():
+    cc.set_transport_policy(shm_threshold=8192)
+    cc.set_transport_policy(remote_payload_chunk_size=1_048_576)
+    registry = _ProcessRegistry.get()
+
+    assert settings.shm_threshold == 8192
+    assert settings.remote_payload_chunk_size == 1_048_576
+    assert registry._runtime_session.client_ipc_config['shm_threshold'] == 8192  # noqa: SLF001
+    assert registry._runtime_session.remote_payload_chunk_size_override == 1_048_576  # noqa: SLF001
+
+    cc.set_transport_policy(shm_threshold=None)
+    registry = _ProcessRegistry.get()
+
+    assert registry._runtime_session.client_ipc_config['shm_threshold'] == 4096  # noqa: SLF001
+    assert registry._runtime_session.remote_payload_chunk_size_override == 1_048_576  # noqa: SLF001
+
+
+def test_remote_payload_chunk_size_zero_rejected(monkeypatch):
+    monkeypatch.setenv('C2_REMOTE_PAYLOAD_CHUNK_SIZE', '0')
+
+    from c_two._native import resolve_remote_payload_chunk_size
+
+    with pytest.raises(ValueError, match='C2_REMOTE_PAYLOAD_CHUNK_SIZE'):
+        resolve_remote_payload_chunk_size()
+
+    monkeypatch.delenv('C2_REMOTE_PAYLOAD_CHUNK_SIZE')
+    with pytest.raises(ValueError, match='C2_REMOTE_PAYLOAD_CHUNK_SIZE'):
+        cc.set_transport_policy(remote_payload_chunk_size=0)
 
 
 def test_shm_override_helper_only_contains_shm_threshold():

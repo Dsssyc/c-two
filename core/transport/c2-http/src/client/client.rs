@@ -4,6 +4,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+use reqwest::header::CONTENT_LENGTH;
 use thiserror::Error;
 
 use c2_contract::ExpectedRouteContract;
@@ -71,21 +72,40 @@ pub enum HttpError {
 pub struct HttpClient {
     client: reqwest::Client,
     base_url: String,
+    remote_payload_chunk_size: u64,
 }
 
 impl HttpClient {
-    /// Create a new client with an explicit relay proxy policy.
-    pub fn new_with_proxy_policy(
+    #[cfg(test)]
+    fn new_with_proxy_policy(
         base_url: &str,
         timeout_secs: f64,
         max_connections: usize,
         use_proxy: bool,
+    ) -> Result<Self, HttpError> {
+        Self::new_with_transport_policy(
+            base_url,
+            timeout_secs,
+            max_connections,
+            use_proxy,
+            c2_config::DEFAULT_REMOTE_PAYLOAD_CHUNK_SIZE,
+        )
+    }
+
+    /// Create a new client with explicit proxy and remote payload batching policy.
+    pub fn new_with_transport_policy(
+        base_url: &str,
+        timeout_secs: f64,
+        max_connections: usize,
+        use_proxy: bool,
+        remote_payload_chunk_size: u64,
     ) -> Result<Self, HttpError> {
         if !timeout_secs.is_finite() || timeout_secs < 0.0 {
             return Err(HttpError::Transport(
                 "HTTP call timeout must be finite and >= 0".to_string(),
             ));
         }
+        crate::payload::validate_remote_payload_chunk_size(remote_payload_chunk_size)?;
         let mut builder = crate::relay_client_builder_with_proxy(use_proxy)
             .pool_max_idle_per_host(max_connections);
         if timeout_secs > 0.0 {
@@ -97,6 +117,7 @@ impl HttpClient {
         Ok(Self {
             client,
             base_url: base_url.trim_end_matches('/').to_owned(),
+            remote_payload_chunk_size,
         })
     }
 
@@ -116,7 +137,11 @@ impl HttpClient {
             .client
             .post(&url)
             .header("Content-Type", "application/octet-stream")
-            .body(data.to_vec());
+            .header(CONTENT_LENGTH, data.len().to_string())
+            .body(crate::payload::reqwest_body_from_payload(
+                data,
+                self.remote_payload_chunk_size,
+            )?);
         let request = add_expected_contract_headers(request, expected);
         let resp = request
             .send()
@@ -189,6 +214,10 @@ impl HttpClient {
     /// Base URL of this client.
     pub fn base_url(&self) -> &str {
         &self.base_url
+    }
+
+    pub fn remote_payload_chunk_size(&self) -> u64 {
+        self.remote_payload_chunk_size
     }
 }
 
