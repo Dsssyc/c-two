@@ -254,9 +254,14 @@ Direct IPC `shutdown("ipc://...")` under `c_two.transport.client.util` is an
 admin/control-plane helper for high-privilege same-host supervisors. It stops
 the addressed native IPC server; it is not ordinary CRM business-client
 behavior and is distinct from top-level `cc.shutdown()`, which cleans up the
-current process registry. Future name-based or HTTP/relay-propagated shutdown
-must be designed as an explicit authenticated admin control plane with clear
-route-level vs server-level scope, not as a hidden normal RPC side effect.
+current process registry. Its direct IPC control acknowledgement is the
+initiate phase only: it proves the server accepted shutdown and entered
+draining, not that active callbacks have drained or shutdown hooks are safe to
+run. Completion and route close outcomes must be observed through
+`RuntimeSession.shutdown()` / bridge barriers or a future explicit wait helper.
+Future name-based or HTTP/relay-propagated shutdown must be designed as an
+explicit authenticated admin control plane with clear route-level vs server-level
+scope, not as a hidden normal RPC side effect.
 
 Server lifecycle/readiness belongs to Rust. Python `NativeServerBridge` may
 expose `start()`, `is_started()`, and shutdown facades, but must delegate
@@ -268,12 +273,13 @@ attempt must be fenced in Rust before readiness waiters run: reset stale
 observe readiness for that attempt. A Rust `Server` may only unlink its IPC
 socket path after that concrete instance successfully bound the socket; failed
 duplicate startups must not remove another server's active socket path. Bridge
-shutdown must still call idempotent native shutdown to drain the PyO3 runtime
-handle even when native lifecycle state is already stopped by an external direct
-IPC shutdown signal. Native `RustServer.shutdown()` is a lifecycle barrier:
-after it returns, runtime-owned server work must be terminal (`Initialized`,
-`Stopped`, or `Failed`) so a following start attempt does not observe stale
-`Stopping` state.
+shutdown must still drive the idempotent native runtime barrier through
+`RuntimeSession.shutdown()` so the PyO3 runtime handle drains even when native
+lifecycle state is already stopped by an external direct IPC shutdown signal.
+That native runtime barrier is a lifecycle fence: after it returns,
+runtime-owned server work must be terminal (`Initialized`, `Stopped`, or
+`Failed`) so a following start attempt does not observe stale `Stopping`
+state.
 
 Python resource servers create an auto-generated `ipc://` address. Use
 `cc.server_address()` after registration only when a same-host process needs to
@@ -573,6 +579,7 @@ through Rust serialized dispatch for symmetry.
 | `C2_IPC_MAX_FRAME_SIZE` | Max inline frame size | `2147483648` |
 | `C2_IPC_MAX_PAYLOAD_SIZE` | Max single-call payload size | `17179869184` |
 | `C2_IPC_MAX_PENDING_REQUESTS` | Max concurrent pending requests per connection | `1024` |
+| `C2_IPC_MAX_EXECUTION_WORKERS` | Max blocking execution workers for server-side resource callbacks | available parallelism clamped to `4..=64` |
 | `C2_IPC_HEARTBEAT_INTERVAL` | Heartbeat interval seconds; `0` disables | `15.0` |
 | `C2_IPC_HEARTBEAT_TIMEOUT` | Heartbeat timeout seconds | `30.0` |
 | `C2_IPC_MAX_TOTAL_CHUNKS` | Max total in-flight chunks across all connections | `512` |

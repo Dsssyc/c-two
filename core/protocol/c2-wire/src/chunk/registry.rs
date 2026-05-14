@@ -88,6 +88,13 @@ impl ChunkRegistry {
         &self.pool
     }
 
+    /// Whether an assembly exists for `(conn_id, request_id)`.
+    pub fn contains(&self, conn_id: u64, request_id: u64) -> bool {
+        self.shard(conn_id)
+            .lock()
+            .contains_key(&(conn_id, request_id))
+    }
+
     /// Begin a new chunked reassembly for `(conn_id, request_id)`.
     pub fn insert(
         &self,
@@ -330,10 +337,12 @@ mod tests {
         let reg = ChunkRegistry::new(pool.clone(), ChunkConfig::default());
         let data = b"hello world!";
         reg.insert(1, 100, 1, data.len()).unwrap();
+        assert!(reg.contains(1, 100));
         assert_eq!(reg.active_count(), 1);
         let complete = reg.feed(1, 100, 0, data).unwrap();
         assert!(complete);
         let finished = reg.finish(1, 100).unwrap();
+        assert!(!reg.contains(1, 100));
         assert_eq!(finished.handle.len(), data.len());
         assert_eq!(reg.active_count(), 0);
         assert_eq!(reg.total_bytes(), 0);

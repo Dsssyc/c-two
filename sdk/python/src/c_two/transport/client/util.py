@@ -20,13 +20,18 @@ def ping(server_address: str, timeout: float = 0.5) -> bool:
         return False
 
 
-def shutdown(server_address: str, timeout: float = 0.5) -> bool:
+def shutdown(server_address: str, timeout: float = 0.5) -> dict[str, object]:
     """Send a direct IPC shutdown signal to a server."""
     from c_two._native import ipc_shutdown
 
     try:
-        return bool(ipc_shutdown(server_address, float(timeout)))
+        return dict(ipc_shutdown(server_address, float(timeout)))
     except ValueError as exc:
         if 'timeout' in str(exc):
             raise
-        return False
+        return {
+            'acknowledged': False,
+            'shutdown_started': False,
+            'server_stopped': False,
+            'route_outcomes': [],
+        }

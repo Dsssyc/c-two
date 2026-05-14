@@ -423,6 +423,7 @@ def test_remote_ipc_scheduler_max_workers_shares_with_local_thread_calls():
     try:
         errors: list[BaseException] = []
         local_result: list[Window] = []
+        remote_result: list[Count] = []
 
         def local_worker():
             try:
@@ -430,18 +431,27 @@ def test_remote_ipc_scheduler_max_workers_shares_with_local_thread_calls():
             except BaseException as exc:
                 errors.append(exc)
 
+        def remote_worker():
+            try:
+                remote_result.append(remote.probe())
+            except BaseException as exc:
+                errors.append(exc)
+
         t1 = threading.Thread(target=local_worker)
         t1.start()
         assert resource.hold_entered.wait(timeout=1)
 
-        with pytest.raises(Exception, match='max_workers=1'):
-            remote.probe()
+        t2 = threading.Thread(target=remote_worker)
+        t2.start()
+        time.sleep(0.1)
 
+        assert t2.is_alive(), 'remote call should wait for shared worker capacity'
         assert resource.probe_calls == 0
         assert not errors
         resource.release.set()
-        _join_all([t1])
+        _join_all([t1, t2])
         assert local_result and local_result[0].end >= local_result[0].start
+        assert remote_result and remote_result[0].value == 1
     finally:
         cc.close(local)
         cc.close(remote)

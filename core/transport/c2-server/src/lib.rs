@@ -1,14 +1,23 @@
 pub mod config;
 pub mod connection;
-pub mod dispatcher;
+mod dispatcher;
 pub mod heartbeat;
 pub mod response;
-pub mod scheduler;
+pub mod runtime;
+mod scheduler;
 pub mod server;
 
 pub use config::ServerIpcConfig;
 pub use connection::Connection;
-pub use dispatcher::{CrmCallback, CrmError, CrmRoute, Dispatcher, RequestData, ResponseMeta};
+pub use dispatcher::{
+    BuiltRoute, CrmCallback, CrmError, RequestData, ResponseMeta, RouteBuildSpec,
+};
 pub use heartbeat::{HeartbeatResult, run_heartbeat};
-pub use scheduler::{AccessLevel, ConcurrencyMode, Scheduler};
-pub use server::{Server, ServerError, ServerIdentity, ServerLifecycleState};
+pub use runtime::{ServerRuntimeBuilder, ServerRuntimeOptions};
+pub use scheduler::{
+    AccessLevel, ConcurrencyMode, RouteConcurrencyHandle, SchedulerAcquireError, SchedulerGuard,
+    SchedulerLimits, SchedulerSnapshot,
+};
+pub use server::{
+    Server, ServerError, ServerIdentity, ServerLifecycleState, ServerRouteCloseOutcome,
+};

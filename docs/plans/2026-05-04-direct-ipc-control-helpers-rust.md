@@ -6,6 +6,15 @@
 socket-path, ping, and shutdown control helpers; Python `client/util.py` is now
 a thin native-call facade.
 
+**2026-05-14 design correction:** direct IPC shutdown must use the normative
+two-phase initiate/observe model in
+`docs/plans/2026-05-14-direct-ipc-shutdown-two-phase.md`. Any older snippet in
+this plan that omits required `shutdown_started`, derives a drain wait from the
+control timeout, returns route outcomes from the initiate acknowledgement, or
+treats `ShutdownClient` as anything other than the canonical single-byte
+initiate request is superseded. The control helper's timeout is acknowledgement
+timeout only.
+
 **Goal:** Move direct IPC `ping()` and `shutdown()` control-plane helpers from Python raw-socket/frame construction into Rust `c2-ipc`, with Python left as a thin native-call facade.
 
 **Architecture:** Rust `c2-ipc` becomes the language-neutral owner for IPC address validation, UDS socket-path derivation, signal frame encoding, timeout handling, and response validation. The Python SDK keeps the public `c_two.transport.client.util.ping()` and `shutdown()` functions for API continuity, but those functions call PyO3 wrappers instead of constructing frames or opening sockets themselves. Relay remains out of this path: all helpers operate on explicit `ipc://` addresses and never consult relay configuration.
@@ -25,6 +34,11 @@ C-Two is in the 0.x line. Do not keep Python raw-socket fallback behavior after 
 3. **Canonical address validation only.** IPC region validation and socket-path derivation must be owned by Rust. Python tests may keep a private helper only if it delegates to native validation and uses the native resolved path.
 4. **No data-plane changes.** This work touches control probes only. Do not change CRM call, SHM, buddy, chunked, scheduler, or relay-aware data paths.
 5. **Timeouts are bounded.** Failed probes must return or raise promptly according to the provided timeout. Do not add indefinite blocking reads or writes.
+6. **Shutdown initiation is not drain waiting.** Direct IPC `shutdown()` sends a
+   shutdown command and waits only for a structured acknowledgement that the
+   server entered draining. Completion and route close outcomes are observed by a
+   separate owner-process runtime barrier. Any future cross-process route-outcome
+   observe helper requires a separate authenticated admin design.
 
 ## Current Problem
 
@@ -66,14 +80,14 @@ use crate::client::IpcError;
 
 pub fn socket_path_from_ipc_address(address: &str) -> Result<PathBuf, IpcError>;
 pub fn ping(address: &str, timeout: Duration) -> Result<bool, IpcError>;
-pub fn shutdown(address: &str, timeout: Duration) -> Result<bool, IpcError>;
+pub fn shutdown(address: &str, timeout: Duration) -> Result<DirectShutdownAck, IpcError>;
 ```
 
 Behavior:
 
 - `socket_path_from_ipc_address()` validates `ipc://` addresses through `c2_config::validate_ipc_region_id()` and derives the same `/tmp/c_two_ipc/{region}.sock` path used by `c2-server` and `IpcClient`.
-- `ping()` returns `Ok(false)` when the socket path does not exist, connect/read/write times out, the peer closes, or the response is not a valid PONG signal. It returns `Err(IpcError::Config(_))` for invalid IPC addresses.
-- `shutdown()` returns `Ok(true)` when the socket path does not exist, matching current Python idempotent behavior. When the socket exists, it sends `SHUTDOWN_CLIENT_BYTES`, waits for `SHUTDOWN_ACK_BYTES`, and returns `Ok(true)` only for that valid ACK. Timeout/closed/invalid response returns `Ok(false)`. Invalid IPC addresses return `Err(IpcError::Config(_))`.
+- `ping()` treats `timeout` as a deadline and retries short failed attempts until the socket answers with a valid PONG signal or the deadline expires. It returns `Err(IpcError::Config(_))` for invalid IPC addresses.
+- `shutdown()` returns a structured shutdown acknowledgement with required `acknowledged`, `shutdown_started`, `server_stopped`, and `route_outcomes` fields. An absent socket returns `{acknowledged: true, shutdown_started: false, server_stopped: true, route_outcomes: []}`. A live socket sends the canonical single-byte `ShutdownClient` initiate command with no drain-budget payload. A valid `ShutdownAck` means the server accepted the command and entered draining; it does not prove route drain or hook safety, and its `route_outcomes` are empty. Invalid, malformed, or timed-out replies return an explicit non-acknowledged outcome. See `docs/plans/2026-05-14-direct-ipc-shutdown-two-phase.md` for the normative shutdown semantics.
 - The helper uses `std::os::unix::net::UnixStream` plus `set_read_timeout()`/`set_write_timeout()` for a small synchronous control path. This avoids creating a Tokio runtime for one-shot probes and keeps PyO3 wrappers simple.
 
 ### Python facade API
@@ -82,13 +96,13 @@ Keep the existing public functions:
 
 ```python
 def ping(server_address: str, timeout: float = 0.5) -> bool: ...
-def shutdown(server_address: str, timeout: float = 0.5) -> bool: ...
+def shutdown(server_address: str, timeout: float = 0.5) -> dict[str, object]: ...
 ```
 
 Facade behavior:
 
 - `ping()` returns `False` on invalid addresses and unavailable servers, preserving current public behavior.
-- `shutdown()` returns `False` on invalid addresses and failed communication, and `True` when the socket is already absent, preserving current public behavior.
+- `shutdown()` returns the native structured outcome dict and returns the explicit false outcome dict for invalid addresses; it no longer exposes a bool success/failure surface.
 - `_socket_path_from_address()` remains only for tests/fixtures that inspect socket paths. It delegates to native `ipc_socket_path()` and raises `ValueError` for invalid addresses. It must not construct `/tmp/c_two_ipc/...` in Python.
 
 ### PyO3 wrappers
@@ -105,14 +119,18 @@ fn ipc_ping(address: &str, timeout_seconds: f64) -> PyResult<bool>;
 
 #[pyfunction]
 #[pyo3(signature = (address, timeout_seconds=0.5))]
-fn ipc_shutdown(address: &str, timeout_seconds: f64) -> PyResult<bool>;
+fn ipc_shutdown<'py>(
+    py: Python<'py>,
+    address: String,
+    timeout_seconds: f64,
+) -> PyResult<Bound<'py, PyDict>>;
 ```
 
 Wrapper mapping:
 
-- `IpcError::Config(_)` maps to `PyValueError` for `ipc_socket_path()` and to `False` through the Python facade for `ping()`/`shutdown()`.
-- Other Rust errors from the helper should normally be converted to `Ok(false)` by the Rust helper. If any unexpected `Err` remains, map it to `PyRuntimeError` so tests catch it.
-- Reject negative or non-finite timeout values with `PyValueError`. A zero timeout is allowed but may immediately return `False` if the socket operation cannot complete.
+- `IpcError::Config(_)` maps to `PyValueError` for `ipc_socket_path()` and to `False` through the Python facade for `ping()`. The shutdown facade converts invalid addresses to the explicit false outcome dict.
+- Other Rust errors from `ping()` should normally be converted to `Ok(false)` by the Rust helper; shutdown communication failures should return the explicit false outcome. If any unexpected `Err` remains, map it to `PyRuntimeError` so tests catch it.
+- Reject negative or non-finite timeout values with `PyValueError`. A zero timeout is allowed but may immediately return `False` for `ping()` or a false outcome for `shutdown()` if the socket operation cannot complete.
 
 ## Implementation Tasks
 
@@ -310,7 +328,12 @@ use std::os::unix::net::UnixStream;
 
 use c2_wire::flags::{FLAG_RESPONSE, FLAG_SIGNAL};
 use c2_wire::frame::{self, HEADER_SIZE};
-use c2_wire::msg_type::{PING_BYTES, PONG_BYTES, SHUTDOWN_ACK_BYTES, SHUTDOWN_CLIENT_BYTES};
+use c2_wire::msg_type::{PING_BYTES, PONG_BYTES};
+use c2_wire::shutdown_control::{
+    DirectShutdownAck,
+    decode_shutdown_ack,
+    encode_shutdown_initiate,
+};
 
 fn recv_exact(stream: &mut UnixStream, len: usize) -> Result<Vec<u8>, IpcError> {
     let mut buf = vec![0u8; len];
@@ -396,20 +419,46 @@ Replace the placeholder functions with:
 
 ```rust
 pub fn ping(address: &str, timeout: Duration) -> Result<bool, IpcError> {
-    match send_signal_and_read_reply(address, timeout, 0, &PING_BYTES)? {
-        Some((flags, payload)) => Ok(is_signal_reply(flags, &payload, &PONG_BYTES)),
-        None => Ok(false),
+    let started = std::time::Instant::now();
+    loop {
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            return Ok(false);
+        }
+        let remaining = timeout.saturating_sub(elapsed);
+        match send_signal_and_read_reply(address, remaining.min(Duration::from_millis(100)), 0, &PING_BYTES)? {
+            Some((flags, payload)) => return Ok(is_signal_reply(flags, &payload, &PONG_BYTES)),
+            None => std::thread::sleep(remaining.min(Duration::from_millis(10))),
+        }
     }
 }
 
-pub fn shutdown(address: &str, timeout: Duration) -> Result<bool, IpcError> {
+pub fn shutdown(address: &str, timeout: Duration) -> Result<DirectShutdownAck, IpcError> {
     let socket_path = socket_path_from_ipc_address(address)?;
     if !socket_path.exists() {
-        return Ok(true);
+        return Ok(DirectShutdownAck {
+            acknowledged: true,
+            shutdown_started: false,
+            server_stopped: true,
+            route_outcomes: Vec::new(),
+        });
     }
-    match send_signal_and_read_reply(address, timeout, 0, &SHUTDOWN_CLIENT_BYTES)? {
-        Some((flags, payload)) => Ok(is_signal_reply(flags, &payload, &SHUTDOWN_ACK_BYTES)),
-        None => Ok(false),
+    let request = encode_shutdown_initiate();
+    match send_signal_and_read_reply(address, timeout, 0, &request)? {
+        Some((flags, payload)) if flags & FLAG_SIGNAL != 0 && flags & FLAG_RESPONSE != 0 => {
+            decode_shutdown_ack(&payload).or_else(|_| Ok(DirectShutdownAck {
+                acknowledged: false,
+                shutdown_started: false,
+                server_stopped: false,
+                route_outcomes: Vec::new(),
+            }))
+        }
+        _ => Ok(DirectShutdownAck {
+            acknowledged: false,
+            shutdown_started: false,
+            server_stopped: false,
+            route_outcomes: Vec::new(),
+        }),
     }
 }
 ```
@@ -494,12 +543,16 @@ fn ipc_ping(py: Python<'_>, address: &str, timeout_seconds: f64) -> PyResult<boo
 
 #[pyfunction]
 #[pyo3(signature = (address, timeout_seconds=0.5))]
-fn ipc_shutdown(py: Python<'_>, address: &str, timeout_seconds: f64) -> PyResult<bool> {
+fn ipc_shutdown<'py>(
+    py: Python<'py>,
+    address: String,
+    timeout_seconds: f64,
+) -> PyResult<Bound<'py, PyDict>> {
     let timeout = timeout_from_seconds(timeout_seconds)?;
-    let address = address.to_string();
-    py.detach(move || {
+    let outcome = py.detach(move || {
         c2_ipc::shutdown(&address, timeout).map_err(|e| PyRuntimeError::new_err(e.to_string()))
-    })
+    })?;
+    shutdown_outcome_to_dict(py, outcome)
 }
 
 pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -570,19 +623,26 @@ def ping(server_address: str, timeout: float = 0.5) -> bool:
         return False
 
 
-def shutdown(server_address: str, timeout: float = 0.5) -> bool:
+def shutdown(server_address: str, timeout: float = 0.5) -> dict[str, object]:
     """Send a direct IPC shutdown signal to a server.
 
-    Invalid addresses and failed communication return ``False``. A missing
-    socket returns ``True`` because shutdown is idempotent for an already-stopped
-    direct IPC server.
+    Invalid addresses return an explicit false outcome dict. A missing socket
+    returns an acknowledged stopped outcome because shutdown is idempotent for an
+    already-stopped direct IPC server. For a live server, timeout covers only the
+    control acknowledgement; route drain and hook-safe completion are observed by
+    a separate runtime barrier.
     """
     from c_two._native import ipc_shutdown
 
     try:
-        return bool(ipc_shutdown(server_address, float(timeout)))
+        return dict(ipc_shutdown(server_address, float(timeout)))
     except ValueError:
-        return False
+        return {
+            'acknowledged': False,
+            'shutdown_started': False,
+            'server_stopped': False,
+            'route_outcomes': [],
+        }
 ```
 
 Do not retain imports of `os`, `socket`, or `struct`, and do not retain copied frame/signal constants.
@@ -706,7 +766,12 @@ def test_shutdown_stops_direct_ipc_without_relay(monkeypatch):
     server.start()
     _wait_for_ping(address)
 
-    assert shutdown(address, timeout=0.5) is True
+    assert shutdown(address, timeout=0.5) == {
+        'acknowledged': True,
+        'shutdown_started': True,
+        'server_stopped': False,
+        'route_outcomes': [],
+    }
 
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline:
@@ -866,7 +931,10 @@ Expected: only intentional files changed.
 
 - `c2-ipc` owns direct IPC `ping`, `shutdown`, socket-path derivation, and signal response validation.
 - Python `client/util.py` no longer builds frames, copies signal constants, or opens raw sockets.
-- Python `ping()` / `shutdown()` keep their public bool-return behavior for invalid/unavailable addresses.
+- Python `ping()` keeps its public bool-return behavior for invalid/unavailable
+  addresses. Python `shutdown()` returns the native structured
+  `DirectShutdownAck`-compatible dict and maps invalid/unavailable addresses to
+  the documented non-acknowledged outcome.
 - Direct IPC probes work without relay and with a bad relay environment variable.
 - Invalid IPC addresses are rejected through Rust validation.
 - Existing server readiness fixtures continue to work.

@@ -85,6 +85,7 @@ def test_override_schemas_are_typed_and_do_not_include_derived_or_global_fields(
     assert base['chunk_gc_interval'] is float
     assert server['heartbeat_interval'] is float
     assert server['max_pending_requests'] is int
+    assert server['max_execution_workers'] is int
     assert client['reassembly_segment_size'] is int
 
     for hints in (base, server, client):
@@ -140,6 +141,53 @@ def test_server_ipc_overrides_beat_env(monkeypatch):
         assert server._config['pool_segment_size'] == 4 * 1024 * 1024  # noqa: SLF001
     finally:
         server.shutdown()
+
+
+def test_server_execution_workers_env_and_override(monkeypatch):
+    monkeypatch.setenv('C2_IPC_MAX_EXECUTION_WORKERS', '9')
+
+    server = Server(bind_address='ipc://unit_execution_workers_env')
+    try:
+        assert server._config['max_execution_workers'] == 9  # noqa: SLF001
+    finally:
+        server.shutdown()
+
+    override_server = Server(
+        bind_address='ipc://unit_execution_workers_override',
+        ipc_overrides={'max_execution_workers': 7},
+    )
+    try:
+        assert override_server._config['max_execution_workers'] == 7  # noqa: SLF001
+    finally:
+        override_server.shutdown()
+
+
+def test_server_execution_workers_zero_rejected(monkeypatch):
+    monkeypatch.setenv('C2_IPC_MAX_EXECUTION_WORKERS', '0')
+
+    with pytest.raises(ValueError, match='max_execution_workers'):
+        Server(bind_address='ipc://unit_execution_workers_zero_env')
+
+    monkeypatch.delenv('C2_IPC_MAX_EXECUTION_WORKERS')
+    with pytest.raises(ValueError, match='max_execution_workers'):
+        Server(
+            bind_address='ipc://unit_execution_workers_zero_override',
+            ipc_overrides={'max_execution_workers': 0},
+        )
+
+
+def test_server_execution_workers_above_hard_limit_rejected(monkeypatch):
+    monkeypatch.setenv('C2_IPC_MAX_EXECUTION_WORKERS', '65')
+
+    with pytest.raises(ValueError, match='max_execution_workers'):
+        Server(bind_address='ipc://unit_execution_workers_oversized_env')
+
+    monkeypatch.delenv('C2_IPC_MAX_EXECUTION_WORKERS')
+    with pytest.raises(ValueError, match='max_execution_workers'):
+        Server(
+            bind_address='ipc://unit_execution_workers_oversized_override',
+            ipc_overrides={'max_execution_workers': 65},
+        )
 
 
 def test_client_ipc_overrides_beat_env(monkeypatch):

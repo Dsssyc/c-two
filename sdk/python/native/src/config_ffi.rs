@@ -115,6 +115,7 @@ fn parse_server_ipc_overrides_dict(dict: &Bound<'_, PyDict>) -> PyResult<ServerI
         max_frame_size: get_opt(dict, "max_frame_size")?,
         max_payload_size: get_opt(dict, "max_payload_size")?,
         max_pending_requests: get_opt(dict, "max_pending_requests")?,
+        max_execution_workers: get_opt(dict, "max_execution_workers")?,
         pool_decay_seconds: get_opt(dict, "pool_decay_seconds")?,
         heartbeat_interval_secs: get_opt(dict, "heartbeat_interval")?,
         heartbeat_timeout_secs: get_opt(dict, "heartbeat_timeout")?,
@@ -207,6 +208,9 @@ pub(crate) fn server_ipc_overrides_to_dict<'py>(
     }
     if let Some(value) = overrides.max_pending_requests {
         dict.set_item("max_pending_requests", value)?;
+    }
+    if let Some(value) = overrides.max_execution_workers {
+        dict.set_item("max_execution_workers", value)?;
     }
     if let Some(value) = overrides.pool_decay_seconds {
         dict.set_item("pool_decay_seconds", value)?;
@@ -381,6 +385,7 @@ fn server_ipc_to_dict<'py>(py: Python<'py>, cfg: &ServerIpcConfig) -> PyResult<B
     dict.set_item("max_frame_size", cfg.max_frame_size)?;
     dict.set_item("max_payload_size", cfg.max_payload_size)?;
     dict.set_item("max_pending_requests", cfg.max_pending_requests)?;
+    dict.set_item("max_execution_workers", cfg.max_execution_workers)?;
     dict.set_item("pool_decay_seconds", cfg.pool_decay_seconds)?;
     dict.set_item("heartbeat_interval", cfg.heartbeat_interval_secs)?;
     dict.set_item("heartbeat_timeout", cfg.heartbeat_timeout_secs)?;

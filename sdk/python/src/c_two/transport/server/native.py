@@ -87,6 +87,43 @@ def _session_has_relay(runtime_session: object, relay_anchor_address: str | None
     except Exception:
         return False
 
+
+def _new_standalone_runtime_session() -> object:
+    from c_two._native import RuntimeSession
+    return RuntimeSession(use_process_relay_anchor=False)
+
+
+def _ensure_no_standalone_relay(
+    runtime_session: object | None,
+    relay_anchor_address: str | None,
+) -> None:
+    if runtime_session is None and relay_anchor_address is not None:
+        raise ValueError(
+            'relay operations require a runtime_session-owned server bridge',
+        )
+
+
+def _close_outcome_by_route(outcome: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
+    route_outcomes = outcome.get('route_outcomes') or ()
+    by_route: dict[str, Mapping[str, Any]] = {}
+    for close in route_outcomes:
+        if not isinstance(close, Mapping):
+            continue
+        route_name = close.get('route_name')
+        if isinstance(route_name, str) and route_name:
+            by_route[route_name] = close
+    return by_route
+
+
+def _close_outcome_is_hook_safe(close: Mapping[str, Any] | None) -> bool:
+    if not isinstance(close, Mapping):
+        return False
+    if not bool(close.get('local_removed', False)):
+        return False
+    if not bool(close.get('active_drained', False)):
+        return False
+    return close.get('closed_reason') != 'registration_rollback'
+
 class NativeServerBridge:
     """Drop-in replacement for the Python ``Server`` class.
 
@@ -138,6 +175,7 @@ class NativeServerBridge:
             max_frame_size=self._config['max_frame_size'],
             max_payload_size=self._config['max_payload_size'],
             max_pending_requests=self._config['max_pending_requests'],
+            max_execution_workers=self._config['max_execution_workers'],
             pool_decay_seconds=self._config['pool_decay_seconds'],
             heartbeat_interval=self._config['heartbeat_interval'],
             heartbeat_timeout=self._config['heartbeat_timeout'],
@@ -217,39 +255,14 @@ class NativeServerBridge:
         with self._slots_lock:
             if routing_name in self._slots:
                 raise ValueError(f'Name already registered: {routing_name!r}')
-            if runtime_session is not None and _session_has_relay(runtime_session, relay_anchor_address) and not self.is_started():
+            _ensure_no_standalone_relay(runtime_session, relay_anchor_address)
+            if runtime_session is None:
+                runtime_session = _new_standalone_runtime_session()
+            if _session_has_relay(runtime_session, relay_anchor_address) and not self.is_started():
                 self.start()
-            if runtime_session is not None:
-                try:
-                    _outcome, native_concurrency = runtime_session.register_route(
-                        self._rust_server,
-                        routing_name,
-                        dispatcher,
-                        methods,
-                        access_map,
-                        cc_config.mode.value,
-                        cc_config.max_pending,
-                        cc_config.max_workers,
-                        crm_ns,
-                        crm_name,
-                        crm_ver,
-                        abi_hash,
-                        signature_hash,
-                        relay_anchor_address,
-                    )
-                except Exception as exc:
-                    if (
-                        getattr(exc, 'status_code', None) == 409
-                        and getattr(exc, 'relay_duplicate', False)
-                    ):
-                        raise ResourceAlreadyRegistered(
-                            f'Route name already registered with relay: {routing_name!r}',
-                        ) from exc
-                    if getattr(exc, 'status_code', None) == 409:
-                        raise ValueError(str(exc)) from exc
-                    raise
-            else:
-                native_concurrency = self._rust_server.register_route(
+            try:
+                _outcome, native_concurrency = runtime_session.register_route(
+                    self._rust_server,
                     routing_name,
                     dispatcher,
                     methods,
@@ -257,12 +270,24 @@ class NativeServerBridge:
                     cc_config.mode.value,
                     cc_config.max_pending,
                     cc_config.max_workers,
-                    slot.crm_ns,
-                    slot.crm_name,
-                    slot.crm_ver,
-                    slot.abi_hash,
-                    slot.signature_hash,
+                    crm_ns,
+                    crm_name,
+                    crm_ver,
+                    abi_hash,
+                    signature_hash,
+                    relay_anchor_address,
                 )
+            except Exception as exc:
+                if (
+                    getattr(exc, 'status_code', None) == 409
+                    and getattr(exc, 'relay_duplicate', False)
+                ):
+                    raise ResourceAlreadyRegistered(
+                        f'Route name already registered with relay: {routing_name!r}',
+                    ) from exc
+                if getattr(exc, 'status_code', None) == 409:
+                    raise ValueError(str(exc)) from exc
+                raise
             slot.scheduler = Scheduler(native_concurrency, method_index)
             self._slots[routing_name] = slot
         return routing_name
@@ -279,9 +304,9 @@ class NativeServerBridge:
             if slot is None:
                 raise KeyError(f'Name not registered: {name!r}')
 
+        _ensure_no_standalone_relay(runtime_session, relay_anchor_address)
         if runtime_session is None:
-            from c_two._native import RuntimeSession
-            runtime_session = RuntimeSession()
+            runtime_session = _new_standalone_runtime_session()
 
         outcome = dict(runtime_session.unregister_route(
             self._rust_server,
@@ -290,11 +315,13 @@ class NativeServerBridge:
         ))
         if not outcome.get('local_removed', False):
             raise KeyError(f'Name not registered in native server: {name!r}')
+        close = outcome.get('close')
+        if not _close_outcome_is_hook_safe(close):
+            return outcome
 
         with self._slots_lock:
             slot = self._slots.pop(name, None)
         if slot is not None:
-            slot.scheduler.shutdown()
             self._invoke_shutdown(slot)
         return outcome
 
@@ -341,6 +368,7 @@ class NativeServerBridge:
     def shutdown(
         self,
         *,
+        timeout: float = 5.0,
         runtime_session: object | None = None,
         relay_anchor_address: str | None = None,
     ) -> dict[str, Any]:
@@ -348,17 +376,21 @@ class NativeServerBridge:
             slots_by_name = dict(self._slots)
             route_names = list(slots_by_name)
 
+        _ensure_no_standalone_relay(runtime_session, relay_anchor_address)
         if runtime_session is None:
-            from c_two._native import RuntimeSession
-            runtime_session = RuntimeSession()
+            runtime_session = _new_standalone_runtime_session()
 
         outcome = dict(runtime_session.shutdown(
             self._rust_server,
             route_names=route_names,
             relay_anchor_address=relay_anchor_address,
+            timeout_seconds=float(timeout),
         ))
 
-        removed_names = list(outcome.get('removed_routes') or [])
+        close_by_route = _close_outcome_by_route(outcome)
+        removed_names = [
+            name for name in route_names if _close_outcome_is_hook_safe(close_by_route.get(name))
+        ]
         removed_slots: list[CRMSlot] = []
         with self._slots_lock:
             for name in removed_names:
@@ -367,15 +399,7 @@ class NativeServerBridge:
                     removed_slots.append(slot)
 
         for slot in removed_slots:
-            slot.scheduler.shutdown()
-
-        for slot in removed_slots:
             self._invoke_shutdown(slot)
-
-        try:
-            self._rust_server.shutdown()
-        except Exception:
-            logger.warning('Error shutting down RustServer', exc_info=True)
         return outcome
 
     # ------------------------------------------------------------------
@@ -441,7 +465,7 @@ class NativeServerBridge:
     def _make_dispatcher(
         self, route_name: str, slot: CRMSlot,
     ) -> Callable[[str, int, object], object]:
-        """Build the Python callable passed to ``RustServer.register_route()``.
+        """Build the Python callable passed into native route registration.
 
         The callable is invoked from Rust's ``spawn_blocking`` with the GIL
         held.  Signature: ``(route_name, method_idx, shm_buffer)``.

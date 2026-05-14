@@ -4,6 +4,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::{
     Json, Router,
@@ -16,8 +17,8 @@ use axum::{
 };
 
 use crate::relay::authority::{
-    ControlError, RegisterPreparation, RouteAuthority, attest_ipc_route_contract,
-    read_ipc_route_contract,
+    ControlError, RegisterPreparation, RouteAuthority, attest_ipc_pending_route_contract,
+    attest_ipc_route_contract, read_ipc_route_contract,
 };
 use crate::relay::conn_pool::UpstreamLease;
 use crate::relay::gossip::{broadcast_route_announce, broadcast_route_withdraw};
@@ -267,6 +268,24 @@ fn register_contract_claim_from_body(
     }
 }
 
+async fn connect_ipc_for_register(address: &str) -> Result<IpcClient, String> {
+    let started = Instant::now();
+    let timeout = Duration::from_millis(500);
+    loop {
+        let mut client = IpcClient::new(address);
+        match client.connect().await {
+            Ok(()) => return Ok(client),
+            Err(err) => {
+                let message = err.to_string();
+                if started.elapsed() >= timeout {
+                    return Err(message);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+}
+
 fn register_body_string_field<'a>(
     body: &'a serde_json::Value,
     field: &'static str,
@@ -283,6 +302,25 @@ fn register_body_string_field<'a>(
                 .into_response()
         }),
         None => Ok(None),
+    }
+}
+
+fn register_body_bool_field(
+    body: &serde_json::Value,
+    field: &'static str,
+) -> Result<bool, Response> {
+    match body.get(field) {
+        Some(value) => value.as_bool().ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "InvalidRegisterRequest",
+                    "message": format!("{field} must be a boolean"),
+                })),
+            )
+                .into_response()
+        }),
+        None => Ok(false),
     }
 }
 
@@ -386,6 +424,24 @@ async fn handle_register(
         Ok(claim) => claim,
         Err(response) => return response,
     };
+    let registration_token = match register_body_string_field(&body, "registration_token") {
+        Ok(value) => value.map(str::to_string),
+        Err(response) => return response,
+    };
+    let prepare_only = match register_body_bool_field(&body, "prepare_only") {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if prepare_only && registration_token.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "PendingRouteAttestationRequired",
+                "message": "prepare_only registration requires registration_token",
+            })),
+        )
+            .into_response();
+    }
 
     if let Err(ControlError::InvalidServerInstanceId { reason }) =
         RouteAuthority::new(&state).validate_server_instance_id(&server_instance_id)
@@ -418,13 +474,16 @@ async fn handle_register(
 
     // Connect IPC client and attest the registered route contract.
     let (client, crm_ns, crm_name, crm_ver, abi_hash, signature_hash) = {
-        let mut c = IpcClient::new(&address);
-        if let Err(e) = c.connect().await {
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({"error": format!("Failed to connect upstream '{name}' at {address}: {e}")})),
-            ).into_response();
-        }
+        let mut c = match connect_ipc_for_register(&address).await {
+            Ok(client) => client,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({"error": format!("Failed to connect upstream '{name}' at {address}: {e}")})),
+                )
+                    .into_response();
+            }
+        };
         let identity_matches = c.server_id() == Some(server_id.as_str())
             && c.server_instance_id() == Some(server_instance_id.as_str());
         if !identity_matches {
@@ -437,47 +496,101 @@ async fn handle_register(
             )
                 .into_response();
         }
-        if !c.has_route(&name) {
-            close_client(c);
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": format!("IPC upstream at {address} does not export route '{name}'"),
-                })),
-            )
-                .into_response();
-        }
         let contract = match claimed_contract.as_ref() {
-            Some(claimed_contract) => match attest_ipc_route_contract(
-                &c,
-                &name,
-                &claimed_contract.crm_ns,
-                &claimed_contract.crm_name,
-                &claimed_contract.crm_ver,
-                &claimed_contract.abi_hash,
-                &claimed_contract.signature_hash,
-            ) {
-                Ok(contract) => contract,
-                Err(ControlError::ContractMismatch { reason }) => {
-                    close_client(c);
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({ "error": reason })),
+            Some(claimed_contract) => {
+                if c.has_route(&name) {
+                    match attest_ipc_route_contract(
+                        &c,
+                        &name,
+                        &claimed_contract.crm_ns,
+                        &claimed_contract.crm_name,
+                        &claimed_contract.crm_ver,
+                        &claimed_contract.abi_hash,
+                        &claimed_contract.signature_hash,
+                    ) {
+                        Ok(contract) => contract,
+                        Err(ControlError::ContractMismatch { reason }) => {
+                            close_client(c);
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({ "error": reason })),
+                            )
+                                .into_response();
+                        }
+                        Err(ControlError::NotFound) => {
+                            close_client(c);
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": format!("IPC upstream at {address} does not export route '{name}'"),
+                                })),
+                            )
+                                .into_response();
+                        }
+                        Err(_) => {
+                            unreachable!("route contract attestation returns only contract errors")
+                        }
+                    }
+                } else {
+                    if !prepare_only {
+                        close_client(c);
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": "PendingRouteNotCommitted",
+                                "message": format!("IPC upstream at {address} does not export committed route '{name}'"),
+                            })),
+                        )
+                            .into_response();
+                    }
+                    let Some(registration_token) = registration_token.as_deref() else {
+                        close_client(c);
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": "PendingRouteAttestationRequired",
+                                "message": format!("IPC upstream at {address} does not export committed route '{name}' and no registration_token was provided"),
+                            })),
+                        )
+                            .into_response();
+                    };
+                    match attest_ipc_pending_route_contract(
+                        &mut c,
+                        &name,
+                        registration_token,
+                        &claimed_contract.crm_ns,
+                        &claimed_contract.crm_name,
+                        &claimed_contract.crm_ver,
+                        &claimed_contract.abi_hash,
+                        &claimed_contract.signature_hash,
                     )
-                        .into_response();
+                    .await
+                    {
+                        Ok(contract) => contract,
+                        Err(ControlError::ContractMismatch { reason }) => {
+                            close_client(c);
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({ "error": reason })),
+                            )
+                                .into_response();
+                        }
+                        Err(ControlError::NotFound) => {
+                            close_client(c);
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(serde_json::json!({
+                                    "error": format!("IPC upstream at {address} does not attest pending route '{name}'"),
+                                })),
+                            )
+                                .into_response();
+                        }
+                        Err(_) => unreachable!(
+                            "pending route contract attestation returns only contract errors"
+                        ),
+                    }
                 }
-                Err(ControlError::NotFound) => {
-                    close_client(c);
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({
-                            "error": format!("IPC upstream at {address} does not export route '{name}'"),
-                        })),
-                    )
-                        .into_response();
-                }
-                Err(_) => unreachable!("route contract attestation returns only contract errors"),
-            },
+            }
             None => match read_ipc_route_contract(&c, &name) {
                 Ok(contract) => contract,
                 Err(ControlError::NotFound) => {
@@ -510,6 +623,18 @@ async fn handle_register(
             contract.signature_hash,
         )
     };
+
+    if prepare_only {
+        close_arc_client(client);
+        return (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "status": "prepared",
+                "name": name,
+            })),
+        )
+            .into_response();
+    }
 
     let replacement = match RouteAuthority::new(&state)
         .confirm_replacement_for_commit(replacement_candidate)
@@ -981,8 +1106,9 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::relay::test_support::{
-        register_echo_route, start_live_server, start_live_server_with_identity_and_contracts,
-        start_live_server_with_routes, test_state_for_client,
+        register_echo_route, reserve_echo_route, shutdown_live_server, start_live_server,
+        start_live_server_with_identity_and_contracts, start_live_server_with_routes,
+        test_state_for_client,
     };
     use crate::relay::types::RouteInfo;
 
@@ -1126,6 +1252,47 @@ mod tests {
                             "server_id": server_id,
                             "server_instance_id": format!("{server_id}-instance"),
                             "address": address,
+                            "crm_ns": crm_ns,
+                            "crm_name": crm_name,
+                            "crm_ver": crm_ver,
+                            "abi_hash": TEST_ABI_HASH,
+                            "signature_hash": TEST_SIGNATURE_HASH,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        status
+    }
+
+    async fn post_register_with_crm_and_token(
+        state: Arc<RelayState>,
+        name: &str,
+        server_id: &str,
+        address: &str,
+        registration_token: &str,
+        crm_ns: &str,
+        crm_name: &str,
+        crm_ver: &str,
+    ) -> StatusCode {
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": name,
+                            "server_id": server_id,
+                            "server_instance_id": format!("{server_id}-instance"),
+                            "address": address,
+                            "registration_token": registration_token,
                             "crm_ns": crm_ns,
                             "crm_name": crm_name,
                             "crm_ver": crm_ver,
@@ -1440,7 +1607,7 @@ mod tests {
             StatusCode::OK,
         );
 
-        server.shutdown();
+        shutdown_live_server(&server).await;
     }
 
     #[tokio::test]
@@ -1471,7 +1638,7 @@ mod tests {
             StatusCode::OK,
         );
 
-        server.shutdown();
+        shutdown_live_server(&server).await;
     }
 
     #[tokio::test]
@@ -1683,7 +1850,7 @@ mod tests {
             StatusCode::BAD_GATEWAY
         );
 
-        server.shutdown();
+        shutdown_live_server(&server).await;
     }
 
     #[tokio::test]
@@ -1705,7 +1872,130 @@ mod tests {
             "relay must not advertise a route that the upstream handshake did not export"
         );
 
-        server.shutdown();
+        shutdown_live_server(&server).await;
+    }
+
+    #[tokio::test]
+    async fn register_rejects_claimed_contract_when_upstream_does_not_export_route() {
+        let state = test_state();
+        let address = format!(
+            "ipc://relay_claimed_missing_route_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let server = start_live_server_with_routes(&address, "server-grid", &["counter"]).await;
+
+        assert_eq!(
+            post_register_with_crm(
+                state.clone(),
+                "grid",
+                "server-grid",
+                &address,
+                TEST_CRM_NS,
+                TEST_CRM_NAME,
+                TEST_CRM_VER,
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(
+            state.resolve("grid").is_empty(),
+            "relay must not advertise caller-claimed CRM metadata for an unexported IPC route"
+        );
+
+        shutdown_live_server(&server).await;
+    }
+
+    #[tokio::test]
+    async fn register_rejects_publishing_server_attested_pending_route_with_token() {
+        let state = test_state();
+        let address = format!(
+            "ipc://relay_pending_attested_route_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let server = start_live_server_with_identity_and_contracts(
+            &address,
+            "server-grid",
+            "server-grid-instance",
+            &[],
+        )
+        .await;
+        let reservation = reserve_echo_route(&server, "grid").await;
+        let registration_token = reservation.registration_token().to_string();
+
+        assert_eq!(
+            post_register_with_crm_and_token(
+                state.clone(),
+                "grid",
+                "server-grid",
+                &address,
+                &registration_token,
+                "test.echo",
+                "Echo",
+                "0.1.0",
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
+        assert!(
+            state.resolve("grid").is_empty(),
+            "ordinary register must not publish pending routes even with a valid token"
+        );
+
+        server.abort_reserved_route(reservation).await;
+        shutdown_live_server(&server).await;
+    }
+
+    #[tokio::test]
+    async fn register_prepare_with_pending_token_does_not_publish_route() {
+        let state = test_state();
+        let address = format!(
+            "ipc://relay_pending_prepare_route_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let server = start_live_server_with_identity_and_contracts(
+            &address,
+            "server-grid",
+            "server-grid-instance",
+            &[],
+        )
+        .await;
+        let reservation = reserve_echo_route(&server, "grid").await;
+        let registration_token = reservation.registration_token().to_string();
+
+        let prepare_status = post_register_json(
+            state.clone(),
+            serde_json::json!({
+                "name": "grid",
+                "server_id": "server-grid",
+                "server_instance_id": "server-grid-instance",
+                "address": address,
+                "registration_token": registration_token,
+                "prepare_only": true,
+                "crm_ns": "test.echo",
+                "crm_name": "Echo",
+                "crm_ver": "0.1.0",
+                "abi_hash": TEST_ABI_HASH,
+                "signature_hash": TEST_SIGNATURE_HASH,
+            }),
+        )
+        .await;
+        assert_eq!(prepare_status, StatusCode::ACCEPTED);
+        assert!(
+            state.resolve("grid").is_empty(),
+            "prepare-only registration must not publish relay-visible route state"
+        );
+
+        server.commit_reserved_route(reservation).await.unwrap();
+        assert_eq!(
+            post_register(state.clone(), "grid", "server-grid", &address).await,
+            StatusCode::CREATED
+        );
+        assert_eq!(state.resolve("grid").len(), 1);
+
+        shutdown_live_server(&server).await;
     }
 
     #[tokio::test]
@@ -1728,7 +2018,7 @@ mod tests {
         assert_eq!(routes[0].crm_ns, "test.echo");
         assert_eq!(routes[0].crm_ver, "0.1.0");
 
-        server.shutdown();
+        shutdown_live_server(&server).await;
     }
 
     #[tokio::test]
@@ -1763,7 +2053,7 @@ mod tests {
             "relay must not silently ignore malformed claimed CRM contract fields"
         );
 
-        server.shutdown();
+        shutdown_live_server(&server).await;
     }
 
     #[tokio::test]
@@ -1794,7 +2084,7 @@ mod tests {
             "relay must not advertise a route with caller-claimed CRM metadata that disagrees with the IPC handshake"
         );
 
-        server.shutdown();
+        shutdown_live_server(&server).await;
     }
 
     #[tokio::test]
@@ -1830,7 +2120,7 @@ mod tests {
         assert_eq!(routes[0].crm_ns, "test.echo");
         assert_eq!(routes[0].crm_ver, "0.1.0");
 
-        server.shutdown();
+        shutdown_live_server(&server).await;
     }
 
     #[tokio::test]
@@ -1883,7 +2173,7 @@ mod tests {
         assert_eq!(routes[0].crm_ns, "test.echo");
         assert_eq!(routes[0].crm_name, "Echo");
 
-        server.shutdown();
+        shutdown_live_server(&server).await;
     }
 
     #[tokio::test]
@@ -2054,7 +2344,7 @@ mod tests {
             "unexpected body: {body}"
         );
 
-        server.shutdown();
+        shutdown_live_server(&server).await;
     }
 
     async fn install_mismatched_route_swap_after_precheck(
@@ -2168,8 +2458,8 @@ mod tests {
             StatusCode::CONFLICT
         );
 
-        old_server.shutdown();
-        new_server.shutdown();
+        shutdown_live_server(&old_server).await;
+        shutdown_live_server(&new_server).await;
     }
 
     #[tokio::test]
@@ -2235,8 +2525,8 @@ mod tests {
             StatusCode::CONFLICT
         );
 
-        old_server.shutdown();
-        new_server.shutdown();
+        shutdown_live_server(&old_server).await;
+        shutdown_live_server(&new_server).await;
     }
 
     #[tokio::test]
@@ -2272,8 +2562,8 @@ mod tests {
             Some(new_address.as_str())
         );
 
-        old_server.shutdown();
-        new_server.shutdown();
+        shutdown_live_server(&old_server).await;
+        shutdown_live_server(&new_server).await;
     }
 
     #[tokio::test]
@@ -2296,7 +2586,7 @@ mod tests {
             StatusCode::CREATED
         );
         state.evict_connection("grid");
-        old_server.shutdown();
+        shutdown_live_server(&old_server).await;
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
         let preliminary = RouteAuthority::new(&state)
@@ -2326,7 +2616,7 @@ mod tests {
                 if existing_address == old_address
         ));
 
-        recovered_old.shutdown();
+        shutdown_live_server(&recovered_old).await;
     }
 
     #[tokio::test]
@@ -2349,7 +2639,7 @@ mod tests {
             StatusCode::CREATED
         );
         state.evict_connection("grid");
-        old_server.shutdown();
+        shutdown_live_server(&old_server).await;
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
         let preliminary = RouteAuthority::new(&state)
@@ -2397,7 +2687,7 @@ mod tests {
             StatusCode::CREATED
         );
         state.evict_connection("grid");
-        old_server.shutdown();
+        shutdown_live_server(&old_server).await;
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
         let replacement = RouteAuthority::new(&state)
@@ -2417,7 +2707,7 @@ mod tests {
                 if existing_address == old_address
         ));
 
-        recovered_old.shutdown();
+        shutdown_live_server(&recovered_old).await;
     }
 
     #[tokio::test]
@@ -2435,7 +2725,7 @@ mod tests {
             StatusCode::CREATED
         );
         state.evict_connection("grid");
-        stale_server.shutdown();
+        shutdown_live_server(&stale_server).await;
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
         assert_eq!(
@@ -2476,7 +2766,7 @@ mod tests {
             StatusCode::NOT_FOUND
         );
 
-        stale_server.shutdown();
+        shutdown_live_server(&stale_server).await;
     }
 
     #[tokio::test]
@@ -2494,7 +2784,7 @@ mod tests {
             StatusCode::CREATED
         );
         state.evict_connection("grid");
-        old_server.shutdown();
+        shutdown_live_server(&old_server).await;
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
         let new_server = start_live_server_with_identity_and_contracts(
@@ -2518,7 +2808,7 @@ mod tests {
         );
         assert!(state.local_route("grid").is_none());
 
-        new_server.shutdown();
+        shutdown_live_server(&new_server).await;
     }
 
     #[tokio::test]
@@ -2536,7 +2826,7 @@ mod tests {
             StatusCode::CREATED
         );
         state.evict_connection("grid");
-        old_server.shutdown();
+        shutdown_live_server(&old_server).await;
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
         let new_server = start_live_server_with_identity_and_contracts(
@@ -2560,7 +2850,7 @@ mod tests {
         );
         assert!(state.local_route("grid").is_none());
 
-        new_server.shutdown();
+        shutdown_live_server(&new_server).await;
     }
 
     #[tokio::test]
@@ -2589,7 +2879,7 @@ mod tests {
             StatusCode::NOT_FOUND
         );
 
-        stale_server.shutdown();
+        shutdown_live_server(&stale_server).await;
     }
 
     #[tokio::test]
@@ -2623,8 +2913,8 @@ mod tests {
             Some(old_address.as_str())
         );
 
-        old_server.shutdown();
-        new_server.shutdown();
+        shutdown_live_server(&old_server).await;
+        shutdown_live_server(&new_server).await;
     }
 
     #[tokio::test]
@@ -2648,7 +2938,7 @@ mod tests {
             StatusCode::CREATED
         );
         state.evict_connection("grid");
-        old_server.shutdown();
+        shutdown_live_server(&old_server).await;
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
         assert_eq!(
@@ -2660,7 +2950,7 @@ mod tests {
             Some(new_address.as_str())
         );
 
-        new_server.shutdown();
+        shutdown_live_server(&new_server).await;
     }
 
     #[tokio::test]
@@ -2714,7 +3004,7 @@ mod tests {
             "all concurrent requests should succeed after one task reconnects, got {statuses:?}"
         );
 
-        server.shutdown();
+        shutdown_live_server(&server).await;
     }
 
     #[tokio::test]
@@ -2772,8 +3062,8 @@ mod tests {
             "final route owner should be one of the racing addresses, got {final_address}"
         );
 
-        first_server.shutdown();
-        second_server.shutdown();
+        shutdown_live_server(&first_server).await;
+        shutdown_live_server(&second_server).await;
     }
 
     #[tokio::test]
@@ -2802,7 +3092,7 @@ mod tests {
             StatusCode::OK
         );
 
-        server.shutdown();
+        shutdown_live_server(&server).await;
     }
 
     #[tokio::test]
@@ -2828,7 +3118,7 @@ mod tests {
             StatusCode::OK
         );
 
-        server.shutdown();
+        shutdown_live_server(&server).await;
     }
 
     #[tokio::test]
@@ -2854,7 +3144,7 @@ mod tests {
             StatusCode::NOT_FOUND
         );
 
-        server.shutdown();
+        shutdown_live_server(&server).await;
     }
 
     fn unique_suffix() -> u64 {

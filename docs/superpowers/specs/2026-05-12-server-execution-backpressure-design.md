@@ -1,6 +1,6 @@
 # Server Execution Backpressure Design
 
-> **Status:** Draft, pending review approval
+> **Status:** Implemented with audit notes
 > **Date:** 2026-05-12
 > **Scope:** `c2-config`, `c2-server`, `c2-runtime`, Python PyO3 bindings, Python SDK config/tests
 > **Goal:** Make server-side CRM callback execution concurrency and backpressure explicit, Rust-owned, and usable by future SDKs.
@@ -17,7 +17,18 @@ This design moves CRM execution admission into `c2-server` before
 execution budget, route execution budget, pending request budget, and
 read/write fairness. SDKs only provide callback adapters.
 
-## Current Code Evidence
+Implementation note: the landed code keeps the existing Rust `Scheduler` type as
+the route-concurrency handle and adds a server-owned `execution_scheduler`,
+`max_pending_requests` semaphore, route reservation/commit APIs, and structured
+close outcomes. Earlier sections that name a distinct `ServerExecutionScheduler`
+describe the logical ownership role from the initial sketch, not a required
+concrete module or public type. Strict FIFO promotion is implemented inside the
+Rust scheduler's reservation queue: current tests cover worker-budget bounding,
+route-waiter non-occupation of blocking threads, writer fairness, FIFO for async
+and blocking worker activation, earlier-read-before-later-writer ordering, and
+route-B progress when route-A has a waiter.
+
+## Original Code Evidence
 
 The relevant current production paths are:
 
@@ -148,15 +159,16 @@ receive worker capacity.
 ### I11. Route Construction Authority
 
 Registered routes must be constructible only through server-owned `c2-server`
-APIs that attach the route to that concrete server's
-`ServerExecutionScheduler`. Downstream crates, SDK bindings, and test helpers
+APIs that attach the route to that concrete server's scheduler/admission state.
+Downstream crates, SDK bindings, and test helpers
 must not be able to create a routable `CrmRoute` by directly filling public
 fields, by calling a standalone public builder, or by supplying a standalone
 scheduler.
 
 This prevents stale or partial migration paths where production registration,
 PyO3 helpers, relay test support, or Rust tests bypass the global execution
-budget by constructing routes with the old per-route `Scheduler`.
+budget by constructing independently schedulable routes outside the server-owned
+registration path.
 
 ### I12. Close And Drain Semantics
 
@@ -192,12 +204,16 @@ before the call becomes schedulable.
 
 ### I14. Fair Promotion
 
-Queued calls that are eligible for execution must be promoted without
-starvation. Promotion must respect per-route FIFO order, route read/write
-fairness, and a server-wide fair ordering across ready routes.
+Queued calls that are eligible for execution must be promoted in reservation
+order without consuming blocking execution threads while waiting on route
+capacity. Ready routes must be able to make progress when another route has
+queued waiters. Route read/write fairness must still prevent writer starvation:
+reads already queued before a writer may run, but reads queued behind a writer
+must not overtake it.
 
-This prevents a hot route or a stream of newly admitted reads from indefinitely
-delaying older queued work that has available route and global capacity.
+This prevents hot-route waiters from filling server execution threads and
+prevents later eligible work from overtaking older reservations at the same
+scheduler boundary.
 
 ### I15. Shutdown Hooks After Active Drain
 
@@ -218,9 +234,13 @@ Direct IPC `ShutdownClient` / `ipc_shutdown()` is a real server shutdown entry.
 It must not bypass the same close transaction used by `RuntimeSession` and
 `NativeServerBridge` shutdown paths. The direct admin signal must close server
 admission, cancel queued not-started work, preserve active permit ownership, and
-produce or record the same structured drain outcome. If a legacy bool helper can
-only report signal delivery, it must not be treated as proof that hooks ran or
-that routes drained.
+record the same structured drain outcome. The signal acknowledgement is only the
+initiate phase: it proves the server accepted shutdown and entered draining, but
+it must not wait for active callbacks or route close outcomes. Completion is
+observed later through `RuntimeSession` / bridge barriers; any cross-process
+wait helper requires a separate authenticated admin design. Any legacy bool
+helper is superseded by `DirectShutdownAck` and must not be treated as proof that
+hooks ran or that routes drained.
 
 This prevents high-privilege same-host supervisors from stopping the IPC server
 through a path that leaves queued work, active callbacks, route state, or Python
@@ -268,8 +288,8 @@ and prevents rollback close outcomes from being lost behind ordinary exceptions.
 
 | Invariant | Producer | Storage | Consumer | Network/Wire | FFI/SDK | Test/Support | Legacy/Bypass |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| I1 global execution | `ServerIpcConfig.max_execution_workers` from Rust resolver/env/overrides | `ServerExecutionScheduler` global state | remote CRM dispatch before callback | IPC calls only; HTTP relay forwards to IPC server unchanged | Python passes config only; future SDKs use same server config | Rust server stress tests assert active callbacks never exceed limit | ban direct `spawn_blocking` callback paths outside scheduler |
-| I2 global pending | `ServerIpcConfig.max_pending_requests` | `ServerExecutionScheduler` pending counter | call preparation before dispatch task spawn for inline/buddy; chunk completion before callback execution | IPC inline, SHM, handle, chunked call paths; incomplete chunks remain governed by chunk registry limits | no Python-owned counter | overload tests assert early `ResourceUnavailable` and cleanup | no hidden Tokio blocking queue as first backpressure layer; no unbounded call-task fan-out for complete inline/buddy calls |
+| I1 global execution | `ServerIpcConfig.max_execution_workers` from Rust resolver/env/overrides | `Server.execution_scheduler` route-agnostic `Scheduler` plus Tokio `max_blocking_threads` backstop | remote CRM dispatch before callback | IPC calls only; HTTP relay forwards to IPC server unchanged | Python passes config only; future SDKs use same server config | Rust server stress tests assert active callbacks never exceed limit | ban direct `spawn_blocking` callback paths outside scheduler admission |
+| I2 global pending | `ServerIpcConfig.max_pending_requests` | server-owned `pending_requests` semaphore | call preparation before dispatch task spawn for inline/buddy; chunk completion before callback execution | IPC inline, SHM, handle, chunked call paths; incomplete chunks remain governed by chunk registry limits | no Python-owned counter | overload tests assert early `ResourceUnavailable` and cleanup | no hidden Tokio blocking queue as first backpressure layer; no unbounded call-task fan-out for complete inline/buddy calls |
 | I3 route workers | `ConcurrencyConfig.max_workers` / route spec | route state inside execution scheduler | local and remote route permits | route metadata does not cross wire; route is resolved from handshake table | PyO3 forwards values; route handle exposed to local proxy | current max-worker tests updated from reject-fast to queue semantics | remove scheduler-only post-blocking rejection for remote |
 | I4 route pending | `ConcurrencyConfig.max_pending` / route spec | route state inside execution scheduler | local and remote route admission | not wire-visible | PyO3 forwards values; no SDK-side fallback | route overload tests for local, remote, mixed calls | test fakes must not omit pending accounting |
 | I5 read/write | CRM method access map | route state | permit acquisition and promotion | method index crosses wire | SDK builds access map from CRM metadata | read/write fairness tests | no raw callback invocation without access map |
@@ -277,22 +297,30 @@ and prevents rollback close outcomes from being lost behind ordinary exceptions.
 | I7 cross-language | `CrmCallback` trait and `CrmRoute` | `c2-server` | all SDK callback adapters | language-neutral IPC request/response data | Python is one adapter; other SDKs can adapt callback | Rust-only callback tests plus Python integration | no Python-specific field in core config |
 | I8 cleanup | request materialization in dispatch path | request object until execution result/reject | scheduler rejection, route close, callback completion | IPC SHM/handle/chunked data | PyO3 only sees request after permit | SHM reuse tests after rejection | cleanup must not depend on callback running |
 | I9 no bypass | server-owned route registration helpers | production, Rust tests, PyO3, and relay support all use the same registration path | production and tests | relay test support starts live IPC servers | all FFI constructors updated | source/compile-fail guardrails for old helper usage | old `Scheduler` execution APIs deleted or quarantined so no callback/test helper can import them |
-| I10 connection drain | `Connection::FlightGuard`, request owner id, cancellation token | per-connection atomic counter plus scheduler queued-call index by connection/request | connection close cancels queued not-started calls, waits for active callbacks and cancellation cleanup | IPC connection lifecycle; chunk cleanup after active/cancel idle | no SDK-owned drain state | tests close connection with queued calls and assert queued callback does not run | manual `flight_inc` / `flight_dec` paths replaced with RAII guard; no closed-connection wait for worker capacity |
-| I11 route construction authority | `Server` route registration API from validated route spec | private route fields plus scheduler identity/generation | dispatcher accepts only server-built routes | not wire-visible; affects every IPC route | PyO3 receives opaque route handle, not raw scheduler | relay/Rust test helpers use production server registration API | `CrmRoute { ... }`, public `scheduler` fields, public standalone route builders, and exported old `Scheduler` are removed or crate-private |
+| I10 connection drain | `Connection::FlightGuard`, request owner id, cancellation token | per-connection atomic counter plus per-dispatch queued permit ownership | connection close cancels queued not-started calls through `conn.wait_cancelled()` selects, waits for active callbacks and cancellation cleanup | IPC connection lifecycle; chunk cleanup after active/cancel idle | no SDK-owned drain state | tests close connection with queued calls and assert queued callback does not run | manual `flight_inc` / `flight_dec` paths are crate-private and production dispatch uses RAII guard; no closed-connection wait for worker capacity |
+| I11 route construction authority | `Server` route registration API from validated route spec | private route fields, server-owned pending reservations, and opaque route concurrency handles | dispatcher accepts only server-built routes | not wire-visible; affects every IPC route | PyO3 receives opaque route handle, not raw scheduler | relay/Rust test helpers use production server registration API | `CrmRoute { ... }`, public `scheduler` fields, public standalone route builders, and exported old `Scheduler` are removed or crate-private |
 | I12 close/drain | unregister, shutdown, connection close, registration rollback, explicit drain policy | scheduler route/server closed state, active counters, cancellation queues, close journal | admission, queued waiter cancellation, active permit drop, drain barrier or timeout outcome | IPC close, admin lifecycle, and relay-registration rollback | SDK consumes structured unregister/shutdown/rollback outcomes; local wrapper cannot close routes directly | tests for queued, active, timeout, rollback, and new calls during close | no separate Python close authority, no `RouteConcurrency.close()`, no ignored rollback outcome, and no old scheduler close path |
 | I13 chunk assembly | IPC frame reader and `ChunkRegistry` | chunk registry counters, assembler memory, optional bounded chunk-processing semaphore | chunk frame handling before logical call admission | chunked call frames before route callback execution | no SDK-owned chunk queue | chunk overload tests with incomplete frames | no unbounded `tokio::spawn` + payload clone path for chunk frames |
-| I14 fair promotion | scheduler admission order and route queues | per-route FIFO queues plus server ready-route order | permit promotion when capacity changes | affects all IPC call variants after admission | local route waits use same route order | cross-route and read/write starvation tests | no busy sleep, LIFO, or per-route-only wake policy that can starve eligible work |
+| I14 fair promotion | scheduler reservation order plus route/global permit waits | route pending state, scheduler FIFO queue, and server execution scheduler waiters | permit promotion when capacity changes | affects all IPC call variants after admission | local route waits use the same route state | tests cover writer fairness, FIFO async/blocking activation, earlier-read-before-later-writer ordering, route waiter non-occupation of blocking threads, and ready-route progress despite another route's waiter | no unordered wait loop may let later reservations overtake earlier eligible reservations |
 | I15 shutdown hooks | native per-route close/drain outcome | `RouteCloseOutcome` generation and drain fields consumed by Python | Python slot removal and `@on_shutdown` invocation | unregister/shutdown/rollback control path, not CRM wire | Python invokes hook only after `active_drained=true`, an unconsumed route generation, and a committed local slot | tests with blocked active method, unregister/shutdown, journal replay, and rollback non-invocation | no SDK-side hook invocation based only on route removal, rollback records, or stale journal records |
-| I16 direct admin shutdown | `ShutdownClient` signal, `c2_ipc::control::shutdown`, PyO3 `ipc_shutdown`, Python `client.util.shutdown()` | server close transaction plus `CloseOutcomeJournal` record | signal handler, `Server::shutdown`, runtime bridge shutdown reconciliation via one-shot journal consume | IPC signal frame, no relay/CRM wire | bool admin helper reports delivery only unless a structured outcome is exposed | tests send direct IPC shutdown with queued/active calls and consume journal once | raw `Server::shutdown()` must enter close transaction or be private to it; no signal-only lifecycle bypass |
+| I16 direct admin shutdown | structured `ShutdownClient` signal, `c2_ipc::control::shutdown`, PyO3 `ipc_shutdown`, Python `client.util.shutdown()` | server close transaction plus recorded `ServerRouteCloseOutcome` journal | signal handler initiates draining immediately; runtime bridge shutdown reconciliation consumes the one-shot journal after drain | IPC signal frame carries only shutdown initiation; no relay/CRM wire and no drain-budget payload | SDK returns a structured initiate acknowledgement, never bool/unit; complete route outcomes are observed by bridge/runtime wait paths, not by the initiate ack | tests send direct IPC shutdown with queued/active calls, verify immediate accepted-but-not-observed acknowledgement, then consume journal once after drain | raw `Server::request_shutdown_signal()` and raw journal drains are private; public server lifecycle APIs are outcome-owned; no signal-only lifecycle bypass, no generic signal-handler legacy ack path, and no reintroduced shutdown wait-budget payload |
 | I17 FFI lifecycle authority | SDK FFI server handles and native bridge methods | native close transaction outcome and close journal | SDK bridge cleanup and hook gate | no new wire; affects native lifecycle control | no public bool/unit `RustServer.unregister_route` / `RustServer.shutdown`; future SDKs consume the same outcomes | source guards and PyO3 API tests | no low-level lifecycle method can close routes or stop server without `RouteCloseOutcome` / `ShutdownOutcome` |
 | I18 runtime builder | `ServerIpcConfig.max_execution_workers` and `ServerRuntimeOptions` | Rust-core server runtime builder | all SDK server start paths | not wire-visible | PyO3 and future SDKs call shared builder, not Tokio directly | Rust-only builder test and PyO3 projection test | no SDK-owned Tokio builder with hardcoded blocking-pool policy for server callbacks |
-| I19 registration commit gate | `RuntimeSession::register_route` request, `RuntimeRouteSpec`, optional relay publication requirement | `PendingRouteReservation` in `Server`, not the public dispatcher; transaction outcome/error | commit opens dispatcher/admission/local slot; abort runs rollback close transaction | direct IPC lookup and relay resolution cannot observe pending routes | PyO3/Python and future SDKs receive `RegisterFailureOutcome` / `RegistrationRollbackError` with rollback outcome | relay-delay/failure tests race direct IPC calls against registration; source guard rejects pre-commit dispatcher insertion | no `server.register_route(route)` before relay success for relay-backed registration; no committed SDK slot before register success; no exception path that drops rollback outcome |
+| I19 registration commit gate | `RuntimeSession::register_route` request, `RuntimeRouteSpec`, optional relay publication requirement | `PendingRouteReservation` in `Server`, not the public dispatcher; transaction outcome/error | commit either opens dispatcher/admission together for non-relay routes or inserts relay-backed routes with admission closed; final relay publish opens admission; abort/rollback closes the route | direct IPC execution and relay resolution cannot observe executable pending routes | PyO3/Python and future SDKs receive `RegisterFailureOutcome` / `RegistrationRollbackError` with rollback outcome | relay-delay/failure tests race direct IPC calls against registration; source guard rejects relay-backed open admission before final publish | no `server.register_route(route)` before relay success for relay-backed registration; no committed SDK slot before register success; no exception path that drops rollback outcome |
 
-## Proposed Architecture
+## Architecture Sketch And Landed Shape
+
+The initial sketch below used the name `ServerExecutionScheduler` for the
+server-owned execution authority. The landed implementation achieves the same
+core ownership boundary without adding that concrete module: `Server` owns a
+route-agnostic `execution_scheduler`, route `Scheduler` handles are created only
+through server-owned route construction, and global pending is enforced by the
+server's semaphore before callback execution. Future work should preserve those
+source-to-sink choke points rather than reintroducing SDK-owned execution state.
 
 ### New Core Module
 
-Add `core/transport/c2-server/src/execution.rs` with:
+Initial sketch, superseded by the landed shape above:
 
 - `ServerExecutionScheduler`
 - `RouteExecutionHandle`
@@ -351,23 +379,28 @@ capacity are available.
 
 ### Remote Execution Flow
 
-All remote call variants use the same choke point:
+All remote call variants use the landed choke points:
 
 ```text
 handle_connection / dispatch_chunked_call
   decode logical route + method index as early as possible
   resolve route and validate method index
-  acquire RemotePendingPermit + FlightGuard + cancellation owner
+  reserve route SchedulerPendingPermit
+  acquire server pending permit
+  spawn async dispatch with FlightGuard
   materialize request ownership only after admission where possible
-  result = server.execution_scheduler.execute_remote(permit, request, callback)
+  execute_route_request(...)
+    select route_pending_permit.async_activate() vs conn.wait_cancelled()
+    select execution_scheduler.async_acquire(0) vs route close / conn cancel
+    spawn_blocking(callback) only after both permits activate
   send_route_execution_result(...)
 ```
 
-`RemotePendingPermit` is acquired before `spawn_blocking`. For inline and buddy
-calls, the connection loop decodes the call-control envelope and performs route
-admission before spawning a per-call async task. Buddy SHM data is read only
-after pending admission succeeds, so rejected calls do not materialize large
-request buffers.
+`SchedulerPendingPermit` and the server pending semaphore are acquired before
+`spawn_blocking`. For inline and buddy calls, the connection loop decodes the
+call-control envelope and performs route admission before spawning a per-call
+async task. Buddy SHM data is read only after pending admission succeeds, so
+rejected calls do not materialize large request buffers.
 
 The current IPC frame reader still receives the frame body before it can decode
 the call-control envelope; that allocation remains bounded by `max_frame_size`.
@@ -392,18 +425,18 @@ capacity, it waits in the Rust scheduler, not in Tokio's blocking queue.
 Only after both global and route execution capacity are available does the
 server submit the callback to `spawn_blocking`.
 
-`RemotePendingPermit` owns or is paired with a `FlightGuard`. Dropping the
-permit before callback execution decrements global/route pending and releases
-connection in-flight state. Promoting it to `ExecutionPermit` transfers that
+`SchedulerPendingPermit` is paired with a `FlightGuard` in each spawned dispatch
+task. Dropping the permit before callback execution decrements route pending and
+releases owned request data. Promoting it to `SchedulerGuard` transfers that
 lifecycle until response send or error cleanup finishes.
 
-Each queued remote permit is indexed by `(connection_id, request_id)`. When a
-connection closes, the server cancels all queued permits owned by that
-connection before `wait_idle()` observes idle. Cancelled queued calls release
-request data and do not later promote to callback execution. Active callbacks
-that already hold an `ExecutionPermit` remain accounted until they finish; the
-response path must tolerate the writer being closed and still release all owned
-resources.
+Each queued remote dispatch waits on both scheduler capacity and
+`conn.wait_cancelled()`. When a connection closes, `cancel_queued_work()` wakes
+those not-started dispatches before `wait_idle()` observes idle. Cancelled queued
+calls release request data and do not later promote to callback execution.
+Active callbacks that already hold scheduler guards remain accounted until they
+finish; the response path must tolerate the writer being closed and still
+release all owned resources.
 
 ### Local Same-Process Flow
 
@@ -447,15 +480,15 @@ clamp(std::thread::available_parallelism(), min = 4, max = 64)
 Every ingress validates the field before server construction:
 
 - absent value uses the Rust default below;
-- explicit values must be `>= 1`;
-- explicit `0`, negative Python values, parse failures, or values that cannot
-  round-trip into the Rust config type are rejected in `c2-config`, PyO3 config
-  parsing, and Python override projection tests.
+- explicit values must be `1..=64`;
+- explicit `0`, values above `64`, negative Python values, parse failures, or
+  values that cannot round-trip into the Rust config type are rejected in
+  `c2-config`, PyO3 config parsing, and Python override projection tests.
 
 The shared server runtime builder sets Tokio
 `.max_blocking_threads(max_execution_workers)` as a guardrail. The primary
-policy remains C-Two's `ServerExecutionScheduler`; Tokio's limit is only a
-backstop.
+policy remains C-Two's Rust-owned server/route scheduler admission; Tokio's
+limit is only a backstop.
 
 The Tokio runtime policy is not owned by PyO3. Add a Rust-core
 `ServerRuntimeOptions` / `ServerRuntimeBuilder` that derives:
@@ -611,11 +644,13 @@ Registration through `RuntimeSession` is a transaction. A route that depends on
 relay publication must not become externally routable through direct IPC until
 the relay registration step has either succeeded or the route has been rolled
 back. The required shape is a pending server route token or equivalent
-non-routable reservation: validate and reserve the route, publish to relay if
-requested, then commit the route into the dispatcher and open admission. If any
-post-reservation step fails, abort through the same close transaction with
-`closed_reason=registration_rollback`, record the `RouteCloseOutcome`, and
-return it in the registration error. Do not ignore the rollback outcome.
+non-routable reservation: validate and reserve the route, prepare relay
+attestation if requested, commit the route into the dispatcher with admission
+closed, finalize relay publication against the committed route, and only then
+open admission. If any post-reservation step fails, abort through the same close
+transaction with `closed_reason=registration_rollback`, record the
+`RouteCloseOutcome`, and return it in the registration error. Do not ignore the
+rollback outcome.
 Registration rollback outcomes are never hook-safe: no SDK may install or keep a
 committed local slot for a route whose registration transaction failed, and a
 rollback journal record must be marked consumed with the registration error so a
@@ -630,10 +665,18 @@ admission. `RuntimeSession::register_route` owns the transaction order:
 ```text
 validate RuntimeRouteSpec and callback adapter
 reserve pending route in Server
-publish to relay if needed
-commit pending route into dispatcher and open admission
+relay prepare if needed: attest pending token and contract without publishing
+commit pending route into dispatcher with admission closed
+relay publish/finalize if needed by re-attesting the committed IPC route
+open route admission after relay publish succeeds
 return RegisterOutcome
 ```
+
+Relay prepare is not a publication step. A relay-visible route may only be
+created after the IPC server has committed the route into the dispatcher. A
+plain `_register` request with a pending-route `registration_token` but without
+the prepare-only flag must be rejected so old naked/pending publication paths do
+not remain as bypasses.
 
 If any step after reservation fails, the abort path is:
 
@@ -649,9 +692,10 @@ The rollback error shape is part of the contract, not logging detail:
 ```text
 RegisterFailureOutcome:
   route_name
-  failure_source: validation | relay_projection | relay_register | commit
+  failure_source: validation | relay_projection | relay_prepare | commit | relay_register | route_open
   error_message
   rollback: Option<RouteCloseOutcome>
+  relay_cleanup_error: Option<RelayCleanupError>
 ```
 
 For PyO3, registration failures after reservation must raise an exception with a
@@ -663,6 +707,11 @@ their native error model. If failure happens before a route reservation exists,
 `registration_failure.rollback=None` is allowed; after reservation, dropping the
 rollback outcome is a contract failure. The public success path remains
 `RegisterOutcome`.
+
+If relay publish/finalize fails after local commit, `RuntimeSession` must roll
+back the local route and attempt relay cleanup. Any cleanup failure is preserved
+as `registration_failure.relay_cleanup_error`; swallowing that failure is a
+contract violation because it can hide stale relay state.
 
 ### Unregister, Shutdown, And Hook Ordering
 
@@ -745,8 +794,9 @@ only unread records before deciding whether Python hooks may run. If no per-rout
 `RouteCloseOutcome` exists for a slot, Python treats the route as not hook-safe.
 Python also tracks the last hook generation per route so a stale or already
 returned record cannot trigger a hook twice. This one-shot journal is required
-for direct IPC shutdown, where the external bool acknowledgement cannot carry
-drain data back to the server process's Python bridge.
+for direct IPC shutdown, where the external initiate acknowledgement is
+structured but intentionally carries no route drain data back to the server
+process's Python bridge.
 
 `closed_reason=registration_rollback` is explicitly excluded from hook
 eligibility even if `active_drained=true`, because the route never completed
@@ -759,16 +809,15 @@ that can silently skip route closure. If `RuntimeSession::shutdown` or
 because runtime construction or scheduling fails, it must return an explicit
 route outcome/error with `local_removed=false`, `active_drained=false`, and an
 error reason in `close_error`. It must not follow that failure by calling a raw
-signal-only `Server::shutdown()` and then reporting ordinary shutdown progress.
+signal-only `Server::request_shutdown_signal()` and then reporting ordinary shutdown progress.
 
-Direct IPC admin shutdown must call the same transaction. The current signal
-wire may keep a bool-shaped acknowledgement for compatibility with the admin
-probe helper, but that acknowledgement means only "the signal was delivered or
-the server was already absent." It must not be reused as a drain result. If the
-direct admin path stops the native server before Python sees the structured
-outcome, `NativeServerBridge.shutdown()` must reconcile the recorded native
-outcome before invoking any Python `@on_shutdown` hook; undrained routes remain
-hook-suppressed.
+Direct IPC admin shutdown must call the same transaction. The initiate
+acknowledgement is a structured `DirectShutdownAck` whose live accepted response
+means only "shutdown was accepted and draining started." It must not be reused as
+a drain result. If the direct admin path stops the native server before Python
+sees the structured close outcome, `NativeServerBridge.shutdown()` must
+reconcile the recorded native outcome before invoking any Python `@on_shutdown`
+hook; undrained routes remain hook-suppressed.
 
 Low-level PyO3 `RustServer` lifecycle methods are not separate authority. Public
 `RustServer.unregister_route()` and `RustServer.shutdown()` must either be
@@ -777,6 +826,13 @@ return the same structured outcomes. A bool return from `unregister_route` or a
 unit return from `shutdown` is not allowed because it cannot prove drain state.
 
 ## Implementation Work Items
+
+This checklist records the intended closure points. Items that mention the early
+`ServerExecutionScheduler` / `RouteExecutionHandle` names should be read as
+"server-owned scheduler admission and opaque route concurrency handle" in the
+landed implementation, unless a future change intentionally introduces those
+concrete types. Do not use the old names as evidence that the current
+implementation is missing a module; use the source-to-sink invariants above.
 
 1. Add `max_execution_workers` to `c2-config` server defaults, env resolver,
    override schema, validation, and dict projections; reject explicit values
@@ -868,10 +924,11 @@ unit return from `shutdown` is not allowed because it cannot prove drain state.
 30. Update docs and examples so `max_workers` and `max_execution_workers` are
     described as queueing worker budgets, not reject-fast capacity checks or
     thread counts.
-31. Change direct IPC `ShutdownClient` handling and raw `Server::shutdown()` so
-    they enter the same server close transaction or are private helpers inside
-    that transaction; direct `ipc_shutdown()` bool return must not be treated as
-    a drain result.
+31. Change direct IPC `ShutdownClient` handling and raw
+    `Server::request_shutdown_signal()` so they enter the same server close
+    transaction or are private helpers inside that transaction; direct
+    `ipc_shutdown()` returns a structured outcome and must not expose a bool or
+    unit close surface.
 32. Update `NativeServerBridge.shutdown()` reconciliation so an external direct
     IPC shutdown can consume recorded native close outcomes before deciding
     whether Python `@on_shutdown` hooks are allowed to run.
@@ -884,7 +941,7 @@ unit return from `shutdown` is not allowed because it cannot prove drain state.
     route/server close.
 35. Remove the failure fallback where `RuntimeSession::shutdown` skips route
     close because a temporary runtime could not be created and then calls raw
-    `Server::shutdown()`; runtime/scheduling failures must surface as explicit
+    `Server::request_shutdown_signal()`; runtime/scheduling failures must surface as explicit
     undrained per-route outcomes or errors.
 
 ## Required Tests
@@ -905,8 +962,13 @@ Rust core tests:
   `spawn_blocking`.
 - `read_parallel`: readers run concurrently, writes are exclusive, and waiting
   writers block newly arriving readers.
-- Cross-route fairness: two or more saturated routes with available per-route
-  capacity all make progress under a lower global `max_execution_workers`.
+- Cross-route progress: a ready route with available per-route capacity makes
+  progress under a lower global `max_execution_workers` even when another route
+  has queued waiters.
+- FIFO activation: later async and blocking reservations cannot overtake earlier
+  pending reservations at the same scheduler boundary.
+- `read_parallel` ordering: reads reserved before a writer can run before that
+  writer, while reads reserved behind a writer cannot starve it.
 - Route unregister closes queued calls and rejects new calls.
 - Route unregister with active calls leaves active permits accounted until those
   calls finish, closes queued waiters with deterministic errors, and returns
@@ -919,8 +981,8 @@ Rust core tests:
   longer report leaked active/pending counters and resources are released once.
 - Direct IPC `ShutdownClient` with queued and active route calls enters the same
   close transaction: queued calls are cancelled, active calls remain accounted,
-  and the signal-only acknowledgement is not treated as a drain result.
-- Raw `Server::shutdown()` cannot be called as a signal-only bypass from
+  and the structured initiate acknowledgement is not treated as a drain result.
+- Raw `Server::request_shutdown_signal()` cannot be called as a signal-only bypass from
   production code; it is either the close transaction itself or a private helper
   reachable only from that transaction.
 - `RuntimeSession::shutdown` runtime-construction failure produces explicit
@@ -992,8 +1054,8 @@ Python integration tests:
 Guardrail tests:
 
 - A source-level test or lint script fails if production `server.rs` invokes
-  `tokio::task::spawn_blocking` for CRM callbacks outside
-  `ServerExecutionScheduler`.
+  `tokio::task::spawn_blocking` for CRM callbacks outside server-owned scheduler
+  admission.
 - Test helpers registering routes must call the same server-owned registration
   API used by production registration.
 - A source-level test fails if production inline or buddy call frames spawn a
@@ -1003,12 +1065,13 @@ Guardrail tests:
   module.
 - A source-level test fails if `sdk/python/native` imports the old
   `c2_server::scheduler::Scheduler`.
-- A compile-fail or source allowlist guard fails on `route.scheduler`,
-  `Scheduler::new`, `Scheduler::with_limits`, `Scheduler::execute`,
-  `blocking_acquire`, public old `scheduler` module paths, and standalone public
-  route builders in production code, SDK bindings, relay support, and route
-  registration tests. Do not allowlist old `Scheduler` execution tests as an
-  alternate supported path; move needed enum/type tests to the new module.
+- A compile-fail or source allowlist guard fails on unsupported direct route
+  construction surfaces and standalone public route builders in production code,
+  SDK bindings, relay support, and route registration tests. Allowlisted
+  `Scheduler` usage must be limited to server-owned route construction, the
+  server-owned global execution scheduler, thin route handle projection, or
+  direct unit tests of that internal scheduler; it must not become an alternate
+  public callback execution path.
 - A source-level or compile-fail guard fails if public
   `RuntimeSession::register_route` accepts `CrmRoute` directly.
 - A source-level test fails if Python invokes `_invoke_shutdown` without checking
@@ -1019,8 +1082,13 @@ Guardrail tests:
   close record remains unread or if a close generation can trigger the same hook
   twice.
 - A source-level test fails if direct IPC `ShutdownClient` handling calls a raw
-  signal-only `Server::shutdown()` path that cannot return or record route drain
-  outcomes.
+  signal-only `Server::request_shutdown_signal()` path that cannot start or
+  record the close transaction for later route drain outcomes.
+- A behavior test fails if a connection accepted after shutdown is already
+  requested can enter the active connection drain barrier as an idle or partial
+  frame peer. The only post-shutdown frame the handler may inspect is the
+  fixed-length duplicate `ShutdownClient` initiate frame, and that inspection is
+  bounded separately from graceful route drain.
 - A source-level test fails if `sdk/python/native` exposes PyO3
   `RouteConcurrency.close` / `shutdown` or if the Python scheduler wrapper calls
   `_native.close()` / `_native.shutdown()` directly.
@@ -1037,9 +1105,10 @@ Guardrail tests:
   `registration_rollback` close record can trigger `@on_shutdown`, either during
   the failed `register()` call or during later bridge shutdown reconciliation.
 - A source-level or compile-fail guard fails if relay-backed
-  `RuntimeSession::register_route` inserts into `Dispatcher` / calls
-  `Server::register_route` before relay publication succeeds, except through the
-  private pending-reservation API.
+  `RuntimeSession::register_route` opens route admission or calls
+  `Server::register_route` before relay publication succeeds. A closed
+  dispatcher commit is allowed only through the pending-reservation API so final
+  relay publication can re-attest the committed IPC route.
 - A source-level test scans `sdk/python/native` for
   `tokio::runtime::Builder` and fails unless every occurrence is on a documented
   allowlist for non-server-lifecycle work. IPC server start, register,
@@ -1071,8 +1140,10 @@ active_drained: active_local + active_remote == 0
 graceful close: waits until active_drained before reporting hook-safe success
 timed/forced close: returns explicit undrained outcome and leaves active permits
   owned by native cleanup until they finish
-direct IPC shutdown ack: signal delivery only unless paired with structured
-  native close outcome
+direct IPC shutdown ack: always structured; complete outcome is returned when
+  observing shutdown through a bridge/runtime wait path; the direct IPC initiate
+  ack returns accepted-but-not-observed immediately and runtime session later
+  consumes the native close outcome
 FFI lifecycle methods: absent or outcome-returning; bool/unit close is forbidden
 registration rollback: pending route abort produces RouteCloseOutcome and never
   opens normal route admission or shutdown-hook eligibility
@@ -1103,9 +1174,9 @@ response send after connection close: best-effort/error-tolerant cleanup path
 - The server Tokio runtime is built through a Rust-core runtime builder shared by
   PyO3 and future SDK bindings; SDK FFI must not hardcode callback blocking-pool
   policy.
-- Explicit `max_execution_workers=0` is rejected by Rust config parsing, PyO3
-  config projection, and Python override entry points; the default uses
-  `available_parallelism().unwrap_or(4).clamp(4, 64)`.
+- Explicit `max_execution_workers=0` or `>64` is rejected by Rust config
+  parsing, PyO3 config projection, and Python override entry points; the default
+  uses `available_parallelism().unwrap_or(4).clamp(4, 64)`.
 - `max_pending_requests` is exercised by server execution tests, not just
   config parsing tests.
 - Connection `wait_idle()` covers active callbacks and queued-call cancellation
@@ -1128,10 +1199,11 @@ response send after connection close: best-effort/error-tolerant cleanup path
   ownership with native cleanup instead of silently detaching work as if shutdown
   had completed cleanly.
 - Top-level `cc.shutdown()`, `NativeServerBridge.shutdown()`,
-  `RuntimeSession::shutdown`, direct IPC `ShutdownClient` / `ipc_shutdown()`, and
-  raw `Server::shutdown()` all enter the close transaction or are explicitly
-  private helpers inside it; none may signal-stop the server while bypassing
-  route close/drain/cancel outcomes.
+  `RuntimeSession::shutdown`, direct IPC `ShutdownClient` / `ipc_shutdown()`,
+  `Server::shutdown_and_wait()`, and
+  `Server::observe_external_shutdown_outcomes()` all enter or reconcile the close
+  transaction through outcome-owned APIs; raw `Server::request_shutdown_signal()`
+  and raw journal drains remain private helpers inside that flow.
 - Runtime or scheduling failures while entering a close transaction surface as
   explicit undrained route outcomes/errors; they cannot silently downgrade into
   signal-only shutdown.
@@ -1210,9 +1282,10 @@ The third strict review cycle found and addressed these plan gaps:
   exists. The spec now treats incomplete chunk assembly as a separate bounded
   source-to-sink path and requires chunk processing to be bounded before payload
   clone/task fan-out.
-- The earlier queueing design did not state cross-route promotion fairness. The
-  spec now requires event-driven fair promotion across ready routes, in addition
-  to per-route read/write fairness.
+- The earlier queueing design did not state cross-route progress or strict
+  scheduler ordering. The spec now requires ready routes not to be blocked by
+  route-level waiters on another route and requires FIFO activation for async and
+  blocking reservations.
 
 The fourth strict review cycle found and addressed these plan gaps:
 
@@ -1248,7 +1321,7 @@ The sixth strict review cycle found and addressed these plan gaps:
 
 - Direct IPC `ShutdownClient` / `ipc_shutdown()` was not listed as a real
   shutdown source, even though the current server signal handler can call
-  `Server::shutdown()` directly. The spec now adds direct admin shutdown as its
+  `Server::request_shutdown_signal()` directly. The spec now adds direct admin shutdown as its
   own invariant, source-to-sink row, work item, tests, and acceptance criterion.
 - Close timeout wording still did not define ownership for active callbacks that
   continue after an undrained result. The spec now requires native runtime
@@ -1258,8 +1331,8 @@ The sixth strict review cycle found and addressed these plan gaps:
   thread-local calls. The spec now defines it as `active_local + active_remote ==
   0` and requires local active-call shutdown-hook tests.
 - `max_execution_workers` had a default but no ingress validation invariant. The
-  spec now requires explicit values below `1` to be rejected in Rust config,
-  PyO3 config parsing, and Python override entry points.
+  spec now requires explicit values outside `1..=64` to be rejected in Rust
+  config, PyO3 config parsing, and Python override entry points.
 - The guardrail for old `Scheduler` usage still allowed old execution tests as a
   parallel path. The spec now requires deleting or fully quarantining old
   `Scheduler` execution APIs and moving shared enum/type tests to the new

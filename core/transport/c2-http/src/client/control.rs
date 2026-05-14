@@ -50,11 +50,19 @@ struct RegisterRequest<'a> {
     server_id: &'a str,
     server_instance_id: &'a str,
     address: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    registration_token: Option<&'a str>,
+    #[serde(skip_serializing_if = "is_false")]
+    prepare_only: bool,
     crm_ns: &'a str,
     crm_name: &'a str,
     crm_ver: &'a str,
     abi_hash: &'a str,
     signature_hash: &'a str,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -148,6 +156,8 @@ impl RelayControlClient {
             server_id,
             server_instance_id,
             address,
+            registration_token: None,
+            prepare_only: false,
             crm_ns,
             crm_name,
             crm_ver,
@@ -160,6 +170,38 @@ impl RelayControlClient {
             &[200, 201],
         ))?;
         self.invalidate(name);
+        Ok(())
+    }
+
+    pub fn prepare_register(
+        &self,
+        name: &str,
+        server_id: &str,
+        server_instance_id: &str,
+        address: &str,
+        crm_ns: &str,
+        crm_name: &str,
+        crm_ver: &str,
+        abi_hash: &str,
+        signature_hash: &str,
+        registration_token: &str,
+    ) -> Result<(), HttpError> {
+        let request = RegisterRequest {
+            name,
+            server_id,
+            server_instance_id,
+            address,
+            registration_token: Some(registration_token),
+            prepare_only: true,
+            crm_ns,
+            crm_name,
+            crm_ver,
+            abi_hash,
+            signature_hash,
+        };
+        runtime()
+            .handle()
+            .block_on(self.post_json_with_retry("/_register", &request, &[202]))?;
         Ok(())
     }
 

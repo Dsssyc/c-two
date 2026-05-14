@@ -48,7 +48,12 @@ def test_ping_invalid_address_returns_false():
 
 
 def test_shutdown_invalid_address_returns_false():
-    assert util.shutdown('tcp://not-ipc') is False
+    assert util.shutdown('tcp://not-ipc') == {
+        'acknowledged': False,
+        'shutdown_started': False,
+        'server_stopped': False,
+        'route_outcomes': [],
+    }
 
 
 @pytest.mark.parametrize('timeout', [-1.0, float('nan'), float('inf')])

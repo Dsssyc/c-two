@@ -404,11 +404,16 @@ Also add `PONG_BYTES` to the import from `msg_type` at the top of the file (line
 from ..ipc.msg_type import (
     MsgType,
     PING_BYTES,
-    PONG_BYTES,           # ← ADD
-    SHUTDOWN_CLIENT_BYTES,
-    SHUTDOWN_ACK_BYTES,
+    PONG_BYTES,           # ADD
 )
 ```
+
+Historical note: this import sketch predates the direct-IPC shutdown two-phase
+correction. Do not expose shutdown payload constants through Python. Current
+shutdown control uses Rust-owned codecs: the single-byte `SHUTDOWN_CLIENT_BYTES`
+discriminant is the complete canonical initiate request payload, while
+`SHUTDOWN_ACK_BYTES` is not a complete acknowledgement because shutdown
+acknowledgements remain structured.
 
 - [ ] **Step 4: Run full test suite to verify no regression**
 

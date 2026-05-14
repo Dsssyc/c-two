@@ -121,6 +121,10 @@ pub struct Connection {
 
     /// Notified whenever `inflight` drops to zero.
     idle_notify: Notify,
+
+    /// Set when the read loop has closed and queued not-started work should stop.
+    cancelled: AtomicBool,
+    cancel_notify: Notify,
 }
 
 impl Connection {
@@ -137,6 +141,8 @@ impl Connection {
             last_activity: Mutex::new(Instant::now()),
             inflight: AtomicI32::new(0),
             idle_notify: Notify::new(),
+            cancelled: AtomicBool::new(false),
+            cancel_notify: Notify::new(),
         }
     }
 
@@ -367,17 +373,42 @@ impl Connection {
     }
 
     /// Mark a new request as in-flight.
-    pub fn flight_inc(&self) {
+    pub(crate) fn flight_inc(&self) {
         self.inflight.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Mark a request as completed.  If the in-flight counter reaches zero,
     /// all waiters on [`wait_idle`](Self::wait_idle) are notified.
-    pub fn flight_dec(&self) {
+    pub(crate) fn flight_dec(&self) {
         let prev = self.inflight.fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
             // Counter went 1 → 0: connection is idle.
             self.idle_notify.notify_waiters();
+        }
+    }
+
+    pub(crate) fn cancel_queued_work(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.cancel_notify.notify_waiters();
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn wait_cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        loop {
+            let notified = self.cancel_notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+            if self.is_cancelled() {
+                return;
+            }
         }
     }
 
@@ -532,6 +563,27 @@ mod tests {
         assert_eq!(conn.inflight_count(), 1);
         conn.flight_dec();
         assert_eq!(conn.inflight_count(), 0);
+    }
+
+    #[test]
+    fn manual_flight_counter_methods_are_not_public_surface() {
+        let source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/connection.rs"))
+                .unwrap();
+        assert!(
+            !source
+                .lines()
+                .any(|line| line.trim_start().starts_with("pub fn flight_inc(")),
+            "manual flight counter increment must not be part of the public API"
+        );
+        assert!(
+            !source
+                .lines()
+                .any(|line| line.trim_start().starts_with("pub fn flight_dec(")),
+            "manual flight counter decrement must not be part of the public API"
+        );
+        assert!(source.contains("pub(crate) fn flight_inc("));
+        assert!(source.contains("pub(crate) fn flight_dec("));
     }
 
     #[tokio::test]

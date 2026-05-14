@@ -232,6 +232,17 @@ def test_runtime_session_does_not_infer_started_from_socket_file():
     assert "socket_path().exists()" not in source
 
 
+def test_runtime_session_uses_commit_gated_server_registration() -> None:
+    root = Path(__file__).resolve().parents[4]
+    session_rs = root / "core" / "runtime" / "c2-runtime" / "src" / "session.rs"
+    source = session_rs.read_text(encoding="utf-8")
+
+    assert "server.reserve_route(route)" in source
+    assert "server.commit_reserved_route(" in source
+    assert "server.abort_reserved_route(" in source
+    assert "server.register_route(route)" not in source
+
+
 def test_native_route_contract_boundaries_have_no_empty_defaults_or_raw_calls():
     root = Path(__file__).resolve().parents[4]
     native_root = root / "sdk" / "python" / "native" / "src"
@@ -386,6 +397,89 @@ def test_python_ipc_config_facade_does_not_validate_override_keys():
     assert offenders == []
 
 
+def test_python_route_concurrency_wrapper_does_not_expose_public_close_authority():
+    root = Path(__file__).resolve().parents[2] / "src" / "c_two" / "transport" / "server"
+    scheduler_source = (root / "scheduler.py").read_text(encoding="utf-8")
+    native_source = (
+        Path(__file__).resolve().parents[4]
+        / "sdk"
+        / "python"
+        / "native"
+        / "src"
+        / "route_concurrency_ffi.rs"
+    ).read_text(encoding="utf-8")
+
+    assert "def close(" not in scheduler_source
+    assert "def shutdown(" not in scheduler_source
+    assert "fn close(" not in native_source
+    assert "fn shutdown(" not in native_source
+    assert "_shutdown_internal" not in scheduler_source
+    assert "fn _shutdown_internal(" not in native_source
+
+
+def test_python_native_does_not_expose_legacy_shutdown_signal_payloads():
+    from c_two import _native
+
+    assert not hasattr(_native, "SHUTDOWN_CLIENT_BYTES")
+    assert not hasattr(_native, "SHUTDOWN_ACK_BYTES")
+
+
+def test_python_native_server_bridge_does_not_expose_public_bool_unit_lifecycle_bypass():
+    root = Path(__file__).resolve().parents[4]
+    bridge_source = (
+        root / "sdk" / "python" / "src" / "c_two" / "transport" / "server" / "native.py"
+    ).read_text(encoding="utf-8")
+    native_source = (
+        root / "sdk" / "python" / "native" / "src" / "server_ffi.rs"
+    ).read_text(encoding="utf-8")
+    runtime_session_source = (
+        root / "sdk" / "python" / "native" / "src" / "runtime_session_ffi.rs"
+    ).read_text(encoding="utf-8")
+
+    assert "fn shutdown(" not in native_source
+    assert "fn unregister_route(" not in native_source
+    assert "fn register_route(" not in native_source
+    assert "unregister_route_blocking" not in native_source
+    assert "fn _shutdown_runtime_barrier(" not in native_source
+    assert "shutdown_runtime_barrier_blocking" in native_source
+    assert "self._rust_server.register_route(" not in bridge_source
+    assert "self._rust_server.shutdown()" not in bridge_source
+    assert "self._rust_server._shutdown_runtime_barrier()" not in bridge_source
+    assert "shutdown_runtime_barrier_blocking(py, timeout)" in runtime_session_source
+    assert "outcome.get('removed_routes')" not in bridge_source
+    assert "_close_outcome_is_hook_safe" in bridge_source
+
+
+def test_python_native_server_ffi_does_not_build_tokio_runtime_directly():
+    root = Path(__file__).resolve().parents[4]
+    native_root = root / "sdk" / "python" / "native" / "src"
+    direct_builder_uses: list[str] = []
+
+    for path in native_root.rglob("*.rs"):
+        text = path.read_text(encoding="utf-8")
+        if "tokio::runtime::Builder::" in text:
+            direct_builder_uses.append(path.relative_to(root).as_posix())
+
+    assert direct_builder_uses == []
+
+    server_ffi = (native_root / "server_ffi.rs").read_text(encoding="utf-8")
+    assert "ServerRuntimeBuilder::build(" in server_ffi
+
+
+def test_python_native_server_start_wait_uses_core_responsive_fence():
+    root = Path(__file__).resolve().parents[4]
+    server_ffi = (
+        root / "sdk" / "python" / "native" / "src" / "server_ffi.rs"
+    ).read_text(encoding="utf-8")
+    core_server = (
+        root / "core" / "transport" / "c2-server" / "src" / "server.rs"
+    ).read_text(encoding="utf-8")
+
+    assert "wait_until_responsive(timeout)" in server_ffi
+    assert "wait_until_ready(timeout)" not in server_ffi.split("fn start_runtime_and_wait", 1)[1]
+    assert "pub async fn wait_until_responsive(&self, timeout: Duration)" in core_server
+
+
 def test_relay_does_not_keep_second_crm_tag_validator():
     root = Path(__file__).resolve().parents[4]
     route_table = root / "core" / "transport" / "c2-http" / "src" / "relay" / "route_table.rs"
@@ -452,6 +546,7 @@ def test_relay_control_client_does_not_expose_name_only_resolve_to_python():
 
     assert "fn resolve(&self" not in control_client_impl
     assert "inner.resolve(&name)" not in control_client_impl
+    assert "registration_token" not in control_client_impl
 
 
 def test_relay_skip_ipc_validation_is_not_a_production_surface():

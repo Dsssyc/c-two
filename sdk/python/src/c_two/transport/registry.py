@@ -56,6 +56,13 @@ CRM = TypeVar('CRM')
 log = logging.getLogger(__name__)
 
 
+def _runtime_session_kwargs_from_settings() -> dict[str, int]:
+    shm_overrides = settings._shm_overrides()  # noqa: SLF001
+    if 'shm_threshold' not in shm_overrides:
+        return {}
+    return {'shm_threshold': shm_overrides['shm_threshold']}
+
+
 def _relay_control_error_status(exc: BaseException) -> int | None:
     value = getattr(exc, "status_code", None)
     return value if isinstance(value, int) else None
@@ -128,7 +135,7 @@ class _ProcessRegistry:
         self._lock = threading.Lock()
         from c_two._native import RuntimeSession
         self._server: Server | None = None
-        self._runtime_session = RuntimeSession(shm_threshold=settings.shm_threshold)
+        self._runtime_session = RuntimeSession(**_runtime_session_kwargs_from_settings())
 
     # ------------------------------------------------------------------
     # Public API
@@ -485,7 +492,7 @@ class _ProcessRegistry:
             server = self._server
             runtime_session = self._runtime_session
             from c_two._native import RuntimeSession
-            self._runtime_session = RuntimeSession(shm_threshold=settings.shm_threshold)
+            self._runtime_session = RuntimeSession(**_runtime_session_kwargs_from_settings())
             self._server = None
 
         runtime_session.set_relay_anchor_address(settings._relay_anchor_address)  # noqa: SLF001

@@ -9,6 +9,7 @@
 //! - `tokio::sync::RwLock` — async lock for `Dispatcher` (must `.await`)
 //! - `parking_lot::RwLock` — sync lock for `MemPool` (blocking, no `.await`)
 
+use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
@@ -19,7 +20,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Mutex, RwLock, watch};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore, mpsc, watch};
 use tracing::{debug, info, warn};
 
 /// Monotonic counter ensuring each `Server` instance gets a unique SHM prefix,
@@ -41,8 +42,8 @@ use c2_wire::buddy::{
 use c2_wire::chunk::{REPLY_CHUNK_META_SIZE, decode_chunk_header, encode_reply_chunk_meta};
 use c2_wire::control::{ReplyControl, decode_call_control, try_encode_reply_control};
 use c2_wire::flags::{
-    FLAG_BUDDY, FLAG_CHUNK_LAST, FLAG_CHUNKED, FLAG_HANDSHAKE, FLAG_REPLY_V2, FLAG_RESPONSE,
-    FLAG_SIGNAL,
+    FLAG_BUDDY, FLAG_CHUNK_LAST, FLAG_CHUNKED, FLAG_CTRL, FLAG_HANDSHAKE, FLAG_REPLY_V2,
+    FLAG_RESPONSE, FLAG_SIGNAL,
 };
 use c2_wire::frame::{self, decode_frame_body, encode_frame};
 pub use c2_wire::handshake::ServerIdentity;
@@ -50,18 +51,32 @@ use c2_wire::handshake::{
     CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX, MAX_METHODS, MAX_ROUTES, MethodEntry, RouteInfo,
     decode_handshake, encode_server_handshake,
 };
-use c2_wire::msg_type::{DISCONNECT_ACK_BYTES, MsgType, PONG_BYTES, SHUTDOWN_ACK_BYTES};
+use c2_wire::msg_type::{DISCONNECT_ACK_BYTES, MsgType, PONG_BYTES};
+use c2_wire::registration_control::{
+    PENDING_ROUTE_REJECT_INVALID, PENDING_ROUTE_REJECT_NOT_FOUND,
+    PENDING_ROUTE_REJECT_TOKEN_MISMATCH, PendingRouteAttestation, PendingRouteAttestationResponse,
+    decode_pending_route_attestation_request, encode_pending_route_attestation_response,
+};
+use c2_wire::shutdown_control::{DirectShutdownAck, decode_shutdown_initiate, encode_shutdown_ack};
 
 use crate::config::ServerIpcConfig;
 use crate::connection::Connection;
 use crate::dispatcher::{
-    CrmError, CrmRoute, Dispatcher, RequestData, ResponseMeta, cleanup_request,
+    BuiltRoute, CrmCallback, CrmError, CrmRoute, Dispatcher, RequestData, ResponseMeta,
+    RouteBuildSpec, cleanup_request,
 };
 use crate::heartbeat::run_heartbeat;
 use crate::response::buddy_response_data_size;
-use crate::scheduler::{Scheduler, SchedulerAcquireError};
+use crate::scheduler::{
+    RouteConcurrencyHandle, Scheduler, SchedulerAcquireError, SchedulerLimits,
+    SchedulerPendingPermit, SchedulerSnapshot,
+};
 
 const IPC_SOCK_DIR: &str = "/tmp/c_two_ipc";
+const FRAME_FIXED_BODY_LEN: u32 = 12;
+const SHUTDOWN_INITIATE_FRAME_BODY_LEN: u32 =
+    FRAME_FIXED_BODY_LEN + c2_wire::msg_type::SHUTDOWN_CLIENT_BYTES.len() as u32;
+const POST_SHUTDOWN_DUPLICATE_INITIATE_READ_TIMEOUT_MS: u64 = 100;
 
 fn error_wire(code: ErrorCode, message: impl Into<String>) -> Vec<u8> {
     C2Error::new(code, message).to_wire_bytes()
@@ -122,6 +137,13 @@ impl ServerLifecycleState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerRouteCloseOutcome {
+    pub route_name: String,
+    pub active_drained: bool,
+    pub closed_reason: String,
+}
+
 /// The main IPC server.
 ///
 /// Binds a UDS socket, accepts connections, and dispatches CRM calls through
@@ -130,6 +152,7 @@ impl ServerLifecycleState {
 pub struct Server {
     identity: ServerIdentity,
     config: ServerIpcConfig,
+    ipc_address: String,
     socket_path: PathBuf,
     /// **tokio async RwLock** — guards CRM dispatch table; requires `.read().await`
     /// / `.write().await`.  Do NOT confuse with `parking_lot::RwLock` below.
@@ -139,11 +162,79 @@ pub struct Server {
     lifecycle_tx: watch::Sender<ServerLifecycleState>,
     socket_bound: AtomicBool,
     conn_counter: AtomicU64,
+    route_registration: Mutex<()>,
     /// Sharded chunk reassembly lifecycle manager.
     chunk_registry: Arc<c2_wire::chunk::ChunkRegistry>,
     /// **parking_lot sync RwLock** — guards SHM memory pool; blocking `.read()`
     /// / `.write()` (no `.await`).  Safe to hold briefly inside tokio tasks.
     response_pool: Arc<parking_lot::RwLock<MemPool>>,
+    pending_routes: Arc<parking_lot::Mutex<HashMap<String, PendingRouteInfo>>>,
+    pending_requests: Arc<Semaphore>,
+    chunk_processing_permits: Arc<Semaphore>,
+    chunk_route_pending: parking_lot::Mutex<HashMap<(u64, u64), ChunkRouteAdmission>>,
+    active_connections: parking_lot::Mutex<HashMap<u64, Arc<Connection>>>,
+    active_connections_notify: Notify,
+    shutdown_route_outcomes: parking_lot::Mutex<Vec<ServerRouteCloseOutcome>>,
+    shutdown_generation: AtomicU64,
+    execution_scheduler: Scheduler,
+}
+
+pub struct PendingRouteReservation {
+    route_name: String,
+    registration_token: String,
+    route: Option<CrmRoute>,
+    pending_routes: Arc<parking_lot::Mutex<HashMap<String, PendingRouteInfo>>>,
+    shutdown_generation: u64,
+    resolved: bool,
+}
+
+pub struct RouteAdmissionToken {
+    route_name: String,
+    shutdown_generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PendingRouteInfo {
+    registration_token: String,
+    contract: c2_contract::ExpectedRouteContract,
+    method_names: Vec<String>,
+}
+
+impl PendingRouteReservation {
+    fn route_name(&self) -> &str {
+        &self.route_name
+    }
+
+    pub fn registration_token(&self) -> &str {
+        &self.registration_token
+    }
+
+    fn into_route(mut self) -> CrmRoute {
+        self.route
+            .take()
+            .expect("pending route reservation must still own the route")
+    }
+
+    fn resolve(&mut self) {
+        if !self.resolved {
+            self.pending_routes.lock().remove(&self.route_name);
+            self.resolved = true;
+        }
+    }
+
+    fn close_scheduler_for_abort(&self) {
+        if let Some(route) = self.route.as_ref() {
+            route.scheduler.close();
+        }
+    }
+}
+
+impl Drop for PendingRouteReservation {
+    fn drop(&mut self) {
+        if !self.resolved {
+            self.pending_routes.lock().remove(&self.route_name);
+        }
+    }
 }
 
 impl Server {
@@ -210,9 +301,18 @@ impl Server {
             .ensure_ready()
             .map_err(|e| ServerError::Config(format!("response pool init: {e}")))?;
         let (lifecycle_tx, _lifecycle_rx) = watch::channel(ServerLifecycleState::Initialized);
+        let pending_requests = Arc::new(Semaphore::new(config.max_pending_requests as usize));
+        let chunk_processing_permits = Arc::new(Semaphore::new(config.max_total_chunks as usize));
+        let execution_scheduler = Scheduler::with_limits(
+            crate::scheduler::ConcurrencyMode::Parallel,
+            HashMap::new(),
+            SchedulerLimits::try_from_usize(None, Some(config.max_execution_workers as usize))
+                .expect("validated server config must provide max_execution_workers >= 1"),
+        );
         Ok(Self {
             identity,
             config,
+            ipc_address: address.to_string(),
             socket_path,
             dispatcher: RwLock::new(Dispatcher::new()),
             shutdown_tx,
@@ -220,9 +320,155 @@ impl Server {
             lifecycle_tx,
             socket_bound: AtomicBool::new(false),
             conn_counter: AtomicU64::new(0),
+            route_registration: Mutex::new(()),
             chunk_registry,
             response_pool: Arc::new(parking_lot::RwLock::new(response_pool)),
+            pending_routes: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            pending_requests,
+            chunk_processing_permits,
+            chunk_route_pending: parking_lot::Mutex::new(HashMap::new()),
+            active_connections: parking_lot::Mutex::new(HashMap::new()),
+            active_connections_notify: Notify::new(),
+            shutdown_route_outcomes: parking_lot::Mutex::new(Vec::new()),
+            shutdown_generation: AtomicU64::new(0),
+            execution_scheduler,
         })
+    }
+
+    fn try_acquire_pending_request(&self) -> Result<OwnedSemaphorePermit, u32> {
+        self.pending_requests
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| self.config.max_pending_requests)
+    }
+
+    fn try_acquire_chunk_processing_permit(&self) -> Result<OwnedSemaphorePermit, u32> {
+        self.chunk_processing_permits
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| self.config.max_total_chunks)
+    }
+
+    fn store_chunk_route_pending(
+        &self,
+        conn_id: u64,
+        request_id: u64,
+        admission: ChunkRouteAdmission,
+    ) -> Result<(), ChunkRouteAdmission> {
+        let mut pending = self.chunk_route_pending.lock();
+        if pending.contains_key(&(conn_id, request_id)) {
+            return Err(admission);
+        }
+        pending.insert((conn_id, request_id), admission);
+        Ok(())
+    }
+
+    fn take_chunk_route_pending(
+        &self,
+        conn_id: u64,
+        request_id: u64,
+    ) -> Option<ChunkRouteAdmission> {
+        self.chunk_route_pending
+            .lock()
+            .remove(&(conn_id, request_id))
+    }
+
+    fn abort_chunk_request(&self, conn_id: u64, request_id: u64) {
+        self.chunk_registry.abort(conn_id, request_id);
+        self.take_chunk_route_pending(conn_id, request_id);
+    }
+
+    fn cleanup_chunk_requests_for_connection(&self, conn_id: u64) {
+        self.chunk_registry.cleanup_connection(conn_id);
+        self.chunk_route_pending
+            .lock()
+            .retain(|(pending_conn_id, _), _| *pending_conn_id != conn_id);
+    }
+
+    fn sweep_stale_chunk_route_pending(&self) -> usize {
+        let stale_keys = {
+            let pending = self.chunk_route_pending.lock();
+            pending
+                .keys()
+                .filter(|(conn_id, request_id)| {
+                    !self.chunk_registry.contains(*conn_id, *request_id)
+                })
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        if stale_keys.is_empty() {
+            return 0;
+        }
+        let mut pending = self.chunk_route_pending.lock();
+        for key in &stale_keys {
+            pending.remove(key);
+        }
+        stale_keys.len()
+    }
+
+    fn register_active_connection(&self, conn: Arc<Connection>) {
+        self.active_connections.lock().insert(conn.conn_id(), conn);
+    }
+
+    fn unregister_active_connection(&self, conn_id: u64) {
+        self.active_connections.lock().remove(&conn_id);
+        self.active_connections_notify.notify_waiters();
+    }
+
+    async fn close_registered_routes_for_shutdown(
+        &self,
+        closed_reason: &str,
+    ) -> Vec<ServerRouteCloseOutcome> {
+        let routes = {
+            let _guard = self.route_registration.lock().await;
+            let mut dispatcher = self.dispatcher.write().await;
+            let routes = dispatcher.routes_snapshot();
+            for route in &routes {
+                route.scheduler.close();
+            }
+            dispatcher.take_all()
+        };
+        Self::wait_closed_routes_drained(routes, closed_reason).await
+    }
+
+    async fn wait_closed_routes_drained(
+        routes: Vec<Arc<CrmRoute>>,
+        closed_reason: &str,
+    ) -> Vec<ServerRouteCloseOutcome> {
+        let mut outcomes = Vec::with_capacity(routes.len());
+        for route in routes {
+            route.scheduler.wait_drained_async().await;
+            outcomes.push(ServerRouteCloseOutcome {
+                route_name: route.name.clone(),
+                active_drained: true,
+                closed_reason: closed_reason.to_string(),
+            });
+        }
+        outcomes
+    }
+
+    async fn wait_for_active_connections_drained(&self) {
+        loop {
+            let notified = self.active_connections_notify.notified();
+            if self.active_connections.lock().is_empty() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    #[cfg(test)]
+    fn active_connection_ids(&self) -> Vec<u64> {
+        self.active_connections.lock().keys().copied().collect()
+    }
+
+    #[cfg(test)]
+    fn active_connection(&self, conn_id: u64) -> Option<Arc<Connection>> {
+        self.active_connections.lock().get(&conn_id).cloned()
+    }
+
+    fn take_shutdown_route_outcomes(&self) -> Vec<ServerRouteCloseOutcome> {
+        std::mem::take(&mut *self.shutdown_route_outcomes.lock())
     }
 
     /// Identity announced in server→client handshake ACKs.
@@ -240,25 +486,200 @@ impl Server {
         &self.identity.server_instance_id
     }
 
-    /// Register a CRM route with the dispatcher.
-    pub async fn register_route(&self, route: CrmRoute) -> Result<(), ServerError> {
+    pub fn config(&self) -> &ServerIpcConfig {
+        &self.config
+    }
+
+    pub fn ipc_address(&self) -> &str {
+        &self.ipc_address
+    }
+
+    pub fn build_route(
+        &self,
+        spec: RouteBuildSpec,
+        callback: Arc<dyn CrmCallback>,
+    ) -> Result<BuiltRoute, ServerError> {
+        let scheduler =
+            Scheduler::with_limits(spec.concurrency_mode, spec.access_map.clone(), spec.limits);
+        let route_handle = RouteConcurrencyHandle::new(scheduler.clone());
+        let route = CrmRoute::new(spec, scheduler, callback);
         validate_route_for_wire(&route)?;
-        let mut dispatcher = self.dispatcher.write().await;
-        if dispatcher.resolve(&route.name).is_some() {
+        Ok(BuiltRoute::new(route, route_handle))
+    }
+
+    pub async fn reserve_route(
+        &self,
+        route: BuiltRoute,
+    ) -> Result<PendingRouteReservation, ServerError> {
+        let route = route.into_route();
+        validate_route_for_wire(&route)?;
+        let route_name = route.name.clone();
+        let _guard = self.route_registration.lock().await;
+        let dispatcher = self.dispatcher.read().await;
+        if dispatcher.resolve(&route_name).is_some() {
             return Err(ServerError::Protocol(format!(
                 "route already registered: {}",
-                route.name
+                route_name
             )));
         }
-        if dispatcher.len() >= MAX_ROUTES && dispatcher.resolve(&route.name).is_none() {
+        let mut pending_routes = self.pending_routes.lock();
+        if pending_routes.contains_key(&route_name) {
+            return Err(ServerError::Protocol(format!(
+                "route already registered: {}",
+                route_name
+            )));
+        }
+        if dispatcher.len() + pending_routes.len() >= MAX_ROUTES {
             return Err(ServerError::Protocol(format!(
                 "route count exceeds wire limit: {} > {}",
-                dispatcher.len() + 1,
+                dispatcher.len() + pending_routes.len() + 1,
                 MAX_ROUTES
             )));
         }
-        dispatcher.register(route);
+        if matches!(self.lifecycle_state(), ServerLifecycleState::Stopping) {
+            return Err(ServerError::Protocol(format!(
+                "server is shutting down; cannot reserve route {}",
+                route_name
+            )));
+        }
+        drop(dispatcher);
+        let registration_token = uuid::Uuid::new_v4().simple().to_string();
+        pending_routes.insert(
+            route_name.clone(),
+            PendingRouteInfo {
+                registration_token: registration_token.clone(),
+                contract: c2_contract::ExpectedRouteContract {
+                    route_name: route_name.clone(),
+                    crm_ns: route.crm_ns.clone(),
+                    crm_name: route.crm_name.clone(),
+                    crm_ver: route.crm_ver.clone(),
+                    abi_hash: route.abi_hash.clone(),
+                    signature_hash: route.signature_hash.clone(),
+                },
+                method_names: route.method_names.clone(),
+            },
+        );
+        Ok(PendingRouteReservation {
+            route_name,
+            registration_token,
+            route: Some(route),
+            pending_routes: Arc::clone(&self.pending_routes),
+            shutdown_generation: self.shutdown_generation.load(Ordering::Acquire),
+            resolved: false,
+        })
+    }
+
+    #[cfg(test)]
+    async fn register_route(&self, route: CrmRoute) -> Result<(), ServerError> {
+        let route_handle = RouteConcurrencyHandle::new(route.scheduler.as_ref().clone());
+        let reservation = self
+            .reserve_route(BuiltRoute::new(route, route_handle))
+            .await?;
+        self.commit_reserved_route(reservation).await
+    }
+
+    pub async fn commit_reserved_route(
+        &self,
+        reservation: PendingRouteReservation,
+    ) -> Result<(), ServerError> {
+        self.commit_reserved_route_with_admission(reservation, true)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn commit_reserved_route_closed(
+        &self,
+        reservation: PendingRouteReservation,
+    ) -> Result<RouteAdmissionToken, ServerError> {
+        self.commit_reserved_route_with_admission(reservation, false)
+            .await
+    }
+
+    async fn commit_reserved_route_with_admission(
+        &self,
+        mut reservation: PendingRouteReservation,
+        admission_open: bool,
+    ) -> Result<RouteAdmissionToken, ServerError> {
+        let _guard = self.route_registration.lock().await;
+        if reservation.shutdown_generation != self.shutdown_generation.load(Ordering::Acquire)
+            || matches!(self.lifecycle_state(), ServerLifecycleState::Stopping)
+        {
+            reservation.close_scheduler_for_abort();
+            reservation.resolve();
+            return Err(ServerError::Protocol(format!(
+                "server is shutting down; cannot commit route {}",
+                reservation.route_name()
+            )));
+        }
+        let mut dispatcher = self.dispatcher.write().await;
+        if dispatcher.resolve(reservation.route_name()).is_some() {
+            reservation.close_scheduler_for_abort();
+            reservation.resolve();
+            return Err(ServerError::Protocol(format!(
+                "route already registered: {}",
+                reservation.route_name()
+            )));
+        }
+        let token = RouteAdmissionToken {
+            route_name: reservation.route_name().to_string(),
+            shutdown_generation: reservation.shutdown_generation,
+        };
+        if !admission_open {
+            reservation.close_scheduler_for_abort();
+        }
+        reservation.resolve();
+        dispatcher.register(reservation.into_route());
+        Ok(token)
+    }
+
+    pub async fn open_route_admission(
+        &self,
+        token: RouteAdmissionToken,
+    ) -> Result<(), ServerError> {
+        let _guard = self.route_registration.lock().await;
+        let name = token.route_name;
+        if token.shutdown_generation != self.shutdown_generation.load(Ordering::Acquire)
+            || matches!(self.lifecycle_state(), ServerLifecycleState::Stopping)
+        {
+            return Err(ServerError::Protocol(format!(
+                "server is shutting down; cannot open route {name}"
+            )));
+        }
+        let dispatcher = self.dispatcher.read().await;
+        let Some(route) = dispatcher.resolve(&name) else {
+            return Err(ServerError::Protocol(format!(
+                "route not registered: {name}"
+            )));
+        };
+        route.scheduler.open_admission_for_registration();
         Ok(())
+    }
+
+    pub async fn abort_reserved_route(&self, mut reservation: PendingRouteReservation) {
+        let _guard = self.route_registration.lock().await;
+        reservation.close_scheduler_for_abort();
+        reservation.resolve();
+    }
+
+    fn attest_pending_route(
+        &self,
+        route_name: &str,
+        registration_token: &str,
+    ) -> Result<PendingRouteInfo, PendingRouteAttestationResponse> {
+        let pending_routes = self.pending_routes.lock();
+        let Some(info) = pending_routes.get(route_name) else {
+            return Err(PendingRouteAttestationResponse::Rejected {
+                code: PENDING_ROUTE_REJECT_NOT_FOUND.to_string(),
+                message: format!("pending route '{route_name}' not found"),
+            });
+        };
+        if info.registration_token != registration_token {
+            return Err(PendingRouteAttestationResponse::Rejected {
+                code: PENDING_ROUTE_REJECT_TOKEN_MISMATCH.to_string(),
+                message: format!("pending route '{route_name}' registration token mismatch"),
+            });
+        }
+        Ok(info.clone())
     }
 
     /// Remove a CRM route. Returns `true` if it existed.
@@ -267,14 +688,50 @@ impl Server {
     /// that removes the route, so local handle clones and remote route lookup
     /// cannot observe an open-but-unregistered window.
     pub async fn unregister_route(&self, name: &str) -> bool {
+        let _guard = self.route_registration.lock().await;
         let mut dispatcher = self.dispatcher.write().await;
-        let removed = dispatcher.unregister(name);
-        if let Some(route) = removed.as_ref() {
+        if let Some(route) = dispatcher.resolve(name) {
             route.scheduler.close();
+        }
+        let removed = dispatcher.unregister(name);
+        drop(dispatcher);
+        if let Some(route) = removed {
+            route.scheduler.wait_drained_async().await;
             true
         } else {
             false
         }
+    }
+
+    /// Remove multiple CRM routes as one shutdown transaction.
+    ///
+    /// All target route handles are closed before any route waits for drain, so
+    /// shutdown cannot keep later routes open while an earlier route is draining.
+    pub async fn unregister_routes_for_shutdown(
+        &self,
+        names: &[String],
+        closed_reason: &str,
+    ) -> Vec<ServerRouteCloseOutcome> {
+        let routes = {
+            let _guard = self.route_registration.lock().await;
+            let mut dispatcher = self.dispatcher.write().await;
+            let mut seen = HashSet::new();
+            let mut routes = Vec::new();
+            for name in names {
+                if !seen.insert(name.as_str()) {
+                    continue;
+                }
+                if let Some(route) = dispatcher.resolve(name) {
+                    route.scheduler.close();
+                    routes.push(route);
+                }
+            }
+            for route in &routes {
+                dispatcher.unregister(&route.name);
+            }
+            routes
+        };
+        Self::wait_closed_routes_drained(routes, closed_reason).await
     }
 
     /// Filesystem path of the bound UDS socket.
@@ -318,6 +775,7 @@ impl Server {
             | ServerLifecycleState::Stopped
             | ServerLifecycleState::Failed(_) => {
                 self.shutdown_tx.send_replace(false);
+                self.shutdown_route_outcomes.lock().clear();
                 self.set_lifecycle_state(ServerLifecycleState::Starting);
                 Ok(())
             }
@@ -360,6 +818,27 @@ impl Server {
                 timeout.as_secs_f64(),
             ))
         })?
+    }
+
+    pub async fn wait_until_responsive(&self, timeout: Duration) -> Result<(), ServerError> {
+        let started = std::time::Instant::now();
+        self.wait_until_ready(timeout).await?;
+        loop {
+            if started.elapsed() >= timeout {
+                return Err(ServerError::Config(format!(
+                    "server became ready but did not answer direct IPC ping within {:.3}s",
+                    timeout.as_secs_f64(),
+                )));
+            }
+            let remaining = timeout.saturating_sub(started.elapsed());
+            let probe_timeout = remaining.min(Duration::from_millis(100));
+            if tokio::time::timeout(probe_timeout, ping_server_socket(self.socket_path())).await
+                == Ok(true)
+            {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     pub async fn wait_until_stopped(&self, timeout: Duration) -> Result<(), ServerError> {
@@ -428,9 +907,13 @@ impl Server {
         self.dispatcher.read().await.resolve(name).is_some()
     }
 
-    /// Get the chunk registry (for FFI or external use).
-    pub fn chunk_registry(&self) -> &Arc<c2_wire::chunk::ChunkRegistry> {
-        &self.chunk_registry
+    /// Return the current route scheduler state, if the route is registered.
+    pub async fn route_scheduler_snapshot(&self, name: &str) -> Option<SchedulerSnapshot> {
+        self.dispatcher
+            .read()
+            .await
+            .resolve(name)
+            .map(|route| route.scheduler.snapshot())
     }
 
     /// Run the accept loop.  Blocks until [`shutdown`](Self::shutdown) is called.
@@ -467,7 +950,7 @@ impl Server {
         info!(path = %self.socket_path.display(), "server listening");
 
         // Spawn periodic GC sweep for expired chunk assemblies.
-        let gc_registry = self.chunk_registry.clone();
+        let gc_server = Arc::clone(self);
         let gc_interval = self.chunk_registry.config().gc_interval;
         let mut gc_shutdown_rx = self.shutdown_rx.clone();
         tokio::spawn(async move {
@@ -476,9 +959,15 @@ impl Server {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        let stats = gc_registry.gc_sweep();
+                        let stats = gc_server.chunk_registry.gc_sweep();
+                        let released_route_pending = gc_server.sweep_stale_chunk_route_pending();
                         if stats.expired > 0 {
-                            info!(expired = stats.expired, freed = stats.freed_bytes, "chunk GC sweep");
+                            info!(
+                                expired = stats.expired,
+                                freed = stats.freed_bytes,
+                                released_route_pending,
+                                "chunk GC sweep"
+                            );
                         }
                     }
                     _ = gc_shutdown_rx.changed() => break,
@@ -487,6 +976,8 @@ impl Server {
         });
 
         let mut shutdown_rx = self.shutdown_rx.clone();
+        let (shutdown_done_tx, mut shutdown_done_rx) = mpsc::unbounded_channel();
+        let mut shutdown_close_started = false;
         loop {
             tokio::select! {
                 result = listener.accept() => {
@@ -499,28 +990,121 @@ impl Server {
                     }
                 }
                 _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
+                    if *shutdown_rx.borrow() && !shutdown_close_started {
                         info!("server shutting down");
                         self.set_lifecycle_state(ServerLifecycleState::Stopping);
-                        break;
+                        shutdown_close_started = true;
+                        let server = Arc::clone(self);
+                        let done_tx = shutdown_done_tx.clone();
+                        tokio::spawn(async move {
+                            let outcomes = server
+                                .close_registered_routes_for_shutdown("direct_ipc_shutdown")
+                                .await;
+                            let _ = done_tx.send(outcomes);
+                        });
                     }
+                }
+                shutdown_route_outcomes = shutdown_done_rx.recv(), if shutdown_close_started => {
+                    let shutdown_route_outcomes = shutdown_route_outcomes.unwrap_or_default();
+                    self.wait_for_active_connections_drained().await;
+                    if !shutdown_route_outcomes.is_empty() {
+                        self.shutdown_route_outcomes
+                            .lock()
+                            .extend(shutdown_route_outcomes);
+                    }
+                    self.remove_owned_socket_file();
+                    self.set_lifecycle_state(ServerLifecycleState::Stopped);
+                        break;
                 }
             }
         }
-
-        self.remove_owned_socket_file();
-        self.set_lifecycle_state(ServerLifecycleState::Stopped);
         Ok(())
     }
 
-    /// Signal the server to stop and remove the socket file.
-    pub fn shutdown(&self) {
+    /// Observe route-close outcomes from an already initiated external shutdown.
+    ///
+    /// This is the reconciliation path for owners that did not initiate the
+    /// shutdown, for example a runtime bridge observing a direct IPC admin stop.
+    /// It never starts shutdown for a ready server.
+    pub async fn observe_external_shutdown_outcomes(
+        &self,
+        timeout: Duration,
+    ) -> Result<Vec<ServerRouteCloseOutcome>, ServerError> {
+        if matches!(
+            self.lifecycle_state(),
+            ServerLifecycleState::Stopping | ServerLifecycleState::Stopped
+        ) {
+            self.wait_until_stopped(timeout).await?;
+            Ok(self.take_shutdown_route_outcomes())
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Initiate shutdown and wait for the runtime-owned close transaction.
+    pub async fn shutdown_and_wait(
+        &self,
+        timeout: Duration,
+    ) -> Result<Vec<ServerRouteCloseOutcome>, ServerError> {
+        self.request_shutdown_signal();
+        self.wait_until_stopped(timeout).await?;
+        Ok(self.take_shutdown_route_outcomes())
+    }
+
+    fn request_shutdown_signal(&self) {
+        match self.lifecycle_state() {
+            ServerLifecycleState::Starting | ServerLifecycleState::Ready => {
+                self.shutdown_generation.fetch_add(1, Ordering::AcqRel);
+                self.set_lifecycle_state(ServerLifecycleState::Stopping);
+            }
+            ServerLifecycleState::Stopping
+            | ServerLifecycleState::Initialized
+            | ServerLifecycleState::Stopped
+            | ServerLifecycleState::Failed(_) => {}
+        }
         if self.is_running() {
             self.set_lifecycle_state(ServerLifecycleState::Stopping);
         }
-        let _ = self.shutdown_tx.send(true);
-        self.remove_owned_socket_file();
+        let shutdown_already_requested = *self.shutdown_tx.borrow();
+        if !shutdown_already_requested {
+            let _ = self.shutdown_tx.send(true);
+        }
     }
+}
+
+async fn ping_server_socket(socket_path: &Path) -> bool {
+    let mut stream = match UnixStream::connect(socket_path).await {
+        Ok(stream) => stream,
+        Err(_) => return false,
+    };
+    let frame = encode_frame(0, FLAG_SIGNAL, &c2_wire::msg_type::PING_BYTES);
+    if stream.write_all(&frame).await.is_err() {
+        return false;
+    }
+    let mut header = [0u8; frame::HEADER_SIZE];
+    if stream.read_exact(&mut header).await.is_err() {
+        return false;
+    }
+    let (total_len, body) = match frame::decode_total_len(&header) {
+        Ok(decoded) => decoded,
+        Err(_) => return false,
+    };
+    let (frame_header, payload_prefix) = match frame::decode_frame_body(body, total_len) {
+        Ok(decoded) => decoded,
+        Err(_) => return false,
+    };
+    let payload_len = frame_header.payload_len();
+    let mut payload = payload_prefix.to_vec();
+    if payload.len() < payload_len {
+        let mut tail = vec![0u8; payload_len - payload.len()];
+        if stream.read_exact(&mut tail).await.is_err() {
+            return false;
+        }
+        payload.extend_from_slice(&tail);
+    }
+    frame_header.flags & FLAG_SIGNAL != 0
+        && frame_header.flags & FLAG_RESPONSE != 0
+        && payload == c2_wire::msg_type::PONG_BYTES
 }
 
 fn validate_route_for_wire(route: &CrmRoute) -> Result<(), ServerError> {
@@ -640,12 +1224,65 @@ fn validate_region_id(region: &str) -> Result<(), String> {
 enum SignalAction {
     Continue,
     Disconnect,
-    Shutdown,
+}
+
+async fn handle_post_shutdown_connection(server: Arc<Server>, stream: UnixStream) {
+    let conn_id = server.conn_counter.fetch_add(1, Ordering::Relaxed);
+    let conn = Connection::new(conn_id);
+    let (mut reader, write_half) = stream.into_split();
+    let writer = Arc::new(Mutex::new(write_half));
+    let read_timeout = Duration::from_millis(POST_SHUTDOWN_DUPLICATE_INITIATE_READ_TIMEOUT_MS);
+
+    let mut len_buf = [0u8; 4];
+    if !matches!(
+        tokio::time::timeout(read_timeout, reader.read_exact(&mut len_buf)).await,
+        Ok(Ok(_))
+    ) {
+        return;
+    }
+    let total_len = u32::from_le_bytes(len_buf);
+    if total_len != SHUTDOWN_INITIATE_FRAME_BODY_LEN {
+        warn!(
+            conn_id,
+            total_len, "non-shutdown frame received after shutdown requested"
+        );
+        return;
+    }
+
+    let mut body = vec![0u8; total_len as usize];
+    if !matches!(
+        tokio::time::timeout(read_timeout, reader.read_exact(&mut body)).await,
+        Ok(Ok(_))
+    ) {
+        return;
+    }
+    let (header, payload) = match decode_frame_body(&body, total_len) {
+        Ok(value) => value,
+        Err(err) => {
+            warn!(conn_id, ?err, "post-shutdown duplicate frame decode error");
+            return;
+        }
+    };
+    if header.is_signal()
+        && matches!(
+            payload.first().and_then(|&b| MsgType::from_byte(b)),
+            Some(MsgType::ShutdownClient)
+        )
+    {
+        handle_shutdown_signal(&server, &conn, payload, header.request_id, &writer).await;
+    }
 }
 
 async fn handle_connection(server: Arc<Server>, stream: UnixStream) {
+    let mut shutdown_rx = server.shutdown_rx.clone();
+    if *shutdown_rx.borrow() {
+        handle_post_shutdown_connection(server, stream).await;
+        return;
+    }
+
     let conn_id = server.conn_counter.fetch_add(1, Ordering::Relaxed);
     let conn = Arc::new(Connection::new(conn_id));
+    server.register_active_connection(Arc::clone(&conn));
 
     let (mut reader, write_half) = stream.into_split();
     let writer = Arc::new(Mutex::new(write_half));
@@ -665,11 +1302,28 @@ async fn handle_connection(server: Arc<Server>, stream: UnixStream) {
     loop {
         // 1. Read 4-byte total_len prefix.
         let mut len_buf = [0u8; 4];
-        if reader.read_exact(&mut len_buf).await.is_err() {
-            break; // EOF or broken pipe
+        tokio::select! {
+            read_result = reader.read_exact(&mut len_buf) => {
+                if read_result.is_err() {
+                    break; // EOF or broken pipe
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+                continue;
+            }
         }
         let total_len = u32::from_le_bytes(len_buf);
 
+        if *shutdown_rx.borrow() && total_len != SHUTDOWN_INITIATE_FRAME_BODY_LEN {
+            warn!(
+                conn_id,
+                total_len, "non-shutdown frame received after shutdown requested"
+            );
+            break;
+        }
         if total_len < 12 || (total_len as u64) > max_frame {
             warn!(conn_id, total_len, "invalid frame length");
             break;
@@ -677,8 +1331,18 @@ async fn handle_connection(server: Arc<Server>, stream: UnixStream) {
 
         // 2. Read body (request_id + flags + payload).
         let mut body = vec![0u8; total_len as usize];
-        if reader.read_exact(&mut body).await.is_err() {
-            break;
+        tokio::select! {
+            read_result = reader.read_exact(&mut body) => {
+                if read_result.is_err() {
+                    break;
+                }
+            }
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+                continue;
+            }
         }
 
         // 3. Decode header + payload.
@@ -694,6 +1358,18 @@ async fn handle_connection(server: Arc<Server>, stream: UnixStream) {
         let flags = header.flags;
         let request_id = header.request_id;
 
+        if *shutdown_rx.borrow() {
+            if header.is_signal()
+                && matches!(
+                    payload.first().and_then(|&b| MsgType::from_byte(b)),
+                    Some(MsgType::ShutdownClient)
+                )
+            {
+                handle_shutdown_signal(&server, &conn, payload, request_id, &writer).await;
+            }
+            break;
+        }
+
         // 4. Dispatch by frame type.
         if header.is_handshake() {
             if let Err(e) = handle_handshake(&server, &conn, payload, request_id, &writer).await {
@@ -701,40 +1377,144 @@ async fn handle_connection(server: Arc<Server>, stream: UnixStream) {
                 break;
             }
         } else if header.is_signal() {
-            match handle_signal(payload, request_id, &writer, &server).await {
+            if matches!(
+                payload.first().and_then(|&b| MsgType::from_byte(b)),
+                Some(MsgType::ShutdownClient)
+            ) {
+                handle_shutdown_signal(&server, &conn, payload, request_id, &writer).await;
+                break;
+            }
+            match handle_signal(payload, request_id, &writer).await {
                 SignalAction::Continue => {}
-                SignalAction::Disconnect | SignalAction::Shutdown => break,
+                SignalAction::Disconnect => break,
             }
         } else if header.is_ctrl() {
-            debug!(conn_id, "ctrl frame ignored");
+            handle_ctrl(&server, payload, request_id, &writer).await;
         } else if header.is_call_v2() {
             if c2_wire::flags::is_chunked(flags) {
+                let chunk_processing_permit = match server.try_acquire_chunk_processing_permit() {
+                    Ok(permit) => permit,
+                    Err(limit) => {
+                        write_chunk_processing_capacity_error(&writer, request_id, limit).await;
+                        continue;
+                    }
+                };
                 let srv = Arc::clone(&server);
                 let cn = Arc::clone(&conn);
                 let wr = Arc::clone(&writer);
                 let pl = payload.to_vec();
                 tokio::spawn(async move {
-                    dispatch_chunked_call(&srv, &cn, request_id, flags, &pl, &wr).await;
+                    dispatch_chunked_call(
+                        &srv,
+                        &cn,
+                        request_id,
+                        flags,
+                        &pl,
+                        &wr,
+                        chunk_processing_permit,
+                    )
+                    .await;
                 });
                 continue;
             }
             if c2_wire::flags::is_buddy(flags) {
+                let (ctrl, ctrl_consumed) = match decode_call_control(payload, BUDDY_PAYLOAD_SIZE) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(
+                            conn_id = conn.conn_id(),
+                            ?e,
+                            "buddy call control decode error"
+                        );
+                        continue;
+                    }
+                };
+                let route_admission =
+                    match reserve_route_execution(&server, &ctrl.route_name, ctrl.method_idx).await
+                    {
+                        Ok(admission) => admission,
+                        Err(err) => {
+                            write_route_admission_error(&writer, request_id, err).await;
+                            continue;
+                        }
+                    };
+                let pending_permit = match server.try_acquire_pending_request() {
+                    Ok(permit) => permit,
+                    Err(limit) => {
+                        drop(route_admission.pending_permit);
+                        write_server_pending_capacity_error(&writer, request_id, limit).await;
+                        continue;
+                    }
+                };
                 let srv = Arc::clone(&server);
                 let cn = Arc::clone(&conn);
                 let wr = Arc::clone(&writer);
                 let pl = payload.to_vec();
+                let route = route_admission.route;
+                let route_pending_permit = route_admission.pending_permit;
+                let method_idx = ctrl.method_idx;
                 tokio::spawn(async move {
-                    dispatch_buddy_call(&srv, &cn, request_id, &pl, &wr).await;
+                    dispatch_admitted_buddy_call(
+                        &srv,
+                        &cn,
+                        request_id,
+                        &pl,
+                        ctrl_consumed,
+                        route,
+                        method_idx,
+                        &wr,
+                        pending_permit,
+                        route_pending_permit,
+                    )
+                    .await;
                 });
                 continue;
             }
 
+            let (ctrl, ctrl_consumed) = match decode_call_control(payload, 0) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(conn_id = conn.conn_id(), ?e, "call control decode error");
+                    continue;
+                }
+            };
+            let route_admission =
+                match reserve_route_execution(&server, &ctrl.route_name, ctrl.method_idx).await {
+                    Ok(admission) => admission,
+                    Err(err) => {
+                        write_route_admission_error(&writer, request_id, err).await;
+                        continue;
+                    }
+                };
+            let pending_permit = match server.try_acquire_pending_request() {
+                Ok(permit) => permit,
+                Err(limit) => {
+                    drop(route_admission.pending_permit);
+                    write_server_pending_capacity_error(&writer, request_id, limit).await;
+                    continue;
+                }
+            };
             let srv = Arc::clone(&server);
             let cn = Arc::clone(&conn);
             let wr = Arc::clone(&writer);
             let pl = payload.to_vec();
+            let route = route_admission.route;
+            let route_pending_permit = route_admission.pending_permit;
+            let method_idx = ctrl.method_idx;
             tokio::spawn(async move {
-                dispatch_call(&srv, &cn, request_id, &pl, &wr).await;
+                dispatch_admitted_call(
+                    &srv,
+                    &cn,
+                    request_id,
+                    &pl,
+                    ctrl_consumed,
+                    route,
+                    method_idx,
+                    &wr,
+                    pending_permit,
+                    route_pending_permit,
+                )
+                .await;
             });
         } else {
             warn!(conn_id, flags, "unknown frame type");
@@ -743,8 +1523,10 @@ async fn handle_connection(server: Arc<Server>, stream: UnixStream) {
 
     debug!(conn_id, "connection closing, draining in-flight");
     hb_handle.abort();
+    conn.cancel_queued_work();
     conn.wait_idle().await;
-    server.chunk_registry.cleanup_connection(conn_id);
+    server.cleanup_chunk_requests_for_connection(conn_id);
+    server.unregister_active_connection(conn_id);
     debug!(conn_id, "connection closed");
 }
 
@@ -829,11 +1611,44 @@ async fn handle_handshake(
 // Signal handling
 // ---------------------------------------------------------------------------
 
+async fn handle_shutdown_signal(
+    server: &Server,
+    conn: &Connection,
+    payload: &[u8],
+    request_id: u64,
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+) {
+    if decode_shutdown_initiate(payload).is_err() {
+        let outcome = DirectShutdownAck {
+            acknowledged: false,
+            shutdown_started: false,
+            server_stopped: false,
+            route_outcomes: Vec::new(),
+        };
+        let payload = encode_shutdown_ack(&outcome)
+            .expect("shutdown control outcome serialization should not fail");
+        let frame = encode_frame(request_id, FLAG_RESPONSE | FLAG_SIGNAL, &payload);
+        let _ = writer.lock().await.write_all(&frame).await;
+        return;
+    }
+    server.unregister_active_connection(conn.conn_id());
+    server.request_shutdown_signal();
+    let outcome = DirectShutdownAck {
+        acknowledged: true,
+        shutdown_started: true,
+        server_stopped: false,
+        route_outcomes: Vec::new(),
+    };
+    let payload = encode_shutdown_ack(&outcome)
+        .expect("shutdown control outcome serialization should not fail");
+    let frame = encode_frame(request_id, FLAG_RESPONSE | FLAG_SIGNAL, &payload);
+    let _ = writer.lock().await.write_all(&frame).await;
+}
+
 async fn handle_signal(
     payload: &[u8],
     request_id: u64,
     writer: &Arc<Mutex<OwnedWriteHalf>>,
-    server: &Server,
 ) -> SignalAction {
     let sig = match payload.first().and_then(|&b| MsgType::from_byte(b)) {
         Some(s) => s,
@@ -842,18 +1657,64 @@ async fn handle_signal(
 
     let (reply, action) = match sig {
         MsgType::Ping => (&PONG_BYTES[..], SignalAction::Continue),
-        MsgType::ShutdownClient => (&SHUTDOWN_ACK_BYTES[..], SignalAction::Shutdown),
         MsgType::Disconnect => (&DISCONNECT_ACK_BYTES[..], SignalAction::Disconnect),
         _ => return SignalAction::Continue,
     };
 
     let frame = encode_frame(request_id, FLAG_RESPONSE | FLAG_SIGNAL, reply);
     let _ = writer.lock().await.write_all(&frame).await;
-
-    if matches!(action, SignalAction::Shutdown) {
-        server.shutdown();
-    }
     action
+}
+
+async fn handle_ctrl(
+    server: &Server,
+    payload: &[u8],
+    request_id: u64,
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+) {
+    let Some(msg_type) = payload.first().and_then(|&b| MsgType::from_byte(b)) else {
+        return;
+    };
+    if msg_type != MsgType::PendingRouteAttest {
+        debug!(request_id, "unknown ctrl frame ignored");
+        return;
+    }
+
+    let response = match decode_pending_route_attestation_request(payload) {
+        Ok(request) => {
+            match server.attest_pending_route(&request.route_name, &request.registration_token) {
+                Ok(info) => PendingRouteAttestationResponse::Attested {
+                    contract: PendingRouteAttestation {
+                        route_name: info.contract.route_name,
+                        crm_ns: info.contract.crm_ns,
+                        crm_name: info.contract.crm_name,
+                        crm_ver: info.contract.crm_ver,
+                        abi_hash: info.contract.abi_hash,
+                        signature_hash: info.contract.signature_hash,
+                        method_names: info.method_names,
+                    },
+                },
+                Err(response) => response,
+            }
+        }
+        Err(err) => PendingRouteAttestationResponse::Rejected {
+            code: PENDING_ROUTE_REJECT_INVALID.to_string(),
+            message: err,
+        },
+    };
+
+    match encode_pending_route_attestation_response(&response) {
+        Ok(payload) => write_ctrl_response(writer, request_id, &payload).await,
+        Err(err) => {
+            let fallback = PendingRouteAttestationResponse::Rejected {
+                code: PENDING_ROUTE_REJECT_INVALID.to_string(),
+                message: err,
+            };
+            if let Ok(payload) = encode_pending_route_attestation_response(&fallback) {
+                write_ctrl_response(writer, request_id, &payload).await;
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -862,28 +1723,100 @@ enum RouteExecutionError {
     Crm(CrmError),
 }
 
-async fn execute_route_request<F>(
-    scheduler: Scheduler,
+struct RouteExecutionAdmission {
+    route: Arc<CrmRoute>,
+    pending_permit: SchedulerPendingPermit,
+}
+
+struct ChunkRouteAdmission {
+    route: Arc<CrmRoute>,
     method_idx: u16,
+    pending_permit: SchedulerPendingPermit,
+}
+
+enum RouteAdmissionError {
+    RouteNotFound(String),
+    UnknownMethod { route_name: String, method_idx: u16 },
+    Acquire(SchedulerAcquireError),
+}
+
+async fn execute_route_request<F>(
+    execution_scheduler: Scheduler,
+    route_pending_permit: SchedulerPendingPermit,
+    conn: &Connection,
     request: RequestData,
     f: F,
 ) -> Result<ResponseMeta, RouteExecutionError>
 where
     F: FnOnce(RequestData) -> Result<ResponseMeta, CrmError> + Send + 'static,
 {
-    tokio::task::spawn_blocking(move || {
-        let guard = match scheduler.blocking_acquire(method_idx) {
+    let route_guard = tokio::select! {
+        result = route_pending_permit.async_activate() => match result {
             Ok(guard) => guard,
             Err(err) => {
                 cleanup_request(request);
                 return Err(RouteExecutionError::Acquire(err));
             }
-        };
-        let _guard = guard;
+        },
+        _ = conn.wait_cancelled() => {
+            cleanup_request(request);
+            return Err(RouteExecutionError::Acquire(SchedulerAcquireError::Closed));
+        }
+    };
+    let execution_guard = tokio::select! {
+        result = execution_scheduler.async_acquire(0) => match result {
+            Ok(guard) => guard,
+            Err(err) => {
+                cleanup_request(request);
+                return Err(RouteExecutionError::Acquire(err));
+            }
+        },
+        _ = route_guard.wait_closed() => {
+            cleanup_request(request);
+            return Err(RouteExecutionError::Acquire(SchedulerAcquireError::Closed));
+        },
+        _ = conn.wait_cancelled() => {
+            cleanup_request(request);
+            return Err(RouteExecutionError::Acquire(SchedulerAcquireError::Closed));
+        }
+    };
+    if route_guard.is_closed() || conn.is_cancelled() {
+        cleanup_request(request);
+        return Err(RouteExecutionError::Acquire(SchedulerAcquireError::Closed));
+    }
+
+    tokio::task::spawn_blocking(move || {
+        let _route_guard = route_guard;
+        let _execution_guard = execution_guard;
         f(request).map_err(RouteExecutionError::Crm)
     })
     .await
     .expect("route execution task panicked")
+}
+
+async fn reserve_route_execution(
+    server: &Server,
+    route_name: &str,
+    method_idx: u16,
+) -> Result<RouteExecutionAdmission, RouteAdmissionError> {
+    let route = match server.dispatcher.read().await.resolve(route_name) {
+        Some(route) => route,
+        None => return Err(RouteAdmissionError::RouteNotFound(route_name.to_string())),
+    };
+    if !route.has_method_index(method_idx) {
+        return Err(RouteAdmissionError::UnknownMethod {
+            route_name: route.name.clone(),
+            method_idx,
+        });
+    }
+    let pending_permit = route
+        .scheduler
+        .reserve_pending(method_idx)
+        .map_err(RouteAdmissionError::Acquire)?;
+    Ok(RouteExecutionAdmission {
+        route,
+        pending_permit,
+    })
 }
 
 async fn send_route_execution_result(
@@ -954,6 +1887,41 @@ async fn send_route_execution_result(
     }
 }
 
+async fn write_route_admission_error(
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    request_id: u64,
+    err: RouteAdmissionError,
+) {
+    match err {
+        RouteAdmissionError::RouteNotFound(route_name) => {
+            write_reply(writer, request_id, &ReplyControl::RouteNotFound(route_name)).await;
+        }
+        RouteAdmissionError::UnknownMethod {
+            route_name,
+            method_idx,
+        } => {
+            write_unknown_method_index(writer, request_id, &route_name, method_idx).await;
+        }
+        RouteAdmissionError::Acquire(SchedulerAcquireError::Closed) => {
+            write_reply(
+                writer,
+                request_id,
+                &ReplyControl::Error(error_wire(ErrorCode::ResourceUnavailable, "route closed")),
+            )
+            .await;
+        }
+        RouteAdmissionError::Acquire(SchedulerAcquireError::Capacity { field, limit }) => {
+            let msg = format!("route concurrency capacity exceeded: {field}={limit}");
+            write_reply(
+                writer,
+                request_id,
+                &ReplyControl::Error(error_wire(ErrorCode::ResourceUnavailable, msg)),
+            )
+            .await;
+        }
+    }
+}
+
 async fn write_unknown_method_index(
     writer: &Arc<Mutex<OwnedWriteHalf>>,
     request_id: u64,
@@ -973,101 +1941,107 @@ async fn write_unknown_method_index(
 // CRM call dispatch (inline, non-buddy, non-chunked)
 // ---------------------------------------------------------------------------
 
+async fn dispatch_admitted_call(
+    server: &Server,
+    conn: &Connection,
+    request_id: u64,
+    payload: &[u8],
+    control_consumed: usize,
+    route: Arc<CrmRoute>,
+    method_idx: u16,
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    _pending_permit: OwnedSemaphorePermit,
+    route_pending_permit: SchedulerPendingPermit,
+) {
+    let _flight = crate::connection::FlightGuard::new(conn);
+
+    let callback = Arc::clone(&route.callback);
+    let name = route.name.clone();
+    let args = payload[control_consumed..].to_vec();
+    let resp_pool = Arc::clone(&server.response_pool);
+
+    let execution_scheduler = server.execution_scheduler.clone();
+    let request = RequestData::Inline(args);
+    let result = execute_route_request(
+        execution_scheduler,
+        route_pending_permit,
+        conn,
+        request,
+        move |request| callback.invoke(&name, method_idx, request, resp_pool),
+    )
+    .await;
+
+    send_route_execution_result(server, writer, request_id, result).await;
+}
+
+#[cfg(test)]
 async fn dispatch_call(
     server: &Server,
     conn: &Connection,
     request_id: u64,
     payload: &[u8],
     writer: &Arc<Mutex<OwnedWriteHalf>>,
+    pending_permit: OwnedSemaphorePermit,
 ) {
-    conn.flight_inc();
-
     let (ctrl, consumed) = match decode_call_control(payload, 0) {
         Ok(v) => v,
         Err(e) => {
             warn!(conn_id = conn.conn_id(), ?e, "call control decode error");
-            conn.flight_dec();
             return;
         }
     };
 
-    let route = server.dispatcher.read().await.resolve(&ctrl.route_name);
-    let route = match route {
-        Some(r) => r,
-        None => {
-            write_reply(
-                writer,
-                request_id,
-                &ReplyControl::RouteNotFound(ctrl.route_name),
-            )
-            .await;
-            conn.flight_dec();
+    let admission = match reserve_route_execution(server, &ctrl.route_name, ctrl.method_idx).await {
+        Ok(admission) => admission,
+        Err(err) => {
+            write_route_admission_error(writer, request_id, err).await;
             return;
         }
     };
 
-    let idx = ctrl.method_idx;
-    if !route.has_method_index(idx) {
-        write_unknown_method_index(writer, request_id, &route.name, idx).await;
-        conn.flight_dec();
-        return;
-    }
-
-    let callback = Arc::clone(&route.callback);
-    let name = ctrl.route_name;
-    let args = payload[consumed..].to_vec();
-    let resp_pool = Arc::clone(&server.response_pool);
-
-    let scheduler = route.scheduler.as_ref().clone();
-    let request = RequestData::Inline(args);
-    let result = execute_route_request(scheduler, idx, request, move |request| {
-        callback.invoke(&name, idx, request, resp_pool)
-    })
+    dispatch_admitted_call(
+        server,
+        conn,
+        request_id,
+        payload,
+        consumed,
+        admission.route,
+        ctrl.method_idx,
+        writer,
+        pending_permit,
+        admission.pending_permit,
+    )
     .await;
-
-    send_route_execution_result(server, writer, request_id, result).await;
-
-    conn.flight_dec();
 }
 
 // ---------------------------------------------------------------------------
 // CRM call dispatch — buddy SHM
 // ---------------------------------------------------------------------------
 
-async fn dispatch_buddy_call(
+async fn dispatch_admitted_buddy_call(
     server: &Server,
     conn: &Arc<Connection>,
     request_id: u64,
     payload: &[u8],
+    ctrl_consumed: usize,
+    route: Arc<CrmRoute>,
+    method_idx: u16,
     writer: &Arc<Mutex<OwnedWriteHalf>>,
+    _pending_permit: OwnedSemaphorePermit,
+    route_pending_permit: SchedulerPendingPermit,
 ) {
-    conn.flight_inc();
+    let _flight = crate::connection::FlightGuard::new(conn.as_ref());
 
     // 1. Decode buddy pointer (11 bytes).
     let (bp, _bp_consumed) = match decode_buddy_payload(payload) {
         Ok(v) => v,
         Err(e) => {
             warn!(conn_id = conn.conn_id(), ?e, "buddy payload decode error");
-            conn.flight_dec();
             return;
         }
     };
 
-    // 2. Decode call control (route_name + method_idx) after buddy header.
-    let (ctrl, ctrl_consumed) = match decode_call_control(payload, BUDDY_PAYLOAD_SIZE) {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(
-                conn_id = conn.conn_id(),
-                ?e,
-                "buddy call control decode error"
-            );
-            conn.flight_dec();
-            return;
-        }
-    };
-
-    // 3. Ensure peer SHM segment is mapped and get pool Arc (single lock).
+    // 2. Ensure peer SHM segment is mapped and get pool Arc (single lock).
     let peer_pool = match conn.ensure_and_get_peer_pool(bp.seg_idx, bp.data_size, bp.is_dedicated) {
         Ok(p) => p,
         Err(e) => {
@@ -1079,12 +2053,11 @@ async fn dispatch_buddy_call(
                 &ReplyControl::Error(error_wire(ErrorCode::ResourceInputDeserializing, msg)),
             )
             .await;
-            conn.flight_dec();
             return;
         }
     };
 
-    // 4. Check for extra inline args appended after control header.
+    // 3. Check for extra inline args appended after control header.
     let inline_start = BUDDY_PAYLOAD_SIZE + ctrl_consumed;
     let extra_args = if inline_start < payload.len() {
         &payload[inline_start..]
@@ -1092,7 +2065,7 @@ async fn dispatch_buddy_call(
         &[]
     };
 
-    // 5. Build request — zero-copy SHM or fallback to inline if extra args present.
+    // 4. Build request — zero-copy SHM or fallback to inline if extra args present.
     let request = if extra_args.is_empty() {
         RequestData::Shm {
             pool: peer_pool,
@@ -1119,7 +2092,6 @@ async fn dispatch_buddy_call(
                     &ReplyControl::Error(error_wire(ErrorCode::ResourceInputDeserializing, msg)),
                 )
                 .await;
-                conn.flight_dec();
                 return;
             }
         };
@@ -1137,44 +2109,21 @@ async fn dispatch_buddy_call(
         RequestData::Inline(combined)
     };
 
-    // 6. Route + execute.
-    let route = server.dispatcher.read().await.resolve(&ctrl.route_name);
-    let route = match route {
-        Some(r) => r,
-        None => {
-            cleanup_request(request);
-            write_reply(
-                writer,
-                request_id,
-                &ReplyControl::RouteNotFound(ctrl.route_name),
-            )
-            .await;
-            conn.flight_dec();
-            return;
-        }
-    };
-
-    let idx = ctrl.method_idx;
-    if !route.has_method_index(idx) {
-        cleanup_request(request);
-        write_unknown_method_index(writer, request_id, &route.name, idx).await;
-        conn.flight_dec();
-        return;
-    }
-
     let callback = Arc::clone(&route.callback);
-    let name = ctrl.route_name;
+    let name = route.name.clone();
     let resp_pool = Arc::clone(&server.response_pool);
 
-    let scheduler = route.scheduler.as_ref().clone();
-    let result = execute_route_request(scheduler, idx, request, move |request| {
-        callback.invoke(&name, idx, request, resp_pool)
-    })
+    let execution_scheduler = server.execution_scheduler.clone();
+    let result = execute_route_request(
+        execution_scheduler,
+        route_pending_permit,
+        conn,
+        request,
+        move |request| callback.invoke(&name, method_idx, request, resp_pool),
+    )
     .await;
 
     send_route_execution_result(server, writer, request_id, result).await;
-
-    conn.flight_dec();
 }
 
 // ---------------------------------------------------------------------------
@@ -1188,6 +2137,7 @@ async fn dispatch_chunked_call(
     flags: u32,
     payload: &[u8],
     writer: &Arc<Mutex<OwnedWriteHalf>>,
+    chunk_processing_permit: OwnedSemaphorePermit,
 ) {
     let is_buddy = c2_wire::flags::is_buddy(flags);
     let mut offset: usize = 0;
@@ -1201,6 +2151,7 @@ async fn dispatch_chunked_call(
             Ok(v) => v,
             Err(e) => {
                 warn!(conn_id = conn.conn_id(), ?e, "chunked buddy decode error");
+                server.abort_chunk_request(conn.conn_id(), request_id);
                 return;
             }
         };
@@ -1220,6 +2171,7 @@ async fn dispatch_chunked_call(
             }
             Err(e) => {
                 warn!(conn_id = conn.conn_id(), %e, "chunked SHM read failed");
+                server.abort_chunk_request(conn.conn_id(), request_id);
                 return;
             }
         }
@@ -1232,6 +2184,7 @@ async fn dispatch_chunked_call(
         Ok(v) => v,
         Err(e) => {
             warn!(conn_id = conn.conn_id(), ?e, "chunk header decode error");
+            server.abort_chunk_request(conn.conn_id(), request_id);
             return;
         }
     };
@@ -1250,6 +2203,14 @@ async fn dispatch_chunked_call(
                 return;
             }
         };
+        let route_admission =
+            match reserve_route_execution(server, &ctrl.route_name, ctrl.method_idx).await {
+                Ok(admission) => admission,
+                Err(err) => {
+                    write_route_admission_error(writer, request_id, err).await;
+                    return;
+                }
+            };
         offset += ctrl_consumed;
 
         // Determine chunk_size from this first chunk's data length.
@@ -1282,6 +2243,25 @@ async fn dispatch_chunked_call(
             ctrl.route_name,
             ctrl.method_idx,
         );
+        if server
+            .store_chunk_route_pending(
+                conn.conn_id(),
+                request_id,
+                ChunkRouteAdmission {
+                    route: route_admission.route,
+                    method_idx: ctrl.method_idx,
+                    pending_permit: route_admission.pending_permit,
+                },
+            )
+            .is_err()
+        {
+            server.chunk_registry.abort(conn.conn_id(), request_id);
+            warn!(
+                conn_id = conn.conn_id(),
+                request_id, "chunk route pending permit unexpectedly duplicated"
+            );
+            return;
+        }
     }
 
     // 4. Get chunk data.
@@ -1300,12 +2280,33 @@ async fn dispatch_chunked_call(
             Ok(complete) => complete,
             Err(e) => {
                 warn!(conn_id = conn.conn_id(), %e, "chunk feed error");
+                server.abort_chunk_request(conn.conn_id(), request_id);
                 return;
             }
         };
 
     // 6. If complete, finish and dispatch.
     if complete {
+        let chunk_admission = match server.take_chunk_route_pending(conn.conn_id(), request_id) {
+            Some(admission) => admission,
+            None => {
+                server.abort_chunk_request(conn.conn_id(), request_id);
+                warn!(
+                    conn_id = conn.conn_id(),
+                    request_id, "chunked call missing stored route admission"
+                );
+                write_reply(
+                    writer,
+                    request_id,
+                    &ReplyControl::Error(error_wire(
+                        ErrorCode::ResourceUnavailable,
+                        "chunked call missing route admission",
+                    )),
+                )
+                .await;
+                return;
+            }
+        };
         let finished = match server.chunk_registry.finish(conn.conn_id(), request_id) {
             Ok(f) => f,
             Err(e) => {
@@ -1323,6 +2324,15 @@ async fn dispatch_chunked_call(
             handle,
             pool: pool_arc,
         };
+        let _pending_permit = match server.try_acquire_pending_request() {
+            Ok(permit) => permit,
+            Err(limit) => {
+                cleanup_request(request);
+                write_server_pending_capacity_error(writer, request_id, limit).await;
+                return;
+            }
+        };
+        drop(chunk_processing_permit);
         let (route_name, method_idx) = match (route_name, method_idx) {
             (Some(route_name), Some(method_idx)) => (route_name, method_idx),
             (route_name, method_idx) => {
@@ -1346,35 +2356,43 @@ async fn dispatch_chunked_call(
                 return;
             }
         };
+        if route_name != chunk_admission.route.name || method_idx != chunk_admission.method_idx {
+            cleanup_request(request);
+            warn!(
+                conn_id = conn.conn_id(),
+                request_id,
+                expected_route = chunk_admission.route.name,
+                expected_method_idx = chunk_admission.method_idx,
+                actual_route = route_name,
+                actual_method_idx = method_idx,
+                "chunked call route metadata drifted from stored admission"
+            );
+            write_reply(
+                writer,
+                request_id,
+                &ReplyControl::Error(error_wire(
+                    ErrorCode::ResourceInputDeserializing,
+                    "chunked call route metadata drifted from admission",
+                )),
+            )
+            .await;
+            return;
+        }
 
         // FlightGuard: increments on create, decrements on drop.
         let _flight = crate::connection::FlightGuard::new(conn);
 
-        let route = server.dispatcher.read().await.resolve(&route_name);
-        let route = match route {
-            Some(r) => r,
-            None => {
-                cleanup_request(request);
-                write_reply(writer, request_id, &ReplyControl::RouteNotFound(route_name)).await;
-                return;
-            }
-        };
-
-        let idx = method_idx;
-        if !route.has_method_index(idx) {
-            cleanup_request(request);
-            write_unknown_method_index(writer, request_id, &route.name, idx).await;
-            return;
-        }
-
-        let callback = Arc::clone(&route.callback);
-        let name = route_name;
+        let callback = Arc::clone(&chunk_admission.route.callback);
+        let name = chunk_admission.route.name.clone();
         let resp_pool = Arc::clone(&server.response_pool);
-
-        let scheduler = route.scheduler.as_ref().clone();
-        let result = execute_route_request(scheduler, idx, request, move |request| {
-            callback.invoke(&name, idx, request, resp_pool)
-        })
+        let execution_scheduler = server.execution_scheduler.clone();
+        let result = execute_route_request(
+            execution_scheduler,
+            chunk_admission.pending_permit,
+            conn,
+            request,
+            move |request| callback.invoke(&name, method_idx, request, resp_pool),
+        )
         .await;
 
         send_route_execution_result(server, writer, request_id, result).await;
@@ -1462,6 +2480,34 @@ impl std::fmt::Display for ResponseSendError {
     }
 }
 
+async fn write_server_pending_capacity_error(
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    request_id: u64,
+    limit: u32,
+) {
+    let msg = format!("server execution capacity exceeded: max_pending_requests={limit}");
+    write_reply(
+        writer,
+        request_id,
+        &ReplyControl::Error(error_wire(ErrorCode::ResourceUnavailable, msg)),
+    )
+    .await;
+}
+
+async fn write_chunk_processing_capacity_error(
+    writer: &Arc<Mutex<OwnedWriteHalf>>,
+    request_id: u64,
+    limit: u32,
+) {
+    let msg = format!("server chunk processing capacity exceeded: max_total_chunks={limit}");
+    write_reply(
+        writer,
+        request_id,
+        &ReplyControl::Error(error_wire(ErrorCode::ResourceUnavailable, msg)),
+    )
+    .await;
+}
+
 async fn write_reply(writer: &Arc<Mutex<OwnedWriteHalf>>, request_id: u64, ctrl: &ReplyControl) {
     let payload = match try_encode_reply_control(ctrl) {
         Ok(payload) => payload,
@@ -1486,6 +2532,13 @@ async fn write_reply(writer: &Arc<Mutex<OwnedWriteHalf>>, request_id: u64, ctrl:
     let frame = encode_frame(request_id, REPLY_FLAGS, &payload);
     if let Err(err) = writer.lock().await.write_all(&frame).await {
         warn!(request_id, error = %err, "failed to write reply frame");
+    }
+}
+
+async fn write_ctrl_response(writer: &Arc<Mutex<OwnedWriteHalf>>, request_id: u64, payload: &[u8]) {
+    let frame = encode_frame(request_id, FLAG_RESPONSE | FLAG_CTRL, payload);
+    if let Err(err) = writer.lock().await.write_all(&frame).await {
+        warn!(request_id, error = %err, "failed to write ctrl response frame");
     }
 }
 
@@ -2000,11 +3053,36 @@ mod tests {
         assert!(server.is_running());
         assert!(StdUnixStream::connect(server.socket_path()).is_ok());
 
-        server.shutdown();
+        server.request_shutdown_signal();
         runner.await.unwrap().unwrap();
         assert_eq!(server.lifecycle_state(), ServerLifecycleState::Stopped);
         assert!(!server.is_ready());
         assert!(!server.is_running());
+    }
+
+    #[test]
+    fn wait_until_responsive_only_returns_after_ping_round_trip() {
+        let server = Arc::new(
+            Server::new(
+                &unique_readiness_address("responsive_ready"),
+                ServerIpcConfig::default(),
+            )
+            .unwrap(),
+        );
+        let runner = {
+            let server = Arc::clone(&server);
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(server.run())
+            })
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        rt.block_on(server.wait_until_responsive(Duration::from_secs(2)))
+            .expect("server should answer control ping before readiness returns");
+
+        server.request_shutdown_signal();
+        runner.join().unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -2039,14 +3117,14 @@ mod tests {
             }
             Ok(Ok(())) => panic!("second server unexpectedly started and stopped cleanly"),
             Err(_) => {
-                second.shutdown();
+                second.request_shutdown_signal();
                 panic!("second server hung instead of rejecting the active socket");
             }
         }
 
         assert!(first.is_ready());
         assert!(StdUnixStream::connect(first.socket_path()).is_ok());
-        first.shutdown();
+        first.request_shutdown_signal();
         first_runner.await.unwrap().unwrap();
     }
 
@@ -2078,11 +3156,11 @@ mod tests {
                 || err.to_string().contains("address already in use"),
             "unexpected error: {err}",
         );
-        second.shutdown();
+        second.request_shutdown_signal();
 
         assert!(first.is_ready());
         assert!(StdUnixStream::connect(first.socket_path()).is_ok());
-        first.shutdown();
+        first.request_shutdown_signal();
         first_runner.await.unwrap().unwrap();
     }
 
@@ -2107,7 +3185,7 @@ mod tests {
             .unwrap();
         assert!(StdUnixStream::connect(server.socket_path()).is_ok());
 
-        server.shutdown();
+        server.request_shutdown_signal();
         first_runner.await.unwrap().unwrap();
         assert_eq!(server.lifecycle_state(), ServerLifecycleState::Stopped);
 
@@ -2122,7 +3200,7 @@ mod tests {
             .unwrap();
         assert!(StdUnixStream::connect(server.socket_path()).is_ok());
 
-        server.shutdown();
+        server.request_shutdown_signal();
         second_runner.await.unwrap().unwrap();
         assert_eq!(server.lifecycle_state(), ServerLifecycleState::Stopped);
     }
@@ -2157,7 +3235,7 @@ mod tests {
             ServerLifecycleState::Failed(_)
         ));
 
-        first.shutdown();
+        first.request_shutdown_signal();
         first_runner.await.unwrap().unwrap();
 
         second.begin_start_attempt().unwrap();
@@ -2171,7 +3249,7 @@ mod tests {
             .unwrap();
         assert!(StdUnixStream::connect(second.socket_path()).is_ok());
 
-        second.shutdown();
+        second.request_shutdown_signal();
         second_runner.await.unwrap().unwrap();
     }
 
@@ -2195,7 +3273,7 @@ mod tests {
             .await
             .unwrap();
 
-        server.shutdown();
+        server.request_shutdown_signal();
         server
             .wait_until_stopped(Duration::from_secs(2))
             .await
@@ -2281,6 +3359,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reserved_route_cannot_commit_after_shutdown_generation_advances() {
+        let address = unique_readiness_address("stale_reservation_after_shutdown");
+        let server = Arc::new(Server::new(&address, ServerIpcConfig::default()).unwrap());
+        let runner = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { server.run().await })
+        };
+        server
+            .wait_until_ready(Duration::from_secs(2))
+            .await
+            .expect("server ready");
+
+        let route = make_route("late");
+        let route_handle = RouteConcurrencyHandle::new(route.scheduler.as_ref().clone());
+        let reservation = server
+            .reserve_route(BuiltRoute::new(route, route_handle))
+            .await
+            .unwrap();
+        server.request_shutdown_signal();
+        server
+            .wait_until_stopped(Duration::from_secs(2))
+            .await
+            .expect("server stopped");
+
+        let err = server
+            .commit_reserved_route(reservation)
+            .await
+            .expect_err("stale pre-shutdown reservation must not commit after stop");
+        assert!(
+            err.to_string().contains("shutting down"),
+            "unexpected error: {err}",
+        );
+        assert!(
+            !server.contains_route("late").await,
+            "stale reservation committed a route after shutdown completed",
+        );
+
+        runner.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn duplicate_route_registration_is_rejected() {
         let s = Arc::new(Server::new("ipc://dup_route_test", ServerIpcConfig::default()).unwrap());
 
@@ -2324,20 +3443,27 @@ mod tests {
                 max_workers: Some(NonZeroUsize::new(1).unwrap()),
             },
         );
-        let _first = scheduler.try_acquire(0).unwrap();
+        let execution_scheduler = Scheduler::with_limits(
+            ConcurrencyMode::Parallel,
+            HashMap::new(),
+            SchedulerLimits::default(),
+        );
+        let reserved = scheduler
+            .reserve_pending(0)
+            .expect("pending reservation should succeed");
+        scheduler.close();
 
-        let err = execute_route_request(scheduler.clone(), 0, request, |_request| {
-            panic!("callback must not run when acquire fails")
-        })
-        .await
-        .unwrap_err();
+        let conn = Connection::new(99);
+        let err =
+            execute_route_request(execution_scheduler, reserved, &conn, request, |_request| {
+                panic!("callback must not run when acquire fails")
+            })
+            .await
+            .unwrap_err();
 
         assert!(matches!(
             err,
-            RouteExecutionError::Acquire(SchedulerAcquireError::Capacity {
-                field: "max_pending",
-                limit: 1,
-            })
+            RouteExecutionError::Acquire(SchedulerAcquireError::Closed)
         ));
         let reused = pool.write().alloc(128).unwrap();
         assert_eq!(reused.offset, alloc.offset);
@@ -2438,7 +3564,8 @@ mod tests {
         let writer = Arc::new(Mutex::new(write_half));
         let payload = encode_call_control("grid", 99).unwrap();
 
-        dispatch_call(&server, &conn, 42, &payload, &writer).await;
+        let pending_permit = server.try_acquire_pending_request().unwrap();
+        dispatch_call(&server, &conn, 42, &payload, &writer, pending_permit).await;
 
         let mut total_len_buf = [0u8; 4];
         client_stream.read_exact(&mut total_len_buf).await.unwrap();
@@ -2461,13 +3588,1480 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
+    #[tokio::test]
+    async fn remote_callbacks_respect_server_wide_execution_limit_across_routes() {
+        use c2_wire::control::encode_call_control;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::time::{Duration, sleep, timeout};
+
+        struct BlockingCallback {
+            active: Arc<AtomicUsize>,
+            peak: Arc<AtomicUsize>,
+            started: Arc<AtomicUsize>,
+            release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        }
+
+        impl CrmCallback for BlockingCallback {
+            fn invoke(
+                &self,
+                _: &str,
+                _: u16,
+                _request: RequestData,
+                _response_pool: Arc<parking_lot::RwLock<MemPool>>,
+            ) -> Result<ResponseMeta, CrmError> {
+                let current = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(current, Ordering::SeqCst);
+                self.started.fetch_add(1, Ordering::SeqCst);
+
+                let (lock, cvar) = &*self.release;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = cvar.wait(released).unwrap();
+                }
+
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                Ok(ResponseMeta::Inline(b"done".to_vec()))
+            }
+        }
+
+        let mut config = ServerIpcConfig::default();
+        config.max_execution_workers = 1;
+        let server = Arc::new(Server::new("ipc://server_execution_limit", config).unwrap());
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+
+        for name in ["grid_a", "grid_b"] {
+            let mut route = make_route(name);
+            route.callback = Arc::new(BlockingCallback {
+                active: Arc::clone(&active),
+                peak: Arc::clone(&peak),
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+            });
+            server.register_route(route).await.unwrap();
+        }
+
+        let conn_a = Connection::new(1);
+        let conn_b = Connection::new(2);
+        let writer_a = closed_writer();
+        let writer_b = closed_writer();
+        let payload_a = encode_call_control("grid_a", 0).unwrap();
+        let payload_b = encode_call_control("grid_b", 0).unwrap();
+
+        let first = {
+            let server = Arc::clone(&server);
+            let writer = Arc::clone(&writer_a);
+            tokio::spawn(async move {
+                let pending_permit = server.try_acquire_pending_request().unwrap();
+                dispatch_call(&server, &conn_a, 1, &payload_a, &writer, pending_permit).await;
+            })
+        };
+
+        timeout(Duration::from_secs(1), async {
+            while started.load(Ordering::SeqCst) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first callback should start");
+
+        let second = {
+            let server = Arc::clone(&server);
+            let writer = Arc::clone(&writer_b);
+            tokio::spawn(async move {
+                let pending_permit = server.try_acquire_pending_request().unwrap();
+                dispatch_call(&server, &conn_b, 2, &payload_b, &writer, pending_permit).await;
+            })
+        };
+
+        sleep(Duration::from_millis(50)).await;
+        let started_while_blocked = started.load(Ordering::SeqCst);
+        let peak_while_blocked = peak.load(Ordering::SeqCst);
+
+        {
+            let (lock, cvar) = &*release;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+
+        first.await.unwrap();
+        second.await.unwrap();
+        assert_eq!(
+            started_while_blocked, 1,
+            "second route started executing while first callback still held the server-wide execution slot",
+        );
+        assert_eq!(peak_while_blocked, 1);
+        assert_eq!(started.load(Ordering::SeqCst), 2);
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn route_waiters_do_not_occupy_blocking_execution_threads() {
+        use crate::runtime::ServerRuntimeBuilder;
+        use c2_wire::control::encode_call_control;
+        use std::num::NonZeroUsize;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::time::{Duration, sleep, timeout};
+
+        struct BlockingCallback {
+            route_a_started: Arc<AtomicUsize>,
+            route_b_started: Arc<AtomicUsize>,
+            release_route_a: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        }
+
+        impl CrmCallback for BlockingCallback {
+            fn invoke(
+                &self,
+                route_name: &str,
+                _: u16,
+                _request: RequestData,
+                _response_pool: Arc<parking_lot::RwLock<MemPool>>,
+            ) -> Result<ResponseMeta, CrmError> {
+                if route_name == "grid_a" {
+                    self.route_a_started.fetch_add(1, Ordering::SeqCst);
+                    let (lock, cvar) = &*self.release_route_a;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = cvar.wait(released).unwrap();
+                    }
+                } else {
+                    self.route_b_started.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(ResponseMeta::Inline(b"done".to_vec()))
+            }
+        }
+
+        let mut config = ServerIpcConfig::default();
+        config.max_execution_workers = 2;
+        config.max_pending_requests = 8;
+        let rt = ServerRuntimeBuilder::build(&config).unwrap();
+
+        rt.block_on(async move {
+            let server = Arc::new(Server::new("ipc://route_waiter_starvation", config).unwrap());
+            let route_a_started = Arc::new(AtomicUsize::new(0));
+            let route_b_started = Arc::new(AtomicUsize::new(0));
+            let release_route_a =
+                Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+
+            let route_a_scheduler = Scheduler::with_limits(
+                ConcurrencyMode::Parallel,
+                HashMap::new(),
+                SchedulerLimits {
+                    max_pending: Some(NonZeroUsize::new(3).unwrap()),
+                    max_workers: Some(NonZeroUsize::new(1).unwrap()),
+                },
+            );
+            let route_b_scheduler = Scheduler::with_limits(
+                ConcurrencyMode::Parallel,
+                HashMap::new(),
+                SchedulerLimits {
+                    max_pending: Some(NonZeroUsize::new(1).unwrap()),
+                    max_workers: Some(NonZeroUsize::new(1).unwrap()),
+                },
+            );
+
+            for (name, scheduler) in [
+                ("grid_a", route_a_scheduler.clone()),
+                ("grid_b", route_b_scheduler),
+            ] {
+                let mut route = make_route(name);
+                route.scheduler = Arc::new(scheduler);
+                route.callback = Arc::new(BlockingCallback {
+                    route_a_started: Arc::clone(&route_a_started),
+                    route_b_started: Arc::clone(&route_b_started),
+                    release_route_a: Arc::clone(&release_route_a),
+                });
+                server.register_route(route).await.unwrap();
+            }
+
+            let payload_a = encode_call_control("grid_a", 0).unwrap();
+            let payload_b = encode_call_control("grid_b", 0).unwrap();
+            let writer_a = closed_writer();
+            let writer_a_waiter = closed_writer();
+            let writer_b = closed_writer();
+
+            let first_a = {
+                let server = Arc::clone(&server);
+                let payload = payload_a.clone();
+                tokio::spawn(async move {
+                    let pending_permit = server.try_acquire_pending_request().unwrap();
+                    dispatch_call(
+                        &server,
+                        &Connection::new(101),
+                        1,
+                        &payload,
+                        &writer_a,
+                        pending_permit,
+                    )
+                    .await;
+                })
+            };
+
+            timeout(Duration::from_secs(1), async {
+                while route_a_started.load(Ordering::SeqCst) < 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("first route A callback should start");
+
+            let second_a = {
+                let server = Arc::clone(&server);
+                let payload = payload_a.clone();
+                tokio::spawn(async move {
+                    let pending_permit = server.try_acquire_pending_request().unwrap();
+                    dispatch_call(
+                        &server,
+                        &Connection::new(102),
+                        2,
+                        &payload,
+                        &writer_a_waiter,
+                        pending_permit,
+                    )
+                    .await;
+                })
+            };
+
+            timeout(Duration::from_secs(1), async {
+                loop {
+                    let snapshot = route_a_scheduler.snapshot();
+                    if snapshot.pending >= 2 && snapshot.active_workers == 1 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("second route A request should be waiting on route capacity");
+            sleep(Duration::from_millis(50)).await;
+
+            let route_b = {
+                let server = Arc::clone(&server);
+                tokio::spawn(async move {
+                    let pending_permit = server.try_acquire_pending_request().unwrap();
+                    dispatch_call(
+                        &server,
+                        &Connection::new(201),
+                        3,
+                        &payload_b,
+                        &writer_b,
+                        pending_permit,
+                    )
+                    .await;
+                })
+            };
+
+            let route_b_ready = timeout(Duration::from_millis(250), async {
+                while route_b_started.load(Ordering::SeqCst) < 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+
+            {
+                let (lock, cvar) = &*release_route_a;
+                *lock.lock().unwrap() = true;
+                cvar.notify_all();
+            }
+
+            first_a.await.unwrap();
+            second_a.await.unwrap();
+            route_b.await.unwrap();
+
+            route_b_ready.expect("ready route B callback should not be blocked by route A waiter");
+        });
+    }
+
+    #[test]
+    fn unregister_closes_admission_before_waiting_on_blocking_pool_drain() {
+        use crate::runtime::ServerRuntimeBuilder;
+        use c2_wire::control::encode_call_control;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::time::{Duration, sleep, timeout};
+
+        struct BlockingCallback {
+            route_a_started: Arc<AtomicUsize>,
+            route_b_started: Arc<AtomicUsize>,
+            release_route_a: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        }
+
+        impl CrmCallback for BlockingCallback {
+            fn invoke(
+                &self,
+                route_name: &str,
+                _: u16,
+                _request: RequestData,
+                _response_pool: Arc<parking_lot::RwLock<MemPool>>,
+            ) -> Result<ResponseMeta, CrmError> {
+                if route_name == "grid_a" {
+                    self.route_a_started.fetch_add(1, Ordering::SeqCst);
+                    let (lock, cvar) = &*self.release_route_a;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = cvar.wait(released).unwrap();
+                    }
+                } else {
+                    self.route_b_started.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(ResponseMeta::Inline(b"done".to_vec()))
+            }
+        }
+
+        let mut config = ServerIpcConfig::default();
+        config.max_execution_workers = 1;
+        config.max_pending_requests = 8;
+        let rt = ServerRuntimeBuilder::build(&config).unwrap();
+
+        rt.block_on(async move {
+            let server = Arc::new(
+                Server::new("ipc://unregister_closes_before_blocking_wait", config).unwrap(),
+            );
+            let route_a_started = Arc::new(AtomicUsize::new(0));
+            let route_b_started = Arc::new(AtomicUsize::new(0));
+            let release_route_a =
+                Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+            let route_b_scheduler = Scheduler::new(ConcurrencyMode::Parallel, HashMap::new());
+
+            for (name, scheduler) in [
+                (
+                    "grid_a",
+                    Scheduler::new(ConcurrencyMode::Parallel, HashMap::new()),
+                ),
+                ("grid_b", route_b_scheduler.clone()),
+            ] {
+                let mut route = make_route(name);
+                route.scheduler = Arc::new(scheduler);
+                route.callback = Arc::new(BlockingCallback {
+                    route_a_started: Arc::clone(&route_a_started),
+                    route_b_started: Arc::clone(&route_b_started),
+                    release_route_a: Arc::clone(&release_route_a),
+                });
+                server.register_route(route).await.unwrap();
+            }
+
+            let payload_a = encode_call_control("grid_a", 0).unwrap();
+            let payload_b = encode_call_control("grid_b", 0).unwrap();
+            let writer_a = closed_writer();
+            let writer_b = closed_writer();
+
+            let first = {
+                let server = Arc::clone(&server);
+                tokio::spawn(async move {
+                    let pending_permit = server.try_acquire_pending_request().unwrap();
+                    dispatch_call(
+                        &server,
+                        &Connection::new(501),
+                        1,
+                        &payload_a,
+                        &writer_a,
+                        pending_permit,
+                    )
+                    .await;
+                })
+            };
+
+            timeout(Duration::from_secs(1), async {
+                while route_a_started.load(Ordering::SeqCst) < 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("route A callback should occupy the only blocking execution thread");
+
+            let second = {
+                let server = Arc::clone(&server);
+                tokio::spawn(async move {
+                    let pending_permit = server.try_acquire_pending_request().unwrap();
+                    dispatch_call(
+                        &server,
+                        &Connection::new(502),
+                        2,
+                        &payload_b,
+                        &writer_b,
+                        pending_permit,
+                    )
+                    .await;
+                })
+            };
+
+            let route_b_admitted = timeout(Duration::from_secs(1), async {
+                loop {
+                    let snapshot = route_b_scheduler.snapshot();
+                    if snapshot.active_workers == 1 && route_b_started.load(Ordering::SeqCst) == 0 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok();
+            sleep(Duration::from_millis(50)).await;
+
+            let mut unregister = {
+                let server = Arc::clone(&server);
+                tokio::spawn(async move { server.unregister_route("grid_b").await })
+            };
+            let mut removed_before_release = None;
+            let unregister_finished_before_release =
+                match timeout(Duration::from_millis(100), &mut unregister).await {
+                    Ok(result) => {
+                        removed_before_release = Some(result.unwrap());
+                        true
+                    }
+                    Err(_) => false,
+                };
+            assert_eq!(
+                route_b_started.load(Ordering::SeqCst),
+                0,
+                "route B callback must not start while unregister waits for drain",
+            );
+
+            {
+                let (lock, cvar) = &*release_route_a;
+                *lock.lock().unwrap() = true;
+                cvar.notify_all();
+            }
+
+            first.await.unwrap();
+            second.await.unwrap();
+            let removed = match removed_before_release {
+                Some(removed) => removed,
+                None => unregister.await.unwrap(),
+            };
+            assert!(
+                route_b_admitted,
+                "route B request should wait after route admission and before callback start",
+            );
+            assert!(
+                unregister_finished_before_release,
+                "unregister must close route admission without waiting for blocking pool capacity",
+            );
+            assert!(removed);
+            assert_eq!(route_b_started.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_closes_all_route_admissions_before_waiting_for_drain() {
+        use std::collections::HashSet;
+        use tokio::time::{Duration, timeout};
+
+        let server = Arc::new(
+            Server::new(
+                "ipc://shutdown_closes_all_before_drain",
+                ServerIpcConfig::default(),
+            )
+            .unwrap(),
+        );
+        let scheduler_a = Scheduler::new(ConcurrencyMode::Parallel, HashMap::new());
+        let scheduler_b = Scheduler::new(ConcurrencyMode::Parallel, HashMap::new());
+        for (name, scheduler) in [
+            ("grid_a", scheduler_a.clone()),
+            ("grid_b", scheduler_b.clone()),
+        ] {
+            let mut route = make_route(name);
+            route.scheduler = Arc::new(scheduler);
+            server.register_route(route).await.unwrap();
+        }
+
+        let guard_a = scheduler_a
+            .blocking_acquire(0)
+            .expect("route A guard should enter");
+        let guard_b = scheduler_b
+            .blocking_acquire(0)
+            .expect("route B guard should enter");
+        let close_task = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move {
+                server
+                    .close_registered_routes_for_shutdown("direct_ipc_shutdown")
+                    .await
+            })
+        };
+
+        timeout(Duration::from_secs(1), async {
+            while !scheduler_a.snapshot().closed && !scheduler_b.snapshot().closed {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shutdown should close at least one route before waiting for drain");
+        assert!(
+            scheduler_a.snapshot().closed && scheduler_b.snapshot().closed,
+            "direct shutdown must close every route admission before waiting for any route to drain"
+        );
+
+        drop(guard_a);
+        drop(guard_b);
+        let outcomes = close_task.await.unwrap();
+        let route_names: HashSet<_> = outcomes
+            .iter()
+            .map(|outcome| outcome.route_name.as_str())
+            .collect();
+        assert_eq!(route_names, HashSet::from(["grid_a", "grid_b"]));
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_waits_for_active_connection_drain_before_stopped() {
+        use c2_wire::control::encode_call_control;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::time::{Duration, timeout};
+
+        struct BlockingCallback {
+            started: Arc<AtomicUsize>,
+            release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        }
+
+        impl CrmCallback for BlockingCallback {
+            fn invoke(
+                &self,
+                _: &str,
+                _: u16,
+                _request: RequestData,
+                _response_pool: Arc<parking_lot::RwLock<MemPool>>,
+            ) -> Result<ResponseMeta, CrmError> {
+                self.started.fetch_add(1, Ordering::SeqCst);
+
+                let (lock, cvar) = &*self.release;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = cvar.wait(released).unwrap();
+                }
+
+                Ok(ResponseMeta::Inline(b"done".to_vec()))
+            }
+        }
+
+        let address = unique_readiness_address("shutdown_connection_drain");
+        let server = Arc::new(Server::new(&address, ServerIpcConfig::default()).unwrap());
+        let started = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let mut route = make_route("grid");
+        route.callback = Arc::new(BlockingCallback {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+        });
+        server.register_route(route).await.unwrap();
+
+        let runner = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { server.run().await })
+        };
+        server
+            .wait_until_ready(Duration::from_secs(2))
+            .await
+            .expect("server ready");
+
+        let _client = StdUnixStream::connect(server.socket_path()).expect("connect idle client");
+        let conn_id = timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(conn_id) = server.active_connection_ids().into_iter().next() {
+                    return conn_id;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("connection should register");
+        let conn = server
+            .active_connection(conn_id)
+            .expect("tracked connection should be accessible");
+
+        let payload = encode_call_control("grid", 0).unwrap();
+        let writer = closed_writer();
+        let request = {
+            let server = Arc::clone(&server);
+            let conn = Arc::clone(&conn);
+            let writer = Arc::clone(&writer);
+            tokio::spawn(async move {
+                let pending_permit = server.try_acquire_pending_request().unwrap();
+                dispatch_call(&server, &conn, 1, &payload, &writer, pending_permit).await;
+            })
+        };
+
+        timeout(Duration::from_secs(1), async {
+            while started.load(Ordering::SeqCst) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("callback should start");
+
+        server.request_shutdown_signal();
+        server
+            .wait_until_stopped(Duration::from_millis(50))
+            .await
+            .expect_err("server must not report stopped while connection callback is still active");
+
+        {
+            let (lock, cvar) = &*release;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+
+        request.await.unwrap();
+        runner.await.unwrap().unwrap();
+        assert_eq!(server.lifecycle_state(), ServerLifecycleState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn duplicate_shutdown_signal_does_not_rebroadcast_watch() {
+        use tokio::time::{Duration, timeout};
+
+        let server = Server::new(
+            "ipc://duplicate_shutdown_signal_no_rebroadcast",
+            ServerIpcConfig::default(),
+        )
+        .unwrap();
+        server.set_lifecycle_state(ServerLifecycleState::Ready);
+        let mut shutdown_rx = server.shutdown_rx.clone();
+
+        server.request_shutdown_signal();
+        timeout(Duration::from_secs(1), shutdown_rx.changed())
+            .await
+            .expect("first shutdown signal should notify")
+            .expect("shutdown watch should remain open");
+        assert!(*shutdown_rx.borrow_and_update());
+
+        server.request_shutdown_signal();
+        timeout(Duration::from_millis(50), shutdown_rx.changed())
+            .await
+            .expect_err("duplicate shutdown signal must not wake active connection reads again");
+    }
+
+    #[tokio::test]
+    async fn unregister_cancels_request_waiting_for_server_execution_slot() {
+        use c2_wire::control::encode_call_control;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::time::{Duration, sleep, timeout};
+
+        struct BlockingCallback {
+            route_a_started: Arc<AtomicUsize>,
+            route_b_started: Arc<AtomicUsize>,
+            release_route_a: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        }
+
+        impl CrmCallback for BlockingCallback {
+            fn invoke(
+                &self,
+                route_name: &str,
+                _: u16,
+                _request: RequestData,
+                _response_pool: Arc<parking_lot::RwLock<MemPool>>,
+            ) -> Result<ResponseMeta, CrmError> {
+                if route_name == "grid_a" {
+                    self.route_a_started.fetch_add(1, Ordering::SeqCst);
+                    let (lock, cvar) = &*self.release_route_a;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = cvar.wait(released).unwrap();
+                    }
+                } else {
+                    self.route_b_started.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(ResponseMeta::Inline(b"done".to_vec()))
+            }
+        }
+
+        let mut config = ServerIpcConfig::default();
+        config.max_execution_workers = 1;
+        let server =
+            Arc::new(Server::new("ipc://unregister_cancels_global_waiter", config).unwrap());
+
+        let route_a_started = Arc::new(AtomicUsize::new(0));
+        let route_b_started = Arc::new(AtomicUsize::new(0));
+        let release_route_a = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+
+        for name in ["grid_a", "grid_b"] {
+            let mut route = make_route(name);
+            route.callback = Arc::new(BlockingCallback {
+                route_a_started: Arc::clone(&route_a_started),
+                route_b_started: Arc::clone(&route_b_started),
+                release_route_a: Arc::clone(&release_route_a),
+            });
+            server.register_route(route).await.unwrap();
+        }
+
+        let payload_a = encode_call_control("grid_a", 0).unwrap();
+        let payload_b = encode_call_control("grid_b", 0).unwrap();
+        let writer_a = closed_writer();
+        let writer_b = closed_writer();
+        let conn_a = Connection::new(301);
+        let conn_b = Connection::new(302);
+
+        let first = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move {
+                let pending_permit = server.try_acquire_pending_request().unwrap();
+                dispatch_call(&server, &conn_a, 1, &payload_a, &writer_a, pending_permit).await;
+            })
+        };
+
+        timeout(Duration::from_secs(1), async {
+            while route_a_started.load(Ordering::SeqCst) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("route A callback should occupy the only execution slot");
+
+        let second = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move {
+                let pending_permit = server.try_acquire_pending_request().unwrap();
+                dispatch_call(&server, &conn_b, 2, &payload_b, &writer_b, pending_permit).await;
+            })
+        };
+
+        sleep(Duration::from_millis(50)).await;
+        let unregister_result = timeout(
+            Duration::from_millis(100),
+            server.unregister_route("grid_b"),
+        )
+        .await;
+        assert_eq!(
+            route_b_started.load(Ordering::SeqCst),
+            0,
+            "route B callback must not run after route unregister cancels the queued request",
+        );
+
+        {
+            let (lock, cvar) = &*release_route_a;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+
+        first.await.unwrap();
+        second.await.unwrap();
+        let removed = unregister_result
+            .expect("unregister must cancel a not-started request waiting for server execution");
+        assert!(removed);
+        assert_eq!(route_b_started.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn connection_close_cancels_request_waiting_for_server_execution_slot() {
+        use c2_wire::control::encode_call_control;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::time::{Duration, sleep, timeout};
+
+        struct BlockingCallback {
+            route_a_started: Arc<AtomicUsize>,
+            route_b_started: Arc<AtomicUsize>,
+            release_route_a: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        }
+
+        impl CrmCallback for BlockingCallback {
+            fn invoke(
+                &self,
+                route_name: &str,
+                _: u16,
+                _request: RequestData,
+                _response_pool: Arc<parking_lot::RwLock<MemPool>>,
+            ) -> Result<ResponseMeta, CrmError> {
+                if route_name == "grid_a" {
+                    self.route_a_started.fetch_add(1, Ordering::SeqCst);
+                    let (lock, cvar) = &*self.release_route_a;
+                    let mut released = lock.lock().unwrap();
+                    while !*released {
+                        released = cvar.wait(released).unwrap();
+                    }
+                } else {
+                    self.route_b_started.fetch_add(1, Ordering::SeqCst);
+                }
+                Ok(ResponseMeta::Inline(b"done".to_vec()))
+            }
+        }
+
+        let mut config = ServerIpcConfig::default();
+        config.max_execution_workers = 1;
+        let server =
+            Arc::new(Server::new("ipc://connection_cancels_global_waiter", config).unwrap());
+
+        let route_a_started = Arc::new(AtomicUsize::new(0));
+        let route_b_started = Arc::new(AtomicUsize::new(0));
+        let release_route_a = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+
+        for name in ["grid_a", "grid_b"] {
+            let mut route = make_route(name);
+            route.callback = Arc::new(BlockingCallback {
+                route_a_started: Arc::clone(&route_a_started),
+                route_b_started: Arc::clone(&route_b_started),
+                release_route_a: Arc::clone(&release_route_a),
+            });
+            server.register_route(route).await.unwrap();
+        }
+
+        let payload_a = encode_call_control("grid_a", 0).unwrap();
+        let payload_b = encode_call_control("grid_b", 0).unwrap();
+        let writer_a = closed_writer();
+        let writer_b = closed_writer();
+        let conn_a = Connection::new(401);
+        let conn_b = Arc::new(Connection::new(402));
+
+        let first = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move {
+                let pending_permit = server.try_acquire_pending_request().unwrap();
+                dispatch_call(&server, &conn_a, 1, &payload_a, &writer_a, pending_permit).await;
+            })
+        };
+
+        timeout(Duration::from_secs(1), async {
+            while route_a_started.load(Ordering::SeqCst) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("route A callback should occupy the only execution slot");
+
+        let second = {
+            let server = Arc::clone(&server);
+            let conn_b = Arc::clone(&conn_b);
+            tokio::spawn(async move {
+                let pending_permit = server.try_acquire_pending_request().unwrap();
+                dispatch_call(&server, &conn_b, 2, &payload_b, &writer_b, pending_permit).await;
+            })
+        };
+
+        sleep(Duration::from_millis(50)).await;
+        conn_b.cancel_queued_work();
+        timeout(Duration::from_millis(100), conn_b.wait_idle())
+            .await
+            .expect("connection idle wait must not wait for a cancelled queued callback");
+        assert_eq!(
+            route_b_started.load(Ordering::SeqCst),
+            0,
+            "route B callback must not run after its connection cancels queued work",
+        );
+
+        {
+            let (lock, cvar) = &*release_route_a;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+
+        first.await.unwrap();
+        second.await.unwrap();
+        assert_eq!(route_b_started.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_interrupts_partial_frame_body_reads() {
+        use std::io::Write;
+        use tokio::time::timeout;
+
+        let address = unique_readiness_address("shutdown_partial_frame");
+        let server = Arc::new(Server::new(&address, ServerIpcConfig::default()).unwrap());
+        let runner = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { server.run().await })
+        };
+        server
+            .wait_until_ready(Duration::from_secs(2))
+            .await
+            .expect("server ready");
+
+        let mut client = StdUnixStream::connect(server.socket_path()).expect("connect client");
+        client
+            .write_all(&12u32.to_le_bytes())
+            .expect("write partial frame header");
+
+        let conn_id = timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(conn_id) = server.active_connection_ids().into_iter().next() {
+                    return conn_id;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("connection should register");
+        assert!(
+            server.active_connection(conn_id).is_some(),
+            "tracked connection should remain visible while body read is pending",
+        );
+
+        server.request_shutdown_signal();
+        server
+            .wait_until_stopped(Duration::from_secs(1))
+            .await
+            .expect("shutdown should interrupt partial body reads");
+        runner.await.unwrap().unwrap();
+        assert_eq!(server.lifecycle_state(), ServerLifecycleState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn inline_dispatch_rejects_when_server_pending_capacity_is_exhausted() {
+        use c2_wire::control::{ReplyControl, decode_reply_control, encode_call_control};
+        use c2_wire::frame::decode_frame;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::oneshot;
+        use tokio::time::{Duration, timeout};
+
+        struct BlockingCallback {
+            started: Arc<AtomicUsize>,
+            release: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        }
+
+        impl CrmCallback for BlockingCallback {
+            fn invoke(
+                &self,
+                _: &str,
+                _: u16,
+                _request: RequestData,
+                _response_pool: Arc<parking_lot::RwLock<MemPool>>,
+            ) -> Result<ResponseMeta, CrmError> {
+                self.started.fetch_add(1, Ordering::SeqCst);
+
+                let (lock, cvar) = &*self.release;
+                let mut released = lock.lock().unwrap();
+                while !*released {
+                    released = cvar.wait(released).unwrap();
+                }
+
+                Ok(ResponseMeta::Inline(b"done".to_vec()))
+            }
+        }
+
+        let mut config = ServerIpcConfig::default();
+        config.max_pending_requests = 1;
+        config.max_execution_workers = 2;
+        let server = Arc::new(Server::new("ipc://server_pending_limit", config).unwrap());
+
+        let started = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+
+        for name in ["grid_a", "grid_b"] {
+            let mut route = make_route(name);
+            route.callback = Arc::new(BlockingCallback {
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+            });
+            server.register_route(route).await.unwrap();
+        }
+
+        let conn_a = Connection::new(11);
+        let conn_b = Connection::new(22);
+        let writer_a = closed_writer();
+        let payload_a = encode_call_control("grid_a", 0).unwrap();
+        let payload_b = encode_call_control("grid_b", 0).unwrap();
+
+        let first = {
+            let server = Arc::clone(&server);
+            let writer = Arc::clone(&writer_a);
+            tokio::spawn(async move {
+                let pending_permit = server.try_acquire_pending_request().unwrap();
+                dispatch_call(&server, &conn_a, 1, &payload_a, &writer, pending_permit).await;
+            })
+        };
+
+        timeout(Duration::from_secs(1), async {
+            while started.load(Ordering::SeqCst) < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first callback should start");
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let second = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move {
+                let (mut client_stream, server_stream) = UnixStream::pair().unwrap();
+                let (_read_half, write_half) = server_stream.into_split();
+                let writer = Arc::new(Mutex::new(write_half));
+
+                match server.try_acquire_pending_request() {
+                    Ok(pending_permit) => {
+                        dispatch_call(&server, &conn_b, 2, &payload_b, &writer, pending_permit)
+                            .await;
+                    }
+                    Err(limit) => {
+                        write_server_pending_capacity_error(&writer, 2, limit).await;
+                    }
+                }
+
+                let mut total_len_buf = [0u8; 4];
+                client_stream.read_exact(&mut total_len_buf).await.unwrap();
+                let total_len = u32::from_le_bytes(total_len_buf);
+                let mut body = vec![0u8; total_len as usize];
+                client_stream.read_exact(&mut body).await.unwrap();
+                let mut frame = Vec::with_capacity(4 + body.len());
+                frame.extend_from_slice(&total_len_buf);
+                frame.extend_from_slice(&body);
+                let (_header, reply_payload) = decode_frame(&frame).unwrap();
+                let message = match decode_reply_control(reply_payload, 0).unwrap().0 {
+                    ReplyControl::Error(err) => String::from_utf8_lossy(&err).to_string(),
+                    other => panic!("expected pending-capacity error reply, got {other:?}"),
+                };
+                let _ = reply_tx.send(message);
+            })
+        };
+
+        let reply = match timeout(Duration::from_millis(200), reply_rx).await {
+            Ok(Ok(message)) => message,
+            Ok(Err(_)) => panic!("second reply channel dropped unexpectedly"),
+            Err(_) => {
+                {
+                    let (lock, cvar) = &*release;
+                    *lock.lock().unwrap() = true;
+                    cvar.notify_all();
+                }
+                first.await.unwrap();
+                second.await.unwrap();
+                panic!("second call waited instead of rejecting at server pending admission");
+            }
+        };
+
+        assert!(reply.contains("max_pending_requests=1"), "{reply}");
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+
+        {
+            let (lock, cvar) = &*release;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
+
+        first.await.unwrap();
+        second.await.unwrap();
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn chunked_handle_connection_path_uses_chunk_processing_permit() {
+        let source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/server.rs")).unwrap();
+        let start = source
+            .find("if c2_wire::flags::is_chunked(flags)")
+            .expect("chunked branch must exist");
+        let rest = &source[start..];
+        let end = rest
+            .find("if c2_wire::flags::is_buddy(flags)")
+            .expect("buddy branch must follow chunked branch");
+        let chunked_branch = &rest[..end];
+
+        assert!(
+            chunked_branch.contains("try_acquire_chunk_processing_permit()"),
+            "chunked call spawn path must be bounded by a chunk-processing permit",
+        );
+    }
+
+    #[test]
+    fn raw_server_shutdown_surface_is_transaction_owned() {
+        let source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/server.rs")).unwrap();
+        let raw_shutdown_fn = concat!("pub fn request_", "shutdown_signal(&self) {");
+        let raw_journal_drain_fn = concat!(
+            "pub fn take_shutdown_",
+            "route_outcomes(&self) -> Vec<ServerRouteCloseOutcome> {"
+        );
+
+        assert!(
+            !source
+                .lines()
+                .any(|line| line.trim() == "pub fn shutdown(&self) {")
+        );
+        assert!(!source.lines().any(|line| line.trim() == raw_shutdown_fn));
+        assert!(
+            !source
+                .lines()
+                .any(|line| line.trim() == raw_journal_drain_fn)
+        );
+    }
+
+    #[test]
+    fn relay_route_admission_open_is_token_gated() {
+        let source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/server.rs")).unwrap();
+        let open_route_start = source
+            .find("pub async fn open_route_admission")
+            .expect("open_route_admission should exist");
+        let open_route_signature = &source[open_route_start
+            ..source[open_route_start..]
+                .find(") -> Result<(), ServerError>")
+                .expect("open_route_admission signature should return ServerError")
+                + open_route_start];
+
+        assert!(
+            !source.lines().any(|line| {
+                line.trim() == "pub async fn open_route_admission(&self, name: &str) -> Result<(), ServerError> {"
+            }),
+            "closed relay-backed route admission must not be reopened by route name alone",
+        );
+        assert!(
+            open_route_signature.contains("token: RouteAdmissionToken"),
+            "closed relay-backed route admission must consume the token returned by closed commit",
+        );
+    }
+
+    #[test]
+    fn raw_route_construction_and_scheduler_surfaces_are_not_public() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let lib_source = std::fs::read_to_string(root.join("lib.rs")).unwrap();
+        let dispatcher_source = std::fs::read_to_string(root.join("dispatcher.rs")).unwrap();
+        let server_source = std::fs::read_to_string(root.join("server.rs")).unwrap();
+        let crm_route_start = dispatcher_source
+            .find("struct CrmRoute")
+            .expect("CrmRoute should exist");
+        let crm_route_rest = &dispatcher_source[crm_route_start..];
+        let crm_route_end = crm_route_rest
+            .find("impl CrmRoute")
+            .expect("CrmRoute impl should follow struct");
+        let crm_route_source = &crm_route_rest[..crm_route_end];
+
+        assert!(
+            !lib_source.contains("pub mod dispatcher;"),
+            "dispatcher internals must not be a public construction surface",
+        );
+        assert!(
+            !lib_source.contains("pub mod scheduler;"),
+            "raw Scheduler must not be a public SDK-facing concurrency authority",
+        );
+        assert!(
+            !lib_source.contains("pub use scheduler::{AccessLevel, ConcurrencyMode, Scheduler};"),
+            "raw Scheduler must not be re-exported",
+        );
+        assert!(
+            !lib_source.contains("CrmRoute"),
+            "raw CrmRoute type must not be re-exported",
+        );
+        assert!(
+            !lib_source.contains("Dispatcher"),
+            "raw Dispatcher type must not be re-exported",
+        );
+        for field in [
+            "pub name:",
+            "pub crm_ns:",
+            "pub crm_name:",
+            "pub crm_ver:",
+            "pub abi_hash:",
+            "pub signature_hash:",
+            "pub scheduler:",
+            "pub callback:",
+            "pub method_names:",
+        ] {
+            assert!(
+                !crm_route_source.contains(field),
+                "CrmRoute field remained public: {field}",
+            );
+        }
+        assert!(
+            !server_source.lines().any(|line| {
+                line.trim()
+                    == "pub async fn register_route(&self, route: CrmRoute) -> Result<(), ServerError> {"
+            }),
+            "raw CrmRoute registration must not be a public Server API",
+        );
+    }
+
+    #[test]
+    fn generic_signal_handler_does_not_keep_legacy_shutdown_ack_path() {
+        let source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/server.rs")).unwrap();
+        let start = source
+            .find("async fn handle_signal(")
+            .expect("generic signal handler must exist");
+        let rest = &source[start..];
+        let end = rest
+            .find("#[derive(Debug)]\nenum RouteExecutionError")
+            .expect("route execution error enum should follow signal handler");
+        let handle_signal_source = &rest[..end];
+
+        assert!(
+            !handle_signal_source.contains("MsgType::ShutdownClient"),
+            "shutdown control must flow through handle_shutdown_signal, not the legacy generic signal ack path",
+        );
+    }
+
+    #[test]
+    fn shutdown_signal_handler_ack_path_does_not_wait_for_drain_budget() {
+        let source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/server.rs")).unwrap();
+        let start = source
+            .find("async fn handle_shutdown_signal(")
+            .expect("shutdown signal handler must exist");
+        let rest = &source[start..];
+        let end = rest
+            .find("\nasync fn handle_signal(")
+            .expect("generic signal handler should follow shutdown signal handler");
+        let handler_source = &rest[..end];
+
+        assert!(handler_source.contains("decode_shutdown_initiate(payload)"));
+        for forbidden in [
+            concat!("decode_shutdown_request_", "wait_", "budget"),
+            concat!("wait_", "budget"),
+            concat!("wait_for_shutdown_", "control_outcome"),
+            "tokio::time::timeout",
+            "wait_for_active_connections_drained",
+        ] {
+            assert!(
+                !handler_source.contains(forbidden),
+                "shutdown initiate ack path must not wait for drain or accept a server-side wait budget: {forbidden}",
+            );
+        }
+
+        let start_ack = handler_source
+            .find("let outcome = DirectShutdownAck {\n        acknowledged: true,")
+            .expect("success ack outcome should be constructed directly in the handler");
+        let success_ack = &handler_source[start_ack..];
+        assert!(success_ack.contains("shutdown_started: true"));
+        assert!(success_ack.contains("server_stopped: false"));
+        assert!(success_ack.contains("route_outcomes: Vec::new()"));
+    }
+
+    #[tokio::test]
+    async fn malformed_shutdown_signal_does_not_stop_server() {
+        let server = Server::new(
+            "ipc://malformed_shutdown_signal",
+            ServerIpcConfig::default(),
+        )
+        .unwrap();
+        server.set_lifecycle_state(ServerLifecycleState::Ready);
+        let conn = Connection::new(12);
+        let writer = closed_writer();
+        let malformed = [MsgType::ShutdownClient.as_byte(), 0x01, 0x02];
+
+        handle_shutdown_signal(&server, &conn, &malformed, 99, &writer).await;
+
+        assert_eq!(server.lifecycle_state(), ServerLifecycleState::Ready);
+        assert!(!*server.shutdown_rx.borrow());
+    }
+
+    #[tokio::test]
+    async fn connection_accepted_after_shutdown_reads_duplicate_shutdown_signal() {
+        use c2_wire::shutdown_control::{decode_shutdown_ack, encode_shutdown_initiate};
+
+        let server = Arc::new(
+            Server::new(
+                "ipc://duplicate_shutdown_after_signal",
+                ServerIpcConfig::default(),
+            )
+            .unwrap(),
+        );
+        server.set_lifecycle_state(ServerLifecycleState::Ready);
+        server.request_shutdown_signal();
+
+        let (mut client, server_stream) = UnixStream::pair().expect("unix stream pair");
+        let handler = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move {
+                handle_connection(server, server_stream).await;
+            })
+        };
+
+        let request = encode_frame(7, FLAG_SIGNAL, &encode_shutdown_initiate());
+        client.write_all(&request).await.expect("write request");
+        let mut header = [0u8; frame::HEADER_SIZE];
+        client
+            .read_exact(&mut header)
+            .await
+            .expect("read ack header");
+        let (total_len, body) = frame::decode_total_len(&header).unwrap();
+        let (frame_header, payload_prefix) = decode_frame_body(body, total_len).unwrap();
+        let payload_len = frame_header.payload_len();
+        let mut payload = payload_prefix.to_vec();
+        if payload.len() < payload_len {
+            let mut tail = vec![0u8; payload_len - payload.len()];
+            client.read_exact(&mut tail).await.expect("read ack body");
+            payload.extend_from_slice(&tail);
+        }
+        let ack = decode_shutdown_ack(&payload).expect("structured shutdown ack");
+
+        assert_eq!(frame_header.request_id, 7);
+        assert!(frame_header.flags & FLAG_SIGNAL != 0);
+        assert!(frame_header.flags & FLAG_RESPONSE != 0);
+        assert!(ack.acknowledged);
+        assert!(ack.shutdown_started);
+        assert!(!ack.server_stopped);
+        assert!(ack.route_outcomes.is_empty());
+        handler.await.expect("handler completes");
+    }
+
+    #[tokio::test]
+    async fn connection_accepted_after_shutdown_idle_peer_does_not_block_handler() {
+        use tokio::time::{Duration, timeout};
+
+        let server = Arc::new(
+            Server::new(
+                "ipc://duplicate_shutdown_idle_peer",
+                ServerIpcConfig::default(),
+            )
+            .unwrap(),
+        );
+        server.set_lifecycle_state(ServerLifecycleState::Ready);
+        server.request_shutdown_signal();
+
+        let (_client, server_stream) = UnixStream::pair().expect("unix stream pair");
+
+        timeout(
+            Duration::from_millis(250),
+            handle_connection(server, server_stream),
+        )
+        .await
+        .expect("post-shutdown idle peer must not park the handler");
+    }
+
+    #[tokio::test]
+    async fn connection_accepted_after_shutdown_partial_shutdown_frame_does_not_wait_for_body() {
+        use tokio::time::{Duration, timeout};
+
+        let server = Arc::new(
+            Server::new(
+                "ipc://duplicate_shutdown_partial_frame",
+                ServerIpcConfig::default(),
+            )
+            .unwrap(),
+        );
+        server.set_lifecycle_state(ServerLifecycleState::Ready);
+        server.request_shutdown_signal();
+
+        let (mut client, server_stream) = UnixStream::pair().expect("unix stream pair");
+        let handler = tokio::spawn(async move {
+            handle_connection(server, server_stream).await;
+        });
+
+        client
+            .write_all(&SHUTDOWN_INITIATE_FRAME_BODY_LEN.to_le_bytes())
+            .await
+            .expect("write shutdown initiate frame length only");
+
+        timeout(Duration::from_millis(250), handler)
+            .await
+            .expect("post-shutdown partial shutdown frame must not wait for body")
+            .expect("handler completes");
+    }
+
+    #[tokio::test]
+    async fn connection_accepted_after_shutdown_rejects_non_shutdown_frame_without_body_wait() {
+        use tokio::time::{Duration, timeout};
+
+        let server = Arc::new(
+            Server::new(
+                "ipc://duplicate_shutdown_rejects_non_shutdown",
+                ServerIpcConfig::default(),
+            )
+            .unwrap(),
+        );
+        server.set_lifecycle_state(ServerLifecycleState::Ready);
+        server.request_shutdown_signal();
+
+        let (mut client, server_stream) = UnixStream::pair().expect("unix stream pair");
+        let handler = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move {
+                handle_connection(server, server_stream).await;
+            })
+        };
+
+        let non_shutdown_body_len = SHUTDOWN_INITIATE_FRAME_BODY_LEN + 1;
+        client
+            .write_all(&non_shutdown_body_len.to_le_bytes())
+            .await
+            .expect("write oversized post-shutdown frame prefix");
+
+        timeout(Duration::from_millis(100), handler)
+            .await
+            .expect("post-shutdown non-shutdown frame must close without waiting for body")
+            .expect("handler completes");
+    }
+
+    #[test]
+    fn inline_and_buddy_handle_connection_paths_reserve_route_pending_before_spawn() {
+        let source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/server.rs")).unwrap();
+
+        let buddy_start = source
+            .find("if c2_wire::flags::is_buddy(flags)")
+            .expect("buddy branch must exist");
+        let buddy_rest = &source[buddy_start..];
+        let buddy_end = buddy_rest
+            .find("continue;\n            }\n\n            let (ctrl, ctrl_consumed)")
+            .expect("inline branch must follow buddy branch");
+        let buddy_branch = &buddy_rest[..buddy_end];
+        let buddy_reserve = buddy_branch
+            .find("reserve_route_execution(&server, &ctrl.route_name, ctrl.method_idx)")
+            .expect("buddy branch must reserve route pending before spawn");
+        let buddy_spawn = buddy_branch
+            .find("tokio::spawn(async move")
+            .expect("buddy branch must spawn dispatch task");
+        assert!(
+            buddy_reserve < buddy_spawn,
+            "buddy branch must reserve route pending before spawning dispatch",
+        );
+
+        let inline_start = source
+            .find("let (ctrl, ctrl_consumed) = match decode_call_control(payload, 0)")
+            .expect("inline call branch must decode control");
+        let inline_rest = &source[inline_start..];
+        let inline_end = inline_rest
+            .find("} else {\n            warn!(conn_id, flags, \"unknown frame type\");")
+            .expect("unknown-frame branch must follow inline call branch");
+        let inline_branch = &inline_rest[..inline_end];
+        let inline_reserve = inline_branch
+            .find("reserve_route_execution(&server, &ctrl.route_name, ctrl.method_idx)")
+            .expect("inline branch must reserve route pending before spawn");
+        let inline_spawn = inline_branch
+            .find("tokio::spawn(async move")
+            .expect("inline branch must spawn dispatch task");
+        assert!(
+            inline_reserve < inline_spawn,
+            "inline branch must reserve route pending before spawning dispatch",
+        );
+    }
+
+    #[test]
+    fn dispatch_paths_use_flight_guard_instead_of_manual_connection_counters() {
+        let source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/server.rs")).unwrap();
+        let tests_start = source
+            .find("\n#[cfg(test)]\nmod tests")
+            .expect("server source must end with test module");
+        let production_source = &source[..tests_start];
+        let flight_inc = concat!(".flight_", "inc(");
+        let flight_dec = concat!(".flight_", "dec(");
+
+        assert!(
+            !production_source.contains(flight_inc),
+            "server dispatch paths must use FlightGuard rather than manual flight increment"
+        );
+        assert!(
+            !production_source.contains(flight_dec),
+            "server dispatch paths must use FlightGuard rather than manual flight decrement"
+        );
+        assert!(
+            production_source.matches("FlightGuard::new").count() >= 3,
+            "inline, buddy, and chunked dispatch should all use FlightGuard"
+        );
+    }
+
+    #[test]
+    fn chunk_processing_permit_is_bounded_by_max_total_chunks() {
+        let config = ServerIpcConfig {
+            base: c2_config::BaseIpcConfig {
+                max_total_chunks: 1,
+                ..c2_config::BaseIpcConfig::default()
+            },
+            ..ServerIpcConfig::default()
+        };
+        let server = Server::new("ipc://chunk_processing_limit", config).unwrap();
+
+        let first = server.try_acquire_chunk_processing_permit().unwrap();
+        assert_eq!(server.try_acquire_chunk_processing_permit().unwrap_err(), 1);
+        drop(first);
+        assert!(server.try_acquire_chunk_processing_permit().is_ok());
+    }
+
     // -- shutdown --
 
     #[tokio::test]
     async fn shutdown_sets_signal() {
         let s = Server::new("ipc://shut_test", ServerIpcConfig::default()).unwrap();
         let mut rx = s.shutdown_rx.clone();
-        s.shutdown();
+        s.request_shutdown_signal();
         rx.changed().await.unwrap();
         assert!(*rx.borrow());
     }
@@ -2564,6 +5158,204 @@ mod tests {
         assert_eq!(&slice[16..18], b"cc");
         drop(p);
         pool.write().release_handle(finished.handle);
+    }
+
+    #[tokio::test]
+    async fn first_chunked_chunk_holds_route_pending_until_feed_error_aborts() {
+        use crate::scheduler::{SchedulerAcquireError, SchedulerLimits};
+        use c2_wire::chunk::encode_chunk_header;
+        use c2_wire::control::encode_call_control;
+        use std::num::NonZeroUsize;
+
+        let server = Arc::new(
+            Server::new(
+                "ipc://chunk_route_pending_abort",
+                ServerIpcConfig::default(),
+            )
+            .unwrap(),
+        );
+        let mut route = make_route("grid");
+        let scheduler = Scheduler::with_limits(
+            ConcurrencyMode::Parallel,
+            HashMap::new(),
+            SchedulerLimits {
+                max_pending: Some(NonZeroUsize::new(1).unwrap()),
+                max_workers: Some(NonZeroUsize::new(1).unwrap()),
+            },
+        );
+        route.scheduler = Arc::new(scheduler.clone());
+        server.register_route(route).await.unwrap();
+
+        let conn = Arc::new(Connection::new(77));
+        let writer = closed_writer();
+        let mut first_payload = Vec::new();
+        first_payload.extend_from_slice(&encode_chunk_header(0, 2));
+        first_payload.extend_from_slice(&encode_call_control("grid", 0).unwrap());
+        first_payload.extend_from_slice(b"abcd");
+
+        let chunk_permit = server.try_acquire_chunk_processing_permit().unwrap();
+        dispatch_chunked_call(
+            &server,
+            &conn,
+            42,
+            FLAG_CHUNKED,
+            &first_payload,
+            &writer,
+            chunk_permit,
+        )
+        .await;
+
+        assert!(server.chunk_registry.contains(conn.conn_id(), 42));
+        assert!(matches!(
+            scheduler.try_acquire(0),
+            Err(SchedulerAcquireError::Capacity {
+                field: "max_pending",
+                limit: 1,
+            })
+        ));
+
+        let mut bad_second_payload = Vec::new();
+        bad_second_payload.extend_from_slice(&encode_chunk_header(7, 2));
+        bad_second_payload.extend_from_slice(b"zzzz");
+        let chunk_permit = server.try_acquire_chunk_processing_permit().unwrap();
+        dispatch_chunked_call(
+            &server,
+            &conn,
+            42,
+            FLAG_CHUNKED,
+            &bad_second_payload,
+            &writer,
+            chunk_permit,
+        )
+        .await;
+
+        assert!(!server.chunk_registry.contains(conn.conn_id(), 42));
+        let guard = scheduler
+            .try_acquire(0)
+            .expect("feed error abort should release route pending capacity");
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn chunked_connection_cleanup_releases_route_pending_capacity() {
+        use crate::scheduler::{SchedulerAcquireError, SchedulerLimits};
+        use c2_wire::chunk::encode_chunk_header;
+        use c2_wire::control::encode_call_control;
+        use std::num::NonZeroUsize;
+
+        let server = Arc::new(
+            Server::new(
+                "ipc://chunk_route_pending_cleanup",
+                ServerIpcConfig::default(),
+            )
+            .unwrap(),
+        );
+        let mut route = make_route("grid");
+        let scheduler = Scheduler::with_limits(
+            ConcurrencyMode::Parallel,
+            HashMap::new(),
+            SchedulerLimits {
+                max_pending: Some(NonZeroUsize::new(1).unwrap()),
+                max_workers: Some(NonZeroUsize::new(1).unwrap()),
+            },
+        );
+        route.scheduler = Arc::new(scheduler.clone());
+        server.register_route(route).await.unwrap();
+
+        let conn = Arc::new(Connection::new(88));
+        let writer = closed_writer();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&encode_chunk_header(0, 2));
+        payload.extend_from_slice(&encode_call_control("grid", 0).unwrap());
+        payload.extend_from_slice(b"abcd");
+
+        let chunk_permit = server.try_acquire_chunk_processing_permit().unwrap();
+        dispatch_chunked_call(
+            &server,
+            &conn,
+            9,
+            FLAG_CHUNKED,
+            &payload,
+            &writer,
+            chunk_permit,
+        )
+        .await;
+
+        assert!(server.chunk_registry.contains(conn.conn_id(), 9));
+        assert!(matches!(
+            scheduler.try_acquire(0),
+            Err(SchedulerAcquireError::Capacity {
+                field: "max_pending",
+                limit: 1,
+            })
+        ));
+
+        server.cleanup_chunk_requests_for_connection(conn.conn_id());
+
+        assert!(!server.chunk_registry.contains(conn.conn_id(), 9));
+        let guard = scheduler
+            .try_acquire(0)
+            .expect("connection cleanup should release route pending capacity");
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn chunked_gc_sweep_releases_stale_route_pending_capacity() {
+        use crate::scheduler::{SchedulerAcquireError, SchedulerLimits};
+        use c2_wire::chunk::encode_chunk_header;
+        use c2_wire::control::encode_call_control;
+        use std::num::NonZeroUsize;
+
+        let server = Arc::new(
+            Server::new("ipc://chunk_route_pending_gc", ServerIpcConfig::default()).unwrap(),
+        );
+        let mut route = make_route("grid");
+        let scheduler = Scheduler::with_limits(
+            ConcurrencyMode::Parallel,
+            HashMap::new(),
+            SchedulerLimits {
+                max_pending: Some(NonZeroUsize::new(1).unwrap()),
+                max_workers: Some(NonZeroUsize::new(1).unwrap()),
+            },
+        );
+        route.scheduler = Arc::new(scheduler.clone());
+        server.register_route(route).await.unwrap();
+
+        let conn = Arc::new(Connection::new(99));
+        let writer = closed_writer();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&encode_chunk_header(0, 2));
+        payload.extend_from_slice(&encode_call_control("grid", 0).unwrap());
+        payload.extend_from_slice(b"abcd");
+
+        let chunk_permit = server.try_acquire_chunk_processing_permit().unwrap();
+        dispatch_chunked_call(
+            &server,
+            &conn,
+            11,
+            FLAG_CHUNKED,
+            &payload,
+            &writer,
+            chunk_permit,
+        )
+        .await;
+
+        assert!(server.chunk_registry.contains(conn.conn_id(), 11));
+        assert!(matches!(
+            scheduler.try_acquire(0),
+            Err(SchedulerAcquireError::Capacity {
+                field: "max_pending",
+                limit: 1,
+            })
+        ));
+
+        server.chunk_registry.abort(conn.conn_id(), 11);
+        assert_eq!(server.sweep_stale_chunk_route_pending(), 1);
+
+        let guard = scheduler
+            .try_acquire(0)
+            .expect("GC stale sweep should release route pending capacity");
+        drop(guard);
     }
 
     #[test]

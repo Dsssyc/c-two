@@ -69,6 +69,7 @@ These should be owned by the Rust resolver.
 | `C2_IPC_MAX_FRAME_SIZE` | Python settings, `.env.example` | IPC frame cap | Keep. Server IPC config. |
 | `C2_IPC_MAX_PAYLOAD_SIZE` | Python settings, `.env.example` | IPC payload cap | Keep. Server IPC config. |
 | `C2_IPC_MAX_PENDING_REQUESTS` | Python settings, `.env.example` | Server pending request cap | Keep. Server IPC config. |
+| `C2_IPC_MAX_EXECUTION_WORKERS` | Rust/Python server runtime config, `.env.example` | Server blocking execution worker cap | Keep. Server IPC config. |
 | `C2_IPC_HEARTBEAT_INTERVAL` | Python settings, `.env.example` | Server heartbeat interval | Keep. Server IPC config. |
 | `C2_IPC_HEARTBEAT_TIMEOUT` | Python settings, `.env.example` | Server heartbeat timeout | Keep. Server IPC config. |
 | `C2_IPC_MAX_TOTAL_CHUNKS` | Python settings, `.env.example` | Chunk registry cap | Keep. IPC base config. |
@@ -135,6 +136,7 @@ The resolver should use current Rust `c2-config` defaults as the canonical runti
 | `max_frame_size` | `2_147_483_648` |
 | `max_payload_size` | `17_179_869_184` |
 | `max_pending_requests` | `1024` |
+| `max_execution_workers` | available parallelism clamped to `4..=64` |
 | `pool_decay_seconds` | `60.0` |
 | `heartbeat_interval_secs` | `15.0` |
 | `heartbeat_timeout_secs` | `30.0` |

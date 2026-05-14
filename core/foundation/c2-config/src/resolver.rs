@@ -106,6 +106,7 @@ pub struct ServerIpcConfigOverrides {
     pub max_frame_size: Option<u64>,
     pub max_payload_size: Option<u64>,
     pub max_pending_requests: Option<u32>,
+    pub max_execution_workers: Option<u32>,
     pub pool_decay_seconds: Option<f64>,
     pub heartbeat_interval_secs: Option<f64>,
     pub heartbeat_timeout_secs: Option<f64>,
@@ -474,6 +475,12 @@ fn resolve_server_ipc_config(
         cfg.max_pending_requests = v;
     }
     if let Some(v) = catalog
+        .optional_u32("C2_IPC_MAX_EXECUTION_WORKERS")
+        .transpose()?
+    {
+        cfg.max_execution_workers = v;
+    }
+    if let Some(v) = catalog
         .optional_f64("C2_IPC_POOL_DECAY_SECONDS")
         .transpose()?
     {
@@ -502,6 +509,9 @@ fn resolve_server_ipc_config(
     }
     if let Some(v) = overrides.max_pending_requests {
         cfg.max_pending_requests = v;
+    }
+    if let Some(v) = overrides.max_execution_workers {
+        cfg.max_execution_workers = v;
     }
     if let Some(v) = overrides.pool_decay_seconds {
         cfg.pool_decay_seconds = v;
@@ -1000,6 +1010,87 @@ mod tests {
 
         assert!(err.to_string().contains("heartbeat_interval_secs"));
         assert!(err.to_string().contains("representable duration"));
+    }
+
+    #[test]
+    fn server_ipc_execution_workers_env_and_override_are_resolved() {
+        let sources = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[("C2_IPC_MAX_EXECUTION_WORKERS", "9")]),
+        };
+
+        let from_env = ConfigResolver::resolve_server_ipc(
+            ServerIpcConfigOverrides::default(),
+            RuntimeConfigOverrides::default(),
+            sources,
+        )
+        .expect("env execution worker override should resolve");
+        assert_eq!(from_env.max_execution_workers, 9);
+
+        let from_override = ConfigResolver::resolve_server_ipc(
+            ServerIpcConfigOverrides {
+                max_execution_workers: Some(7),
+                ..Default::default()
+            },
+            RuntimeConfigOverrides::default(),
+            ConfigSources::empty(),
+        )
+        .expect("explicit execution worker override should resolve");
+        assert_eq!(from_override.max_execution_workers, 7);
+    }
+
+    #[test]
+    fn server_ipc_execution_workers_rejects_zero_env_and_override() {
+        let env_sources = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[("C2_IPC_MAX_EXECUTION_WORKERS", "0")]),
+        };
+        let env_err = ConfigResolver::resolve_server_ipc(
+            ServerIpcConfigOverrides::default(),
+            RuntimeConfigOverrides::default(),
+            env_sources,
+        )
+        .expect_err("zero env execution worker override should fail");
+        assert!(env_err.to_string().contains("max_execution_workers"));
+
+        let override_err = ConfigResolver::resolve_server_ipc(
+            ServerIpcConfigOverrides {
+                max_execution_workers: Some(0),
+                ..Default::default()
+            },
+            RuntimeConfigOverrides::default(),
+            ConfigSources::empty(),
+        )
+        .expect_err("zero explicit execution worker override should fail");
+        assert!(override_err.to_string().contains("max_execution_workers"));
+    }
+
+    #[test]
+    fn server_ipc_execution_workers_rejects_values_above_hard_limit() {
+        let env_sources = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[("C2_IPC_MAX_EXECUTION_WORKERS", "65")]),
+        };
+        let env_err = ConfigResolver::resolve_server_ipc(
+            ServerIpcConfigOverrides::default(),
+            RuntimeConfigOverrides::default(),
+            env_sources,
+        )
+        .expect_err("oversized env execution worker override should fail");
+        assert!(env_err.to_string().contains("max_execution_workers"));
+        assert!(env_err.to_string().contains("64"));
+
+        let override_err = ConfigResolver::resolve_server_ipc(
+            ServerIpcConfigOverrides {
+                max_execution_workers: Some(65),
+                ..Default::default()
+            },
+            RuntimeConfigOverrides::default(),
+            ConfigSources::empty(),
+        )
+        .expect_err("oversized explicit execution worker override should fail");
+        assert!(override_err.to_string().contains("max_execution_workers"));
+        assert!(override_err.to_string().contains("64"));
     }
 
     #[test]

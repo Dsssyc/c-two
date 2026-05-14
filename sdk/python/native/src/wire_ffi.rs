@@ -583,14 +583,6 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
         PyBytes::new(py, &c2_wire::msg_type::PONG_BYTES),
     )?;
     m.add(
-        "SHUTDOWN_CLIENT_BYTES",
-        PyBytes::new(py, &c2_wire::msg_type::SHUTDOWN_CLIENT_BYTES),
-    )?;
-    m.add(
-        "SHUTDOWN_ACK_BYTES",
-        PyBytes::new(py, &c2_wire::msg_type::SHUTDOWN_ACK_BYTES),
-    )?;
-    m.add(
         "DISCONNECT_BYTES",
         PyBytes::new(py, &c2_wire::msg_type::DISCONNECT_BYTES),
     )?;

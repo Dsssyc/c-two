@@ -22,6 +22,8 @@ pub mod flags;
 pub mod frame;
 pub mod handshake;
 pub mod msg_type;
+pub mod registration_control;
+pub mod shutdown_control;
 
 #[cfg(test)]
 mod tests;

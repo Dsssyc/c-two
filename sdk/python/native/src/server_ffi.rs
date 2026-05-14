@@ -21,10 +21,11 @@ use pyo3::types::{PyAny, PyBytes, PyDict};
 use c2_config::{BaseIpcConfig, ServerIpcConfig};
 use c2_error::{C2Error, ErrorCode};
 use c2_mem::MemPool;
-use c2_server::Server;
-use c2_server::dispatcher::{CrmCallback, CrmError, CrmRoute, RequestData, ResponseMeta};
 use c2_server::response::try_prepare_shm_response;
-use c2_server::scheduler::{AccessLevel, ConcurrencyMode, Scheduler, SchedulerLimits};
+use c2_server::{
+    AccessLevel, BuiltRoute as ServerBuiltRoute, ConcurrencyMode, CrmCallback, CrmError,
+    RequestData, ResponseMeta, RouteBuildSpec, SchedulerLimits, Server, ServerRuntimeBuilder,
+};
 
 use crate::route_concurrency_ffi::PyRouteConcurrency;
 use crate::shm_buffer::PyShmBuffer;
@@ -111,18 +112,8 @@ impl CrmCallback for PyCrmCallback {
 
 /// A Rust-native IPC server for hosting CRM routes.
 ///
-/// ```python
-/// from c_two._native import RustServer
-/// srv = RustServer("ipc://my_server")
-/// srv.register_route(
-///     "grid", dispatcher_fn, ["step", "query"],
-///     {0: "read", 1: "write"}, "read_parallel", None, None,
-///     "example.ns", "Grid", "0.1.0", abi_hash, signature_hash,
-/// )
-/// srv.start()
-/// # ... serve requests ...
-/// srv.shutdown()
-/// ```
+/// Route registration is driven by `RuntimeSession`, which owns registration
+/// transactions, relay publication, rollback, and route admission state.
 #[pyclass(name = "RustServer", frozen)]
 pub struct PyServer {
     pub(crate) inner: Arc<Server>,
@@ -130,7 +121,7 @@ pub struct PyServer {
 }
 
 pub(crate) struct BuiltRoute {
-    pub route: CrmRoute,
+    pub route: ServerBuiltRoute,
     pub route_handle: PyRouteConcurrency,
 }
 
@@ -172,31 +163,28 @@ impl PyServer {
             map.insert(idx, level);
         }
 
-        let scheduler = Scheduler::with_limits(mode, map, limits);
-        let route_handle = PyRouteConcurrency::new(scheduler.clone());
         let callback = Arc::new(PyCrmCallback {
             py_callable: dispatcher,
             shm_threshold: self.inner.response_shm_threshold(),
             max_payload_size: self.inner.response_max_payload_size(),
         });
-        c2_contract::validate_crm_tag(crm_ns, crm_name, crm_ver)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        c2_contract::validate_contract_hash("abi_hash", abi_hash)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        c2_contract::validate_contract_hash("signature_hash", signature_hash)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-
-        let route = CrmRoute {
+        let spec = RouteBuildSpec {
             name: name.to_string(),
             crm_ns: crm_ns.to_string(),
             crm_name: crm_name.to_string(),
             crm_ver: crm_ver.to_string(),
             abi_hash: abi_hash.to_string(),
             signature_hash: signature_hash.to_string(),
-            scheduler: Arc::new(scheduler),
-            callback,
             method_names,
+            access_map: map,
+            concurrency_mode: mode,
+            limits,
         };
+        let route = self
+            .inner
+            .build_route(spec, callback)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let route_handle = PyRouteConcurrency::new(route.route_handle());
 
         Ok(BuiltRoute {
             route,
@@ -204,66 +192,28 @@ impl PyServer {
         })
     }
 
-    pub(crate) fn register_built_route(&self, py: Python<'_>, route: CrmRoute) -> PyResult<()> {
-        let server = Arc::clone(&self.inner);
-
-        // Register requires async; use a short-lived runtime if the main
-        // one hasn't started, or block_on the existing runtime's handle.
-        py.detach(move || -> PyResult<()> {
-            let rt_guard = self.rt.lock();
-            if let Some(rt) = rt_guard.as_ref() {
-                rt.block_on(server.register_route(route))
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            } else {
-                // Server not started yet — create a temporary runtime for registration.
-                let tmp_rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| {
-                        PyRuntimeError::new_err(format!("failed to create runtime: {e}"))
-                    })?;
-                tmp_rt
-                    .block_on(server.register_route(route))
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            }
-            Ok(())
-        })
-    }
-
-    pub(crate) fn unregister_route_blocking(&self, py: Python<'_>, name: &str) -> PyResult<bool> {
-        let server = Arc::clone(&self.inner);
-        let name = name.to_string();
-
-        py.detach(move || {
-            let rt_guard = self.rt.lock();
-            if let Some(rt) = rt_guard.as_ref() {
-                Ok(rt.block_on(server.unregister_route(&name)))
-            } else {
-                let tmp_rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
-                Ok(tmp_rt.block_on(server.unregister_route(&name)))
-            }
-        })
-    }
-
     pub(crate) fn runtime_is_running(&self) -> bool {
         self.inner.is_running()
     }
 
-    fn stop_runtime_and_wait(&self, timeout: Duration) -> PyResult<()> {
-        self.inner.shutdown();
+    pub(crate) fn shutdown_runtime_barrier_blocking(
+        &self,
+        py: Python<'_>,
+        timeout: Duration,
+    ) -> PyResult<()> {
+        py.detach(|| self.stop_runtime_and_wait(timeout))
+    }
 
+    fn stop_runtime_and_wait(&self, timeout: Duration) -> PyResult<()> {
         let rt = {
             let mut rt_guard = self.rt.lock();
             rt_guard.take()
         };
 
         let wait_result = if let Some(rt) = rt {
-            let result = rt.block_on(self.inner.wait_until_stopped(timeout));
+            let result = rt.block_on(self.inner.shutdown_and_wait(timeout));
             rt.shutdown_background();
-            result
+            result.map(|_| ())
         } else {
             Ok(())
         };
@@ -275,10 +225,7 @@ impl PyServer {
         let server_for_run = Arc::clone(&self.inner);
         let server_for_wait = Arc::clone(&self.inner);
 
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
+        let rt = ServerRuntimeBuilder::build(self.inner.config())
             .map_err(|e| PyRuntimeError::new_err(format!("failed to create runtime: {e}")))?;
 
         {
@@ -305,7 +252,7 @@ impl PyServer {
             let rt = rt_guard
                 .as_ref()
                 .ok_or_else(|| PyRuntimeError::new_err("server runtime missing after start"))?;
-            rt.block_on(server_for_wait.wait_until_ready(timeout))
+            rt.block_on(server_for_wait.wait_until_responsive(timeout))
         };
 
         match readiness {
@@ -336,7 +283,7 @@ impl PyServer {
         address, shm_threshold, pool_enabled, pool_segment_size,
         max_pool_segments, reassembly_segment_size,
         reassembly_max_segments, max_frame_size, max_payload_size,
-        max_pending_requests, pool_decay_seconds, heartbeat_interval,
+        max_pending_requests, max_execution_workers, pool_decay_seconds, heartbeat_interval,
         heartbeat_timeout, max_total_chunks, chunk_gc_interval,
         chunk_threshold_ratio, chunk_assembler_timeout,
         max_reassembly_bytes, chunk_size,
@@ -353,6 +300,7 @@ impl PyServer {
         max_frame_size: u64,
         max_payload_size: u64,
         max_pending_requests: u32,
+        max_execution_workers: u32,
         pool_decay_seconds: f64,
         heartbeat_interval: f64,
         heartbeat_timeout: f64,
@@ -388,6 +336,7 @@ impl PyServer {
             max_frame_size,
             max_payload_size,
             max_pending_requests,
+            max_execution_workers,
             pool_decay_seconds,
             heartbeat_interval_secs: heartbeat_interval,
             heartbeat_timeout_secs: heartbeat_timeout,
@@ -416,54 +365,6 @@ impl PyServer {
         })
     }
 
-    /// Register a CRM route.
-    ///
-    /// `dispatcher` is a Python callable:
-    /// `(route_name: str, method_idx: int, request_buffer: ShmBuffer) -> None | bytes-like`
-    ///
-    /// Return value conventions:
-    /// - `None` → empty response
-    /// - `bytes` / buffer-protocol object → native response selection
-    ///
-    /// `method_names` lists the CRM method names indexed by method_idx.
-    /// `access_map` maps method_idx → "read" or "write".
-    #[pyo3(signature = (name, dispatcher, method_names, access_map, concurrency_mode, max_pending, max_workers, crm_ns, crm_name, crm_ver, abi_hash, signature_hash))]
-    fn register_route(
-        &self,
-        py: Python<'_>,
-        name: &str,
-        dispatcher: Py<PyAny>,
-        method_names: Vec<String>,
-        access_map: &Bound<'_, PyDict>,
-        concurrency_mode: &str,
-        max_pending: Option<usize>,
-        max_workers: Option<usize>,
-        crm_ns: &str,
-        crm_name: &str,
-        crm_ver: &str,
-        abi_hash: &str,
-        signature_hash: &str,
-    ) -> PyResult<PyRouteConcurrency> {
-        let built = self.build_route(
-            py,
-            name,
-            dispatcher,
-            method_names,
-            access_map,
-            concurrency_mode,
-            max_pending,
-            max_workers,
-            crm_ns,
-            crm_name,
-            crm_ver,
-            abi_hash,
-            signature_hash,
-        )?;
-        let route_handle = built.route_handle.clone();
-        self.register_built_route(py, built.route)?;
-        Ok(route_handle)
-    }
-
     /// Start the server on a background thread with a tokio runtime.
     ///
     /// The GIL is released while the runtime spins up.
@@ -481,19 +382,6 @@ impl PyServer {
         }
         let timeout = Duration::from_secs_f64(timeout_seconds);
         py.detach(|| self.start_runtime_and_wait(timeout))
-    }
-
-    /// Gracefully shut down the server.
-    ///
-    /// Signals the accept loop to stop, then drops the tokio runtime
-    /// (joining all worker threads). The GIL is released during shutdown.
-    fn shutdown(&self, py: Python<'_>) -> PyResult<()> {
-        py.detach(|| self.stop_runtime_and_wait(Duration::from_secs(5)))
-    }
-
-    /// Remove a CRM route. Returns `True` if it existed.
-    fn unregister_route(&self, py: Python<'_>, name: &str) -> PyResult<bool> {
-        self.unregister_route_blocking(py, name)
     }
 
     /// Whether the server is currently running.

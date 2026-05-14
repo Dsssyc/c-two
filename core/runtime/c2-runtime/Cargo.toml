@@ -16,3 +16,6 @@ c2-server = { path = "../../transport/c2-server" }
 parking_lot = { workspace = true }
 tokio = { version = "1", features = ["rt", "time"] }
 uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+c2-ipc = { path = "../../transport/c2-ipc" }

@@ -8,16 +8,18 @@ use pyo3::exceptions::{PyKeyError, PyLookupError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList};
 use std::sync::Arc;
+use std::time::Duration;
 
 use c2_contract::ExpectedRouteContract;
 use c2_http::client::RelayAwareHttpClient;
 use c2_ipc::{ClientPool, IpcError, SyncClient};
 use c2_mem::BufferLeaseTracker;
 use c2_runtime::{
-    RegisterOutcome, RelayCleanupError, RelayResolvedConnection, RuntimeRouteSpec, RuntimeSession,
-    RuntimeSessionOptions, ShutdownOutcome, UnregisterOutcome,
+    RegisterFailureOutcome, RegisterOutcome, RelayCleanupError, RelayResolvedConnection,
+    RouteCloseOutcome, RuntimeRouteSpec, RuntimeSession, RuntimeSessionOptions, ShutdownOutcome,
+    UnregisterOutcome,
 };
-use c2_server::scheduler::AccessLevel;
+use c2_server::AccessLevel;
 
 use crate::client_ffi::{PyRustClient, PyRustClientPool, call_sync_client};
 use crate::config_ffi::{
@@ -127,12 +129,13 @@ pub struct PyRuntimeSession {
 #[pymethods]
 impl PyRuntimeSession {
     #[new]
-    #[pyo3(signature = (server_id=None, server_ipc_overrides=None, client_ipc_overrides=None, shm_threshold=None))]
+    #[pyo3(signature = (server_id=None, server_ipc_overrides=None, client_ipc_overrides=None, shm_threshold=None, use_process_relay_anchor=true))]
     fn new(
         server_id: Option<String>,
         server_ipc_overrides: Option<&Bound<'_, PyAny>>,
         client_ipc_overrides: Option<&Bound<'_, PyAny>>,
         shm_threshold: Option<u64>,
+        use_process_relay_anchor: bool,
     ) -> PyResult<Self> {
         let server_ipc_overrides = match server_ipc_overrides {
             Some(overrides) => Some(parse_server_ipc_overrides(Some(overrides))?),
@@ -148,6 +151,7 @@ impl PyRuntimeSession {
             client_ipc_overrides,
             shm_threshold,
             relay_anchor_address: None,
+            use_process_relay_anchor,
         })
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(Self {
@@ -414,15 +418,30 @@ impl PyRuntimeSession {
         unregister_outcome_to_dict(py, outcome)
     }
 
-    #[pyo3(signature = (server_bridge=None, route_names=None, relay_anchor_address=None))]
+    #[pyo3(signature = (server_bridge=None, route_names=None, relay_anchor_address=None, timeout_seconds=5.0))]
     fn shutdown<'py>(
         &self,
         py: Python<'py>,
         server_bridge: Option<Py<PyAny>>,
         route_names: Option<Vec<String>>,
         relay_anchor_address: Option<&str>,
+        timeout_seconds: f64,
     ) -> PyResult<Bound<'py, PyDict>> {
-        let relay_use_proxy = resolve_relay_use_proxy_if_needed(&self.inner, relay_anchor_address)?;
+        if !timeout_seconds.is_finite() || timeout_seconds < 0.0 {
+            return Err(PyValueError::new_err(
+                "timeout_seconds must be a non-negative finite number",
+            ));
+        }
+        let timeout = Duration::from_secs_f64(timeout_seconds);
+        let mut relay_cleanup_config_error = None;
+        let relay_use_proxy =
+            match resolve_relay_use_proxy_for_shutdown(&self.inner, relay_anchor_address) {
+                Ok(value) => value,
+                Err(message) => {
+                    relay_cleanup_config_error = Some(message);
+                    false
+                }
+            };
         let route_names = route_names.unwrap_or_default();
         let server_bridge = match server_bridge {
             Some(server_bridge) => Some(server_bridge),
@@ -442,12 +461,23 @@ impl PyRuntimeSession {
                 route_names,
                 relay_anchor_address,
                 relay_use_proxy,
+                relay_cleanup_config_error.clone(),
+                timeout,
             );
             outcome.server_was_started = server_ref.runtime_is_running();
+            if let Err(err) = server_ref.shutdown_runtime_barrier_blocking(py, timeout) {
+                outcome.runtime_barrier_error = Some(err.to_string());
+            }
             outcome
         } else {
-            self.inner
-                .shutdown(None, route_names, relay_anchor_address, relay_use_proxy)
+            self.inner.shutdown(
+                None,
+                route_names,
+                relay_anchor_address,
+                relay_use_proxy,
+                relay_cleanup_config_error,
+                timeout,
+            )
         };
         py.detach(|| self.pool.inner.shutdown_all());
         outcome.ipc_clients_drained = true;
@@ -844,6 +874,33 @@ fn runtime_error_to_py(err: c2_runtime::RuntimeSessionError) -> PyErr {
             });
             exc
         }
+        c2_runtime::RuntimeSessionError::RegisterFailure(failure) => {
+            let exc = PyRuntimeError::new_err(format!(
+                "registration failed at {}: {}",
+                failure.failure_source, failure.error_message
+            ));
+            Python::attach(|py| {
+                let value = exc.value(py);
+                if let Ok(dict) = register_failure_to_dict(py, failure.clone()) {
+                    value.setattr("registration_failure", dict.clone()).ok();
+                    match dict.get_item("rollback") {
+                        Ok(Some(rollback)) => value.setattr("rollback", rollback).ok(),
+                        _ => value.setattr("rollback", py.None()).ok(),
+                    };
+                    match dict.get_item("relay_cleanup_error") {
+                        Ok(Some(error)) => value.setattr("relay_cleanup_error", error).ok(),
+                        _ => value.setattr("relay_cleanup_error", py.None()).ok(),
+                    };
+                }
+                if let Some(status_code) = failure.status_code {
+                    value.setattr("status_code", status_code).ok();
+                    if status_code == 409 {
+                        value.setattr("relay_duplicate", true).ok();
+                    }
+                }
+            });
+            exc
+        }
         c2_runtime::RuntimeSessionError::Server(message) => PyRuntimeError::new_err(message),
         c2_runtime::RuntimeSessionError::Relay(message) => {
             PyRuntimeError::new_err(format!("relay error: {message}"))
@@ -869,6 +926,25 @@ fn resolve_relay_use_proxy_if_needed(
         .map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
+fn resolve_relay_use_proxy_for_shutdown(
+    session: &RuntimeSession,
+    relay_anchor_address: Option<&str>,
+) -> Result<bool, String> {
+    let has_relay = match relay_anchor_address {
+        Some(_) => true,
+        None => match session.effective_relay_anchor_address() {
+            Ok(Some(_)) => true,
+            Ok(None) => return Ok(false),
+            Err(_) => return Ok(false),
+        },
+    };
+    if !has_relay {
+        return Ok(false);
+    }
+    c2_config::ConfigResolver::resolve_relay_use_proxy(c2_config::ConfigSources::from_process())
+        .map_err(|e| e.to_string())
+}
+
 fn register_outcome_to_dict<'py>(
     py: Python<'py>,
     outcome: RegisterOutcome,
@@ -879,6 +955,29 @@ fn register_outcome_to_dict<'py>(
     dict.set_item("server_instance_id", outcome.server_instance_id)?;
     dict.set_item("ipc_address", outcome.ipc_address)?;
     dict.set_item("relay_registered", outcome.relay_registered)?;
+    Ok(dict)
+}
+
+fn register_failure_to_dict<'py>(
+    py: Python<'py>,
+    outcome: RegisterFailureOutcome,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("route_name", outcome.route_name)?;
+    dict.set_item("failure_source", outcome.failure_source)?;
+    dict.set_item("error_message", outcome.error_message)?;
+    dict.set_item("status_code", outcome.status_code)?;
+    match outcome.rollback {
+        Some(rollback) => dict.set_item("rollback", route_close_outcome_to_dict(py, rollback)?)?,
+        None => dict.set_item("rollback", py.None())?,
+    }
+    match outcome.relay_cleanup_error {
+        Some(error) => dict.set_item(
+            "relay_cleanup_error",
+            relay_cleanup_error_to_dict(py, error)?,
+        )?,
+        None => dict.set_item("relay_cleanup_error", py.None())?,
+    }
     Ok(dict)
 }
 
@@ -893,6 +992,19 @@ fn relay_cleanup_error_to_dict<'py>(
     Ok(dict)
 }
 
+fn route_close_outcome_to_dict<'py>(
+    py: Python<'py>,
+    outcome: RouteCloseOutcome,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("route_name", outcome.route_name)?;
+    dict.set_item("local_removed", outcome.local_removed)?;
+    dict.set_item("active_drained", outcome.active_drained)?;
+    dict.set_item("closed_reason", outcome.closed_reason)?;
+    dict.set_item("close_error", outcome.close_error)?;
+    Ok(dict)
+}
+
 fn unregister_outcome_to_dict<'py>(
     py: Python<'py>,
     outcome: UnregisterOutcome,
@@ -900,6 +1012,7 @@ fn unregister_outcome_to_dict<'py>(
     let dict = PyDict::new(py);
     dict.set_item("route_name", outcome.route_name)?;
     dict.set_item("local_removed", outcome.local_removed)?;
+    dict.set_item("close", route_close_outcome_to_dict(py, outcome.close)?)?;
     match outcome.relay_error {
         Some(error) => dict.set_item("relay_error", relay_cleanup_error_to_dict(py, error)?)?,
         None => dict.set_item("relay_error", py.None())?,
@@ -913,6 +1026,12 @@ fn shutdown_outcome_to_dict<'py>(
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item("removed_routes", outcome.removed_routes)?;
+    let route_outcomes = outcome
+        .route_outcomes
+        .into_iter()
+        .map(|close| route_close_outcome_to_dict(py, close).map(|dict| dict.unbind()))
+        .collect::<PyResult<Vec<_>>>()?;
+    dict.set_item("route_outcomes", PyList::new(py, route_outcomes)?)?;
     let relay_errors = outcome
         .relay_errors
         .into_iter()
@@ -922,6 +1041,8 @@ fn shutdown_outcome_to_dict<'py>(
     dict.set_item("server_was_started", outcome.server_was_started)?;
     dict.set_item("ipc_clients_drained", outcome.ipc_clients_drained)?;
     dict.set_item("http_clients_drained", outcome.http_clients_drained)?;
+    dict.set_item("route_close_error", outcome.route_close_error)?;
+    dict.set_item("runtime_barrier_error", outcome.runtime_barrier_error)?;
     Ok(dict)
 }
 

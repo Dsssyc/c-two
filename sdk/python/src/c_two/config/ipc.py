@@ -49,6 +49,8 @@ class ServerIPCOverrides(BaseIPCOverrides, total=False):
     max_payload_size: int
     # Maximum number of concurrent pending server requests.
     max_pending_requests: int
+    # Maximum number of actively executing remote resource callbacks.
+    max_execution_workers: int
     # Seconds before unused server-side pool resources may decay.
     pool_decay_seconds: float
     # Seconds between heartbeat probes; zero disables heartbeat probes.

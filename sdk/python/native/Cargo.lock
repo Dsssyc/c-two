@@ -162,6 +162,8 @@ dependencies = [
  "c2-contract",
  "c2-mem",
  "parking_lot",
+ "serde",
+ "serde_json",
  "tracing",
 ]
 

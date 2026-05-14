@@ -111,7 +111,7 @@ def relay_stack(start_c3_relay):
                     'address': ipc_addr,
                 },
             )
-            assert resp.status_code == 201
+            assert resp.status_code == 201, resp.text
 
     yield relay_url, ipc_addr
 
@@ -326,7 +326,7 @@ class TestCcConnectHttp:
                     'address': ipc_addr,
                 },
             )
-            assert resp.status_code == 201
+            assert resp.status_code == 201, resp.text
 
         # Forced HTTP mode (address explicitly set).
         crm = cc.connect(Hello, name=slashed_name, address=relay_url)
@@ -546,7 +546,7 @@ class TestRelayControlPlane:
                     'address': ipc_addr,
                 },
             )
-            assert resp.status_code == 201
+            assert resp.status_code == 201, resp.text
             assert resp.json()['registered'] == 'hello'
 
             # Verify route appears in /_routes.
@@ -586,7 +586,7 @@ class TestRelayControlPlane:
                     'address': ipc_addr,
                 },
             )
-            assert resp.status_code == 201
+            assert resp.status_code == 201, resp.text
 
             # Same-relay duplicate registration uses upsert semantics.
             resp = http.post(
@@ -674,7 +674,7 @@ class TestRelayControlPlane:
                         'address': ipc_addr,
                     },
                 )
-                assert resp.status_code == 201
+                assert resp.status_code == 201, resp.text
 
             resp = http.get(f'{relay_url}/health')
             health = resp.json()

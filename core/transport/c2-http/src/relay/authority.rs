@@ -149,6 +149,71 @@ pub(crate) fn attest_ipc_route_contract(
     })
 }
 
+pub(crate) async fn attest_ipc_pending_route_contract(
+    client: &mut IpcClient,
+    route_name: &str,
+    registration_token: &str,
+    claimed_crm_ns: &str,
+    claimed_crm_name: &str,
+    claimed_crm_ver: &str,
+    claimed_abi_hash: &str,
+    claimed_signature_hash: &str,
+) -> Result<AttestedRouteContract, ControlError> {
+    let contract = match client
+        .pending_route_contract(route_name, registration_token)
+        .await
+    {
+        Ok(contract) => contract,
+        Err(c2_ipc::IpcError::RouteNotFound(_)) => return Err(ControlError::NotFound),
+        Err(err) => {
+            return Err(ControlError::ContractMismatch {
+                reason: format!(
+                    "IPC upstream pending route '{route_name}' attestation failed: {err}"
+                ),
+            });
+        }
+    };
+    let claimed = ExpectedRouteContract {
+        route_name: route_name.to_string(),
+        crm_ns: claimed_crm_ns.to_string(),
+        crm_name: claimed_crm_name.to_string(),
+        crm_ver: claimed_crm_ver.to_string(),
+        abi_hash: claimed_abi_hash.to_string(),
+        signature_hash: claimed_signature_hash.to_string(),
+    };
+    if c2_contract::validate_expected_route_contract(&claimed).is_err() {
+        return Err(ControlError::ContractMismatch {
+            reason: format!(
+                "IPC upstream route '{route_name}' registration did not claim a complete CRM contract"
+            ),
+        });
+    }
+    if claimed != contract {
+        return Err(ControlError::ContractMismatch {
+            reason: format!(
+                "IPC upstream pending route '{route_name}' CRM contract mismatch: claimed {}/{}/{} hashes={}/{}, got {}/{}/{} hashes={}/{}",
+                claimed.crm_ns,
+                claimed.crm_name,
+                claimed.crm_ver,
+                claimed.abi_hash,
+                claimed.signature_hash,
+                contract.crm_ns,
+                contract.crm_name,
+                contract.crm_ver,
+                contract.abi_hash,
+                contract.signature_hash,
+            ),
+        });
+    }
+    Ok(AttestedRouteContract {
+        crm_ns: contract.crm_ns,
+        crm_name: contract.crm_name,
+        crm_ver: contract.crm_ver,
+        abi_hash: contract.abi_hash,
+        signature_hash: contract.signature_hash,
+    })
+}
+
 #[derive(Clone)]
 pub(crate) enum RegisterPreflight {
     Available {

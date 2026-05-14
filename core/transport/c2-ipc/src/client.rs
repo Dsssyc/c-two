@@ -26,6 +26,10 @@ use c2_wire::handshake::{
     CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX, Handshake, MethodEntry, RouteInfo, decode_handshake,
     encode_client_handshake,
 };
+use c2_wire::registration_control::{
+    PENDING_ROUTE_REJECT_NOT_FOUND, PendingRouteAttestationResponse,
+    decode_pending_route_attestation_response, encode_pending_route_attestation_request,
+};
 
 use c2_mem::config::PoolConfig;
 use c2_mem::{MemPool, PoolAllocation};
@@ -1003,6 +1007,85 @@ impl IpcClient {
             })
     }
 
+    pub async fn pending_route_contract(
+        &mut self,
+        route_name: &str,
+        registration_token: &str,
+    ) -> Result<c2_contract::ExpectedRouteContract, IpcError> {
+        let payload = encode_pending_route_attestation_request(route_name, registration_token)
+            .map_err(IpcError::Handshake)?;
+        let rid = self.rid_counter.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        {
+            self.pending.lock().insert(rid, tx);
+        }
+
+        let frame = frame::encode_frame(rid as u64, flags::FLAG_CTRL, &payload);
+        let send_result: Result<(), IpcError> = async {
+            let mut writer_guard = self.writer.lock().await;
+            let writer = writer_guard.as_mut().ok_or(IpcError::Closed)?;
+            writer.write_all(&frame).await?;
+            Ok(())
+        }
+        .await;
+        if let Err(err) = send_result {
+            self.pending.lock().remove(&rid);
+            return Err(err);
+        }
+
+        let response = match rx.await {
+            Ok(result) => result?,
+            Err(_) => return Err(IpcError::Closed),
+        };
+        let payload = match response {
+            ResponseData::Inline(payload) => payload,
+            _ => {
+                return Err(IpcError::Handshake(
+                    "pending route attestation returned non-inline response".to_string(),
+                ));
+            }
+        };
+        match decode_pending_route_attestation_response(&payload).map_err(IpcError::Handshake)? {
+            PendingRouteAttestationResponse::Attested { contract } => {
+                let method_entries = contract
+                    .method_names
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| MethodEntry {
+                        name: name.clone(),
+                        index: index as u16,
+                    })
+                    .collect::<Vec<_>>();
+                self.route_tables.insert(
+                    contract.route_name.clone(),
+                    MethodTable::from_entries(
+                        &method_entries,
+                        contract.crm_ns.clone(),
+                        contract.crm_name.clone(),
+                        contract.crm_ver.clone(),
+                        contract.abi_hash.clone(),
+                        contract.signature_hash.clone(),
+                    ),
+                );
+                Ok(c2_contract::ExpectedRouteContract {
+                    route_name: contract.route_name,
+                    crm_ns: contract.crm_ns,
+                    crm_name: contract.crm_name,
+                    crm_ver: contract.crm_ver,
+                    abi_hash: contract.abi_hash,
+                    signature_hash: contract.signature_hash,
+                })
+            }
+            PendingRouteAttestationResponse::Rejected { code, message } => {
+                if code == PENDING_ROUTE_REJECT_NOT_FOUND {
+                    Err(IpcError::RouteNotFound(route_name.to_string()))
+                } else {
+                    Err(IpcError::Handshake(message))
+                }
+            }
+        }
+    }
+
     /// Get all route names.
     pub fn route_names(&self) -> Vec<&str> {
         self.route_tables.keys().map(|s| s.as_str()).collect()
@@ -1130,6 +1213,14 @@ async fn recv_loop(
         }
 
         let rid = hdr.request_id as u32;
+
+        if hdr.is_response() && hdr.is_ctrl() {
+            let tx = { pending.lock().remove(&rid) };
+            if let Some(tx) = tx {
+                let _ = tx.send(Ok(ResponseData::Inline(recv_buf.clone())));
+            }
+            continue;
+        }
 
         // Handle chunked response frames.
         if hdr.is_response() && flags::is_chunked(hdr.flags) {

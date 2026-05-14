@@ -378,7 +378,7 @@ class TestErrors:
         previous_relay = settings.relay_anchor_address
         try:
             registry.set_relay_anchor('http://127.0.0.1:9')
-            with pytest.raises(Exception, match='relay error'):
+            with pytest.raises(Exception, match='relay_prepare'):
                 registry.register(Hello, HelloImpl(), name='hello')
 
             assert 'hello' not in registry.names
@@ -393,7 +393,7 @@ class TestErrors:
         try:
             cc.register(Hello, HelloImpl(), name='hello')
             registry.set_relay_anchor('http://127.0.0.1:9')
-            with pytest.raises(Exception, match='relay error'):
+            with pytest.raises(Exception, match='relay_prepare'):
                 registry.register(Counter, CounterImpl(), name='counter')
 
             assert registry.names == ['hello']

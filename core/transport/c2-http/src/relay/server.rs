@@ -636,8 +636,8 @@ mod tests {
     use crate::relay::peer::{PeerEnvelope, PeerMessage};
     use crate::relay::state::{RegisterCommitResult, RelayState};
     use crate::relay::test_support::{
-        TEST_ABI_HASH, TEST_SIGNATURE_HASH, start_live_server_with_identity_and_contracts,
-        start_live_server_with_routes,
+        TEST_ABI_HASH, TEST_SIGNATURE_HASH, shutdown_live_server,
+        start_live_server_with_identity_and_contracts, start_live_server_with_routes,
     };
     use crate::relay::types::PeerSnapshot;
 
@@ -851,7 +851,7 @@ mod tests {
 
         assert!(relay.unregister_upstream("grid", "server-other").is_err());
         assert!(relay.unregister_upstream("grid", "server-grid").is_ok());
-        server.shutdown();
+        rt.block_on(shutdown_live_server(&server));
     }
 
     #[tokio::test]
@@ -889,7 +889,7 @@ mod tests {
             }
             other => panic!("expected RouteAnnounce, got {other:?}"),
         }
-        server.shutdown();
+        shutdown_live_server(&server).await;
     }
 
     #[tokio::test]
@@ -927,7 +927,7 @@ mod tests {
             }
             other => panic!("expected RouteAnnounce, got {other:?}"),
         }
-        server.shutdown();
+        shutdown_live_server(&server).await;
     }
 
     #[tokio::test]
@@ -967,7 +967,7 @@ mod tests {
 
         drop(tx);
         task.await.unwrap();
-        server.shutdown();
+        shutdown_live_server(&server).await;
     }
 
     #[tokio::test]
@@ -998,7 +998,7 @@ mod tests {
 
         drop(tx);
         task.await.unwrap();
-        server.shutdown();
+        shutdown_live_server(&server).await;
     }
 
     #[tokio::test]
@@ -1069,7 +1069,7 @@ mod tests {
 
         drop(tx);
         task.await.unwrap();
-        server.shutdown();
+        shutdown_live_server(&server).await;
     }
 
     #[tokio::test]
@@ -1121,7 +1121,7 @@ mod tests {
 
         drop(tx);
         task.await.unwrap();
-        old_server.shutdown();
+        shutdown_live_server(&old_server).await;
     }
 
     #[tokio::test]
@@ -1147,7 +1147,7 @@ mod tests {
         if let Some(client) = state.evict_connection("grid") {
             client.close_shared().await;
         }
-        old_server.shutdown();
+        shutdown_live_server(&old_server).await;
 
         let new_address = unique_ipc_address("dead_evicted_new");
         let new_server = start_live_server_with_routes(&new_address, "server-new", &["grid"]).await;
@@ -1170,7 +1170,7 @@ mod tests {
 
         drop(tx);
         task.await.unwrap();
-        new_server.shutdown();
+        shutdown_live_server(&new_server).await;
     }
 
     #[tokio::test]
@@ -1211,6 +1211,6 @@ mod tests {
             }
             other => panic!("expected RouteWithdraw, got {other:?}"),
         }
-        server.shutdown();
+        shutdown_live_server(&server).await;
     }
 }
