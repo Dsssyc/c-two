@@ -27,6 +27,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import c_two as cc
+from c_two.config.ipc import _resolve_server_ipc_config
+from c_two.crm.contract import CRMContract, crm_contract
 from c_two.transport.registry import _ProcessRegistry
 from tests.fixtures.hello import HelloImpl
 from tests.fixtures.ihello import Hello
@@ -62,7 +64,7 @@ def _require_external_relay(relay_url: str) -> None:
         raise SystemExit(_relay_help(relay_url)) from exc
 
 
-def _post_json(url: str, payload: dict[str, str], timeout: float = 5.0) -> None:
+def _post_json(url: str, payload: dict[str, object], timeout: float = 5.0) -> None:
     data = json.dumps(payload).encode('utf-8')
     req = urllib.request.Request(
         url,
@@ -80,15 +82,61 @@ def _register_relay_upstream(
     name: str,
     address: str,
     server_id: str,
+    server_instance_id: str,
+    expected: CRMContract,
+    max_payload_size: int,
 ) -> None:
     _post_json(
         f'{relay_url}/_register',
-        {'name': name, 'server_id': server_id, 'address': address},
+        {
+            'name': name,
+            'server_id': server_id,
+            'server_instance_id': server_instance_id,
+            'address': address,
+            'crm_ns': expected.crm_ns,
+            'crm_name': expected.crm_name,
+            'crm_ver': expected.crm_ver,
+            'abi_hash': expected.abi_hash,
+            'signature_hash': expected.signature_hash,
+            'max_payload_size': max_payload_size,
+        },
     )
 
 
 def _unregister_relay_upstream(relay_url: str, name: str, server_id: str) -> None:
     _post_json(f'{relay_url}/_unregister', {'name': name, 'server_id': server_id})
+
+
+def _server_instance_id_for(name: str, address: str, crm_class: type) -> str:
+    expected = crm_contract(crm_class)
+    registry = _ProcessRegistry.get()
+    client = registry._runtime_session.acquire_ipc_client(  # noqa: SLF001
+        address,
+        name,
+        *expected.native_args(),
+    )
+    try:
+        instance_id = client.server_instance_id
+        if not isinstance(instance_id, str) or not instance_id:
+            raise RuntimeError('registered server did not expose server_instance_id')
+        return instance_id
+    finally:
+        registry._runtime_session.release_ipc_client(address)  # noqa: SLF001
+
+
+def _expected_contract_hey_args(expected: CRMContract) -> list[str]:
+    return [
+        '-H',
+        f'x-c2-expected-crm-ns: {expected.crm_ns}',
+        '-H',
+        f'x-c2-expected-crm-name: {expected.crm_name}',
+        '-H',
+        f'x-c2-expected-crm-ver: {expected.crm_ver}',
+        '-H',
+        f'x-c2-expected-abi-hash: {expected.abi_hash}',
+        '-H',
+        f'x-c2-expected-signature-hash: {expected.signature_hash}',
+    ]
 
 
 def _stdout_tail(stdout: str, limit: int = 1200) -> str:
@@ -160,8 +208,20 @@ def main():
         server_id = cc.server_id()
         if server_id is None:
             raise RuntimeError('registered server did not expose server_id')
+        server_instance_id = _server_instance_id_for(route_name, ipc_addr, Hello)
+        expected = crm_contract(Hello)
+        expected_header_args = _expected_contract_hey_args(expected)
+        max_payload_size = int(_resolve_server_ipc_config()['max_payload_size'])
 
-        _register_relay_upstream(relay_url, route_name, ipc_addr, server_id)
+        _register_relay_upstream(
+            relay_url,
+            route_name,
+            ipc_addr,
+            server_id,
+            server_instance_id,
+            expected,
+            max_payload_size,
+        )
         route_registered = True
 
         # Warmup with hey
@@ -169,6 +229,7 @@ def main():
             'warmup',
             ['hey', '-n', '500', '-c', '8', '-m', 'POST',
              '-D', PAYLOAD_FILE, '-T', 'application/octet-stream',
+             *expected_header_args,
              f'{relay_url}/{route_name}/greeting'],
         )
 
@@ -178,6 +239,7 @@ def main():
             ['hey', '-n', str(TOTAL_REQUESTS), '-c', str(CONCURRENCY),
              '-m', 'POST', '-D', PAYLOAD_FILE,
              '-T', 'application/octet-stream',
+             *expected_header_args,
              f'{relay_url}/{route_name}/greeting'],
         )
 

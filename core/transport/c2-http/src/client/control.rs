@@ -6,6 +6,7 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 
 use super::client::{HttpError, runtime};
+use c2_contract::ExpectedRouteContract;
 
 const CONTROL_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
@@ -23,39 +24,19 @@ fn encode_segment(s: &str) -> String {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum ResolveCacheKey {
-    Name(String),
-    Typed {
-        name: String,
-        crm_ns: String,
-        crm_name: String,
-        crm_ver: String,
-    },
+struct ResolveCacheKey {
+    expected: ExpectedRouteContract,
 }
 
 impl ResolveCacheKey {
     fn route_name(&self) -> &str {
-        match self {
-            Self::Name(name)
-            | Self::Typed {
-                name,
-                crm_ns: _,
-                crm_name: _,
-                crm_ver: _,
-            } => name,
-        }
+        &self.expected.route_name
     }
 }
 
-fn resolve_cache_key(name: &str, expected_crm: Option<(&str, &str, &str)>) -> ResolveCacheKey {
-    match expected_crm {
-        Some((crm_ns, crm_name, crm_ver)) => ResolveCacheKey::Typed {
-            name: name.to_string(),
-            crm_ns: crm_ns.to_string(),
-            crm_name: crm_name.to_string(),
-            crm_ver: crm_ver.to_string(),
-        },
-        None => ResolveCacheKey::Name(name.to_string()),
+fn resolve_cache_key(expected: &ExpectedRouteContract) -> ResolveCacheKey {
+    ResolveCacheKey {
+        expected: expected.clone(),
     }
 }
 
@@ -69,9 +50,20 @@ struct RegisterRequest<'a> {
     server_id: &'a str,
     server_instance_id: &'a str,
     address: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    registration_token: Option<&'a str>,
+    #[serde(skip_serializing_if = "is_false")]
+    prepare_only: bool,
     crm_ns: &'a str,
     crm_name: &'a str,
     crm_ver: &'a str,
+    abi_hash: &'a str,
+    signature_hash: &'a str,
+    max_payload_size: u64,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -90,6 +82,9 @@ pub struct RelayRouteInfo {
     pub crm_ns: String,
     pub crm_name: String,
     pub crm_ver: String,
+    pub abi_hash: String,
+    pub signature_hash: String,
+    pub max_payload_size: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -155,15 +150,23 @@ impl RelayControlClient {
         crm_ns: &str,
         crm_name: &str,
         crm_ver: &str,
+        abi_hash: &str,
+        signature_hash: &str,
+        max_payload_size: u64,
     ) -> Result<(), HttpError> {
         let request = RegisterRequest {
             name,
             server_id,
             server_instance_id,
             address,
+            registration_token: None,
+            prepare_only: false,
             crm_ns,
             crm_name,
             crm_ver,
+            abi_hash,
+            signature_hash,
+            max_payload_size,
         };
         runtime().handle().block_on(self.post_json_with_retry(
             "/_register",
@@ -171,6 +174,40 @@ impl RelayControlClient {
             &[200, 201],
         ))?;
         self.invalidate(name);
+        Ok(())
+    }
+
+    pub fn prepare_register(
+        &self,
+        name: &str,
+        server_id: &str,
+        server_instance_id: &str,
+        address: &str,
+        crm_ns: &str,
+        crm_name: &str,
+        crm_ver: &str,
+        abi_hash: &str,
+        signature_hash: &str,
+        max_payload_size: u64,
+        registration_token: &str,
+    ) -> Result<(), HttpError> {
+        let request = RegisterRequest {
+            name,
+            server_id,
+            server_instance_id,
+            address,
+            registration_token: Some(registration_token),
+            prepare_only: true,
+            crm_ns,
+            crm_name,
+            crm_ver,
+            abi_hash,
+            signature_hash,
+            max_payload_size,
+        };
+        runtime()
+            .handle()
+            .block_on(self.post_json_with_retry("/_register", &request, &[202]))?;
         Ok(())
     }
 
@@ -185,45 +222,33 @@ impl RelayControlClient {
         Ok(())
     }
 
-    pub fn resolve(&self, name: &str) -> Result<Vec<RelayRouteInfo>, HttpError> {
-        runtime().handle().block_on(self.resolve_async(name))
-    }
-
-    pub async fn resolve_async(&self, name: &str) -> Result<Vec<RelayRouteInfo>, HttpError> {
-        self.resolve_with_query_async(name, None).await
-    }
-
     pub async fn resolve_matching_async(
         &self,
-        route_name: &str,
-        crm_ns: &str,
-        crm_name: &str,
-        crm_ver: &str,
+        expected: &ExpectedRouteContract,
     ) -> Result<Vec<RelayRouteInfo>, HttpError> {
-        self.resolve_with_query_async(route_name, Some((crm_ns, crm_name, crm_ver)))
-            .await
+        self.resolve_with_query_async(expected).await
     }
 
     async fn resolve_with_query_async(
         &self,
-        name: &str,
-        expected_crm: Option<(&str, &str, &str)>,
+        expected: &ExpectedRouteContract,
     ) -> Result<Vec<RelayRouteInfo>, HttpError> {
-        let cache_key = resolve_cache_key(name, expected_crm);
+        c2_contract::validate_expected_route_contract(expected)
+            .map_err(|err| HttpError::InvalidInput(err.to_string()))?;
+        let cache_key = resolve_cache_key(expected);
         if let Some(routes) = self.cached(&cache_key) {
             return Ok(routes);
         }
 
-        let path = match expected_crm {
-            Some((crm_ns, crm_name, crm_ver)) => format!(
-                "/_resolve/{}?crm_ns={}&crm_name={}&crm_ver={}",
-                encode_segment(name),
-                encode_segment(crm_ns),
-                encode_segment(crm_name),
-                encode_segment(crm_ver),
-            ),
-            None => format!("/_resolve/{}", encode_segment(name)),
-        };
+        let path = format!(
+            "/_resolve/{}?crm_ns={}&crm_name={}&crm_ver={}&abi_hash={}&signature_hash={}",
+            encode_segment(&expected.route_name),
+            encode_segment(&expected.crm_ns),
+            encode_segment(&expected.crm_name),
+            encode_segment(&expected.crm_ver),
+            encode_segment(&expected.abi_hash),
+            encode_segment(&expected.signature_hash),
+        );
         let resp = self
             .client
             .get(format!("{}{}", self.base_url, path))
@@ -338,6 +363,19 @@ impl RelayControlClient {
 mod tests {
     use super::*;
 
+    fn expected_contract() -> c2_contract::ExpectedRouteContract {
+        c2_contract::ExpectedRouteContract {
+            route_name: "grid".to_string(),
+            crm_ns: "test.ns".to_string(),
+            crm_name: "Grid".to_string(),
+            crm_ver: "0.1.0".to_string(),
+            abi_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_string(),
+            signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                .to_string(),
+        }
+    }
+
     #[test]
     fn canonicalizes_base_url() {
         let client = RelayControlClient::new(" http://relay.test// ", false).unwrap();
@@ -345,18 +383,69 @@ mod tests {
     }
 
     #[test]
-    fn route_cache_key_distinguishes_name_only_from_typed_identity_with_delimiters() {
-        assert_ne!(
-            resolve_cache_key("grid\0test.ns\0Grid\00.1.0", None),
-            resolve_cache_key("grid", Some(("test.ns", "Grid", "0.1.0"))),
-        );
+    fn relay_control_client_does_not_expose_name_only_resolve() {
+        let source = include_str!("control.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("control.rs must contain production section");
+        for forbidden in [
+            "pub fn resolve(&self, name: &str)",
+            "pub async fn resolve_async(&self, name: &str)",
+            "expected: Option<&ExpectedRouteContract>",
+            "ResolveCacheKey::Name",
+            "None => format!(\"/_resolve/{}\"",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "RelayControlClient must not keep name-only runtime resolve surface: {forbidden}",
+            );
+        }
+    }
+
+    #[test]
+    fn route_cache_key_distinguishes_contract_hashes() {
+        let left = expected_contract();
+        let mut right = left.clone();
+        right.signature_hash =
+            "1111111111111111111111111111111111111111111111111111111111111111".to_string();
+
+        assert_ne!(resolve_cache_key(&left), resolve_cache_key(&right));
+    }
+
+    #[test]
+    fn resolve_matching_rejects_malformed_expected_contract_before_request() {
+        let client = RelayControlClient::new_with_config(
+            "http://127.0.0.1:9",
+            false,
+            RelayControlClientConfig {
+                timeout: Duration::from_millis(50),
+                retry_attempts: 1,
+                retry_delay: Duration::from_millis(0),
+                ..RelayControlClientConfig::default()
+            },
+        )
+        .unwrap();
+        let mut malformed = expected_contract();
+        malformed.abi_hash = "not-a-sha256".to_string();
+
+        let err = runtime()
+            .handle()
+            .block_on(client.resolve_matching_async(&malformed))
+            .expect_err("malformed expected contract must be rejected locally");
+
+        match err {
+            HttpError::InvalidInput(message) => assert!(message.contains("abi_hash"), "{message}"),
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[test]
     fn route_cache_can_be_invalidated() {
         let client = RelayControlClient::new("http://relay.test", false).unwrap();
+        let expected = expected_contract();
         client.cache.lock().insert(
-            resolve_cache_key("grid", None),
+            resolve_cache_key(&expected),
             CacheEntry {
                 routes: vec![RelayRouteInfo {
                     name: "grid".into(),
@@ -367,17 +456,22 @@ mod tests {
                     crm_ns: "".into(),
                     crm_name: "".into(),
                     crm_ver: "".into(),
+                    abi_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .into(),
+                    signature_hash:
+                        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".into(),
+                    max_payload_size: 1024,
                 }],
                 inserted_at: Instant::now(),
             },
         );
 
         assert_eq!(
-            client.cached(&resolve_cache_key("grid", None)).unwrap()[0].relay_url,
+            client.cached(&resolve_cache_key(&expected)).unwrap()[0].relay_url,
             "http://relay-a.test"
         );
         client.invalidate("grid");
-        assert!(client.cached(&resolve_cache_key("grid", None)).is_none());
+        assert!(client.cached(&resolve_cache_key(&expected)).is_none());
     }
 
     #[cfg(feature = "relay")]
@@ -400,7 +494,12 @@ mod tests {
         });
 
         let client = RelayControlClient::new(&format!("http://{addr}"), false).unwrap();
-        let err = match client.resolve("missing/name") {
+        let mut expected = expected_contract();
+        expected.route_name = "missing/name".to_string();
+        let err = match runtime()
+            .handle()
+            .block_on(client.resolve_matching_async(&expected))
+        {
             Ok(_) => panic!("missing route should return a status error"),
             Err(err) => err,
         };

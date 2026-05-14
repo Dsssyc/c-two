@@ -1,11 +1,9 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use c2_config::RelayConfig;
-use c2_ipc::IpcClient;
 use c2_server::{
-    ConcurrencyMode, CrmCallback, CrmError, CrmRoute, RequestData, ResponseMeta, Scheduler, Server,
-    ServerIpcConfig,
+    ConcurrencyMode, CrmCallback, CrmError, RequestData, ResponseMeta, RouteBuildSpec,
+    SchedulerLimits, Server, ServerIpcConfig,
 };
 
 use crate::relay::disseminator::Disseminator;
@@ -27,6 +25,11 @@ impl Disseminator for NoopDisseminator {
 
 struct Echo;
 
+pub(crate) const TEST_ABI_HASH: &str =
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+pub(crate) const TEST_SIGNATURE_HASH: &str =
+    "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
 impl CrmCallback for Echo {
     fn invoke(
         &self,
@@ -42,7 +45,6 @@ impl CrmCallback for Echo {
 pub(crate) fn test_state_for_client() -> Arc<RelayState> {
     let config = RelayConfig {
         relay_id: "test-relay".into(),
-        skip_ipc_validation: false,
         ..RelayConfig::default()
     };
     Arc::new(RelayState::new(
@@ -52,7 +54,16 @@ pub(crate) fn test_state_for_client() -> Arc<RelayState> {
 }
 
 pub(crate) async fn register_echo_route(server: &Arc<Server>, name: &str) {
-    register_echo_route_with_contract(server, name, "test.echo", "Echo", "0.1.0").await;
+    register_echo_route_with_contract(
+        server,
+        name,
+        "test.echo",
+        "Echo",
+        "0.1.0",
+        TEST_ABI_HASH,
+        TEST_SIGNATURE_HASH,
+    )
+    .await;
 }
 
 pub(crate) async fn register_echo_route_with_contract(
@@ -61,22 +72,66 @@ pub(crate) async fn register_echo_route_with_contract(
     crm_ns: &str,
     crm_name: &str,
     crm_ver: &str,
+    abi_hash: &str,
+    signature_hash: &str,
 ) {
+    let route = echo_route(
+        server,
+        name,
+        crm_ns,
+        crm_name,
+        crm_ver,
+        abi_hash,
+        signature_hash,
+    );
+    let reservation = server.reserve_route(route).await.unwrap();
+    server.commit_reserved_route(reservation).await.unwrap();
+}
+
+pub(crate) async fn reserve_echo_route(
+    server: &Arc<Server>,
+    name: &str,
+) -> c2_server::server::PendingRouteReservation {
     server
-        .register_route(CrmRoute {
-            name: name.into(),
-            crm_ns: crm_ns.into(),
-            crm_name: crm_name.into(),
-            crm_ver: crm_ver.into(),
-            scheduler: Arc::new(Scheduler::new(
-                ConcurrencyMode::ReadParallel,
-                HashMap::new(),
-            )),
-            callback: Arc::new(Echo),
-            method_names: vec!["ping".into()],
-        })
+        .reserve_route(echo_route(
+            server,
+            name,
+            "test.echo",
+            "Echo",
+            "0.1.0",
+            TEST_ABI_HASH,
+            TEST_SIGNATURE_HASH,
+        ))
         .await
-        .unwrap();
+        .unwrap()
+}
+
+fn echo_route(
+    server: &Arc<Server>,
+    name: &str,
+    crm_ns: &str,
+    crm_name: &str,
+    crm_ver: &str,
+    abi_hash: &str,
+    signature_hash: &str,
+) -> c2_server::BuiltRoute {
+    server
+        .build_route(
+            RouteBuildSpec {
+                name: name.into(),
+                crm_ns: crm_ns.into(),
+                crm_name: crm_name.into(),
+                crm_ver: crm_ver.into(),
+                abi_hash: abi_hash.into(),
+                signature_hash: signature_hash.into(),
+                method_names: vec!["ping".into()],
+                access_map: std::collections::HashMap::new(),
+                concurrency_mode: ConcurrencyMode::ReadParallel,
+                limits: SchedulerLimits::default(),
+            },
+            Arc::new(Echo),
+        )
+        .unwrap()
 }
 
 pub(crate) async fn start_live_server_with_routes(
@@ -86,7 +141,16 @@ pub(crate) async fn start_live_server_with_routes(
 ) -> Arc<Server> {
     let route_contracts = routes
         .iter()
-        .map(|route| (*route, "test.echo", "Echo", "0.1.0"))
+        .map(|route| {
+            (
+                *route,
+                "test.echo",
+                "Echo",
+                "0.1.0",
+                TEST_ABI_HASH,
+                TEST_SIGNATURE_HASH,
+            )
+        })
         .collect::<Vec<_>>();
     start_live_server_with_identity_and_contracts(
         address,
@@ -101,7 +165,7 @@ pub(crate) async fn start_live_server_with_identity_and_contracts(
     address: &str,
     server_id: &str,
     server_instance_id: &str,
-    routes: &[(&str, &str, &str, &str)],
+    routes: &[(&str, &str, &str, &str, &str, &str)],
 ) -> Arc<Server> {
     let server = Arc::new(
         Server::new_with_identity(
@@ -114,27 +178,35 @@ pub(crate) async fn start_live_server_with_identity_and_contracts(
         )
         .unwrap(),
     );
-    for (route, crm_ns, crm_name, crm_ver) in routes {
-        register_echo_route_with_contract(&server, route, crm_ns, crm_name, crm_ver).await;
+    for (route, crm_ns, crm_name, crm_ver, abi_hash, signature_hash) in routes {
+        register_echo_route_with_contract(
+            &server,
+            route,
+            crm_ns,
+            crm_name,
+            crm_ver,
+            abi_hash,
+            signature_hash,
+        )
+        .await;
     }
     let run_server = server.clone();
     tokio::spawn(async move {
         let _ = run_server.run().await;
     });
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            let mut client = IpcClient::new(address);
-            if client.connect().await.is_ok() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    server
+        .wait_until_responsive(std::time::Duration::from_secs(2))
+        .await
+        .unwrap();
     server
 }
 
 pub(crate) async fn start_live_server(address: &str, server_id: &str) -> Arc<Server> {
     start_live_server_with_routes(address, server_id, &["grid"]).await
+}
+
+pub(crate) async fn shutdown_live_server(server: &Arc<Server>) {
+    let _ = server
+        .shutdown_and_wait(std::time::Duration::from_secs(2))
+        .await;
 }

@@ -164,13 +164,9 @@ mod control_tests {
     }
 
     #[test]
-    fn call_control_empty_name() {
-        let encoded = encode_call_control("", 0).unwrap();
-        assert_eq!(encoded.len(), 3); // 1B name_len=0 + 2B idx
-        let (decoded, consumed) = decode_call_control(&encoded, 0).unwrap();
-        assert_eq!(consumed, 3);
-        assert_eq!(decoded.route_name, "");
-        assert_eq!(decoded.method_idx, 0);
+    fn call_control_rejects_empty_route_name() {
+        assert!(encode_call_control("", 0).is_err());
+        assert!(decode_call_control(&[0, 0, 0], 0).is_err());
     }
 
     #[test]
@@ -185,7 +181,7 @@ mod control_tests {
 
     #[test]
     fn reply_control_success_roundtrip() {
-        let encoded = encode_reply_control(&ReplyControl::Success);
+        let encoded = try_encode_reply_control(&ReplyControl::Success).unwrap();
         assert_eq!(encoded, &[STATUS_SUCCESS]);
         let (decoded, consumed) = decode_reply_control(&encoded, 0).unwrap();
         assert_eq!(consumed, 1);
@@ -195,7 +191,7 @@ mod control_tests {
     #[test]
     fn reply_control_error_roundtrip() {
         let err = b"3:test error".to_vec();
-        let encoded = encode_reply_control(&ReplyControl::Error(err.clone()));
+        let encoded = try_encode_reply_control(&ReplyControl::Error(err.clone())).unwrap();
         let (decoded, consumed) = decode_reply_control(&encoded, 0).unwrap();
         assert_eq!(consumed, encoded.len());
         assert_eq!(decoded, ReplyControl::Error(err));
@@ -203,7 +199,7 @@ mod control_tests {
 
     #[test]
     fn reply_control_error_empty_data() {
-        let encoded = encode_reply_control(&ReplyControl::Error(vec![]));
+        let encoded = try_encode_reply_control(&ReplyControl::Error(vec![])).unwrap();
         // status=1, error_len=0 → [0x01, 0x00, 0x00, 0x00, 0x00]
         assert_eq!(encoded.len(), 5);
         let (decoded, consumed) = decode_reply_control(&encoded, 0).unwrap();
@@ -213,11 +209,19 @@ mod control_tests {
 
     #[test]
     fn reply_control_route_not_found_roundtrip() {
-        let encoded = encode_reply_control(&ReplyControl::RouteNotFound("grid".into()));
+        let encoded =
+            try_encode_reply_control(&ReplyControl::RouteNotFound("grid".into())).unwrap();
         assert_eq!(encoded[0], STATUS_ROUTE_NOT_FOUND);
         let (decoded, consumed) = decode_reply_control(&encoded, 0).unwrap();
         assert_eq!(consumed, encoded.len());
         assert_eq!(decoded, ReplyControl::RouteNotFound("grid".into()));
+    }
+
+    #[test]
+    fn reply_control_route_not_found_rejects_invalid_route_text() {
+        let err = try_encode_reply_control(&ReplyControl::RouteNotFound("grid\0hidden".into()))
+            .expect_err("invalid route text must not be encoded");
+        assert!(err.to_string().contains("route_name"), "{err}");
     }
 
     #[test]
@@ -248,7 +252,7 @@ mod control_tests {
 
     #[test]
     fn call_control_rejects_route_name_longer_than_one_byte_length() {
-        let long_name = "x".repeat(MAX_CALL_ROUTE_NAME_BYTES + 1);
+        let long_name = "x".repeat(c2_contract::MAX_WIRE_TEXT_BYTES + 1);
         let err = encode_call_control(&long_name, 0).unwrap_err();
         assert!(err.to_string().contains("route_name"));
     }
@@ -257,11 +261,175 @@ mod control_tests {
 mod handshake_tests {
     use crate::handshake::*;
 
+    const ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const SIG_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
     fn test_identity() -> ServerIdentity {
         ServerIdentity {
             server_id: "test-server".to_string(),
             server_instance_id: "test-instance".to_string(),
         }
+    }
+
+    fn route(name: &str, methods: &[&str]) -> RouteInfo {
+        RouteInfo {
+            name: name.into(),
+            crm_ns: "test.grid".into(),
+            crm_name: "Grid".into(),
+            crm_ver: "0.1.0".into(),
+            abi_hash: ABI_HASH.into(),
+            signature_hash: SIG_HASH.into(),
+            max_payload_size: 1024,
+            methods: methods
+                .iter()
+                .enumerate()
+                .map(|(index, method)| MethodEntry {
+                    name: (*method).into(),
+                    index: index as u16,
+                })
+                .collect(),
+        }
+    }
+
+    fn route_hash(name: &str) -> RouteInfo {
+        RouteInfo {
+            name: name.into(),
+            crm_ns: "test.grid".into(),
+            crm_name: "Grid".into(),
+            crm_ver: "0.1.0".into(),
+            abi_hash: ABI_HASH.into(),
+            signature_hash: SIG_HASH.into(),
+            max_payload_size: 1024,
+            methods: vec![MethodEntry {
+                name: "get".into(),
+                index: 0,
+            }],
+        }
+    }
+
+    #[test]
+    fn route_hash_fields_roundtrip_through_server_handshake() {
+        let routes = vec![route_hash("grid")];
+        let encoded = encode_server_handshake(&[], CAP_CALL_V2, &routes, "", &test_identity())
+            .expect("hash-bearing route encodes");
+        let decoded = decode_handshake(&encoded).expect("hash-bearing route decodes");
+
+        assert_eq!(decoded.routes[0].abi_hash, ABI_HASH);
+        assert_eq!(decoded.routes[0].signature_hash, SIG_HASH);
+    }
+
+    #[test]
+    fn route_hash_encode_rejects_malformed_hashes() {
+        let mut route = route_hash("grid");
+        route.abi_hash = "ABCDEF".into();
+        let err = encode_server_handshake(&[], CAP_CALL_V2, &[route], "", &test_identity())
+            .expect_err("uppercase or short ABI hash must fail");
+        assert!(err.to_string().contains("abi_hash"));
+
+        let mut route = route_hash("grid");
+        route.signature_hash = "not-a-sha256".into();
+        let err = encode_server_handshake(&[], CAP_CALL_V2, &[route], "", &test_identity())
+            .expect_err("malformed signature hash must fail");
+        assert!(err.to_string().contains("signature_hash"));
+    }
+
+    #[test]
+    fn route_hash_decode_rejects_malformed_hashes() {
+        let route = route_hash("grid");
+        let mut encoded = encode_server_handshake(&[], CAP_CALL_V2, &[route], "", &test_identity())
+            .expect("valid handshake encodes before byte mutation");
+
+        let hash_pos = encoded
+            .windows(ABI_HASH.len())
+            .position(|window| window == ABI_HASH.as_bytes())
+            .expect("encoded ABI hash should be present");
+        encoded[hash_pos] = b'X';
+
+        let err = decode_handshake(&encoded).expect_err("decode must reject malformed ABI hash");
+        assert!(err.to_string().contains("abi_hash"));
+    }
+
+    #[test]
+    fn route_hash_layout_bumps_handshake_version() {
+        assert_eq!(HANDSHAKE_VERSION, 10);
+
+        let mut encoded = encode_client_handshake(&[], CAP_CALL_V2, "")
+            .expect("current client handshake encodes");
+        encoded[0] = 9;
+        let err = decode_handshake(&encoded).expect_err("v9 layout must be rejected");
+        assert!(err.to_string().contains("handshake version"));
+    }
+
+    #[test]
+    fn crm_tag_validator_accepts_normal_contract_identity() {
+        c2_contract::validate_crm_tag("test.grid", "Grid", "0.1.0").unwrap();
+    }
+
+    #[test]
+    fn crm_tag_validator_rejects_malformed_fields() {
+        let too_long = "x".repeat(c2_contract::MAX_WIRE_TEXT_BYTES + 1);
+        for (crm_ns, crm_name, crm_ver, needle) in [
+            ("", "Grid", "0.1.0", "cannot be empty"),
+            ("test.grid", "", "0.1.0", "cannot be empty"),
+            ("test.grid", "Grid", "", "cannot be empty"),
+            (
+                " test.grid",
+                "Grid",
+                "0.1.0",
+                "leading or trailing whitespace",
+            ),
+            ("test.grid", "Grid\nInjected", "0.1.0", "control characters"),
+            ("test/grid", "Grid", "0.1.0", "path or tag separators"),
+            ("test.grid", "Bad\\Grid", "0.1.0", "path or tag separators"),
+            ("test.grid", too_long.as_str(), "0.1.0", "cannot exceed"),
+        ] {
+            let err = c2_contract::validate_crm_tag(crm_ns, crm_name, crm_ver)
+                .expect_err("malformed CrmTag field must fail");
+            let err = err.to_string();
+            assert!(err.contains(needle), "expected {needle:?}, got {err:?}");
+        }
+    }
+
+    #[test]
+    fn server_handshake_encode_rejects_invalid_crm_tag_fields() {
+        let mut route = route("grid", &["get"]);
+        route.crm_name = "Grid\0Injected".into();
+
+        let err = encode_server_handshake(&[], CAP_CALL_V2, &[route], "", &test_identity())
+            .expect_err("invalid CrmTag must fail during encode");
+
+        assert!(err.to_string().contains("crm name"));
+        assert!(err.to_string().contains("control characters"));
+    }
+
+    #[test]
+    fn server_handshake_decode_rejects_invalid_crm_tag_fields() {
+        let route = RouteInfo {
+            name: "grid".into(),
+            crm_ns: "test.grid".into(),
+            crm_name: "Grid".into(),
+            crm_ver: "0.1.0".into(),
+            abi_hash: ABI_HASH.into(),
+            signature_hash: SIG_HASH.into(),
+            max_payload_size: 1024,
+            methods: vec![MethodEntry {
+                name: "get".into(),
+                index: 0,
+            }],
+        };
+        let identity = test_identity();
+        let mut encoded = encode_server_handshake(&[], CAP_CALL_V2, &[route], "", &identity)
+            .expect("valid handshake encodes before byte-level mutation");
+
+        let grid_pos = encoded
+            .windows("Grid".len())
+            .position(|window| window == b"Grid")
+            .expect("encoded CRM name should be present");
+        encoded[grid_pos + 1] = b'\n';
+
+        let err = decode_handshake(&encoded).expect_err("decode must reject malformed CrmTag");
+        assert!(err.to_string().contains("crm name"));
+        assert!(err.to_string().contains("control characters"));
     }
 
     #[test]
@@ -289,6 +457,9 @@ mod handshake_tests {
             crm_ns: "test.grid".to_string(),
             crm_name: "Grid".to_string(),
             crm_ver: "1.2.3".to_string(),
+            abi_hash: ABI_HASH.to_string(),
+            signature_hash: SIG_HASH.to_string(),
+            max_payload_size: 1024,
             methods: vec![MethodEntry {
                 name: "ping".to_string(),
                 index: 0,
@@ -351,6 +522,9 @@ mod handshake_tests {
                 crm_ns: "test.grid".into(),
                 crm_name: "Grid".into(),
                 crm_ver: "0.1.0".into(),
+                abi_hash: ABI_HASH.into(),
+                signature_hash: SIG_HASH.into(),
+                max_payload_size: 1024,
                 methods: vec![
                     MethodEntry {
                         name: "hello".into(),
@@ -371,6 +545,9 @@ mod handshake_tests {
                 crm_ns: "test.counter".into(),
                 crm_name: "Counter".into(),
                 crm_ver: "0.1.0".into(),
+                abi_hash: ABI_HASH.into(),
+                signature_hash: SIG_HASH.into(),
+                max_payload_size: 1024,
                 methods: vec![
                     MethodEntry {
                         name: "get".into(),
@@ -409,10 +586,13 @@ mod handshake_tests {
     #[test]
     fn server_handshake_rejects_overlong_route_name() {
         let routes = vec![RouteInfo {
-            name: "x".repeat(MAX_HANDSHAKE_NAME_BYTES + 1),
+            name: "x".repeat(c2_contract::MAX_WIRE_TEXT_BYTES + 1),
             crm_ns: "test.overlong".into(),
             crm_name: "Overlong".into(),
             crm_ver: "0.1.0".into(),
+            abi_hash: ABI_HASH.into(),
+            signature_hash: SIG_HASH.into(),
+            max_payload_size: 1024,
             methods: vec![],
         }];
 
@@ -425,9 +605,12 @@ mod handshake_tests {
     fn server_handshake_rejects_overlong_crm_metadata() {
         let routes = vec![RouteInfo {
             name: "grid".into(),
-            crm_ns: "x".repeat(MAX_HANDSHAKE_NAME_BYTES + 1),
+            crm_ns: "x".repeat(c2_contract::MAX_WIRE_TEXT_BYTES + 1),
             crm_name: "Grid".into(),
             crm_ver: "0.1.0".into(),
+            abi_hash: ABI_HASH.into(),
+            signature_hash: SIG_HASH.into(),
+            max_payload_size: 1024,
             methods: vec![],
         }];
 
@@ -438,8 +621,11 @@ mod handshake_tests {
         let routes = vec![RouteInfo {
             name: "grid".into(),
             crm_ns: "test.grid".into(),
-            crm_name: "x".repeat(MAX_HANDSHAKE_NAME_BYTES + 1),
+            crm_name: "x".repeat(c2_contract::MAX_WIRE_TEXT_BYTES + 1),
             crm_ver: "0.1.0".into(),
+            abi_hash: ABI_HASH.into(),
+            signature_hash: SIG_HASH.into(),
+            max_payload_size: 1024,
             methods: vec![],
         }];
 
@@ -451,7 +637,10 @@ mod handshake_tests {
             name: "grid".into(),
             crm_ns: "test.grid".into(),
             crm_name: "Grid".into(),
-            crm_ver: "x".repeat(MAX_HANDSHAKE_NAME_BYTES + 1),
+            crm_ver: "x".repeat(c2_contract::MAX_WIRE_TEXT_BYTES + 1),
+            abi_hash: ABI_HASH.into(),
+            signature_hash: SIG_HASH.into(),
+            max_payload_size: 1024,
             methods: vec![],
         }];
 
@@ -467,6 +656,9 @@ mod handshake_tests {
             crm_ns: "test.grid".into(),
             crm_name: "Grid".into(),
             crm_ver: "0.1.0".into(),
+            abi_hash: ABI_HASH.into(),
+            signature_hash: SIG_HASH.into(),
+            max_payload_size: 1024,
             methods: (0..=MAX_METHODS)
                 .map(|i| MethodEntry {
                     name: format!("m{i}"),
@@ -489,8 +681,8 @@ mod handshake_tests {
 
     #[test]
     fn empty_handshake() {
-        // Version 9, prefix_len=0, 0 segments, cap_flags=0
-        let buf = [9, 0, 0, 0, 0, 0];
+        // Version 10, prefix_len=0, 0 segments, cap_flags=0
+        let buf = [10, 0, 0, 0, 0, 0];
         let decoded = decode_handshake(&buf).unwrap();
         assert_eq!(decoded.prefix, "");
         assert!(decoded.segments.is_empty());
@@ -508,6 +700,9 @@ mod cross_lang_tests {
     use crate::control::*;
     use crate::frame::*;
     use crate::handshake::*;
+
+    const ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const SIG_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
 
     fn hex_to_bytes(hex: &str) -> Vec<u8> {
         (0..hex.len())
@@ -535,12 +730,11 @@ mod cross_lang_tests {
     }
 
     #[test]
-    fn canonical_empty_call_control_fixture_decodes() {
+    fn canonical_empty_call_control_fixture_rejects_default_route() {
         let bytes = hex_to_bytes("000000");
-        let (ctrl, consumed) = decode_call_control(&bytes, 0).unwrap();
-        assert_eq!(ctrl.route_name, "");
-        assert_eq!(ctrl.method_idx, 0);
-        assert_eq!(consumed, 3);
+        let err = decode_call_control(&bytes, 0)
+            .expect_err("empty call-control route names are not a compatibility fixture");
+        assert!(err.to_string().contains("route_name"), "{err}");
     }
 
     #[test]
@@ -577,8 +771,8 @@ mod cross_lang_tests {
 
     #[test]
     fn canonical_client_handshake_fixture_decodes() {
-        // v9: [09][00 prefix_len][01 00 seg_count][00 00 00 10 size][04 seg0][03 00 caps]
-        let bytes = hex_to_bytes("090001000000001004736567300300");
+        // v10: [0a][00 prefix_len][01 00 seg_count][00 00 00 10 size][04 seg0][03 00 caps]
+        let bytes = hex_to_bytes("0a0001000000001004736567300300");
         let hs = decode_handshake(&bytes).unwrap();
         assert_eq!(hs.prefix, "");
         assert_eq!(hs.segments.len(), 1);
@@ -591,10 +785,10 @@ mod cross_lang_tests {
 
     #[test]
     fn canonical_server_handshake_fixture_decodes() {
-        // v9: client handshake prefix, server identity, then route table
-        // with per-route full CRM tag.
+        // v10: client handshake prefix, server identity, then route table
+        // with per-route full CRM tag and contract hashes.
         let bytes = hex_to_bytes(
-            "0900010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696409746573742e67726964044772696405302e312e3002000568656c6c6f0000036164640100",
+            "0a00010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696409746573742e67726964044772696405302e312e3040303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566303132333435363738396162636465664061626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839000400000000000002000568656c6c6f0000036164640100",
         );
         let hs = decode_handshake(&bytes).unwrap();
         assert_eq!(hs.prefix, "");
@@ -614,6 +808,8 @@ mod cross_lang_tests {
         assert_eq!(hs.routes[0].crm_ns, "test.grid");
         assert_eq!(hs.routes[0].crm_name, "Grid");
         assert_eq!(hs.routes[0].crm_ver, "0.1.0");
+        assert_eq!(hs.routes[0].abi_hash, ABI_HASH);
+        assert_eq!(hs.routes[0].signature_hash, SIG_HASH);
         assert_eq!(hs.routes[0].methods.len(), 2);
         assert_eq!(hs.routes[0].methods[0].name, "hello");
         assert_eq!(hs.routes[0].methods[0].index, 0);
@@ -630,14 +826,14 @@ mod cross_lang_tests {
 
     #[test]
     fn rust_encode_matches_canonical_reply_success_fixture() {
-        let encoded = encode_reply_control(&ReplyControl::Success);
+        let encoded = try_encode_reply_control(&ReplyControl::Success).unwrap();
         assert_eq!(encoded, hex_to_bytes("00"));
     }
 
     #[test]
     fn rust_encode_matches_canonical_reply_error_fixture() {
         let err = b"3:test error".to_vec();
-        let encoded = encode_reply_control(&ReplyControl::Error(err));
+        let encoded = try_encode_reply_control(&ReplyControl::Error(err)).unwrap();
         let expected = hex_to_bytes("010c000000333a74657374206572726f72");
         assert_eq!(encoded, expected);
     }
@@ -659,8 +855,8 @@ mod cross_lang_tests {
     fn rust_encode_matches_canonical_client_handshake_fixture() {
         let segments = vec![("seg0".into(), 268_435_456u32)];
         let encoded = encode_client_handshake(&segments, CAP_CALL_V2 | CAP_METHOD_IDX, "").unwrap();
-        // v9: [09][00 prefix_len][01 00 seg_count][00 00 00 10 size][04 name_len][seg0][03 00 caps]
-        let expected = hex_to_bytes("090001000000001004736567300300");
+        // v10: [0a][00 prefix_len][01 00 seg_count][00 00 00 10 size][04 name_len][seg0][03 00 caps]
+        let expected = hex_to_bytes("0a0001000000001004736567300300");
         assert_eq!(encoded, expected);
     }
 
@@ -672,6 +868,9 @@ mod cross_lang_tests {
             crm_ns: "test.grid".into(),
             crm_name: "Grid".into(),
             crm_ver: "0.1.0".into(),
+            abi_hash: ABI_HASH.into(),
+            signature_hash: SIG_HASH.into(),
+            max_payload_size: 1024,
             methods: vec![
                 MethodEntry {
                     name: "hello".into(),
@@ -695,10 +894,10 @@ mod cross_lang_tests {
             &identity,
         )
         .unwrap();
-        // v9: [09][00 prefix_len] then segments/caps, identity, and route table
-        // with per-route full CRM tag metadata.
+        // v10: [0a][00 prefix_len] then segments/caps, identity, and route table
+        // with per-route full CRM tag and contract hash metadata.
         let expected = hex_to_bytes(
-            "0900010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696409746573742e67726964044772696405302e312e3002000568656c6c6f0000036164640100",
+            "0a00010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696409746573742e67726964044772696405302e312e3040303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566303132333435363738396162636465664061626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839000400000000000002000568656c6c6f0000036164640100",
         );
         assert_eq!(encoded, expected);
     }

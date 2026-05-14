@@ -42,6 +42,12 @@ def _wait_for_server(address: str, timeout: float = 5.0) -> None:
     raise TimeoutError(f'Server at {address} not ready after {timeout}s')
 
 
+def _hello_server(address: str, *, ipc_overrides: dict[str, object]) -> Server:
+    server = Server(bind_address=address, ipc_overrides=ipc_overrides)
+    server.register_crm(Hello, HelloImpl(), name='hello')
+    return server
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -53,12 +59,9 @@ class TestHeartbeatIntegration:
     def test_active_connection_survives_heartbeat(self):
         """An active client is NOT disconnected by heartbeat probes."""
         address = f'ipc://{_unique_region()}'
-        server = Server(
+        server = _hello_server(
             address,
-            Hello,
-            HelloImpl(),
             ipc_overrides={'heartbeat_interval': 0.3, 'heartbeat_timeout': 0.8},
-            name='hello',
         )
         server.start()
         try:
@@ -81,12 +84,9 @@ class TestHeartbeatIntegration:
     def test_idle_client_survives_heartbeat_with_pong(self):
         """An idle client that responds to PING survives heartbeat probes."""
         address = f'ipc://{_unique_region()}'
-        server = Server(
+        server = _hello_server(
             address,
-            Hello,
-            HelloImpl(),
             ipc_overrides={'heartbeat_interval': 0.2, 'heartbeat_timeout': 0.6},
-            name='hello',
         )
         server.start()
         try:
@@ -114,12 +114,9 @@ class TestHeartbeatIntegration:
         """
         import socket
         address = f'ipc://{_unique_region()}'
-        server = Server(
+        server = _hello_server(
             address,
-            Hello,
-            HelloImpl(),
             ipc_overrides={'heartbeat_interval': 0.1, 'heartbeat_timeout': 0.3},
-            name='hello',
         )
         server.start()
         try:
@@ -146,12 +143,9 @@ class TestHeartbeatIntegration:
     def test_heartbeat_disabled(self):
         """When heartbeat_interval=0, no probes are sent."""
         address = f'ipc://{_unique_region()}'
-        server = Server(
+        server = _hello_server(
             address,
-            Hello,
-            HelloImpl(),
             ipc_overrides={'heartbeat_interval': 0, 'heartbeat_timeout': 30},
-            name='hello',
         )
         server.start()
         try:

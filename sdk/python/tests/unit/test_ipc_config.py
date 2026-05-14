@@ -34,9 +34,11 @@ def _reset_registry_and_settings(monkeypatch):
     _ProcessRegistry.reset()
     settings.relay_anchor_address = None
     settings.shm_threshold = None
+    settings.remote_payload_chunk_size = None
     monkeypatch.setenv('C2_ENV_FILE', '')
     for key in (
         'C2_SHM_THRESHOLD',
+        'C2_REMOTE_PAYLOAD_CHUNK_SIZE',
         'C2_IPC_POOL_SEGMENT_SIZE',
         'C2_IPC_REASSEMBLY_SEGMENT_SIZE',
         'C2_RELAY_ANCHOR_ADDRESS',
@@ -49,6 +51,7 @@ def _reset_registry_and_settings(monkeypatch):
     _ProcessRegistry.reset()
     settings.relay_anchor_address = None
     settings.shm_threshold = None
+    settings.remote_payload_chunk_size = None
 
 
 def test_public_config_exports_only_override_schemas():
@@ -85,6 +88,7 @@ def test_override_schemas_are_typed_and_do_not_include_derived_or_global_fields(
     assert base['chunk_gc_interval'] is float
     assert server['heartbeat_interval'] is float
     assert server['max_pending_requests'] is int
+    assert server['max_execution_workers'] is int
     assert client['reassembly_segment_size'] is int
 
     for hints in (base, server, client):
@@ -124,6 +128,51 @@ def test_transport_policy_override_beats_env(monkeypatch):
         server.shutdown()
 
 
+def test_remote_payload_chunk_size_resolves_from_env_and_policy(monkeypatch):
+    monkeypatch.setenv('C2_REMOTE_PAYLOAD_CHUNK_SIZE', '2097152')
+
+    from c_two._native import resolve_remote_payload_chunk_size
+
+    assert resolve_remote_payload_chunk_size() == 2_097_152
+    assert settings.remote_payload_chunk_size == 2_097_152
+
+    cc.set_transport_policy(remote_payload_chunk_size=1_048_576)
+    registry = _ProcessRegistry.get()
+
+    assert settings.remote_payload_chunk_size == 1_048_576
+    assert registry._runtime_session.remote_payload_chunk_size_override == 1_048_576  # noqa: SLF001
+
+
+def test_transport_policy_updates_preserve_unspecified_overrides():
+    cc.set_transport_policy(shm_threshold=8192)
+    cc.set_transport_policy(remote_payload_chunk_size=1_048_576)
+    registry = _ProcessRegistry.get()
+
+    assert settings.shm_threshold == 8192
+    assert settings.remote_payload_chunk_size == 1_048_576
+    assert registry._runtime_session.client_ipc_config['shm_threshold'] == 8192  # noqa: SLF001
+    assert registry._runtime_session.remote_payload_chunk_size_override == 1_048_576  # noqa: SLF001
+
+    cc.set_transport_policy(shm_threshold=None)
+    registry = _ProcessRegistry.get()
+
+    assert registry._runtime_session.client_ipc_config['shm_threshold'] == 4096  # noqa: SLF001
+    assert registry._runtime_session.remote_payload_chunk_size_override == 1_048_576  # noqa: SLF001
+
+
+def test_remote_payload_chunk_size_zero_rejected(monkeypatch):
+    monkeypatch.setenv('C2_REMOTE_PAYLOAD_CHUNK_SIZE', '0')
+
+    from c_two._native import resolve_remote_payload_chunk_size
+
+    with pytest.raises(ValueError, match='C2_REMOTE_PAYLOAD_CHUNK_SIZE'):
+        resolve_remote_payload_chunk_size()
+
+    monkeypatch.delenv('C2_REMOTE_PAYLOAD_CHUNK_SIZE')
+    with pytest.raises(ValueError, match='C2_REMOTE_PAYLOAD_CHUNK_SIZE'):
+        cc.set_transport_policy(remote_payload_chunk_size=0)
+
+
 def test_shm_override_helper_only_contains_shm_threshold():
     settings.shm_threshold = 4096
     assert settings._shm_overrides() == {'shm_threshold': 4096}  # noqa: SLF001
@@ -140,6 +189,53 @@ def test_server_ipc_overrides_beat_env(monkeypatch):
         assert server._config['pool_segment_size'] == 4 * 1024 * 1024  # noqa: SLF001
     finally:
         server.shutdown()
+
+
+def test_server_execution_workers_env_and_override(monkeypatch):
+    monkeypatch.setenv('C2_IPC_MAX_EXECUTION_WORKERS', '9')
+
+    server = Server(bind_address='ipc://unit_execution_workers_env')
+    try:
+        assert server._config['max_execution_workers'] == 9  # noqa: SLF001
+    finally:
+        server.shutdown()
+
+    override_server = Server(
+        bind_address='ipc://unit_execution_workers_override',
+        ipc_overrides={'max_execution_workers': 7},
+    )
+    try:
+        assert override_server._config['max_execution_workers'] == 7  # noqa: SLF001
+    finally:
+        override_server.shutdown()
+
+
+def test_server_execution_workers_zero_rejected(monkeypatch):
+    monkeypatch.setenv('C2_IPC_MAX_EXECUTION_WORKERS', '0')
+
+    with pytest.raises(ValueError, match='max_execution_workers'):
+        Server(bind_address='ipc://unit_execution_workers_zero_env')
+
+    monkeypatch.delenv('C2_IPC_MAX_EXECUTION_WORKERS')
+    with pytest.raises(ValueError, match='max_execution_workers'):
+        Server(
+            bind_address='ipc://unit_execution_workers_zero_override',
+            ipc_overrides={'max_execution_workers': 0},
+        )
+
+
+def test_server_execution_workers_above_hard_limit_rejected(monkeypatch):
+    monkeypatch.setenv('C2_IPC_MAX_EXECUTION_WORKERS', '65')
+
+    with pytest.raises(ValueError, match='max_execution_workers'):
+        Server(bind_address='ipc://unit_execution_workers_oversized_env')
+
+    monkeypatch.delenv('C2_IPC_MAX_EXECUTION_WORKERS')
+    with pytest.raises(ValueError, match='max_execution_workers'):
+        Server(
+            bind_address='ipc://unit_execution_workers_oversized_override',
+            ipc_overrides={'max_execution_workers': 65},
+        )
 
 
 def test_client_ipc_overrides_beat_env(monkeypatch):
@@ -320,6 +416,8 @@ def test_relay_resolved_connect_delegates_route_validation_to_runtime_session(mo
             expected_crm_ns: str,
             expected_crm_name: str,
             expected_crm_ver: str,
+            expected_abi_hash: str,
+            expected_signature_hash: str,
         ):
             calls.append((
                 self.relay_anchor_address_override,
@@ -327,6 +425,8 @@ def test_relay_resolved_connect_delegates_route_validation_to_runtime_session(mo
                 expected_crm_ns,
                 expected_crm_name,
                 expected_crm_ver,
+                expected_abi_hash,
+                expected_signature_hash,
             ))
             return FakeRelayAwareClient()
 
@@ -342,9 +442,17 @@ def test_relay_resolved_connect_delegates_route_validation_to_runtime_session(mo
     crm = registry.connect(IUnitConfigCRM, name='unit-route')
 
     assert 'RustClientPool.instance()' not in inspect.getsource(type(registry))
-    assert calls == [
-        ('http://registry-relay.test', 'unit-route', 'unit.config', 'IUnitConfigCRM', '0.1.0'),
-    ]
+    assert len(calls) == 1
+    relay_address, route_name, crm_ns, crm_name, crm_ver, abi_hash, signature_hash = calls[0]
+    assert (relay_address, route_name, crm_ns, crm_name, crm_ver) == (
+        'http://registry-relay.test',
+        'unit-route',
+        'unit.config',
+        'IUnitConfigCRM',
+        '0.1.0',
+    )
+    assert len(abi_hash) == 64
+    assert len(signature_hash) == 64
     assert crm.client._client.__class__ is FakeRelayAwareClient  # noqa: SLF001
 
 
@@ -394,6 +502,8 @@ def test_relay_resolved_connect_maps_native_404_to_resource_not_found(monkeypatc
             expected_crm_ns: str,
             expected_crm_name: str,
             expected_crm_ver: str,
+            expected_abi_hash: str,
+            expected_signature_hash: str,
         ):  # noqa: ARG002
             err = RuntimeError('HTTP 404')
             err.status_code = 404

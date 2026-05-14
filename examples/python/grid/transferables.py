@@ -1,7 +1,13 @@
 import c_two as cc
 import pyarrow as pa
 
-@cc.transferable
+@cc.transferable(
+    abi_schema=(
+        'c-two.examples.grid-schema.arrow-ipc.v1;'
+        'fields=epsg:int32,bounds:list<float64>,first_size:list<float64>,'
+        'subdivide_rules:list<list<int32>>'
+    ),
+)
 class GridSchema:
     """
     Grid Schema
@@ -43,7 +49,14 @@ class GridSchema:
             subdivide_rules=row['subdivide_rules']
         )
 
-@cc.transferable
+@cc.transferable(
+    abi_schema=(
+        'c-two.examples.grid-attribute.arrow-ipc.v1;'
+        'fields=deleted:bool,activate:bool,type:int8,level:int8,'
+        'global_id:int32,local_id:int32?,elevation:float64,'
+        'min_x:float64?,min_y:float64?,max_x:float64?,max_y:float64?'
+    ),
+)
 class GridAttribute:
     """
     Attributes of Grid

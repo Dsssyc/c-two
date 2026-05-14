@@ -12,6 +12,7 @@ import uuid
 
 import pytest
 
+import c_two as cc
 from c_two.config import settings
 from c_two.transport import Server, ConcurrencyConfig, ConcurrencyMode
 from c_two.transport.registry import _ProcessRegistry
@@ -21,6 +22,9 @@ from c_two.transport.wire import MethodTable
 from tests.fixtures.ihello import Hello
 from tests.fixtures.hello import HelloImpl
 from tests.fixtures.counter import Counter, CounterImpl
+
+ABI_HASH = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+SIG_HASH = 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789'
 
 
 _IPC_SOCK_DIR = os.environ.get('CC_IPC_SOCK_DIR', '/tmp/c_two_ipc')
@@ -95,12 +99,18 @@ class TestServerNameCollision:
                 return {
                     'route_name': name,
                     'local_removed': True,
+                    'close': {
+                        'route_name': name,
+                        'local_removed': True,
+                        'active_drained': True,
+                        'closed_reason': 'unregister',
+                        'close_error': None,
+                    },
                     'relay_error': None,
                 }
 
         class FakeScheduler:
-            def shutdown(self) -> None:
-                events.append('scheduler_close')
+            pass
 
         class FakeResource:
             def cleanup(self) -> None:
@@ -118,6 +128,8 @@ class TestServerNameCollision:
                 crm_ns='test.grid',
                 crm_name='Grid',
                 crm_ver='0.1.0',
+                abi_hash=ABI_HASH,
+                signature_hash=SIG_HASH,
                 method_table=MethodTable(),
                 scheduler=FakeScheduler(),
                 methods=[],
@@ -125,7 +137,6 @@ class TestServerNameCollision:
             ),
         }
         bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
-        bridge._default_name = 'grid'  # noqa: SLF001
         bridge._rust_server = object()  # noqa: SLF001
 
         bridge.unregister_crm(
@@ -136,7 +147,6 @@ class TestServerNameCollision:
 
         assert events == [
             'native_unregister:grid:http://relay.test',
-            'scheduler_close',
             'crm_shutdown',
         ]
         assert bridge.names == []
@@ -151,12 +161,18 @@ class TestServerNameCollision:
                 return {
                     'route_name': name,
                     'local_removed': False,
+                    'close': {
+                        'route_name': name,
+                        'local_removed': False,
+                        'active_drained': False,
+                        'closed_reason': 'unregister',
+                        'close_error': 'route not registered in native server',
+                    },
                     'relay_error': None,
                 }
 
         class FakeScheduler:
-            def shutdown(self) -> None:
-                events.append('scheduler_close')
+            pass
 
         class FakeResource:
             def cleanup(self) -> None:
@@ -174,6 +190,8 @@ class TestServerNameCollision:
                 crm_ns='test.grid',
                 crm_name='Grid',
                 crm_ver='0.1.0',
+                abi_hash=ABI_HASH,
+                signature_hash=SIG_HASH,
                 method_table=MethodTable(),
                 scheduler=FakeScheduler(),
                 methods=[],
@@ -181,7 +199,6 @@ class TestServerNameCollision:
             ),
         }
         bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
-        bridge._default_name = 'grid'  # noqa: SLF001
         bridge._rust_server = object()  # noqa: SLF001
 
         with pytest.raises(KeyError, match='Name not registered in native server'):
@@ -195,16 +212,34 @@ class TestServerNameCollision:
         events: list[str] = []
 
         class FakeRuntimeSession:
-            def shutdown(self, rust_server, route_names=None, relay_anchor_address=None):  # noqa: ANN001, ARG002
+            def shutdown(  # noqa: ANN001, ARG002
+                self,
+                rust_server,
+                route_names=None,
+                relay_anchor_address=None,
+                timeout_seconds=None,
+            ):
                 events.append(
                     f'native_shutdown:{list(route_names or [])}:{relay_anchor_address}'
                 )
                 return {
                     'removed_routes': list(route_names or []),
+                    'route_outcomes': [
+                        {
+                            'route_name': name,
+                            'local_removed': True,
+                            'active_drained': True,
+                            'closed_reason': 'shutdown',
+                            'close_error': None,
+                        }
+                        for name in list(route_names or [])
+                    ],
                     'relay_errors': [],
                     'server_was_started': True,
                     'ipc_clients_drained': True,
                     'http_clients_drained': False,
+                    'route_close_error': None,
+                    'runtime_barrier_error': None,
                 }
 
         class FakeRustServer:
@@ -216,8 +251,7 @@ class TestServerNameCollision:
                 events.append('rust_shutdown')
 
         class FakeScheduler:
-            def shutdown(self) -> None:
-                events.append('scheduler_close')
+            pass
 
         class FakeResource:
             def cleanup(self) -> None:
@@ -235,6 +269,8 @@ class TestServerNameCollision:
                 crm_ns='test.grid',
                 crm_name='Grid',
                 crm_ver='0.1.0',
+                abi_hash=ABI_HASH,
+                signature_hash=SIG_HASH,
                 method_table=MethodTable(),
                 scheduler=FakeScheduler(),
                 methods=[],
@@ -242,7 +278,6 @@ class TestServerNameCollision:
             ),
         }
         bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
-        bridge._default_name = 'grid'  # noqa: SLF001
         bridge._rust_server = FakeRustServer()  # noqa: SLF001
 
         bridge.shutdown(
@@ -252,25 +287,42 @@ class TestServerNameCollision:
 
         assert events == [
             "native_shutdown:['grid']:http://relay.test",
-            'scheduler_close',
             'crm_shutdown',
-            'rust_shutdown',
         ]
         assert bridge.names == []
 
-    def test_shutdown_keeps_slot_when_native_does_not_remove_route(self):
-        """Python cleanup only runs for routes named in the native outcome."""
+    def test_shutdown_forwards_timeout_to_runtime_session(self):
         events: list[str] = []
 
         class FakeRuntimeSession:
-            def shutdown(self, rust_server, route_names=None, relay_anchor_address=None):  # noqa: ANN001, ARG002
-                events.append(f'native_shutdown:{list(route_names or [])}')
+            def shutdown(
+                self,
+                rust_server,
+                route_names=None,
+                relay_anchor_address=None,
+                timeout_seconds=None,
+            ):  # noqa: ANN001, ARG002
+                events.append(
+                    f'native_shutdown:{list(route_names or [])}:{relay_anchor_address}:{timeout_seconds}'
+                )
                 return {
-                    'removed_routes': [],
+                    'removed_routes': list(route_names or []),
+                    'route_outcomes': [
+                        {
+                            'route_name': name,
+                            'local_removed': True,
+                            'active_drained': True,
+                            'closed_reason': 'shutdown',
+                            'close_error': None,
+                        }
+                        for name in list(route_names or [])
+                    ],
                     'relay_errors': [],
                     'server_was_started': True,
                     'ipc_clients_drained': True,
                     'http_clients_drained': False,
+                    'route_close_error': None,
+                    'runtime_barrier_error': None,
                 }
 
         class FakeRustServer:
@@ -278,12 +330,8 @@ class TestServerNameCollision:
             def is_running(self) -> bool:
                 return True
 
-            def shutdown(self) -> None:
-                events.append('rust_shutdown')
-
         class FakeScheduler:
-            def shutdown(self) -> None:
-                events.append('scheduler_close')
+            pass
 
         class FakeResource:
             def cleanup(self) -> None:
@@ -301,6 +349,8 @@ class TestServerNameCollision:
                 crm_ns='test.grid',
                 crm_name='Grid',
                 crm_ver='0.1.0',
+                abi_hash=ABI_HASH,
+                signature_hash=SIG_HASH,
                 method_table=MethodTable(),
                 scheduler=FakeScheduler(),
                 methods=[],
@@ -308,12 +358,80 @@ class TestServerNameCollision:
             ),
         }
         bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
-        bridge._default_name = 'grid'  # noqa: SLF001
+        bridge._rust_server = FakeRustServer()  # noqa: SLF001
+
+        bridge.shutdown(runtime_session=FakeRuntimeSession(), timeout=1.25)
+
+        assert events == [
+            "native_shutdown:['grid']:None:1.25",
+            'crm_shutdown',
+        ]
+
+    def test_shutdown_keeps_slot_when_native_does_not_remove_route(self):
+        """Python cleanup only runs for routes named in the native outcome."""
+        events: list[str] = []
+
+        class FakeRuntimeSession:
+            def shutdown(  # noqa: ANN001, ARG002
+                self,
+                rust_server,
+                route_names=None,
+                relay_anchor_address=None,
+                timeout_seconds=None,
+            ):
+                events.append(f'native_shutdown:{list(route_names or [])}')
+                return {
+                    'removed_routes': [],
+                    'route_outcomes': [],
+                    'relay_errors': [],
+                    'server_was_started': True,
+                    'ipc_clients_drained': True,
+                    'http_clients_drained': False,
+                    'route_close_error': None,
+                    'runtime_barrier_error': None,
+                }
+
+        class FakeRustServer:
+            @property
+            def is_running(self) -> bool:
+                return True
+
+            def shutdown(self) -> None:
+                events.append('rust_shutdown')
+
+        class FakeScheduler:
+            pass
+
+        class FakeResource:
+            def cleanup(self) -> None:
+                events.append('crm_shutdown')
+
+        class FakeCRM:
+            resource = FakeResource()
+
+        bridge = object.__new__(NativeServerBridge)
+        bridge._slots = {  # noqa: SLF001
+            'grid': CRMSlot(
+                name='grid',
+                crm_instance=FakeCRM(),
+                direct_instance=FakeResource(),
+                crm_ns='test.grid',
+                crm_name='Grid',
+                crm_ver='0.1.0',
+                abi_hash=ABI_HASH,
+                signature_hash=SIG_HASH,
+                method_table=MethodTable(),
+                scheduler=FakeScheduler(),
+                methods=[],
+                shutdown_method='cleanup',
+            ),
+        }
+        bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
         bridge._rust_server = FakeRustServer()  # noqa: SLF001
 
         bridge.shutdown(runtime_session=FakeRuntimeSession())
 
-        assert events == ["native_shutdown:['grid']", 'rust_shutdown']
+        assert events == ["native_shutdown:['grid']"]
         assert bridge.names == ['grid']
 
     def test_shutdown_drains_native_runtime_even_when_lifecycle_stopped(self):
@@ -321,14 +439,23 @@ class TestServerNameCollision:
         events: list[str] = []
 
         class FakeRuntimeSession:
-            def shutdown(self, rust_server, route_names=None, relay_anchor_address=None):  # noqa: ANN001, ARG002
+            def shutdown(  # noqa: ANN001, ARG002
+                self,
+                rust_server,
+                route_names=None,
+                relay_anchor_address=None,
+                timeout_seconds=None,
+            ):
                 events.append(f'native_shutdown:{list(route_names or [])}')
                 return {
                     'removed_routes': [],
+                    'route_outcomes': [],
                     'relay_errors': [],
                     'server_was_started': False,
                     'ipc_clients_drained': True,
                     'http_clients_drained': False,
+                    'route_close_error': None,
+                    'runtime_barrier_error': None,
                 }
 
         class FakeRustServer:
@@ -342,19 +469,95 @@ class TestServerNameCollision:
         bridge = object.__new__(NativeServerBridge)
         bridge._slots = {}  # noqa: SLF001
         bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
-        bridge._default_name = None  # noqa: SLF001
         bridge._rust_server = FakeRustServer()  # noqa: SLF001
 
         bridge.shutdown(runtime_session=FakeRuntimeSession())
 
-        assert events == ['native_shutdown:[]', 'rust_shutdown']
+        assert events == ['native_shutdown:[]']
+
+    def test_shutdown_keeps_slot_and_skips_hook_when_native_route_not_drained(self):
+        events: list[str] = []
+
+        class FakeRuntimeSession:
+            def shutdown(  # noqa: ANN001, ARG002
+                self,
+                rust_server,
+                route_names=None,
+                relay_anchor_address=None,
+                timeout_seconds=None,
+            ):
+                events.append(f'native_shutdown:{list(route_names or [])}')
+                return {
+                    'removed_routes': ['grid'],
+                    'route_outcomes': [
+                        {
+                            'route_name': 'grid',
+                            'local_removed': True,
+                            'active_drained': False,
+                            'closed_reason': 'shutdown',
+                            'close_error': 'active callbacks still running',
+                        },
+                    ],
+                    'relay_errors': [],
+                    'server_was_started': True,
+                    'ipc_clients_drained': True,
+                    'http_clients_drained': False,
+                    'route_close_error': None,
+                    'runtime_barrier_error': None,
+                }
+
+        class FakeRustServer:
+            @property
+            def is_running(self) -> bool:
+                return True
+
+        class FakeScheduler:
+            pass
+
+        class FakeResource:
+            def cleanup(self) -> None:
+                events.append('crm_shutdown')
+
+        class FakeCRM:
+            resource = FakeResource()
+
+        bridge = object.__new__(NativeServerBridge)
+        bridge._slots = {  # noqa: SLF001
+            'grid': CRMSlot(
+                name='grid',
+                crm_instance=FakeCRM(),
+                direct_instance=FakeResource(),
+                crm_ns='test.grid',
+                crm_name='Grid',
+                crm_ver='0.1.0',
+                abi_hash=ABI_HASH,
+                signature_hash=SIG_HASH,
+                method_table=MethodTable(),
+                scheduler=FakeScheduler(),
+                methods=[],
+                shutdown_method='cleanup',
+            ),
+        }
+        bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
+        bridge._rust_server = FakeRustServer()  # noqa: SLF001
+
+        bridge.shutdown(runtime_session=FakeRuntimeSession())
+
+        assert events == ["native_shutdown:['grid']"]
+        assert bridge.names == ['grid']
 
     def test_register_rolls_back_python_slot_when_rust_registration_fails(self, monkeypatch):
         events: list[str] = []
 
         class FakeRustServer:
+            @property
+            def is_running(self) -> bool:
+                return True
+
+        class FakeRuntimeSession:
             def register_route(
                 self,
+                rust_server,
                 name,
                 dispatcher,
                 methods,
@@ -365,29 +568,23 @@ class TestServerNameCollision:
                 crm_ns,
                 crm_name,
                 crm_ver,
+                abi_hash,
+                signature_hash,
+                relay_anchor_address,
             ):  # noqa: ARG002
                 events.append(
-                    f'rust_register:{concurrency_mode}:{max_pending}:{max_workers}:{crm_ns}:{crm_name}:{crm_ver}'
+                    f'native_register:{concurrency_mode}:{max_pending}:{max_workers}:{crm_ns}:{crm_name}:{crm_ver}'
                 )
                 raise RuntimeError('boom')
 
-            def unregister_route(self, name: str) -> bool:
-                events.append(f'rust_unregister:{name}')
-                return True
-
-            @property
-            def is_running(self) -> bool:
-                return True
-
+        @cc.crm(namespace='unit.name_collision', version='0.1.0')
         class FakeCRM:
             pass
 
         bridge = object.__new__(NativeServerBridge)
         bridge._slots = {}  # noqa: SLF001
         bridge._slots_lock = __import__('threading').Lock()  # noqa: SLF001
-        bridge._default_name = None  # noqa: SLF001
         bridge._shm_threshold = 1024  # noqa: SLF001
-        bridge._default_concurrency = ConcurrencyConfig(max_workers=1)  # noqa: SLF001
         bridge._rust_server = FakeRustServer()  # noqa: SLF001
 
         def fake_create(_crm_class, crm_instance):
@@ -408,9 +605,15 @@ class TestServerNameCollision:
         bridge._make_dispatcher = fake_make_dispatcher  # noqa: SLF001
 
         with pytest.raises(RuntimeError, match='boom'):
-            bridge.register_crm(FakeCRM, FakeCRM(), name='grid')
+            bridge.register_crm(
+                FakeCRM,
+                FakeCRM(),
+                concurrency=ConcurrencyConfig(max_workers=1),
+                name='grid',
+                runtime_session=FakeRuntimeSession(),
+            )
 
-        assert events == ['rust_register:read_parallel:None:1::FakeCRM:']
+        assert events == ['native_register:read_parallel:None:1:unit.name_collision:FakeCRM:0.1.0']
         assert bridge.names == []
 
 

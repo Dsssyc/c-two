@@ -110,6 +110,8 @@ pub enum DecodeError {
     },
     /// An invalid value was encountered (e.g. unknown status byte).
     InvalidValue { field: &'static str, value: u64 },
+    /// A UTF-8 text field was structurally valid but semantically invalid.
+    InvalidText { field: &'static str, reason: String },
     /// UTF-8 decoding failed.
     Utf8Error,
 }
@@ -125,6 +127,9 @@ impl std::fmt::Display for DecodeError {
             }
             Self::InvalidValue { field, value } => {
                 write!(f, "{field}: invalid value {value}")
+            }
+            Self::InvalidText { field, reason } => {
+                write!(f, "invalid {field}: {reason}")
             }
             Self::Utf8Error => write!(f, "UTF-8 decode error"),
         }

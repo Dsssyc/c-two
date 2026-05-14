@@ -7,7 +7,7 @@ from c_two.crm.transferable import (
 import c_two as cc
 
 
-@cc.transferable
+@cc.transferable(abi_id='c-two.tests.unit.transfer-decorator.fake-input.pickle-int.v1')
 class _FakeInput(Transferable):
     x: int
     def serialize(d: '_FakeInput') -> bytes:
@@ -16,7 +16,7 @@ class _FakeInput(Transferable):
         return _FakeInput(x=pickle.loads(b))
 
 
-@cc.transferable
+@cc.transferable(abi_id='c-two.tests.unit.transfer-decorator.fake-output.pickle-str.v1')
 class _FakeOutput(Transferable):
     y: str
     def serialize(d: '_FakeOutput') -> bytes:
@@ -25,7 +25,7 @@ class _FakeOutput(Transferable):
         return _FakeOutput(y=pickle.loads(b))
 
 
-@cc.transferable
+@cc.transferable(abi_id='c-two.tests.unit.transfer-decorator.fake-input-fb.pickle-int.v1')
 class _FakeInputWithFromBuffer(Transferable):
     x: int
     def serialize(d: '_FakeInputWithFromBuffer') -> bytes:
@@ -166,7 +166,7 @@ class TestIcrmTransferIntegration:
         serialize_calls = []
         deserialize_calls = []
 
-        @cc.transferable
+        @cc.transferable(abi_id='c-two.tests.unit.transfer-decorator.tracked-input.pickle-int.v1')
         class TrackedInput(Transferable):
             val: int
             def serialize(d: 'TrackedInput') -> bytes:

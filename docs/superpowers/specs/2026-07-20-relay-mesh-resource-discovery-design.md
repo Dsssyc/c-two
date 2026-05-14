@@ -4,6 +4,12 @@
 **Status:** Draft
 **Scope:** Full architecture (Phase 1–3) with Phase 1 implementation detail
 
+**2026-05-11 update:** runtime relay resolution is contract-bound. Any
+`/_resolve` request used for a callable CRM route must include route name,
+CRM tag, ABI hash, and signature hash. The old name-only registry diagnostic is
+removed; future name search must be a separate diagnostic surface that returns
+candidate route metadata instead of producing a callable route.
+
 ## Problem Statement
 
 C-Two currently requires clients to know the exact IPC or HTTP address of the CRM process they want to connect to. This creates three pain points:
@@ -63,7 +69,7 @@ Resolution chain (evaluated in order, first match wins):
 | 3 | Local relay has `name` as PEER route | HTTP direct to owning relay | ~1-5ms |
 | — | None found | raise `ResourceNotFound` | — |
 
-For priority 3 (cross-node), the client queries the local relay's `/_resolve/{name}` endpoint, which looks up the RouteTable and returns the target relay URL. The client then establishes a direct HTTP connection to that relay. Subsequent RPC calls go directly to the target relay — the resolution happens once at `cc.connect()` time.
+For priority 3 (cross-node), the client queries the local relay's contract-bound `/_resolve/{route}` endpoint with the expected CRM tag plus ABI/signature hashes. The relay filters the RouteTable by that complete contract and returns the target relay URL. The client then establishes a direct HTTP connection to that relay. Subsequent RPC calls go directly to the target relay — the resolution happens once at `cc.connect()` time.
 
 ### 1.2 RouteTable (Relay-Internal State)
 
@@ -142,7 +148,7 @@ Callers should use these transactional methods instead of acquiring locks indivi
 
 ```rust
 impl RouteTable {
-    fn resolve(&self, name: &str) -> Vec<RouteInfo>;  // Returns all matches, ordered
+    fn resolve_matching(&self, expected: &ExpectedRouteContract) -> Vec<RouteInfo>;  // Returns matching contracts, ordered
     fn list_routes(&self) -> Vec<RouteEntry>;
     fn list_peers(&self) -> Vec<PeerInfo>;
     fn register_route(&mut self, entry: RouteEntry);
@@ -161,7 +167,7 @@ Resolution priority: LOCAL entries first, then PEER entries sorted by `(register
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/_resolve/{name}` | GET | Resolve a CRM name → `Vec<RouteInfo>` (JSON array, ordered: LOCAL first, then PEER by deterministic sort). Client takes first entry; can fallback to subsequent entries on failure. |
+| `/_resolve/{route}?crm_ns=...&crm_name=...&crm_ver=...&abi_hash=...&signature_hash=...` | GET | Resolve one expected CRM route contract → `Vec<RouteInfo>` (JSON array, ordered: LOCAL first, then PEER by deterministic sort). Client takes first entry; can fallback to subsequent entries on failure. |
 | `/_routes` | GET | List all known routes (already exists, extended) |
 | `/_peers` | GET | List all known peer relays |
 
@@ -199,7 +205,7 @@ Resolution uses a **deterministic sort key**: `(registered_at, relay_id)`. Among
 
 > **Clock skew caveat:** `registered_at` is a wall-clock Unix timestamp (`SystemTime`), not a monotonic clock (which is process-local and cross-machine-incomparable). Deterministic ordering is therefore subject to clock skew across nodes. For clusters with significant clock drift (>1s), the ordering may not reflect true registration order. NTP synchronization across cluster nodes is recommended. This is an accepted limitation in Phase 1 — a Lamport/hybrid logical clock could replace wall-clock ordering in a future phase if needed.
 
-`/_resolve/{name}` returns all matching entries sorted by: LOCAL first, then PEERs by `(registered_at, relay_id)`. The client defaults to the first entry and can fallback to subsequent ones on failure.
+`/_resolve/{route}` with complete expected-contract query fields returns all matching entries sorted by: LOCAL first, then PEERs by `(registered_at, relay_id)`. The client defaults to the first entry and can fallback to subsequent ones on failure.
 
 ### 1.4 Peer Discovery (Seed Bootstrap)
 
@@ -474,16 +480,17 @@ def connect(icrm_class, name, address=None):
 
     raise ResourceNotFound(f"CRM '{name}' not found")
 
-def _resolve_with_cache(relay_address, name):
+def _resolve_with_cache(relay_address, route):
     with _route_cache_lock:
-        cached = _route_cache.get(name)
+        cached = _route_cache.get(route)
         if cached and time.monotonic() - cached[1] < _ROUTE_CACHE_TTL:
             return cached[0]
     # Cache miss or expired — HTTP fetch outside lock to avoid blocking
-    routes = _http_get(f'{relay_address}/_resolve/{name}')  # Returns list
+    query = _expected_contract_query(route, crm_contract)
+    routes = _http_get(f'{relay_address}/_resolve/{route}?{query}')  # Returns matching contracts
     if routes:
         with _route_cache_lock:
-            _route_cache[name] = (routes, time.monotonic())
+            _route_cache[route] = (routes, time.monotonic())
     return routes or []
 ```
 
@@ -501,7 +508,7 @@ c3 relay --bind 0.0.0.0:8080
 # New: query the registry
 c3 registry list-routes
 c3 registry list-relays
-c3 registry resolve grid
+# Name search is a future diagnostic surface, not the runtime resolve API.
 ```
 
 ---

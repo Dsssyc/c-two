@@ -50,7 +50,6 @@ class FakeNativeConcurrency:
             is_unconstrained=unconstrained,
         )
         self.guard_calls: list[int] = []
-        self.closed = False
 
     def snapshot(self):
         return self._snapshot
@@ -58,9 +57,6 @@ class FakeNativeConcurrency:
     def execution_guard(self, method_idx: int):
         self.guard_calls.append(method_idx)
         return nullcontext()
-
-    def close(self):
-        self.closed = True
 
 
 class TestSchedulerAdapter:
@@ -84,8 +80,7 @@ class TestSchedulerAdapter:
         sched = Scheduler(FakeNativeConcurrency(unconstrained=True), {'op': 0})
         assert sched.is_unconstrained is True
 
-    def test_shutdown_closes_native_handle(self):
-        native = FakeNativeConcurrency()
-        sched = Scheduler(native, {'op': 0})
-        sched.shutdown()
-        assert native.closed is True
+    def test_public_shutdown_api_is_not_exposed(self):
+        sched = Scheduler(FakeNativeConcurrency(), {'op': 0})
+        assert not hasattr(sched, 'shutdown')
+        assert not hasattr(sched, '_shutdown_internal')

@@ -33,10 +33,10 @@ class EchoImpl:
 
 @cc.crm(namespace='bench.seg_dict', version='0.1.0')
 class DictEcho:
-    def echo(self, data: dict) -> dict: ...
+    def echo(self, data: dict[str, bytes | dict[str, int]]) -> dict[str, bytes | dict[str, int]]: ...
 
 class DictEchoImpl:
-    def echo(self, data: dict) -> dict:
+    def echo(self, data: dict[str, bytes | dict[str, int]]) -> dict[str, bytes | dict[str, int]]:
         return data
 
 

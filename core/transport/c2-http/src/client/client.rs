@@ -4,7 +4,10 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+use reqwest::header::CONTENT_LENGTH;
 use thiserror::Error;
+
+use c2_contract::ExpectedRouteContract;
 
 /// Characters allowed unencoded in URL path segments — matches Python's
 /// ``urllib.parse.quote(s, safe='')`` so a `/` in a CRM route name is
@@ -17,6 +20,8 @@ const PATH_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
 const EXPECTED_CRM_NS_HEADER: &str = "x-c2-expected-crm-ns";
 const EXPECTED_CRM_NAME_HEADER: &str = "x-c2-expected-crm-name";
 const EXPECTED_CRM_VER_HEADER: &str = "x-c2-expected-crm-ver";
+const EXPECTED_ABI_HASH_HEADER: &str = "x-c2-expected-abi-hash";
+const EXPECTED_SIGNATURE_HASH_HEADER: &str = "x-c2-expected-signature-hash";
 
 fn encode_segment(s: &str) -> String {
     utf8_percent_encode(s, PATH_SEGMENT).to_string()
@@ -42,6 +47,10 @@ pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
 /// Errors returned by [`HttpClient`] operations.
 #[derive(Debug, Error)]
 pub enum HttpError {
+    /// Invalid local request configuration.
+    #[error("HTTP invalid request: {0}")]
+    InvalidInput(String),
+
     /// HTTP 500 — body contains serialized CCError bytes.
     #[error("CRM method error")]
     CrmError(Vec<u8>),
@@ -63,21 +72,40 @@ pub enum HttpError {
 pub struct HttpClient {
     client: reqwest::Client,
     base_url: String,
+    remote_payload_chunk_size: u64,
 }
 
 impl HttpClient {
-    /// Create a new client with an explicit relay proxy policy.
-    pub fn new_with_proxy_policy(
+    #[cfg(test)]
+    fn new_with_proxy_policy(
         base_url: &str,
         timeout_secs: f64,
         max_connections: usize,
         use_proxy: bool,
+    ) -> Result<Self, HttpError> {
+        Self::new_with_transport_policy(
+            base_url,
+            timeout_secs,
+            max_connections,
+            use_proxy,
+            c2_config::DEFAULT_REMOTE_PAYLOAD_CHUNK_SIZE,
+        )
+    }
+
+    /// Create a new client with explicit proxy and remote payload batching policy.
+    pub fn new_with_transport_policy(
+        base_url: &str,
+        timeout_secs: f64,
+        max_connections: usize,
+        use_proxy: bool,
+        remote_payload_chunk_size: u64,
     ) -> Result<Self, HttpError> {
         if !timeout_secs.is_finite() || timeout_secs < 0.0 {
             return Err(HttpError::Transport(
                 "HTTP call timeout must be finite and >= 0".to_string(),
             ));
         }
+        crate::payload::validate_remote_payload_chunk_size(remote_payload_chunk_size)?;
         let mut builder = crate::relay_client_builder_with_proxy(use_proxy)
             .pool_max_idle_per_host(max_connections);
         if timeout_secs > 0.0 {
@@ -89,50 +117,32 @@ impl HttpClient {
         Ok(Self {
             client,
             base_url: base_url.trim_end_matches('/').to_owned(),
+            remote_payload_chunk_size,
         })
-    }
-
-    /// Blocking CRM call (runs on the shared tokio runtime).
-    pub fn call(
-        &self,
-        route_name: &str,
-        method_name: &str,
-        data: &[u8],
-    ) -> Result<Vec<u8>, HttpError> {
-        let handle = runtime().handle();
-        handle.block_on(self.call_async(route_name, method_name, data))
-    }
-
-    /// Async CRM call.
-    pub async fn call_async(
-        &self,
-        route_name: &str,
-        method_name: &str,
-        data: &[u8],
-    ) -> Result<Vec<u8>, HttpError> {
-        self.call_with_expected_crm_async(route_name, method_name, data, None)
-            .await
     }
 
     pub(crate) async fn call_with_expected_crm_async(
         &self,
-        route_name: &str,
+        expected: &ExpectedRouteContract,
         method_name: &str,
         data: &[u8],
-        expected_crm: Option<(&str, &str, &str)>,
     ) -> Result<Vec<u8>, HttpError> {
         let url = format!(
             "{}/{}/{}",
             self.base_url,
-            encode_segment(route_name),
+            encode_segment(&expected.route_name),
             encode_segment(method_name),
         );
-        let mut request = self
+        let request = self
             .client
             .post(&url)
             .header("Content-Type", "application/octet-stream")
-            .body(data.to_vec());
-        request = add_expected_crm_headers(request, expected_crm);
+            .header(CONTENT_LENGTH, data.len().to_string())
+            .body(crate::payload::reqwest_body_from_payload(
+                data,
+                self.remote_payload_chunk_size,
+            )?);
+        let request = add_expected_contract_headers(request, expected);
         let resp = request
             .send()
             .await
@@ -178,19 +188,16 @@ impl HttpClient {
         Ok(resp.status().as_u16() == 200)
     }
 
-    /// Async route probe — GET /_probe/{route_name}.
-    pub async fn probe_route_async(&self, route_name: &str) -> Result<(), HttpError> {
-        self.probe_route_with_expected_crm_async(route_name, None)
-            .await
-    }
-
     pub(crate) async fn probe_route_with_expected_crm_async(
         &self,
-        route_name: &str,
-        expected_crm: Option<(&str, &str, &str)>,
+        expected: &ExpectedRouteContract,
     ) -> Result<(), HttpError> {
-        let url = format!("{}/_probe/{}", self.base_url, encode_segment(route_name));
-        let request = add_expected_crm_headers(self.client.get(&url), expected_crm);
+        let url = format!(
+            "{}/_probe/{}",
+            self.base_url,
+            encode_segment(&expected.route_name)
+        );
+        let request = add_expected_contract_headers(self.client.get(&url), expected);
         let resp = request
             .send()
             .await
@@ -208,19 +215,22 @@ impl HttpClient {
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
+
+    pub fn remote_payload_chunk_size(&self) -> u64 {
+        self.remote_payload_chunk_size
+    }
 }
 
-fn add_expected_crm_headers(
-    mut request: reqwest::RequestBuilder,
-    expected_crm: Option<(&str, &str, &str)>,
+fn add_expected_contract_headers(
+    request: reqwest::RequestBuilder,
+    expected: &ExpectedRouteContract,
 ) -> reqwest::RequestBuilder {
-    if let Some((crm_ns, crm_name, crm_ver)) = expected_crm {
-        request = request
-            .header(EXPECTED_CRM_NS_HEADER, crm_ns)
-            .header(EXPECTED_CRM_NAME_HEADER, crm_name)
-            .header(EXPECTED_CRM_VER_HEADER, crm_ver);
-    }
     request
+        .header(EXPECTED_CRM_NS_HEADER, &expected.crm_ns)
+        .header(EXPECTED_CRM_NAME_HEADER, &expected.crm_name)
+        .header(EXPECTED_CRM_VER_HEADER, &expected.crm_ver)
+        .header(EXPECTED_ABI_HASH_HEADER, &expected.abi_hash)
+        .header(EXPECTED_SIGNATURE_HASH_HEADER, &expected.signature_hash)
 }
 
 #[cfg(test)]
@@ -251,6 +261,44 @@ mod tests {
             assert!(
                 err.to_string().contains("timeout"),
                 "unexpected error for {timeout}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_http_client_does_not_expose_public_named_route_crm_calls() {
+        let source = include_str!("client.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("client.rs must contain production section");
+        for forbidden in [
+            "pub fn call(\n        &self,\n        route_name: &str,",
+            "pub async fn call_async(\n        &self,\n        route_name: &str,",
+            "pub async fn probe_route_async(&self, route_name: &str)",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "raw HttpClient must not expose public named-route CRM API: {forbidden}",
+            );
+        }
+    }
+
+    #[test]
+    fn http_client_expected_contract_helpers_do_not_accept_optional_or_independent_route() {
+        let source = include_str!("client.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("client.rs must contain production section");
+        for forbidden in [
+            "expected: Option<&ExpectedRouteContract>",
+            "call_with_expected_crm_async(\n        &self,\n        route_name: &str,",
+            "probe_route_with_expected_crm_async(\n        &self,\n        route_name: &str,",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "HTTP expected-contract helpers must derive route from a required ExpectedRouteContract: {forbidden}",
             );
         }
     }

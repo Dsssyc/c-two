@@ -1,8 +1,8 @@
 # Config Architecture Design
 
 **Date:** 2026-04-05
-**Status:** Draft
-**Scope:** IPC config unification — Python single source of truth, Rust mirror, FFI full-field pass-through
+**Status:** Historical draft
+**Scope:** Archived migration snapshot from the earlier Python-owned config phase. Current ownership moved to Rust `c2-config` and shared native runtime surfaces.
 
 ## Breaking Changes (0.x.x)
 
@@ -757,6 +757,7 @@ fn new(
 | `max_frame_size` | `int` | `u64` | 2,147,483,648 (2 GB) | `C2_IPC_MAX_FRAME_SIZE` |
 | `max_payload_size` | `int` | `u64` | 17,179,869,184 (16 GB) | `C2_IPC_MAX_PAYLOAD_SIZE` |
 | `max_pending_requests` | `int` | `u32` | 1024 | `C2_IPC_MAX_PENDING_REQUESTS` |
+| `max_execution_workers` | `int` | `u32` | available parallelism clamped to 4..64 | `C2_IPC_MAX_EXECUTION_WORKERS` |
 | `pool_decay_seconds` | `float` | `f64` | 60.0 | `C2_IPC_POOL_DECAY_SECONDS` |
 | `heartbeat_interval` | `float` | `f64` | 15.0 (0 = disabled) | `C2_IPC_HEARTBEAT_INTERVAL` |
 | `heartbeat_timeout` | `float` | `f64` | 30.0 | `C2_IPC_HEARTBEAT_TIMEOUT` |

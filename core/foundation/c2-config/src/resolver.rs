@@ -106,6 +106,7 @@ pub struct ServerIpcConfigOverrides {
     pub max_frame_size: Option<u64>,
     pub max_payload_size: Option<u64>,
     pub max_pending_requests: Option<u32>,
+    pub max_execution_workers: Option<u32>,
     pub pool_decay_seconds: Option<f64>,
     pub heartbeat_interval_secs: Option<f64>,
     pub heartbeat_timeout_secs: Option<f64>,
@@ -134,7 +135,6 @@ pub struct RelayConfigOverrides {
     pub advertise_url: Option<String>,
     pub seeds: Option<Vec<String>>,
     pub idle_timeout_secs: Option<u64>,
-    pub skip_ipc_validation: Option<bool>,
     pub anti_entropy_interval_secs: Option<f64>,
 }
 
@@ -146,6 +146,7 @@ pub struct RuntimeConfigOverrides {
     pub client_ipc: ClientIpcConfigOverrides,
     pub shm_threshold: Option<u64>,
     pub relay_use_proxy: Option<bool>,
+    pub remote_payload_chunk_size: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +157,7 @@ pub struct ResolvedRuntimeConfig {
     pub client_ipc: ClientIpcConfig,
     pub shm_threshold: u64,
     pub relay_use_proxy: bool,
+    pub remote_payload_chunk_size: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -163,6 +165,7 @@ pub struct ResolvedRelayConfig {
     pub relay_anchor_address: Option<String>,
     pub relay: RelayConfig,
     pub relay_use_proxy: bool,
+    pub remote_payload_chunk_size: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +174,7 @@ pub struct ResolvedRelayClientConfig {
     pub relay_use_proxy: bool,
     pub relay_route_max_attempts: usize,
     pub relay_call_timeout_secs: f64,
+    pub remote_payload_chunk_size: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,6 +213,7 @@ impl ConfigResolver {
         let relay_client = resolve_relay_client_config(&catalog, &overrides)?;
         let relay = RelayConfig {
             use_proxy: relay_client.relay_use_proxy,
+            remote_payload_chunk_size: relay_client.remote_payload_chunk_size,
             ..relay
         };
         let server_ipc = resolve_server_ipc_config(&catalog, overrides.server_ipc, shm_threshold)?;
@@ -221,6 +226,7 @@ impl ConfigResolver {
             client_ipc,
             shm_threshold,
             relay_use_proxy: relay_client.relay_use_proxy,
+            remote_payload_chunk_size: relay_client.remote_payload_chunk_size,
         })
     }
 
@@ -235,8 +241,11 @@ impl ConfigResolver {
             .clone()
             .or_else(|| catalog.optional_string("C2_RELAY_ANCHOR_ADDRESS"));
         let relay_use_proxy = resolve_relay_use_proxy(&catalog, &overrides)?;
+        let remote_payload_chunk_size =
+            resolve_remote_payload_chunk_size(&catalog, overrides.remote_payload_chunk_size)?;
         let relay = RelayConfig {
             use_proxy: relay_use_proxy,
+            remote_payload_chunk_size,
             ..relay
         };
 
@@ -244,6 +253,7 @@ impl ConfigResolver {
             relay_anchor_address,
             relay,
             relay_use_proxy,
+            remote_payload_chunk_size,
         })
     }
 
@@ -267,6 +277,14 @@ impl ConfigResolver {
     pub fn resolve_relay_call_timeout_secs(sources: ConfigSources) -> Result<f64, ConfigError> {
         let catalog = EnvCatalog::load(sources)?;
         resolve_relay_call_timeout_secs(&catalog)
+    }
+
+    pub fn resolve_remote_payload_chunk_size(
+        override_value: Option<u64>,
+        sources: ConfigSources,
+    ) -> Result<u64, ConfigError> {
+        let catalog = EnvCatalog::load(sources)?;
+        resolve_remote_payload_chunk_size(&catalog, override_value)
     }
 
     pub fn resolve_server_ipc(
@@ -309,12 +327,15 @@ fn resolve_relay_client_config(
     let relay_use_proxy = resolve_relay_use_proxy(catalog, overrides)?;
     let relay_route_max_attempts = resolve_relay_route_max_attempts(catalog)?;
     let relay_call_timeout_secs = resolve_relay_call_timeout_secs(catalog)?;
+    let remote_payload_chunk_size =
+        resolve_remote_payload_chunk_size(catalog, overrides.remote_payload_chunk_size)?;
 
     Ok(ResolvedRelayClientConfig {
         relay_anchor_address,
         relay_use_proxy,
         relay_route_max_attempts,
         relay_call_timeout_secs,
+        remote_payload_chunk_size,
     })
 }
 
@@ -352,6 +373,22 @@ fn resolve_relay_call_timeout_secs(catalog: &EnvCatalog) -> Result<f64, ConfigEr
         .unwrap_or(300.0);
     duration_from_secs("C2_RELAY_CALL_TIMEOUT", timeout)?;
     Ok(timeout)
+}
+
+fn resolve_remote_payload_chunk_size(
+    catalog: &EnvCatalog,
+    override_value: Option<u64>,
+) -> Result<u64, ConfigError> {
+    let value = match override_value {
+        Some(value) => value,
+        None => catalog
+            .optional_u64("C2_REMOTE_PAYLOAD_CHUNK_SIZE")
+            .transpose()?
+            .unwrap_or(crate::DEFAULT_REMOTE_PAYLOAD_CHUNK_SIZE),
+    };
+    crate::validate_remote_payload_chunk_size(value)
+        .map_err(|reason| ConfigError::new(format!("C2_REMOTE_PAYLOAD_CHUNK_SIZE {reason}")))?;
+    Ok(value)
 }
 
 fn resolve_env(sources: ConfigSources) -> Result<EnvMap, ConfigError> {
@@ -442,9 +479,6 @@ fn resolve_relay_server_config(
     if let Some(v) = overrides.idle_timeout_secs {
         cfg.idle_timeout_secs = validate_millis_timeout("idle_timeout_secs", v)?;
     }
-    if let Some(v) = overrides.skip_ipc_validation {
-        cfg.skip_ipc_validation = v;
-    }
     if let Some(v) = overrides.anti_entropy_interval_secs {
         cfg.anti_entropy_interval = duration_from_secs("anti_entropy_interval_secs", v)?;
     }
@@ -478,6 +512,12 @@ fn resolve_server_ipc_config(
         cfg.max_pending_requests = v;
     }
     if let Some(v) = catalog
+        .optional_u32("C2_IPC_MAX_EXECUTION_WORKERS")
+        .transpose()?
+    {
+        cfg.max_execution_workers = v;
+    }
+    if let Some(v) = catalog
         .optional_f64("C2_IPC_POOL_DECAY_SECONDS")
         .transpose()?
     {
@@ -506,6 +546,9 @@ fn resolve_server_ipc_config(
     }
     if let Some(v) = overrides.max_pending_requests {
         cfg.max_pending_requests = v;
+    }
+    if let Some(v) = overrides.max_execution_workers {
+        cfg.max_execution_workers = v;
     }
     if let Some(v) = overrides.pool_decay_seconds {
         cfg.pool_decay_seconds = v;
@@ -1007,6 +1050,87 @@ mod tests {
     }
 
     #[test]
+    fn server_ipc_execution_workers_env_and_override_are_resolved() {
+        let sources = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[("C2_IPC_MAX_EXECUTION_WORKERS", "9")]),
+        };
+
+        let from_env = ConfigResolver::resolve_server_ipc(
+            ServerIpcConfigOverrides::default(),
+            RuntimeConfigOverrides::default(),
+            sources,
+        )
+        .expect("env execution worker override should resolve");
+        assert_eq!(from_env.max_execution_workers, 9);
+
+        let from_override = ConfigResolver::resolve_server_ipc(
+            ServerIpcConfigOverrides {
+                max_execution_workers: Some(7),
+                ..Default::default()
+            },
+            RuntimeConfigOverrides::default(),
+            ConfigSources::empty(),
+        )
+        .expect("explicit execution worker override should resolve");
+        assert_eq!(from_override.max_execution_workers, 7);
+    }
+
+    #[test]
+    fn server_ipc_execution_workers_rejects_zero_env_and_override() {
+        let env_sources = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[("C2_IPC_MAX_EXECUTION_WORKERS", "0")]),
+        };
+        let env_err = ConfigResolver::resolve_server_ipc(
+            ServerIpcConfigOverrides::default(),
+            RuntimeConfigOverrides::default(),
+            env_sources,
+        )
+        .expect_err("zero env execution worker override should fail");
+        assert!(env_err.to_string().contains("max_execution_workers"));
+
+        let override_err = ConfigResolver::resolve_server_ipc(
+            ServerIpcConfigOverrides {
+                max_execution_workers: Some(0),
+                ..Default::default()
+            },
+            RuntimeConfigOverrides::default(),
+            ConfigSources::empty(),
+        )
+        .expect_err("zero explicit execution worker override should fail");
+        assert!(override_err.to_string().contains("max_execution_workers"));
+    }
+
+    #[test]
+    fn server_ipc_execution_workers_rejects_values_above_hard_limit() {
+        let env_sources = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[("C2_IPC_MAX_EXECUTION_WORKERS", "65")]),
+        };
+        let env_err = ConfigResolver::resolve_server_ipc(
+            ServerIpcConfigOverrides::default(),
+            RuntimeConfigOverrides::default(),
+            env_sources,
+        )
+        .expect_err("oversized env execution worker override should fail");
+        assert!(env_err.to_string().contains("max_execution_workers"));
+        assert!(env_err.to_string().contains("64"));
+
+        let override_err = ConfigResolver::resolve_server_ipc(
+            ServerIpcConfigOverrides {
+                max_execution_workers: Some(65),
+                ..Default::default()
+            },
+            RuntimeConfigOverrides::default(),
+            ConfigSources::empty(),
+        )
+        .expect_err("oversized explicit execution worker override should fail");
+        assert!(override_err.to_string().contains("max_execution_workers"));
+        assert!(override_err.to_string().contains("64"));
+    }
+
+    #[test]
     fn relay_idle_timeout_must_fit_millisecond_sweeper_interval() {
         let sources = ConfigSources {
             env_file: EnvFilePolicy::Disabled,
@@ -1177,6 +1301,46 @@ mod tests {
             .expect("resolve disabled relay call timeout");
 
         assert_eq!(timeout, 0.0);
+    }
+
+    #[test]
+    fn remote_payload_chunk_size_resolves_from_env() {
+        let sources = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[("C2_REMOTE_PAYLOAD_CHUNK_SIZE", "1048576")]),
+        };
+
+        let chunk_size = ConfigResolver::resolve_remote_payload_chunk_size(None, sources)
+            .expect("resolve remote payload chunk size");
+
+        assert_eq!(chunk_size, 1_048_576);
+    }
+
+    #[test]
+    fn remote_payload_chunk_size_rejects_zero() {
+        let sources = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[("C2_REMOTE_PAYLOAD_CHUNK_SIZE", "0")]),
+        };
+
+        let err = ConfigResolver::resolve_remote_payload_chunk_size(None, sources)
+            .expect_err("zero remote payload chunk size should fail");
+
+        assert!(err.to_string().contains("C2_REMOTE_PAYLOAD_CHUNK_SIZE"));
+        assert!(err.to_string().contains("> 0"));
+    }
+
+    #[test]
+    fn relay_client_resolution_carries_remote_payload_chunk_size() {
+        let sources = ConfigSources {
+            env_file: EnvFilePolicy::Disabled,
+            process_env: env(&[("C2_REMOTE_PAYLOAD_CHUNK_SIZE", "2097152")]),
+        };
+
+        let resolved =
+            ConfigResolver::resolve(RuntimeConfigOverrides::default(), sources).expect("resolve");
+
+        assert_eq!(resolved.remote_payload_chunk_size, 2_097_152);
     }
 
     #[test]

@@ -16,6 +16,11 @@ from .. import error
 
 
 R = TypeVar('R')
+DEFAULT_PICKLE_PROTOCOL = 4
+
+
+def _pickle_dumps_default(value: object) -> bytes:
+    return pickle.dumps(value, protocol=DEFAULT_PICKLE_PROTOCOL)
 
 
 class HeldResult:
@@ -181,9 +186,9 @@ def _default_serialize_func(*args):
     """Default serialization function for output transferables."""
     try:
         if len(args) == 1:
-            return pickle.dumps(args[0])
+            return _pickle_dumps_default(args[0])
         else:
-            return pickle.dumps(args)
+            return _pickle_dumps_default(args)
     except Exception as e:
         logger.error(f'Failed to serialize output data: {e}')
         raise
@@ -220,7 +225,10 @@ def create_default_transferable(func, is_input: bool):
         # Create transferable for function input parameters
         sig = inspect.signature(func)
         param_names = list(sig.parameters.keys())
-        type_hints = get_type_hints(func)
+        try:
+            type_hints = get_type_hints(func)
+        except (NameError, ValueError, TypeError):
+            type_hints = {}
         
         # Filter out 'self' or 'cls' if they are the first parameter
         filtered_params = []
@@ -239,8 +247,8 @@ def create_default_transferable(func, is_input: bool):
                 """Default serialization: pickle args directly as tuple."""
                 try:
                     if len(args) == 1:
-                        return pickle.dumps(args[0])
-                    return pickle.dumps(args)
+                        return _pickle_dumps_default(args[0])
+                    return _pickle_dumps_default(args)
                 except Exception as e:
                     logger.error(f'Failed to serialize input data: {e}')
                     raise
@@ -269,7 +277,10 @@ def create_default_transferable(func, is_input: bool):
         class_name = f'Default{func.__name__.title()}OutputTransferable'
         
         # Create transferable for function return value
-        type_hints = get_type_hints(func)
+        try:
+            type_hints = get_type_hints(func)
+        except (NameError, ValueError, TypeError):
+            type_hints = {}
         return_type = type_hints.get('return')
 
         serialize_func = staticmethod(_default_serialize_func)
@@ -311,18 +322,44 @@ def get_transferable(full_name: str) -> Transferable | None:
 
 # Transferable-related decorators #################################################
 
-def transferable(cls=None):
+def _validate_transferable_abi(
+    abi_id: str | None,
+    abi_schema: str | None,
+) -> tuple[str | None, str | None]:
+    if abi_id is not None and not isinstance(abi_id, str):
+        raise TypeError('abi_id must be a string.')
+    if abi_schema is not None and not isinstance(abi_schema, str):
+        raise TypeError('abi_schema must be a string.')
+    if abi_id is not None and abi_schema is not None:
+        raise ValueError('Declare either abi_id or abi_schema, not both.')
+    if abi_id is not None and not abi_id.strip():
+        raise ValueError('abi_id cannot be empty.')
+    if abi_schema is not None and not abi_schema.strip():
+        raise ValueError('abi_schema cannot be empty.')
+    return abi_id, abi_schema
+
+
+def transferable(cls=None, *, abi_id: str | None = None, abi_schema: str | None = None):
     """Decorator to make a class inherit from Transferable.
 
-    Supports both ``@cc.transferable`` and ``@cc.transferable()``.
+    Supports ``@cc.transferable``, ``@cc.transferable()``, and explicit ABI
+    declarations for custom byte formats via ``abi_id`` or ``abi_schema``.
     """
+    abi_id, abi_schema = _validate_transferable_abi(abi_id, abi_schema)
+
     def wrap(cls):
         new_cls = type(cls.__name__, (cls, Transferable), dict(cls.__dict__))
         new_cls.__module__ = cls.__module__
         new_cls.__qualname__ = cls.__qualname__
+        new_cls.__cc_transferable_abi__ = {
+            'abi_id': abi_id,
+            'abi_schema': abi_schema,
+        }
         return new_cls
 
     if cls is not None:
+        if not isinstance(cls, type):
+            raise TypeError('@cc.transferable must decorate a class.')
         return wrap(cls)
     return wrap
 
@@ -576,6 +613,8 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
             raise ValueError(f'Invalid direction value: {crm.direction}. Expected "->" or "<-".')
 
     transfer_wrapper._input_buffer_mode = buffer
+    transfer_wrapper._input_transferable = input
+    transfer_wrapper._output_transferable = output
     return transfer_wrapper
 
 def auto_transfer(func=None, *, input=None, output=None, buffer=None):
@@ -612,7 +651,10 @@ def auto_transfer(func=None, *, input=None, output=None, buffer=None):
         output_transferable = output
 
         if output_transferable is None:
-            type_hints = get_type_hints(func)
+            try:
+                type_hints = get_type_hints(func)
+            except (NameError, ValueError, TypeError):
+                type_hints = {}
 
             if 'return' in type_hints:
                 return_type = type_hints['return']
@@ -680,9 +722,12 @@ def _extract_func_params(func: Callable) -> list[tuple[str, type, Any]]:
     """
     try:
         sig = inspect.signature(func)
-        type_hints = get_type_hints(func)
     except (ValueError, TypeError):
         return []
+    try:
+        type_hints = get_type_hints(func)
+    except (NameError, ValueError, TypeError):
+        type_hints = {}
 
     params = []
     for i, (name, param) in enumerate(sig.parameters.items()):

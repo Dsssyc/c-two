@@ -16,6 +16,8 @@ pub enum MsgType {
     ShutdownAck = 0x07,
     Disconnect = 0x08,
     DisconnectAck = 0x09,
+    PendingRouteAttest = 0x0A,
+    PendingRouteAttestAck = 0x0B,
 }
 
 impl MsgType {
@@ -31,6 +33,8 @@ impl MsgType {
             0x07 => Some(Self::ShutdownAck),
             0x08 => Some(Self::Disconnect),
             0x09 => Some(Self::DisconnectAck),
+            0x0A => Some(Self::PendingRouteAttest),
+            0x0B => Some(Self::PendingRouteAttestAck),
             _ => None,
         }
     }
@@ -56,10 +60,13 @@ impl MsgType {
     }
 }
 
-/// Size of a signal payload (always 1 byte).
+/// Size of legacy single-byte signal payloads. Extended signal payloads keep the
+/// first byte as this discriminant and append type-specific fields.
 pub const SIGNAL_SIZE: usize = 1;
 
-// Pre-encoded signal bytes from the canonical wire protocol.
+// Pre-encoded signal bytes from the canonical wire protocol. `ShutdownClient`
+// is a complete single-byte initiate command; `ShutdownAck` is only a
+// discriminant because acknowledgements carry a structured payload.
 pub const PING_BYTES: [u8; 1] = [MsgType::Ping as u8];
 pub const PONG_BYTES: [u8; 1] = [MsgType::Pong as u8];
 pub const SHUTDOWN_CLIENT_BYTES: [u8; 1] = [MsgType::ShutdownClient as u8];
@@ -82,6 +89,8 @@ mod tests {
             (0x07, MsgType::ShutdownAck),
             (0x08, MsgType::Disconnect),
             (0x09, MsgType::DisconnectAck),
+            (0x0A, MsgType::PendingRouteAttest),
+            (0x0B, MsgType::PendingRouteAttestAck),
         ] {
             let parsed = MsgType::from_byte(byte).unwrap();
             assert_eq!(parsed, expected);

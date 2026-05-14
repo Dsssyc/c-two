@@ -104,9 +104,10 @@ C-Two has a language-neutral Rust core and language SDKs. Python is the current
 SDK surface, not the canonical home for generic runtime mechanisms. The Python
 SDK owns Python domain logic, CRM contracts, Python resource invocation,
 serialization orchestration, and same-process direct-call glue. Rust owns
-shared transport, memory, wire codec, route concurrency enforcement and state,
-HTTP relay, and configuration resolution. PyO3/maturin bridges Rust into Python
-as `c_two._native`.
+shared transport, memory, wire codec, CRM route contract validation and
+fingerprints, route concurrency enforcement and state, HTTP relay, and
+configuration resolution. PyO3/maturin bridges Rust into Python as
+`c_two._native`.
 
 ### CRM Layer
 
@@ -115,6 +116,10 @@ Path: `sdk/python/src/c_two/crm/`
 - CRM contracts are interface classes decorated with
   `@cc.crm(namespace='...', version='...')`.
 - Only methods in the contract are exposed remotely.
+- CRM route contracts are identified by route name plus the CRM namespace,
+  CRM name, CRM version, ABI hash, and signature hash. Python may compute the
+  descriptor/fingerprints from the CRM class, but Rust `c2-contract` validates
+  the complete expected route contract at IPC and relay boundaries.
 - Resource implementations are plain Python classes and are not decorated.
 - `@transferable` marks custom data types that cross the wire. It converts the
   class into a dataclass and registers `serialize`, `deserialize`, and optional
@@ -249,9 +254,14 @@ Direct IPC `shutdown("ipc://...")` under `c_two.transport.client.util` is an
 admin/control-plane helper for high-privilege same-host supervisors. It stops
 the addressed native IPC server; it is not ordinary CRM business-client
 behavior and is distinct from top-level `cc.shutdown()`, which cleans up the
-current process registry. Future name-based or HTTP/relay-propagated shutdown
-must be designed as an explicit authenticated admin control plane with clear
-route-level vs server-level scope, not as a hidden normal RPC side effect.
+current process registry. Its direct IPC control acknowledgement is the
+initiate phase only: it proves the server accepted shutdown and entered
+draining, not that active callbacks have drained or shutdown hooks are safe to
+run. Completion and route close outcomes must be observed through
+`RuntimeSession.shutdown()` / bridge barriers or a future explicit wait helper.
+Future name-based or HTTP/relay-propagated shutdown must be designed as an
+explicit authenticated admin control plane with clear route-level vs server-level
+scope, not as a hidden normal RPC side effect.
 
 Server lifecycle/readiness belongs to Rust. Python `NativeServerBridge` may
 expose `start()`, `is_started()`, and shutdown facades, but must delegate
@@ -263,12 +273,13 @@ attempt must be fenced in Rust before readiness waiters run: reset stale
 observe readiness for that attempt. A Rust `Server` may only unlink its IPC
 socket path after that concrete instance successfully bound the socket; failed
 duplicate startups must not remove another server's active socket path. Bridge
-shutdown must still call idempotent native shutdown to drain the PyO3 runtime
-handle even when native lifecycle state is already stopped by an external direct
-IPC shutdown signal. Native `RustServer.shutdown()` is a lifecycle barrier:
-after it returns, runtime-owned server work must be terminal (`Initialized`,
-`Stopped`, or `Failed`) so a following start attempt does not observe stale
-`Stopping` state.
+shutdown must still drive the idempotent native runtime barrier through
+`RuntimeSession.shutdown()` so the PyO3 runtime handle drains even when native
+lifecycle state is already stopped by an external direct IPC shutdown signal.
+That native runtime barrier is a lifecycle fence: after it returns,
+runtime-owned server work must be terminal (`Initialized`, `Stopped`, or
+`Failed`) so a following start attempt does not observe stale `Stopping`
+state.
 
 Python resource servers create an auto-generated `ipc://` address. Use
 `cc.server_address()` after registration only when a same-host process needs to
@@ -287,6 +298,16 @@ selected route's `relay_url` directly. Direct IPC selection from relay
 resolution is allowed only when the anchor endpoint is loopback/local; nonlocal
 relay responses must be treated as HTTP relay targets even if they include an
 `ipc_address`.
+
+Relay resolution and data-plane calls are contract-scoped, not name-only.
+`cc.connect(CRMClass, name='...')` derives an `ExpectedRouteContract` from the
+CRM class and the route name. Runtime relay resolve, probe, and call paths must
+carry and validate the full route name, CRM tag, ABI hash, and signature hash.
+Do not add production APIs, fallback behavior, cache keys, or wire paths that
+resolve, probe, or call a CRM route by name alone. A future "find by name" or
+diagnostic relay-mesh lookup must be a separate discovery/admin surface that
+returns candidate route metadata and CRM tags; it must not be reused as the
+normal CRM call path.
 
 Relay-discovered IPC fast paths must validate endpoint identity in Rust before
 accepting the IPC client. The relay response identity (`server_id` and
@@ -307,6 +328,7 @@ extension crate under `sdk/python/native/`.
 
 | Layer | Crate | Purpose |
 | --- | --- | --- |
+| foundation | `c2-contract` | Route contract validation and canonical descriptor hashing |
 | foundation | `c2-config` | Unified IPC and relay configuration structs/resolvers |
 | foundation | `c2-error` | Canonical error registry and `code:message` wire codec |
 | foundation | `c2-mem` | Buddy allocator, SHM regions, unified memory pool |
@@ -482,6 +504,9 @@ cc.shutdown()
 The `name` parameter in `cc.register()` is a user-chosen routing key. It is not
 the CRM namespace. Multiple resources using different CRM contracts, or the
 same CRM contract with different instances, can coexist under distinct names.
+For remote IPC/relay paths, name is necessary but not sufficient: the native
+runtime also matches the expected CRM tag and contract hashes derived from the
+client's CRM class.
 
 ### Error Handling
 
@@ -539,6 +564,7 @@ through Rust serialized dispatch for symmetry.
 | `C2_RELAY_ANCHOR_ADDRESS` | SDK relay anchor URL for CRM registration and client name resolution | none |
 | `C2_RELAY_ROUTE_MAX_ATTEMPTS` | Relay-aware client route acquisition attempts | `3` |
 | `C2_RELAY_CALL_TIMEOUT` | Relay HTTP CRM call timeout seconds; `0` disables the reqwest total timeout | `300` |
+| `C2_REMOTE_PAYLOAD_CHUNK_SIZE` | C-Two remote payload body batching size for relay HTTP and future remote protocols; not a TCP packet, HTTP/1 chunk, or HTTP/2 DATA frame guarantee | `1048576` |
 | `C2_RELAY_BIND` | Relay HTTP listen address for `c3 relay --bind` | `0.0.0.0:8080` |
 | `C2_RELAY_ID` | Stable relay identifier for mesh protocol | auto UUID |
 | `C2_RELAY_ADVERTISE_URL` | Publicly reachable URL announced to mesh peers | derived |
@@ -554,6 +580,7 @@ through Rust serialized dispatch for symmetry.
 | `C2_IPC_MAX_FRAME_SIZE` | Max inline frame size | `2147483648` |
 | `C2_IPC_MAX_PAYLOAD_SIZE` | Max single-call payload size | `17179869184` |
 | `C2_IPC_MAX_PENDING_REQUESTS` | Max concurrent pending requests per connection | `1024` |
+| `C2_IPC_MAX_EXECUTION_WORKERS` | Max blocking execution workers for server-side resource callbacks | available parallelism clamped to `4..=64` |
 | `C2_IPC_HEARTBEAT_INTERVAL` | Heartbeat interval seconds; `0` disables | `15.0` |
 | `C2_IPC_HEARTBEAT_TIMEOUT` | Heartbeat timeout seconds | `30.0` |
 | `C2_IPC_MAX_TOTAL_CHUNKS` | Max total in-flight chunks across all connections | `512` |

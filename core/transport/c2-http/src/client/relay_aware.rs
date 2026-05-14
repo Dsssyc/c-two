@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use super::{HttpClient, HttpClientPool, HttpError, RelayControlClient, RelayRouteInfo};
+use c2_contract::ExpectedRouteContract;
 
 #[derive(Debug, Deserialize)]
 struct RelayErrorBody {
@@ -20,6 +21,7 @@ struct RelayErrorBody {
 pub struct RelayAwareClientConfig {
     pub max_attempts: usize,
     pub call_timeout_secs: f64,
+    pub remote_payload_chunk_size: u64,
 }
 
 impl Default for RelayAwareClientConfig {
@@ -27,6 +29,7 @@ impl Default for RelayAwareClientConfig {
         Self {
             max_attempts: 3,
             call_timeout_secs: 300.0,
+            remote_payload_chunk_size: c2_config::DEFAULT_REMOTE_PAYLOAD_CHUNK_SIZE,
         }
     }
 }
@@ -56,62 +59,45 @@ impl RelayResolvedTarget {
 pub struct RelayAwareHttpClient {
     control: Arc<RelayControlClient>,
     pool: &'static HttpClientPool,
-    route_name: String,
+    expected: ExpectedRouteContract,
     use_proxy: bool,
     config: RelayAwareClientConfig,
     current: Mutex<Option<String>>,
     anchor_allows_local_ipc: bool,
-    expected_crm: Option<(String, String, String)>,
 }
 
 impl RelayAwareHttpClient {
     pub fn new(
         relay_url: &str,
-        route_name: &str,
+        expected: ExpectedRouteContract,
         use_proxy: bool,
         config: RelayAwareClientConfig,
     ) -> Result<Self, HttpError> {
         let control = Arc::new(RelayControlClient::new(relay_url, use_proxy)?);
-        Ok(Self::new_with_control(
-            control, route_name, use_proxy, config,
-        ))
+        Self::new_with_control(control, expected, use_proxy, config)
     }
 
     pub fn new_with_control(
         control: Arc<RelayControlClient>,
-        route_name: &str,
+        expected: ExpectedRouteContract,
         use_proxy: bool,
         config: RelayAwareClientConfig,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, HttpError> {
+        c2_contract::validate_expected_route_contract(&expected)
+            .map_err(|err| HttpError::InvalidInput(err.to_string()))?;
+        Ok(Self {
             anchor_allows_local_ipc: relay_anchor_allows_local_ipc(control.base_url()),
             control,
             pool: HttpClientPool::instance(),
-            route_name: route_name.to_string(),
+            expected,
             use_proxy,
             config,
             current: Mutex::new(None),
-            expected_crm: None,
-        }
+        })
     }
 
-    pub fn with_expected_crm(mut self, crm_ns: &str, crm_name: &str, crm_ver: &str) -> Self {
-        if !crm_ns.is_empty() || !crm_name.is_empty() || !crm_ver.is_empty() {
-            self.expected_crm = Some((
-                crm_ns.to_string(),
-                crm_name.to_string(),
-                crm_ver.to_string(),
-            ));
-        }
-        self
-    }
-
-    fn expected_crm_tuple(&self) -> Option<(&str, &str, &str)> {
-        self.expected_crm
-            .as_ref()
-            .map(|(crm_ns, crm_name, crm_ver)| {
-                (crm_ns.as_str(), crm_name.as_str(), crm_ver.as_str())
-            })
+    pub fn route_name(&self) -> &str {
+        &self.expected.route_name
     }
 
     pub fn call(&self, method_name: &str, data: &[u8]) -> Result<Vec<u8>, HttpError> {
@@ -167,7 +153,7 @@ impl RelayAwareHttpClient {
                 Ok(_) => {
                     return Err(HttpError::ServerError(
                         404,
-                        relay_error_body("ResourceNotFound", &self.route_name),
+                        relay_error_body("ResourceNotFound", self.route_name()),
                     ));
                 }
                 Err(err) => {
@@ -179,9 +165,12 @@ impl RelayAwareHttpClient {
                 }
             };
 
-            if let Some(candidate) =
-                select_local_ipc_candidate(prefer_local_ipc, self.anchor_allows_local_ipc, &routes)
-            {
+            if let Some(candidate) = select_local_ipc_candidate(
+                prefer_local_ipc,
+                self.anchor_allows_local_ipc,
+                &routes,
+                &self.expected,
+            ) {
                 return Ok(RelayResolvedTarget::Ipc { candidate });
             }
 
@@ -190,7 +179,7 @@ impl RelayAwareHttpClient {
                 return Err(last_error.unwrap_or_else(|| {
                     HttpError::ServerError(
                         404,
-                        relay_error_body("ResourceNotFound", &self.route_name),
+                        relay_error_body("ResourceNotFound", self.route_name()),
                     )
                 }));
             }
@@ -201,6 +190,7 @@ impl RelayAwareHttpClient {
                     &relay_url,
                     self.use_proxy,
                     self.config.call_timeout_secs,
+                    self.config.remote_payload_chunk_size,
                 ) {
                     Ok(client) => RelayPoolGuard {
                         pool: self.pool,
@@ -215,10 +205,7 @@ impl RelayAwareHttpClient {
 
                 match client
                     .client
-                    .probe_route_with_expected_crm_async(
-                        &self.route_name,
-                        self.expected_crm_tuple(),
-                    )
+                    .probe_route_with_expected_crm_async(&self.expected)
                     .await
                 {
                     Ok(()) => {
@@ -226,7 +213,7 @@ impl RelayAwareHttpClient {
                         return Ok(RelayResolvedTarget::Http { relay_url });
                     }
                     Err(err) if route_is_stale(&err) => {
-                        self.control.invalidate(&self.route_name);
+                        self.control.invalidate(self.route_name());
                         *self.current.lock() = None;
                         excluded_routes.insert(relay_url);
                         last_error = Some(err);
@@ -241,7 +228,7 @@ impl RelayAwareHttpClient {
         }
 
         Err(last_error.unwrap_or_else(|| {
-            HttpError::ServerError(404, relay_error_body("ResourceNotFound", &self.route_name))
+            HttpError::ServerError(404, relay_error_body("ResourceNotFound", self.route_name()))
         }))
     }
 
@@ -260,7 +247,7 @@ impl RelayAwareHttpClient {
                 Ok(_) => {
                     return Err(HttpError::ServerError(
                         404,
-                        relay_error_body("ResourceNotFound", &self.route_name),
+                        relay_error_body("ResourceNotFound", self.route_name()),
                     ));
                 }
                 Err(err) => {
@@ -277,7 +264,7 @@ impl RelayAwareHttpClient {
                 return Err(last_error.unwrap_or_else(|| {
                     HttpError::ServerError(
                         404,
-                        relay_error_body("ResourceNotFound", &self.route_name),
+                        relay_error_body("ResourceNotFound", self.route_name()),
                     )
                 }));
             }
@@ -287,6 +274,7 @@ impl RelayAwareHttpClient {
                     &relay_url,
                     self.use_proxy,
                     self.config.call_timeout_secs,
+                    self.config.remote_payload_chunk_size,
                 ) {
                     Ok(client) => RelayPoolGuard {
                         pool: self.pool,
@@ -301,12 +289,7 @@ impl RelayAwareHttpClient {
 
                 match client
                     .client
-                    .call_with_expected_crm_async(
-                        &self.route_name,
-                        method_name,
-                        data,
-                        self.expected_crm_tuple(),
-                    )
+                    .call_with_expected_crm_async(&self.expected, method_name, data)
                     .await
                 {
                     Ok(bytes) => {
@@ -315,7 +298,7 @@ impl RelayAwareHttpClient {
                     }
                     Err(HttpError::CrmError(err)) => return Err(HttpError::CrmError(err)),
                     Err(err) if route_is_stale(&err) => {
-                        self.control.invalidate(&self.route_name);
+                        self.control.invalidate(self.route_name());
                         *self.current.lock() = None;
                         excluded_routes.insert(relay_url);
                         last_error = Some(err);
@@ -329,7 +312,7 @@ impl RelayAwareHttpClient {
         }
 
         Err(last_error.unwrap_or_else(|| {
-            HttpError::ServerError(404, relay_error_body("ResourceNotFound", &self.route_name))
+            HttpError::ServerError(404, relay_error_body("ResourceNotFound", self.route_name()))
         }))
     }
 
@@ -338,43 +321,28 @@ impl RelayAwareHttpClient {
         force_refresh: bool,
     ) -> Result<Vec<RelayRouteInfo>, HttpError> {
         if force_refresh {
-            self.control.invalidate(&self.route_name);
+            self.control.invalidate(self.route_name());
         }
-        let expected_crm = self.expected_crm_tuple();
-        let routes = match expected_crm {
-            Some((crm_ns, crm_name, crm_ver)) => {
-                self.control
-                    .resolve_matching_async(&self.route_name, crm_ns, crm_name, crm_ver)
-                    .await?
-            }
-            None => self.control.resolve_async(&self.route_name).await?,
-        };
+        let routes = self.control.resolve_matching_async(&self.expected).await?;
         let raw_routes_non_empty = !routes.is_empty();
-        let filtered = filter_routes_by_expected_crm(routes, expected_crm);
-        if !force_refresh && expected_crm.is_some() && raw_routes_non_empty && filtered.is_empty() {
-            self.control.invalidate(&self.route_name);
-            let refreshed = match expected_crm {
-                Some((crm_ns, crm_name, crm_ver)) => {
-                    self.control
-                        .resolve_matching_async(&self.route_name, crm_ns, crm_name, crm_ver)
-                        .await?
-                }
-                None => self.control.resolve_async(&self.route_name).await?,
-            };
+        let filtered = filter_routes_by_expected_contract(routes, &self.expected);
+        if !force_refresh && raw_routes_non_empty && filtered.is_empty() {
+            self.control.invalidate(self.route_name());
+            let refreshed = self.control.resolve_matching_async(&self.expected).await?;
             let refreshed_routes_non_empty = !refreshed.is_empty();
-            let refreshed_filtered = filter_routes_by_expected_crm(refreshed, expected_crm);
+            let refreshed_filtered = filter_routes_by_expected_contract(refreshed, &self.expected);
             if refreshed_routes_non_empty && refreshed_filtered.is_empty() {
                 return Err(HttpError::ServerError(
                     409,
-                    crm_contract_mismatch_body(&self.route_name),
+                    crm_contract_mismatch_body(self.route_name()),
                 ));
             }
             return Ok(refreshed_filtered);
         }
-        if force_refresh && expected_crm.is_some() && raw_routes_non_empty && filtered.is_empty() {
+        if force_refresh && raw_routes_non_empty && filtered.is_empty() {
             return Err(HttpError::ServerError(
                 409,
-                crm_contract_mismatch_body(&self.route_name),
+                crm_contract_mismatch_body(self.route_name()),
             ));
         }
         Ok(filtered)
@@ -459,11 +427,15 @@ fn select_local_ipc_candidate(
     prefer_local_ipc: bool,
     anchor_allows_local_ipc: bool,
     routes: &[RelayRouteInfo],
+    expected: &ExpectedRouteContract,
 ) -> Option<RelayLocalIpcCandidate> {
     if !prefer_local_ipc || !anchor_allows_local_ipc {
         return None;
     }
     routes.iter().find_map(|route| {
+        if !route_matches_expected_contract(route, expected) {
+            return None;
+        }
         Some(RelayLocalIpcCandidate {
             address: route.ipc_address.clone()?,
             server_id: route.server_id.clone()?,
@@ -472,21 +444,26 @@ fn select_local_ipc_candidate(
     })
 }
 
-fn filter_routes_by_expected_crm(
+fn filter_routes_by_expected_contract(
     routes: Vec<RelayRouteInfo>,
-    expected: Option<(&str, &str, &str)>,
+    expected: &ExpectedRouteContract,
 ) -> Vec<RelayRouteInfo> {
-    let Some((expected_ns, expected_name, expected_ver)) = expected else {
-        return routes;
-    };
     routes
         .into_iter()
-        .filter(|route| {
-            route.crm_ns == expected_ns
-                && route.crm_name == expected_name
-                && route.crm_ver == expected_ver
-        })
+        .filter(|route| route_matches_expected_contract(route, expected))
         .collect()
+}
+
+fn route_matches_expected_contract(
+    route: &RelayRouteInfo,
+    expected: &ExpectedRouteContract,
+) -> bool {
+    route.name == expected.route_name
+        && route.crm_ns == expected.crm_ns
+        && route.crm_name == expected.crm_name
+        && route.crm_ver == expected.crm_ver
+        && route.abi_hash == expected.abi_hash
+        && route.signature_hash == expected.signature_hash
 }
 
 fn relay_anchor_allows_local_ipc(anchor_url: &str) -> bool {
@@ -525,32 +502,45 @@ mod tests {
         resolve_count: Arc<AtomicUsize>,
     }
 
+    const TEST_ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const TEST_SIGNATURE_HASH: &str =
+        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+    fn expected_contract() -> ExpectedRouteContract {
+        ExpectedRouteContract {
+            route_name: "grid".to_string(),
+            crm_ns: "test.grid".to_string(),
+            crm_name: "Grid".to_string(),
+            crm_ver: "0.1.0".to_string(),
+            abi_hash: TEST_ABI_HASH.to_string(),
+            signature_hash: TEST_SIGNATURE_HASH.to_string(),
+        }
+    }
+
+    fn route_info(name: String, relay_url: String) -> RelayRouteInfo {
+        RelayRouteInfo {
+            name,
+            relay_url,
+            ipc_address: None,
+            server_id: None,
+            server_instance_id: None,
+            crm_ns: "test.grid".to_string(),
+            crm_name: "Grid".to_string(),
+            crm_ver: "0.1.0".to_string(),
+            abi_hash: TEST_ABI_HASH.to_string(),
+            signature_hash: TEST_SIGNATURE_HASH.to_string(),
+            max_payload_size: 1024,
+        }
+    }
+
     async fn registry_resolve(
         State(state): State<RegistryState>,
         Path(name): Path<String>,
     ) -> Response {
         state.resolve_count.fetch_add(1, Ordering::SeqCst);
         Json(vec![
-            RelayRouteInfo {
-                name: name.clone(),
-                relay_url: state.stale_url.clone(),
-                ipc_address: None,
-                server_id: None,
-                server_instance_id: None,
-                crm_ns: String::new(),
-                crm_name: String::new(),
-                crm_ver: String::new(),
-            },
-            RelayRouteInfo {
-                name,
-                relay_url: state.live_url.clone(),
-                ipc_address: None,
-                server_id: None,
-                server_instance_id: None,
-                crm_ns: String::new(),
-                crm_name: String::new(),
-                crm_ver: String::new(),
-            },
+            route_info(name.clone(), state.stale_url.clone()),
+            route_info(name, state.live_url.clone()),
         ])
         .into_response()
     }
@@ -587,17 +577,7 @@ mod tests {
             )
                 .into_response();
         }
-        Json(vec![RelayRouteInfo {
-            name,
-            relay_url: state.live_url.clone(),
-            ipc_address: None,
-            server_id: None,
-            server_instance_id: None,
-            crm_ns: String::new(),
-            crm_name: String::new(),
-            crm_ver: String::new(),
-        }])
-        .into_response()
+        Json(vec![route_info(name, state.live_url.clone())]).into_response()
     }
 
     async fn misleading_bad_gateway() -> Response {
@@ -632,25 +612,13 @@ mod tests {
     ) -> Response {
         state.resolve_count.fetch_add(1, Ordering::SeqCst);
         Json(vec![
+            route_info(name.clone(), state.live_url.clone()),
             RelayRouteInfo {
-                name: name.clone(),
-                relay_url: state.live_url.clone(),
-                ipc_address: None,
-                server_id: None,
-                server_instance_id: None,
-                crm_ns: String::new(),
-                crm_name: String::new(),
-                crm_ver: String::new(),
-            },
-            RelayRouteInfo {
-                name,
                 relay_url: state.stale_url.clone(),
                 ipc_address: Some("ipc://local-grid".to_string()),
                 server_id: Some("local-grid".to_string()),
                 server_instance_id: Some("inst-local-grid".to_string()),
-                crm_ns: String::new(),
-                crm_name: String::new(),
-                crm_ver: String::new(),
+                ..route_info(name, state.stale_url.clone())
             },
         ])
         .into_response()
@@ -666,17 +634,10 @@ mod tests {
         } else {
             ("test.grid", "0.1.0")
         };
-        Json(vec![RelayRouteInfo {
-            name,
-            relay_url: state.live_url.clone(),
-            ipc_address: None,
-            server_id: None,
-            server_instance_id: None,
-            crm_ns: crm_ns.to_string(),
-            crm_name: "Grid".to_string(),
-            crm_ver: crm_ver.to_string(),
-        }])
-        .into_response()
+        let mut route = route_info(name, state.live_url.clone());
+        route.crm_ns = crm_ns.to_string();
+        route.crm_ver = crm_ver.to_string();
+        Json(vec![route]).into_response()
     }
 
     async fn registry_resolve_expected_contract(
@@ -684,17 +645,7 @@ mod tests {
         Path(name): Path<String>,
     ) -> Response {
         state.resolve_count.fetch_add(1, Ordering::SeqCst);
-        Json(vec![RelayRouteInfo {
-            name,
-            relay_url: state.live_url.clone(),
-            ipc_address: None,
-            server_id: None,
-            server_instance_id: None,
-            crm_ns: "test.grid".to_string(),
-            crm_name: "Grid".to_string(),
-            crm_ver: "0.1.0".to_string(),
-        }])
-        .into_response()
+        Json(vec![route_info(name, state.live_url.clone())]).into_response()
     }
 
     fn expected_crm_headers_match(headers: &HeaderMap) -> bool {
@@ -707,6 +658,12 @@ mod tests {
             && headers
                 .get("x-c2-expected-crm-ver")
                 .is_some_and(|v| v == "0.1.0")
+            && headers
+                .get("x-c2-expected-abi-hash")
+                .is_some_and(|v| v == TEST_ABI_HASH)
+            && headers
+                .get("x-c2-expected-signature-hash")
+                .is_some_and(|v| v == TEST_SIGNATURE_HASH)
     }
 
     async fn probe_requires_expected_crm_headers(headers: HeaderMap) -> Response {
@@ -775,7 +732,7 @@ mod tests {
 
         let client = RelayAwareHttpClient::new(
             &registry_url,
-            "grid",
+            expected_contract(),
             false,
             RelayAwareClientConfig {
                 max_attempts: 3,
@@ -820,7 +777,7 @@ mod tests {
 
         let client = RelayAwareHttpClient::new(
             &registry_url,
-            "grid",
+            expected_contract(),
             false,
             RelayAwareClientConfig {
                 max_attempts: 3,
@@ -855,7 +812,7 @@ mod tests {
 
         let client = RelayAwareHttpClient::new(
             &registry_url,
-            "grid",
+            expected_contract(),
             false,
             RelayAwareClientConfig {
                 max_attempts: 3,
@@ -895,15 +852,14 @@ mod tests {
 
         let client = RelayAwareHttpClient::new(
             &registry_url,
-            "grid",
+            expected_contract(),
             false,
             RelayAwareClientConfig {
                 max_attempts: 1,
                 ..Default::default()
             },
         )
-        .unwrap()
-        .with_expected_crm("test.grid", "Grid", "0.1.0");
+        .unwrap();
 
         client.connect_async().await.unwrap();
         assert_eq!(
@@ -942,15 +898,14 @@ mod tests {
 
         let client = RelayAwareHttpClient::new(
             &registry_url,
-            "grid",
+            expected_contract(),
             false,
             RelayAwareClientConfig {
                 max_attempts: 1,
                 ..Default::default()
             },
         )
-        .unwrap()
-        .with_expected_crm("test.grid", "Grid", "0.1.0");
+        .unwrap();
 
         client.connect_async().await.unwrap();
         let bytes = client.call_async("step", b"payload").await.unwrap();
@@ -961,24 +916,67 @@ mod tests {
     }
 
     #[test]
+    fn construction_rejects_malformed_expected_contract_without_panic() {
+        let mut malformed = expected_contract();
+        malformed.abi_hash = "not-a-sha256".to_string();
+
+        let result = RelayAwareHttpClient::new(
+            "http://relay.example",
+            malformed,
+            false,
+            RelayAwareClientConfig::default(),
+        );
+        let err = match result {
+            Ok(_) => panic!("malformed expected contract must return an error"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("abi_hash"), "{err}");
+    }
+
+    #[test]
+    fn new_with_control_rejects_malformed_expected_contract_without_panic() {
+        let mut malformed = expected_contract();
+        malformed.signature_hash = String::new();
+        let control = Arc::new(RelayControlClient::new("http://relay.example", false).unwrap());
+
+        let result = RelayAwareHttpClient::new_with_control(
+            control,
+            malformed,
+            false,
+            RelayAwareClientConfig::default(),
+        );
+        let err = match result {
+            Ok(_) => panic!("malformed expected contract must return an error"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("signature_hash"), "{err}");
+    }
+
+    #[test]
     fn local_ipc_selection_requires_loopback_anchor() {
         let routes = vec![RelayRouteInfo {
-            name: "grid".to_string(),
             relay_url: "http://relay.example".to_string(),
             ipc_address: Some("ipc://local-grid".to_string()),
             server_id: Some("local-grid".to_string()),
             server_instance_id: Some("inst-local-grid".to_string()),
-            crm_ns: String::new(),
-            crm_name: String::new(),
-            crm_ver: String::new(),
+            ..route_info("grid".to_string(), "http://relay.example".to_string())
         }];
 
         assert_eq!(
-            select_local_ipc_candidate(true, true, &routes).map(|candidate| candidate.address),
+            select_local_ipc_candidate(true, true, &routes, &expected_contract())
+                .map(|candidate| candidate.address),
             Some("ipc://local-grid".to_string())
         );
-        assert_eq!(select_local_ipc_candidate(true, false, &routes), None);
-        assert_eq!(select_local_ipc_candidate(false, true, &routes), None);
+        assert_eq!(
+            select_local_ipc_candidate(true, false, &routes, &expected_contract()),
+            None
+        );
+        assert_eq!(
+            select_local_ipc_candidate(false, true, &routes, &expected_contract()),
+            None
+        );
 
         assert!(relay_anchor_allows_local_ipc("http://127.0.0.1:8080"));
         assert!(relay_anchor_allows_local_ipc("http://[::1]:8080"));
@@ -990,14 +988,10 @@ mod tests {
     #[test]
     fn local_ipc_selection_requires_identity_complete_route() {
         let complete = RelayRouteInfo {
-            name: "grid".to_string(),
-            relay_url: "http://127.0.0.1:8080".to_string(),
             ipc_address: Some("ipc://grid-server".to_string()),
             server_id: Some("grid-server".to_string()),
             server_instance_id: Some("inst-a".to_string()),
-            crm_ns: String::new(),
-            crm_name: String::new(),
-            crm_ver: String::new(),
+            ..route_info("grid".to_string(), "http://127.0.0.1:8080".to_string())
         };
         let missing_instance = RelayRouteInfo {
             server_instance_id: None,
@@ -1009,15 +1003,15 @@ mod tests {
         };
 
         assert_eq!(
-            select_local_ipc_candidate(true, true, &[missing_instance]),
+            select_local_ipc_candidate(true, true, &[missing_instance], &expected_contract()),
             None,
         );
         assert_eq!(
-            select_local_ipc_candidate(true, true, &[missing_server_id]),
+            select_local_ipc_candidate(true, true, &[missing_server_id], &expected_contract()),
             None,
         );
         assert_eq!(
-            select_local_ipc_candidate(true, true, &[complete.clone()]),
+            select_local_ipc_candidate(true, true, &[complete.clone()], &expected_contract()),
             Some(RelayLocalIpcCandidate {
                 address: "ipc://grid-server".to_string(),
                 server_id: "grid-server".to_string(),
@@ -1029,17 +1023,14 @@ mod tests {
     #[test]
     fn relay_resolved_ipc_target_carries_expected_identity() {
         let route = RelayRouteInfo {
-            name: "grid".to_string(),
-            relay_url: "http://127.0.0.1:8080".to_string(),
             ipc_address: Some("ipc://grid-server".to_string()),
             server_id: Some("grid-server".to_string()),
             server_instance_id: Some("inst-a".to_string()),
-            crm_ns: String::new(),
-            crm_name: String::new(),
-            crm_ver: String::new(),
+            ..route_info("grid".to_string(), "http://127.0.0.1:8080".to_string())
         };
 
-        let candidate = select_local_ipc_candidate(true, true, &[route]).expect("candidate");
+        let candidate = select_local_ipc_candidate(true, true, &[route], &expected_contract())
+            .expect("candidate");
         assert_eq!(candidate.address, "ipc://grid-server");
         assert_eq!(candidate.server_id, "grid-server");
         assert_eq!(candidate.server_instance_id, "inst-a");
@@ -1048,44 +1039,32 @@ mod tests {
     #[test]
     fn crm_contract_filter_runs_before_local_ipc_selection() {
         let mismatched_local = RelayRouteInfo {
-            name: "grid".to_string(),
-            relay_url: "http://127.0.0.1:8080".to_string(),
             ipc_address: Some("ipc://wrong-grid".to_string()),
             server_id: Some("wrong-grid".to_string()),
             server_instance_id: Some("inst-wrong".to_string()),
             crm_ns: "other.grid".to_string(),
-            crm_name: "Grid".to_string(),
-            crm_ver: "0.1.0".to_string(),
+            ..route_info("grid".to_string(), "http://127.0.0.1:8080".to_string())
         };
         let mismatched_crm_name = RelayRouteInfo {
-            name: "grid".to_string(),
-            relay_url: "http://127.0.0.1:8082".to_string(),
             ipc_address: Some("ipc://wrong-model".to_string()),
             server_id: Some("wrong-model".to_string()),
             server_instance_id: Some("inst-wrong-model".to_string()),
-            crm_ns: "test.grid".to_string(),
             crm_name: "OtherGrid".to_string(),
-            crm_ver: "0.1.0".to_string(),
+            ..route_info("grid".to_string(), "http://127.0.0.1:8082".to_string())
         };
-        let matched_http = RelayRouteInfo {
-            name: "grid".to_string(),
-            relay_url: "http://127.0.0.1:8081".to_string(),
-            ipc_address: None,
-            server_id: None,
-            server_instance_id: None,
-            crm_ns: "test.grid".to_string(),
-            crm_name: "Grid".to_string(),
-            crm_ver: "0.1.0".to_string(),
-        };
+        let matched_http = route_info("grid".to_string(), "http://127.0.0.1:8081".to_string());
 
-        let filtered = filter_routes_by_expected_crm(
+        let filtered = filter_routes_by_expected_contract(
             vec![mismatched_local, mismatched_crm_name, matched_http.clone()],
-            Some(("test.grid", "Grid", "0.1.0")),
+            &expected_contract(),
         );
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].relay_url, matched_http.relay_url);
-        assert_eq!(select_local_ipc_candidate(true, true, &filtered), None);
+        assert_eq!(
+            select_local_ipc_candidate(true, true, &filtered, &expected_contract()),
+            None
+        );
     }
 
     #[tokio::test]
@@ -1109,7 +1088,7 @@ mod tests {
 
         let client = RelayAwareHttpClient::new(
             &registry_url,
-            "grid",
+            expected_contract(),
             false,
             RelayAwareClientConfig {
                 max_attempts: 1,
@@ -1148,7 +1127,7 @@ mod tests {
 
         let client = RelayAwareHttpClient::new(
             &registry_url,
-            "grid",
+            expected_contract(),
             false,
             RelayAwareClientConfig {
                 max_attempts: 1,
@@ -1187,7 +1166,7 @@ mod tests {
 
         let client = RelayAwareHttpClient::new(
             &registry_url,
-            "grid",
+            expected_contract(),
             false,
             RelayAwareClientConfig {
                 max_attempts: 3,
@@ -1226,7 +1205,7 @@ mod tests {
 
         let client = RelayAwareHttpClient::new(
             &registry_url,
-            "grid",
+            expected_contract(),
             false,
             RelayAwareClientConfig {
                 max_attempts: 1,
@@ -1265,7 +1244,7 @@ mod tests {
 
         let client = RelayAwareHttpClient::new(
             &registry_url,
-            "grid",
+            expected_contract(),
             false,
             RelayAwareClientConfig {
                 max_attempts: 3,
@@ -1307,7 +1286,7 @@ mod tests {
 
         let client = RelayAwareHttpClient::new(
             &registry_url,
-            "grid",
+            expected_contract(),
             false,
             RelayAwareClientConfig {
                 max_attempts: 3,

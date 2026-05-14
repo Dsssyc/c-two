@@ -9,7 +9,10 @@ mod client_tests {
     use c2_wire::frame;
     use c2_wire::handshake::*;
 
-    use crate::client::ClientIpcConfig;
+    use crate::client::{
+        ClientIpcConfig, IpcClient, RequestTransportKind, choose_request_transport,
+        request_chunk_count,
+    };
 
     #[test]
     fn encode_v2_inline_call() {
@@ -38,7 +41,7 @@ mod client_tests {
     #[test]
     fn encode_v2_inline_reply() {
         // [16B header (flags=RESPONSE|REPLY_V2)] [1B status=OK] [data]
-        let ctrl = encode_reply_control(&ReplyControl::Success);
+        let ctrl = try_encode_reply_control(&ReplyControl::Success).unwrap();
         let data = b"result";
         let mut payload = Vec::new();
         payload.extend_from_slice(&ctrl);
@@ -59,7 +62,7 @@ mod client_tests {
     #[test]
     fn encode_v2_error_reply() {
         let err = b"3:test error".to_vec();
-        let ctrl = encode_reply_control(&ReplyControl::Error(err.clone()));
+        let ctrl = try_encode_reply_control(&ReplyControl::Error(err.clone())).unwrap();
         let frame_bytes =
             frame::encode_frame(42, flags::FLAG_RESPONSE | flags::FLAG_REPLY_V2, &ctrl);
 
@@ -247,10 +250,10 @@ mod client_tests {
     }
 
     #[test]
-    fn test_call_full_path_selection() {
-        // Verify ClientIpcConfig thresholds determine the expected transport path.
-        // We can't call call_full directly (no UDS connection), but we can
-        // verify the selection logic by checking threshold boundaries.
+    fn canonical_call_transport_selection_is_testable() {
+        // Verify ClientIpcConfig thresholds determine the transport path used by
+        // IpcClient::call(). This must stay as a pure selector so relay behavior
+        // is not proven only by comments or a live UDS integration test.
         let cfg = ClientIpcConfig {
             shm_threshold: 100,
             base: c2_config::BaseIpcConfig {
@@ -259,23 +262,87 @@ mod client_tests {
             },
         };
 
-        // Below shm_threshold → inline
-        let small = vec![0u8; 50];
-        assert!(small.len() <= cfg.shm_threshold as usize);
+        assert_eq!(
+            choose_request_transport(&cfg, false, 50),
+            RequestTransportKind::Inline
+        );
+        assert_eq!(
+            choose_request_transport(&cfg, true, 50),
+            RequestTransportKind::Inline
+        );
 
-        // Between shm_threshold and chunk_size → buddy (if pool) or inline
-        let medium = vec![0u8; 200];
-        assert!(medium.len() > cfg.shm_threshold as usize);
-        assert!(medium.len() <= cfg.chunk_size as usize);
+        assert_eq!(
+            choose_request_transport(&cfg, true, 200),
+            RequestTransportKind::Buddy
+        );
+        assert_eq!(
+            choose_request_transport(&cfg, false, 200),
+            RequestTransportKind::Inline
+        );
 
-        // Above chunk_size → chunked (if no pool) or buddy first
-        let large = vec![0u8; 600];
-        assert!(large.len() > cfg.chunk_size as usize);
+        assert_eq!(
+            choose_request_transport(&cfg, true, 600),
+            RequestTransportKind::Buddy
+        );
+        assert_eq!(
+            choose_request_transport(&cfg, false, 600),
+            RequestTransportKind::Chunked
+        );
+        assert_eq!(
+            choose_request_transport(&cfg, true, u32::MAX as usize + 1),
+            RequestTransportKind::Chunked,
+            "buddy request metadata cannot represent payload lengths above u32::MAX"
+        );
 
         // Verify chunk count calculation.
         let chunk_size = cfg.chunk_size as usize;
-        let total_chunks = (large.len() + chunk_size - 1) / chunk_size;
-        assert_eq!(total_chunks, 2); // 600 / 500 = 1.2 → 2 chunks
+        let total_chunks = request_chunk_count(600, chunk_size).unwrap();
+        assert_eq!(total_chunks, 2); // 600 / 500 = 1.2 -> 2 chunks
+        assert!(request_chunk_count(usize::from(u16::MAX) * chunk_size + 1, chunk_size).is_err());
+    }
+
+    #[test]
+    fn call_full_is_not_a_public_production_api() {
+        let client_source = include_str!("client.rs");
+        let client_production = client_source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("client.rs must contain a production section");
+        assert!(
+            !client_production.contains("pub async fn call_full("),
+            "IpcClient must expose one canonical semantic call API"
+        );
+
+        let sync_source = include_str!("sync_client.rs");
+        let sync_production = sync_source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("sync_client.rs must contain a production section");
+        assert!(
+            !sync_production.contains(".call_full("),
+            "SyncClient must delegate to canonical IpcClient::call"
+        );
+    }
+
+    #[test]
+    fn with_config_owns_request_pool_when_pool_enabled() {
+        let cfg = ClientIpcConfig {
+            shm_threshold: 100,
+            base: c2_config::BaseIpcConfig {
+                pool_enabled: true,
+                pool_segment_size: 65_536,
+                max_pool_segments: 2,
+                ..c2_config::BaseIpcConfig::default()
+            },
+        };
+        let client = IpcClient::with_config("ipc://configured", cfg.clone());
+        assert!(client.pool.is_some());
+        assert_eq!(client.config.shm_threshold, cfg.shm_threshold);
+
+        let mut disabled = cfg;
+        disabled.base.pool_enabled = false;
+        let client = IpcClient::with_config("ipc://configured-no-pool", disabled);
+        assert!(client.pool.is_none());
     }
 
     #[test]

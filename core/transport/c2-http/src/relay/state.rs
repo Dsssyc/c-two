@@ -6,9 +6,10 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use c2_config::RelayConfig;
-use c2_ipc::IpcClient;
+use c2_ipc::{ClientIpcConfig, IpcClient};
 use parking_lot::RwLock;
 use parking_lot::RwLockWriteGuard;
 
@@ -16,7 +17,8 @@ use crate::relay::authority::{
     ControlError, OwnerReplacement, RouteAuthority, RouteCommand, RouteCommandResult,
 };
 use crate::relay::conn_pool::{
-    AcquireError as PoolAcquireError, CachedClient, ConnectionPool, OwnerToken, UpstreamLease,
+    AcquireError as PoolAcquireError, CachedClient, ConnectionPool, OwnerReplaceError,
+    OwnerReplacementEvidence, OwnerToken, UpstreamLease,
 };
 use crate::relay::route_table::RouteTable;
 use crate::relay::types::*;
@@ -28,17 +30,20 @@ pub struct RelayState {
     disseminator: Arc<dyn crate::relay::disseminator::Disseminator>,
 }
 
-#[derive(Clone)]
-pub struct OwnerReplacementToken {
-    pub existing_address: String,
-    pub token: OwnerToken,
+fn owner_lease_duration(config: &RelayConfig) -> Option<Duration> {
+    match config.idle_timeout_secs {
+        0 => None,
+        seconds => Some(Duration::from_secs(seconds)),
+    }
 }
 
+#[derive(Clone)]
 pub enum RegisterCommitResult {
     Registered { entry: RouteEntry },
     SameOwner { entry: RouteEntry },
     Duplicate { existing_address: String },
     ConflictingOwner { existing_address: String },
+    Invalid { reason: String },
 }
 
 pub enum UnregisterResult {
@@ -66,9 +71,10 @@ impl RelayState {
         config: Arc<RelayConfig>,
         disseminator: Arc<dyn crate::relay::disseminator::Disseminator>,
     ) -> Self {
+        let owner_lease_duration = owner_lease_duration(&config);
         Self {
             route_table: RwLock::new(RouteTable::new(config.relay_id.clone())),
-            conn_pool: ConnectionPool::new(),
+            conn_pool: ConnectionPool::with_owner_lease_duration(owner_lease_duration),
             disseminator,
             config,
         }
@@ -96,13 +102,12 @@ impl RelayState {
         crm_ns: String,
         crm_name: String,
         crm_ver: String,
+        abi_hash: String,
+        signature_hash: String,
+        max_payload_size: u64,
         client: Arc<IpcClient>,
-        replacement: Option<OwnerReplacementToken>,
+        replacement: Option<OwnerReplacement>,
     ) -> RegisterCommitResult {
-        let replacement = replacement.map(|token| OwnerReplacement {
-            existing_address: token.existing_address,
-            token: token.token,
-        });
         match RouteAuthority::new(self).execute(RouteCommand::RegisterLocal {
             name,
             server_id,
@@ -111,6 +116,9 @@ impl RelayState {
             crm_ns,
             crm_name,
             crm_ver,
+            abi_hash,
+            signature_hash,
+            max_payload_size,
             client,
             replacement,
         }) {
@@ -126,16 +134,12 @@ impl RelayState {
             Err(ControlError::DuplicateRoute { existing_address }) => {
                 RegisterCommitResult::Duplicate { existing_address }
             }
-            Err(ControlError::InvalidServerId { .. }) | Err(ControlError::InvalidName { .. }) => {
-                RegisterCommitResult::ConflictingOwner {
-                    existing_address: "<invalid>".to_string(),
-                }
-            }
-            Err(ControlError::InvalidServerInstanceId { .. })
-            | Err(ControlError::ContractMismatch { .. }) => {
-                RegisterCommitResult::ConflictingOwner {
-                    existing_address: "<invalid>".to_string(),
-                }
+            Err(ControlError::InvalidName { reason })
+            | Err(ControlError::InvalidServerId { reason })
+            | Err(ControlError::InvalidServerInstanceId { reason })
+            | Err(ControlError::InvalidAddress { reason })
+            | Err(ControlError::ContractMismatch { reason }) => {
+                RegisterCommitResult::Invalid { reason }
             }
             Ok(
                 RouteCommandResult::Unregistered { .. }
@@ -178,6 +182,7 @@ impl RelayState {
             | Err(ControlError::InvalidName { .. })
             | Err(ControlError::InvalidServerId { .. })
             | Err(ControlError::InvalidServerInstanceId { .. })
+            | Err(ControlError::InvalidAddress { .. })
             | Err(ControlError::ContractMismatch { .. }) => UnregisterResult::OwnerMismatch,
             Err(ControlError::DuplicateRoute { .. }) => UnregisterResult::OwnerMismatch,
         }
@@ -202,20 +207,16 @@ impl RelayState {
 
     // -- Route-only operations --
 
+    #[cfg(test)]
     pub fn resolve(&self, name: &str) -> Vec<RouteInfo> {
         self.route_table.read().resolve(name)
     }
 
     pub fn resolve_matching(
         &self,
-        name: &str,
-        crm_ns: &str,
-        crm_name: &str,
-        crm_ver: &str,
+        expected: &c2_contract::ExpectedRouteContract,
     ) -> Vec<RouteInfo> {
-        self.route_table
-            .read()
-            .resolve_matching(name, crm_ns, crm_name, crm_ver)
+        self.route_table.read().resolve_matching(expected)
     }
 
     pub fn route_names(&self) -> Vec<String> {
@@ -256,7 +257,8 @@ impl RelayState {
                             expected.ipc_address
                         )));
                     }
-                    let mut client = IpcClient::new(&address);
+                    let mut client =
+                        IpcClient::with_config(&address, ClientIpcConfig::default());
                     client.connect().await?;
                     if client.server_id() != expected.server_id.as_deref()
                         || client.server_instance_id() != expected.server_instance_id.as_deref()
@@ -271,12 +273,15 @@ impl RelayState {
                             expected.server_instance_id.as_deref().unwrap_or(""),
                         )));
                     }
-                    if let Err(err) = client.validate_route_contract(
-                        &route_name,
-                        &expected.crm_ns,
-                        &expected.crm_name,
-                        &expected.crm_ver,
-                    ) {
+                    let expected_contract = c2_contract::ExpectedRouteContract {
+                        route_name: route_name.clone(),
+                        crm_ns: expected.crm_ns.clone(),
+                        crm_name: expected.crm_name.clone(),
+                        crm_ver: expected.crm_ver.clone(),
+                        abi_hash: expected.abi_hash.clone(),
+                        signature_hash: expected.signature_hash.clone(),
+                    };
+                    if let Err(err) = client.validate_route_contract(&expected_contract) {
                         client.close().await;
                         return Err(err);
                     }
@@ -301,14 +306,8 @@ impl RelayState {
         };
 
         let lease_address = lease.address();
-        let route_matches_lease = self
-            .route_table
-            .read()
-            .local_route(name)
-            .is_some_and(|entry| {
-                local_route_matches(&entry, &expected)
-                    && entry.ipc_address.as_deref() == Some(lease_address.as_str())
-            });
+        let route_matches_lease =
+            self.renew_owner_lease_if_current_route(&expected, lease_address.as_str());
 
         if route_matches_lease {
             Ok((lease, expected))
@@ -318,6 +317,23 @@ impl RelayState {
             client.close_shared().await;
             Err(UpstreamAcquireError::NotFound)
         }
+    }
+
+    fn renew_owner_lease_if_current_route(
+        &self,
+        expected: &RouteEntry,
+        lease_address: &str,
+    ) -> bool {
+        let route_table = self.route_table.read();
+        let Some(entry) = route_table.local_route(&expected.name) else {
+            return false;
+        };
+        if !local_route_matches(&entry, expected)
+            || entry.ipc_address.as_deref() != Some(lease_address)
+        {
+            return false;
+        }
+        self.conn_pool.renew_current_owner_lease(&expected.name)
     }
 
     #[cfg(test)]
@@ -333,8 +349,20 @@ impl RelayState {
         self.conn_pool.matches_owner_token(name, token)
     }
 
-    pub(crate) fn can_replace_owner_token(&self, name: &str, token: &OwnerToken) -> bool {
-        self.conn_pool.can_replace_owner_token(name, token)
+    pub(crate) fn renew_owner_lease(&self, name: &str, token: &OwnerToken) -> bool {
+        self.conn_pool.renew_owner_lease(name, token)
+    }
+
+    pub(crate) fn replace_if_owner_token(
+        &self,
+        name: &str,
+        token: &OwnerToken,
+        new_address: String,
+        new_client: Arc<IpcClient>,
+        evidence: OwnerReplacementEvidence,
+    ) -> Result<Option<Arc<IpcClient>>, OwnerReplaceError> {
+        self.conn_pool
+            .replace_if_owner_token(name, token, new_address, new_client, evidence)
     }
 
     pub(crate) fn connection_lookup(&self, name: &str) -> CachedClient {
@@ -410,11 +438,11 @@ impl RelayState {
         self.route_table.read().full_snapshot()
     }
 
-    pub fn merge_snapshot(&self, sync: FullSync) {
-        self.route_table.write().merge_snapshot(sync);
+    pub fn merge_snapshot(&self, sync: ValidatedFullSync) {
+        self.route_table.write().merge_validated_snapshot(sync);
     }
 
-    pub fn route_digest(&self) -> HashMap<(String, String, bool), u64> {
+    pub fn route_digest(&self) -> HashMap<(String, String, bool), RouteDigestHash> {
         self.route_table.read().route_digest()
     }
 
@@ -461,6 +489,14 @@ impl RelayState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::relay::authority::RegisterPreparation;
+
+    const TEST_CRM_NS: &str = "test.relay";
+    const TEST_CRM_NAME: &str = "RelayGrid";
+    const TEST_CRM_VER: &str = "0.1.0";
+    const TEST_ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const TEST_SIGNATURE_HASH: &str =
+        "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
 
     struct NullDisseminator;
     impl crate::relay::disseminator::Disseminator for NullDisseminator {
@@ -519,6 +555,8 @@ mod tests {
             "test.echo",
             "Echo",
             "0.1.0",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
             client,
         )
     }
@@ -532,6 +570,8 @@ mod tests {
         crm_ns: &str,
         crm_name: &str,
         crm_ver: &str,
+        abi_hash: &str,
+        signature_hash: &str,
         client: Arc<IpcClient>,
     ) -> RouteEntry {
         match state.commit_register_upstream(
@@ -542,6 +582,9 @@ mod tests {
             crm_ns.to_string(),
             crm_name.to_string(),
             crm_ver.to_string(),
+            abi_hash.to_string(),
+            signature_hash.to_string(),
+            1024,
             client,
             None,
         ) {
@@ -551,7 +594,75 @@ mod tests {
             | RegisterCommitResult::ConflictingOwner { existing_address } => {
                 panic!("unexpected duplicate route at {existing_address}")
             }
+            RegisterCommitResult::Invalid { reason } => {
+                panic!("unexpected invalid route in test helper: {reason}")
+            }
         }
+    }
+
+    async fn confirmed_dead_replacement(
+        state: &RelayState,
+        name: &str,
+        server_id: &str,
+        server_instance_id: &str,
+        address: &str,
+    ) -> OwnerReplacement {
+        let preliminary = RouteAuthority::new(state)
+            .prepare_register(name, server_id, server_instance_id, address)
+            .await
+            .expect("preliminary replacement should be available");
+        let replacement = match preliminary {
+            RegisterPreparation::Available {
+                replacement: Some(replacement),
+            } => replacement,
+            _ => panic!("expected replacement candidate"),
+        };
+        RouteAuthority::new(state)
+            .confirm_replacement_for_commit(Some(replacement))
+            .await
+            .expect("dead owner should confirm replacement")
+            .expect("replacement proof should be present")
+    }
+
+    fn source_between<'a>(source: &'a str, start: &str, end: &str) -> Option<&'a str> {
+        let start_idx = source.find(start)?;
+        let after_start = &source[start_idx..];
+        let end_idx = after_start.find(end)?;
+        Some(&after_start[..end_idx])
+    }
+
+    #[test]
+    fn state_layer_does_not_export_replacement_evidence_token() {
+        let source = include_str!("state.rs");
+        let token_type = concat!("Owner", "Replacement", "Token");
+        let token_argument = concat!("replacement: Option<Owner", "Replacement", "Token>");
+        assert!(
+            !source.contains(token_type),
+            "state.rs must not expose a replacement token that callers can fill with evidence"
+        );
+        assert!(
+            !source.contains(token_argument),
+            "commit_register_upstream must consume opaque OwnerReplacement directly"
+        );
+    }
+
+    #[test]
+    fn state_commit_does_not_reconstruct_replacement_proof() {
+        let source = include_str!("state.rs");
+        let body = source_between(
+            source,
+            "pub fn commit_register_upstream(",
+            "pub fn unregister_upstream(",
+        )
+        .expect("commit_register_upstream body should be found");
+        assert!(
+            !body.contains("OwnerReplacement {"),
+            "state commit must not reconstruct OwnerReplacement from caller-provided fields"
+        );
+        assert!(
+            !body.contains("evidence:"),
+            "state commit must not copy caller-provided evidence into replacement proof"
+        );
     }
 
     fn announce_peer_route(state: &RelayState, entry: RouteEntry) {
@@ -584,6 +695,58 @@ mod tests {
                 .unwrap(),
             RouteCommandResult::PeerRoutesRemoved
         ));
+    }
+
+    #[test]
+    fn local_commit_rejects_invalid_crm_tag_without_fake_duplicate() {
+        let state = RelayState::new(test_config(), null_disseminator());
+        let client = Arc::new(IpcClient::new("ipc://grid"));
+
+        let result = state.commit_register_upstream(
+            "grid".into(),
+            "server-grid".into(),
+            "server-grid-instance".into(),
+            "ipc://grid".into(),
+            "test.mesh".into(),
+            "Grid\nInjected".into(),
+            "0.1.0".into(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
+            1024,
+            client,
+            None,
+        );
+
+        assert!(
+            matches!(result, RegisterCommitResult::Invalid { reason } if reason.contains("control characters"))
+        );
+        assert!(state.resolve("grid").is_empty());
+    }
+
+    #[test]
+    fn local_commit_rejects_invalid_ipc_address_without_fake_duplicate() {
+        let state = RelayState::new(test_config(), null_disseminator());
+        let client = Arc::new(IpcClient::new("ipc://../escape"));
+
+        let result = state.commit_register_upstream(
+            "grid".into(),
+            "server-grid".into(),
+            "server-grid-instance".into(),
+            "ipc://../escape".into(),
+            "test.mesh".into(),
+            "Grid".into(),
+            "0.1.0".into(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
+            1024,
+            client,
+            None,
+        );
+
+        assert!(
+            matches!(result, RegisterCommitResult::Invalid { reason } if reason.contains("path separators"))
+        );
+        assert!(state.resolve("grid").is_empty());
     }
 
     #[test]
@@ -650,6 +813,9 @@ mod tests {
                 crm_ns: "ns".into(),
                 crm_name: "Grid".into(),
                 crm_ver: "0.1.0".into(),
+                abi_hash: TEST_ABI_HASH.into(),
+                signature_hash: TEST_SIGNATURE_HASH.into(),
+                max_payload_size: 1024,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -682,6 +848,9 @@ mod tests {
                 crm_ns: "test.ns".into(),
                 crm_name: "Grid".into(),
                 crm_ver: "0.1.0".into(),
+                abi_hash: TEST_ABI_HASH.into(),
+                signature_hash: TEST_SIGNATURE_HASH.into(),
+                max_payload_size: 1024,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -740,9 +909,12 @@ mod tests {
                 server_id: Some("server-old".into()),
                 server_instance_id: Some("instance-old".into()),
                 ipc_address: Some("ipc://grid-old".into()),
-                crm_ns: String::new(),
-                crm_name: String::new(),
-                crm_ver: String::new(),
+                crm_ns: TEST_CRM_NS.to_string(),
+                crm_name: TEST_CRM_NAME.to_string(),
+                crm_ver: TEST_CRM_VER.to_string(),
+                abi_hash: TEST_ABI_HASH.to_string(),
+                signature_hash: TEST_SIGNATURE_HASH.to_string(),
+                max_payload_size: 1024,
                 locality: Locality::Local,
                 registered_at: 1000.0,
             });
@@ -781,9 +953,12 @@ mod tests {
             "server-first".into(),
             "instance-first".into(),
             "ipc://first".into(),
-            String::new(),
-            String::new(),
-            String::new(),
+            TEST_CRM_NS.to_string(),
+            TEST_CRM_NAME.to_string(),
+            TEST_CRM_VER.to_string(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
+            1024,
             first,
             None,
         );
@@ -797,9 +972,12 @@ mod tests {
             "server-second".into(),
             "instance-second".into(),
             "ipc://second".into(),
-            String::new(),
-            String::new(),
-            String::new(),
+            TEST_CRM_NS.to_string(),
+            TEST_CRM_NAME.to_string(),
+            TEST_CRM_VER.to_string(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
+            1024,
             second,
             None,
         );
@@ -828,9 +1006,12 @@ mod tests {
             "server-racer".into(),
             "instance-racer".into(),
             "ipc://racer".into(),
-            String::new(),
-            String::new(),
-            String::new(),
+            TEST_CRM_NS.to_string(),
+            TEST_CRM_NAME.to_string(),
+            TEST_CRM_VER.to_string(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
+            1024,
             racer,
             None,
         );
@@ -846,9 +1027,12 @@ mod tests {
             "server-candidate".into(),
             "instance-candidate".into(),
             "ipc://candidate".into(),
-            String::new(),
-            String::new(),
-            String::new(),
+            TEST_CRM_NS.to_string(),
+            TEST_CRM_NAME.to_string(),
+            TEST_CRM_VER.to_string(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
+            1024,
             candidate,
             None,
         );
@@ -862,14 +1046,28 @@ mod tests {
         assert_eq!(state.get_address("grid").as_deref(), Some("ipc://racer"));
     }
 
-    #[test]
-    fn replacement_token_can_replace_same_slot_only_while_still_evicted() {
+    #[tokio::test]
+    async fn replacement_proof_can_replace_same_slot_only_while_still_evicted() {
         let state = RelayState::new(test_config(), null_disseminator());
         let old = Arc::new(IpcClient::new("ipc://old"));
         old.force_connected(true);
-        register_local(&state, "grid", "server-old", "ipc://old", old);
-        let old_token = state.owner_token("grid").unwrap();
+        register_local_with_contract(
+            &state,
+            "grid",
+            "server-old",
+            "server-old-instance",
+            "ipc://old",
+            TEST_CRM_NS,
+            TEST_CRM_NAME,
+            TEST_CRM_VER,
+            TEST_ABI_HASH,
+            TEST_SIGNATURE_HASH,
+            old,
+        );
         state.evict_connection("grid");
+        let replacement_proof =
+            confirmed_dead_replacement(&state, "grid", "server-new", "instance-new", "ipc://new")
+                .await;
 
         let replacement = Arc::new(IpcClient::new("ipc://new"));
         replacement.force_connected(true);
@@ -878,27 +1076,35 @@ mod tests {
             "server-new".into(),
             "instance-new".into(),
             "ipc://new".into(),
-            String::new(),
-            String::new(),
-            String::new(),
+            TEST_CRM_NS.to_string(),
+            TEST_CRM_NAME.to_string(),
+            TEST_CRM_VER.to_string(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
+            1024,
             replacement,
-            Some(OwnerReplacementToken {
-                existing_address: "ipc://old".into(),
-                token: old_token,
-            }),
+            Some(replacement_proof),
         );
 
         assert!(matches!(result, RegisterCommitResult::Registered { .. }));
         assert_eq!(state.get_address("grid").as_deref(), Some("ipc://new"));
     }
 
-    #[test]
-    fn replacement_token_does_not_match_re_registered_same_address_owner() {
+    #[tokio::test]
+    async fn replacement_proof_does_not_match_re_registered_same_address_owner() {
         let state = RelayState::new(test_config(), null_disseminator());
         let old = Arc::new(IpcClient::new("ipc://same"));
         old.force_connected(true);
         register_local(&state, "grid", "server-old", "ipc://same", old);
-        let old_token = state.owner_token("grid").unwrap();
+        state.evict_connection("grid");
+        let replacement_proof = confirmed_dead_replacement(
+            &state,
+            "grid",
+            "server-racer",
+            "instance-racer",
+            "ipc://replacement",
+        )
+        .await;
         assert!(matches!(
             state.unregister_upstream("grid", "server-old"),
             UnregisterResult::Removed { .. }
@@ -921,14 +1127,14 @@ mod tests {
             "server-racer".into(),
             "instance-racer".into(),
             "ipc://replacement".into(),
-            String::new(),
-            String::new(),
-            String::new(),
+            TEST_CRM_NS.to_string(),
+            TEST_CRM_NAME.to_string(),
+            TEST_CRM_VER.to_string(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
+            1024,
             stale_replacement,
-            Some(OwnerReplacementToken {
-                existing_address: "ipc://same".into(),
-                token: old_token,
-            }),
+            Some(replacement_proof),
         );
 
         assert!(matches!(
@@ -938,6 +1144,153 @@ mod tests {
             } if existing_address == "ipc://same"
         ));
         assert_eq!(state.get_address("grid").as_deref(), Some("ipc://same"));
+    }
+
+    #[tokio::test]
+    async fn replacement_proof_is_rejected_after_same_owner_lease_renewal() {
+        let state = RelayState::new(test_config(), null_disseminator());
+        let old = Arc::new(IpcClient::new("ipc://old"));
+        old.force_connected(true);
+        register_local_with_contract(
+            &state,
+            "grid",
+            "server-old",
+            "server-old-instance",
+            "ipc://old",
+            TEST_CRM_NS,
+            TEST_CRM_NAME,
+            TEST_CRM_VER,
+            TEST_ABI_HASH,
+            TEST_SIGNATURE_HASH,
+            old,
+        );
+        state.evict_connection("grid");
+        let replacement_proof = confirmed_dead_replacement(
+            &state,
+            "grid",
+            "server-new",
+            "server-new-instance",
+            "ipc://replacement",
+        )
+        .await;
+
+        let same_owner = Arc::new(IpcClient::new("ipc://old"));
+        same_owner.force_connected(true);
+        let same_owner_result = state.commit_register_upstream(
+            "grid".into(),
+            "server-old".into(),
+            "server-old-instance".into(),
+            "ipc://old".into(),
+            TEST_CRM_NS.to_string(),
+            TEST_CRM_NAME.to_string(),
+            TEST_CRM_VER.to_string(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
+            1024,
+            same_owner,
+            None,
+        );
+        assert!(matches!(
+            same_owner_result,
+            RegisterCommitResult::SameOwner { .. }
+        ));
+
+        let replacement = Arc::new(IpcClient::new("ipc://replacement"));
+        replacement.force_connected(true);
+        let result = state.commit_register_upstream(
+            "grid".into(),
+            "server-new".into(),
+            "server-new-instance".into(),
+            "ipc://replacement".into(),
+            TEST_CRM_NS.to_string(),
+            TEST_CRM_NAME.to_string(),
+            TEST_CRM_VER.to_string(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
+            1024,
+            replacement,
+            Some(replacement_proof),
+        );
+
+        assert!(matches!(
+            result,
+            RegisterCommitResult::Duplicate {
+                existing_address
+            } if existing_address == "ipc://old"
+        ));
+        assert_eq!(state.get_address("grid").as_deref(), Some("ipc://old"));
+    }
+
+    #[tokio::test]
+    async fn replacement_proof_is_rejected_after_successful_upstream_acquire() {
+        let state = RelayState::new(test_config(), null_disseminator());
+        let old = Arc::new(IpcClient::new("ipc://old"));
+        old.force_connected(true);
+        register_local(&state, "grid", "server-old", "ipc://old", old);
+        state.evict_connection("grid");
+        let replacement_proof = confirmed_dead_replacement(
+            &state,
+            "grid",
+            "server-new",
+            "server-new-instance",
+            "ipc://replacement",
+        )
+        .await;
+        let reconnected = Arc::new(IpcClient::new("ipc://old"));
+        reconnected.force_connected(true);
+        state.reconnect("grid", reconnected);
+
+        let (lease, route) = match state.acquire_upstream("grid").await {
+            Ok(acquired) => acquired,
+            Err(_) => panic!("expected test upstream acquire to succeed"),
+        };
+        assert_eq!(route.name, "grid");
+        drop(lease);
+
+        state.evict_connection("grid");
+        let replacement = Arc::new(IpcClient::new("ipc://replacement"));
+        replacement.force_connected(true);
+        let result = state.commit_register_upstream(
+            "grid".into(),
+            "server-new".into(),
+            "server-new-instance".into(),
+            "ipc://replacement".into(),
+            TEST_CRM_NS.to_string(),
+            TEST_CRM_NAME.to_string(),
+            TEST_CRM_VER.to_string(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
+            1024,
+            replacement,
+            Some(replacement_proof),
+        );
+
+        assert!(matches!(
+            result,
+            RegisterCommitResult::Duplicate {
+                existing_address
+            } if existing_address == "ipc://old"
+        ));
+        assert_eq!(state.get_address("grid").as_deref(), Some("ipc://old"));
+    }
+
+    #[test]
+    fn owner_lease_renewal_is_not_peer_visible_route_state() {
+        let state = RelayState::new(test_config(), null_disseminator());
+        let old = Arc::new(IpcClient::new("ipc://old"));
+        old.force_connected(true);
+        register_local(&state, "grid", "server-old", "ipc://old", old);
+
+        let before_snapshot =
+            serde_json::to_value(FullSyncSnapshot::from_internal(state.full_snapshot())).unwrap();
+        let before_digest = state.route_digest();
+        assert!(state.conn_pool.renew_current_owner_lease("grid"));
+
+        assert_eq!(
+            serde_json::to_value(FullSyncSnapshot::from_internal(state.full_snapshot())).unwrap(),
+            before_snapshot
+        );
+        assert_eq!(state.route_digest(), before_digest);
     }
 
     #[test]
@@ -954,6 +1307,8 @@ mod tests {
             "test.old",
             "OldGrid",
             "0.1.0",
+            TEST_ABI_HASH,
+            TEST_SIGNATURE_HASH,
             old,
         );
         state.evict_connection("grid");
@@ -973,6 +1328,8 @@ mod tests {
             "test.new",
             "NewGrid",
             "0.1.0",
+            TEST_ABI_HASH,
+            TEST_SIGNATURE_HASH,
             new_same_address,
         );
 
@@ -986,6 +1343,9 @@ mod tests {
             crm_ns: "test.old".into(),
             crm_name: "OldGrid".into(),
             crm_ver: "0.1.0".into(),
+            abi_hash: TEST_ABI_HASH.into(),
+            signature_hash: TEST_SIGNATURE_HASH.into(),
+            max_payload_size: 1024,
             locality: Locality::Local,
             registered_at: 0.0,
         };
@@ -1001,13 +1361,23 @@ mod tests {
     }
 
     #[test]
-    fn replacement_token_cannot_replace_reconnected_owner_slot() {
+    fn replacement_proof_cannot_replace_reconnected_owner_slot() {
         let state = RelayState::new(test_config(), null_disseminator());
         let old = Arc::new(IpcClient::new("ipc://same-slot"));
         old.force_connected(true);
         register_local(&state, "grid", "server-old", "ipc://same-slot", old);
-        let old_token = state.owner_token("grid").unwrap();
         state.evict_connection("grid");
+        let replacement_proof = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime")
+            .block_on(confirmed_dead_replacement(
+                &state,
+                "grid",
+                "server-new",
+                "instance-new",
+                "ipc://replacement",
+            ));
 
         let reconnected_old = Arc::new(IpcClient::new("ipc://same-slot"));
         reconnected_old.force_connected(true);
@@ -1020,14 +1390,14 @@ mod tests {
             "server-new".into(),
             "instance-new".into(),
             "ipc://replacement".into(),
-            String::new(),
-            String::new(),
-            String::new(),
+            TEST_CRM_NS.to_string(),
+            TEST_CRM_NAME.to_string(),
+            TEST_CRM_VER.to_string(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
+            1024,
             replacement,
-            Some(OwnerReplacementToken {
-                existing_address: "ipc://same-slot".into(),
-                token: old_token,
-            }),
+            Some(replacement_proof),
         );
 
         assert!(matches!(
@@ -1047,7 +1417,19 @@ mod tests {
         let state = RelayState::new(test_config(), null_disseminator());
         let original = Arc::new(IpcClient::new("ipc://grid"));
         original.force_connected(true);
-        register_local(&state, "grid", "server-grid", "ipc://grid", original);
+        register_local_with_contract(
+            &state,
+            "grid",
+            "server-grid",
+            "server-grid-instance",
+            "ipc://grid",
+            TEST_CRM_NS,
+            TEST_CRM_NAME,
+            TEST_CRM_VER,
+            TEST_ABI_HASH,
+            TEST_SIGNATURE_HASH,
+            original,
+        );
         state.evict_connection("grid");
 
         let ignored = Arc::new(IpcClient::new("ipc://grid"));
@@ -1057,9 +1439,12 @@ mod tests {
             "server-grid".into(),
             "server-grid-instance".into(),
             "ipc://grid".into(),
-            String::new(),
-            String::new(),
-            String::new(),
+            TEST_CRM_NS.to_string(),
+            TEST_CRM_NAME.to_string(),
+            TEST_CRM_VER.to_string(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
+            1024,
             ignored,
             None,
         );
@@ -1069,6 +1454,41 @@ mod tests {
             state.conn_pool.lookup("grid"),
             CachedClient::Evicted { .. }
         ));
+    }
+
+    #[test]
+    fn same_owner_registration_rejects_contract_change_without_new_instance() {
+        let state = RelayState::new(test_config(), null_disseminator());
+        let original = Arc::new(IpcClient::new("ipc://grid"));
+        original.force_connected(true);
+        register_local(&state, "grid", "server-grid", "ipc://grid", original);
+
+        let changed = Arc::new(IpcClient::new("ipc://grid"));
+        changed.force_connected(true);
+        let result = state.commit_register_upstream(
+            "grid".into(),
+            "server-grid".into(),
+            "server-grid-instance".into(),
+            "ipc://grid".into(),
+            "test.other".into(),
+            "OtherGrid".into(),
+            "0.1.0".into(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
+            1024,
+            changed,
+            None,
+        );
+
+        assert!(matches!(
+            result,
+            RegisterCommitResult::Invalid { reason }
+                if reason.contains("CRM contract mismatch")
+        ));
+        let routes = state.resolve("grid");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].crm_ns, "test.echo");
+        assert_eq!(routes[0].crm_name, "Echo");
     }
 
     #[test]
@@ -1102,9 +1522,12 @@ mod tests {
             "server-grid".into(),
             "instance-new".into(),
             "ipc://grid".into(),
-            String::new(),
-            String::new(),
-            String::new(),
+            TEST_CRM_NS.to_string(),
+            TEST_CRM_NAME.to_string(),
+            TEST_CRM_VER.to_string(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
+            1024,
             replacement,
             None,
         );
@@ -1135,9 +1558,12 @@ mod tests {
             "server-grid".into(),
             "instance-grid".into(),
             "ipc://new".into(),
-            String::new(),
-            String::new(),
-            String::new(),
+            TEST_CRM_NS.to_string(),
+            TEST_CRM_NAME.to_string(),
+            TEST_CRM_VER.to_string(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
+            1024,
             moved,
             None,
         );
@@ -1174,7 +1600,19 @@ mod tests {
         let state = RelayState::new(test_config(), null_disseminator());
         let original = Arc::new(IpcClient::new("ipc://grid"));
         original.force_connected(true);
-        register_local(&state, "grid", "server-grid", "ipc://grid", original);
+        register_local_with_contract(
+            &state,
+            "grid",
+            "server-grid",
+            "server-grid-instance",
+            "ipc://grid",
+            TEST_CRM_NS,
+            TEST_CRM_NAME,
+            TEST_CRM_VER,
+            TEST_ABI_HASH,
+            TEST_SIGNATURE_HASH,
+            original,
+        );
         state.evict_connection("grid");
 
         let replacement = Arc::new(IpcClient::new("ipc://grid"));
@@ -1184,9 +1622,12 @@ mod tests {
             "server-grid".into(),
             "server-grid-instance".into(),
             "ipc://grid".into(),
-            String::new(),
-            String::new(),
-            String::new(),
+            TEST_CRM_NS.to_string(),
+            TEST_CRM_NAME.to_string(),
+            TEST_CRM_VER.to_string(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
+            1024,
             replacement,
             None,
         );

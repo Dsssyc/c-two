@@ -38,6 +38,11 @@ class RenamedHello:
         ...
 
 
+class UndecoratedHello:
+    def greeting(self, name: str) -> str:
+        ...
+
+
 @pytest.fixture(autouse=True)
 def _clean_registry():
     """Ensure a clean registry for every test."""
@@ -56,6 +61,12 @@ class TestRegisterConnect:
     def test_register_returns_name(self):
         n = cc.register(Hello, HelloImpl(), name='hello')
         assert n == 'hello'
+
+    def test_register_rejects_undecorated_contract_before_server_creation(self):
+        with pytest.raises(ValueError, match='decorate it with @cc.crm'):
+            cc.register(UndecoratedHello, HelloImpl(), name='hello')
+
+        assert cc.server_address() is None
 
     def test_connect_thread_local(self):
         """Same-process connect returns thread-local proxy (zero serde)."""
@@ -89,6 +100,12 @@ class TestRegisterConnect:
         with pytest.raises(TypeError, match='CRM contract mismatch'):
             cc.connect(RenamedHello, name='hello')
 
+    def test_connect_rejects_undecorated_contract_before_transport(self):
+        cc.register(Hello, HelloImpl(), name='hello')
+
+        with pytest.raises(ValueError, match='decorate it with @cc.crm'):
+            cc.connect(UndecoratedHello, name='hello')
+
     def test_connect_ipc(self):
         """IPC connect via explicit address returns ipc-mode proxy."""
         cc.register(Hello, HelloImpl(), name='hello')
@@ -119,6 +136,34 @@ class TestRegisterConnect:
 
         with pytest.raises(RuntimeError, match='CRM contract mismatch'):
             cc.connect(RenamedHello, name='hello', address=addr)
+
+    def test_validated_ipc_client_is_bound_to_connected_route(self):
+        cc.register(Hello, HelloImpl(), name='hello')
+        cc.register(Counter, CounterImpl(), name='counter')
+        addr = cc.server_address()
+        assert addr is not None
+
+        crm = cc.connect(Hello, name='hello', address=addr)
+        try:
+            assert crm.client._client.route_name == 'hello'  # noqa: SLF001
+        finally:
+            cc.close(crm)
+
+    def test_raw_ipc_client_rejects_unbound_crm_call(self):
+        from c_two._native import RustClientPool
+
+        cc.register(Hello, HelloImpl(), name='hello')
+        addr = cc.server_address()
+        assert addr is not None
+
+        pool = RustClientPool.instance()
+        client = pool.acquire(addr)
+        try:
+            assert 'hello' in client.route_names()
+            with pytest.raises(RuntimeError, match='route-bound client'):
+                client.call('greeting', b'')
+        finally:
+            pool.release(addr)
 
     def test_close_terminates_proxy(self):
         cc.register(Hello, HelloImpl(), name='hello')
@@ -333,7 +378,7 @@ class TestErrors:
         previous_relay = settings.relay_anchor_address
         try:
             registry.set_relay_anchor('http://127.0.0.1:9')
-            with pytest.raises(Exception, match='relay error'):
+            with pytest.raises(Exception, match='relay_prepare'):
                 registry.register(Hello, HelloImpl(), name='hello')
 
             assert 'hello' not in registry.names
@@ -348,7 +393,7 @@ class TestErrors:
         try:
             cc.register(Hello, HelloImpl(), name='hello')
             registry.set_relay_anchor('http://127.0.0.1:9')
-            with pytest.raises(Exception, match='relay error'):
+            with pytest.raises(Exception, match='relay_prepare'):
                 registry.register(Counter, CounterImpl(), name='counter')
 
             assert registry.names == ['hello']

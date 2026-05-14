@@ -53,14 +53,23 @@ This function populates `_call_header_cache` — a dict of `method_name → pre-
 
 **Changes:**
 
+Historical note: this plan was written before the direct-IPC shutdown
+two-phase correction. For current shutdown control semantics, see
+`docs/plans/2026-05-14-direct-ipc-shutdown-two-phase.md`. The single-byte
+`SHUTDOWN_CLIENT_BYTES` discriminant is now the complete canonical initiate
+request payload; the single-byte `SHUTDOWN_ACK_BYTES` discriminant is still not a
+complete acknowledgement because shutdown acknowledgements remain structured.
+Current code must use Rust
+`c2_wire::shutdown_control::{encode_shutdown_initiate, encode_shutdown_ack}`.
+
 In `ipc/msg_type.py`, add after the `MsgType` enum:
 ```python
 # Pre-encoded 1-byte signal payloads (used as inline frame body)
 PING_BYTES = bytes([MsgType.PING])
 PONG_BYTES = bytes([MsgType.PONG])
-SHUTDOWN_CLIENT_BYTES = bytes([MsgType.SHUTDOWN_CLIENT])
+SHUTDOWN_CLIENT_BYTES = bytes([MsgType.SHUTDOWN_CLIENT])  # historical sketch; Rust codec owns shutdown initiate
 SHUTDOWN_SERVER_BYTES = bytes([MsgType.SHUTDOWN_SERVER])
-SHUTDOWN_ACK_BYTES = bytes([MsgType.SHUTDOWN_ACK])
+SHUTDOWN_ACK_BYTES = bytes([MsgType.SHUTDOWN_ACK])        # historical sketch; not a complete structured ack
 SIGNAL_SIZE = 1
 ```
 
@@ -103,10 +112,10 @@ if flags & FLAG_SIGNAL:
     if payload and payload[0] == MsgType.PING:
         writer.write(encode_frame(request_id, FLAG_RESPONSE | FLAG_SIGNAL, PONG_BYTES))
     elif payload and payload[0] == MsgType.SHUTDOWN_CLIENT:
-        if self._shutdown_event:
-            self._shutdown_event.set()
-        writer.write(encode_frame(request_id, FLAG_RESPONSE | FLAG_SIGNAL, SHUTDOWN_ACK_BYTES))
-        return  # close connection
+        # Obsolete sketch: current Rust server must parse the structured
+        # shutdown request and return a structured outcome ack before changing
+        # server lifecycle state.
+        raise NotImplementedError("use c2_wire::shutdown_control")
     continue
 ```
 

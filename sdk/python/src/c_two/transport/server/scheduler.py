@@ -55,9 +55,3 @@ class Scheduler:
 
     def execution_guard(self, method_idx: int):
         return self._native.execution_guard(method_idx)
-
-    def close(self) -> None:
-        self._native.close()
-
-    def shutdown(self) -> None:
-        self.close()

@@ -15,6 +15,58 @@ from c_two.transport.protocol import (
 )
 from c_two.transport.wire import MethodTable
 
+ABI_HASH = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+SIG_HASH = 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789'
+
+
+def route_info(name: str, methods: list[MethodEntry]) -> RouteInfo:
+    return RouteInfo(
+        name=name,
+        methods=methods,
+        crm_ns='test.wire',
+        crm_name='WireRoute',
+        crm_ver='0.1.0',
+        abi_hash=ABI_HASH,
+        signature_hash=SIG_HASH,
+        max_payload_size=1024,
+    )
+
+
+def test_route_info_requires_explicit_crm_tag():
+    with pytest.raises(TypeError):
+        RouteInfo(
+            name='grid',
+            methods=[MethodEntry(name='get', index=0)],
+        )
+
+
+def test_route_info_rejects_invalid_crm_tag():
+    with pytest.raises(ValueError, match='control characters'):
+        RouteInfo(
+            name='grid',
+            methods=[MethodEntry(name='get', index=0)],
+            crm_ns='test.wire',
+            crm_name='Bad\nRoute',
+            crm_ver='0.1.0',
+            abi_hash=ABI_HASH,
+            signature_hash=SIG_HASH,
+            max_payload_size=1024,
+        )
+
+
+def test_route_info_rejects_zero_max_payload_size():
+    with pytest.raises(ValueError, match='max_payload_size'):
+        RouteInfo(
+            name='grid',
+            methods=[MethodEntry(name='get', index=0)],
+            crm_ns='test.wire',
+            crm_name='WireRoute',
+            crm_ver='0.1.0',
+            abi_hash=ABI_HASH,
+            signature_hash=SIG_HASH,
+            max_payload_size=0,
+        )
+
 
 # ---------------------------------------------------------------------------
 # MethodTable
@@ -75,6 +127,9 @@ class TestHandshake:
             crm_ns="test.hello",
             crm_name="Hello",
             crm_ver="1.2.3",
+            abi_hash=ABI_HASH,
+            signature_hash=SIG_HASH,
+            max_payload_size=2048,
             methods=[
                 MethodEntry(name="add", index=0),
                 MethodEntry(name="greeting", index=1),
@@ -99,6 +154,9 @@ class TestHandshake:
         assert r.crm_ns == "test.hello"
         assert r.crm_name == "Hello"
         assert r.crm_ver == "1.2.3"
+        assert r.abi_hash == ABI_HASH
+        assert r.signature_hash == SIG_HASH
+        assert r.max_payload_size == 2048
         assert len(r.methods) == 2
         assert r.method_by_name("add") == 0
         assert r.method_by_name("greeting") == 1
@@ -106,8 +164,8 @@ class TestHandshake:
 
     def test_multi_segment_multi_route(self):
         segs = [("s1", 100), ("s2", 200)]
-        r1 = RouteInfo("route_a", [MethodEntry("m1", 0)])
-        r2 = RouteInfo("route_b", [MethodEntry("m2", 0), MethodEntry("m3", 1)])
+        r1 = route_info("route_a", [MethodEntry("m1", 0)])
+        r2 = route_info("route_b", [MethodEntry("m2", 0), MethodEntry("m3", 1)])
         encoded = encode_server_handshake(
             segs,
             CAP_CALL,
@@ -136,6 +194,11 @@ class TestHandshake:
         with pytest.raises(ValueError):
             decode_handshake(bytes([HANDSHAKE_VERSION]))
 
+    def test_decode_handshake_does_not_accept_ignored_limit_keywords(self):
+        encoded = encode_client_handshake([], CAP_CALL | CAP_METHOD_IDX)
+        with pytest.raises(TypeError):
+            decode_handshake(encoded, max_segments=1)
+
 
 class TestHandshakePrefixExchange:
     """Handshake v7: prefix and server identity fields."""
@@ -153,7 +216,7 @@ class TestHandshakePrefixExchange:
     def test_server_handshake_with_prefix(self):
         segments = [("/cc3bABCD0000_b0000", 262144)]
         prefix = "/cc3bABCD0000"
-        routes = [RouteInfo(name="grid", methods=[MethodEntry(name="get", index=0)])]
+        routes = [route_info("grid", [MethodEntry(name="get", index=0)])]
         encoded = encode_server_handshake(
             segments,
             CAP_CALL,

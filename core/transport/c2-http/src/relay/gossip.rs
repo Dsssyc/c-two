@@ -14,6 +14,9 @@ pub(crate) fn broadcast_route_announce(state: &Arc<RelayState>, entry: &RouteEnt
             crm_ns: entry.crm_ns.clone(),
             crm_name: entry.crm_name.clone(),
             crm_ver: entry.crm_ver.clone(),
+            abi_hash: entry.abi_hash.clone(),
+            signature_hash: entry.signature_hash.clone(),
+            max_payload_size: entry.max_payload_size,
             registered_at: entry.registered_at,
         },
     );

@@ -11,6 +11,8 @@
 use std::ops::Deref;
 use std::time::Duration;
 
+pub const MAX_EXECUTION_WORKERS: u32 = 64;
+
 /// Code-level IPC override fields shared by both server and client roles.
 pub const BASE_IPC_OVERRIDE_KEYS: &[&str] = &[
     "pool_enabled",
@@ -42,6 +44,7 @@ pub const SERVER_IPC_OVERRIDE_KEYS: &[&str] = &[
     "max_frame_size",
     "max_payload_size",
     "max_pending_requests",
+    "max_execution_workers",
     "pool_decay_seconds",
     "heartbeat_interval",
     "heartbeat_timeout",
@@ -88,6 +91,7 @@ pub struct ServerIpcConfig {
     pub max_frame_size: u64,
     pub max_payload_size: u64,
     pub max_pending_requests: u32,
+    pub max_execution_workers: u32,
     pub pool_decay_seconds: f64,
     pub heartbeat_interval_secs: f64,
     pub heartbeat_timeout_secs: f64,
@@ -134,6 +138,7 @@ impl Default for ServerIpcConfig {
             max_frame_size: 2_147_483_648,    // 2 GB
             max_payload_size: 17_179_869_184, // 16 GB
             max_pending_requests: 1024,
+            max_execution_workers: default_max_execution_workers(),
             pool_decay_seconds: 60.0,
             heartbeat_interval_secs: 15.0,
             heartbeat_timeout_secs: 30.0,
@@ -271,6 +276,15 @@ impl ServerIpcConfig {
         if self.max_payload_size == 0 {
             return Err("max_payload_size must be > 0".into());
         }
+        if self.max_execution_workers == 0 {
+            return Err("max_execution_workers must be > 0".into());
+        }
+        if self.max_execution_workers > MAX_EXECUTION_WORKERS {
+            return Err(format!(
+                "max_execution_workers ({}) must be <= {}",
+                self.max_execution_workers, MAX_EXECUTION_WORKERS
+            ));
+        }
         if self.base.pool_segment_size > self.max_payload_size {
             return Err(format!(
                 "pool_segment_size ({}) must not exceed max_payload_size ({})",
@@ -334,6 +348,13 @@ fn validate_duration_secs(name: &str, secs: f64) -> Result<(), String> {
         .map_err(|_| format!("{name} ({secs}) must be a representable duration in seconds"))
 }
 
+fn default_max_execution_workers() -> u32 {
+    let available = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(4);
+    available.clamp(4, MAX_EXECUTION_WORKERS as usize) as u32
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -346,6 +367,7 @@ mod tests {
     fn override_key_catalogs_exclude_derived_and_global_fields() {
         assert_eq!(CLIENT_IPC_OVERRIDE_KEYS, BASE_IPC_OVERRIDE_KEYS);
         assert!(SERVER_IPC_OVERRIDE_KEYS.contains(&"max_frame_size"));
+        assert!(SERVER_IPC_OVERRIDE_KEYS.contains(&"max_execution_workers"));
         assert!(SERVER_IPC_OVERRIDE_KEYS.contains(&"heartbeat_timeout"));
         assert!(!CLIENT_IPC_OVERRIDE_KEYS.contains(&"max_frame_size"));
 
@@ -359,6 +381,25 @@ mod tests {
     #[test]
     fn server_default_validates() {
         assert!(ServerIpcConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn server_default_execution_workers_uses_bounded_os_parallelism() {
+        let cfg = ServerIpcConfig::default();
+
+        assert!((4..=MAX_EXECUTION_WORKERS).contains(&cfg.max_execution_workers));
+    }
+
+    #[test]
+    fn reject_zero_execution_workers() {
+        let mut cfg = ServerIpcConfig::default();
+        cfg.max_execution_workers = 0;
+
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .contains("max_execution_workers")
+        );
     }
 
     #[test]

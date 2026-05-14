@@ -32,6 +32,22 @@ from c_two.transport.wire import (
     decode_reply_control,
 )
 
+ABI_HASH = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+SIG_HASH = 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789'
+
+
+def route_info(name: str, methods: list[MethodEntry]) -> RouteInfo:
+    return RouteInfo(
+        name=name,
+        methods=methods,
+        crm_ns='test.security',
+        crm_name='SecurityRoute',
+        crm_ver='0.1.0',
+        abi_hash=ABI_HASH,
+        signature_hash=SIG_HASH,
+        max_payload_size=1024,
+    )
+
 
 def _append_server_identity(buf: bytearray) -> None:
     server_id = b'security-server'
@@ -111,7 +127,7 @@ class TestHandshakeBoundsChecking:
     def test_truncated_route_entry(self):
         """Route section present but truncated."""
         segs = [('s1', 100)]
-        routes = [RouteInfo('r1', [MethodEntry('m1', 0)])]
+        routes = [route_info('r1', [MethodEntry('m1', 0)])]
         full = encode_server_handshake(
             segs,
             CAP_CALL,
@@ -145,9 +161,17 @@ class TestHandshakeBoundsChecking:
         buf += struct.pack('<H', 1)     # route_count=1
         buf.append(2)                   # route_name_len=2
         buf += b'r1'                    # route_name
-        buf.append(0)                   # crm_ns_len=0
-        buf.append(0)                   # crm_name_len=0
-        buf.append(0)                   # crm_ver_len=0
+        buf.append(len(b'test.security'))
+        buf += b'test.security'
+        buf.append(len(b'SecurityRoute'))
+        buf += b'SecurityRoute'
+        buf.append(len(b'0.1.0'))
+        buf += b'0.1.0'
+        buf.append(len(ABI_HASH))
+        buf += ABI_HASH.encode()
+        buf.append(len(SIG_HASH))
+        buf += SIG_HASH.encode()
+        buf += struct.pack('<Q', 1024)
         buf += struct.pack('<H', _MAX_HANDSHAKE_METHODS + 1)  # method count
         with pytest.raises(ValueError, match='invalid value|exceeds'):
             decode_handshake(bytes(buf))
@@ -156,8 +180,8 @@ class TestHandshakeBoundsChecking:
         """Ensure normal encode/decode still works after bounds checks."""
         segs = [('seg_a', 256), ('seg_b', 512)]
         routes = [
-            RouteInfo('ns1', [MethodEntry('add', 0), MethodEntry('mul', 1)]),
-            RouteInfo('ns2', [MethodEntry('get', 0)]),
+            route_info('ns1', [MethodEntry('add', 0), MethodEntry('mul', 1)]),
+            route_info('ns2', [MethodEntry('get', 0)]),
         ]
         encoded = encode_server_handshake(
             segs,

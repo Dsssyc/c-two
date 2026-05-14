@@ -43,7 +43,7 @@ def _join_all(threads: list[threading.Thread]) -> None:
     assert not alive, f'threads did not finish: {alive}'
 
 
-@cc.transferable
+@cc.transferable(abi_id='c-two.tests.remote-scheduler.delay.pickle-float.v1')
 class Delay:
     value: float
 
@@ -54,7 +54,7 @@ class Delay:
         return Delay(float(pickle.loads(bytes(buf))))
 
 
-@cc.transferable
+@cc.transferable(abi_id='c-two.tests.remote-scheduler.window.pickle-tuple-float-float.v1')
 class Window:
     start: float
     end: float
@@ -67,7 +67,7 @@ class Window:
         return Window(float(start), float(end))
 
 
-@cc.transferable
+@cc.transferable(abi_id='c-two.tests.remote-scheduler.count.pickle-int.v1')
 class Count:
     value: int
 
@@ -303,7 +303,7 @@ def test_remote_ipc_registers_all_public_concurrency_modes(mode):
         cc.close(client)
 
 
-@cc.transferable
+@cc.transferable(abi_id='c-two.tests.remote-scheduler.large-payload.raw-bytes.v1')
 class LargePayload:
     data: bytes
 
@@ -423,6 +423,7 @@ def test_remote_ipc_scheduler_max_workers_shares_with_local_thread_calls():
     try:
         errors: list[BaseException] = []
         local_result: list[Window] = []
+        remote_result: list[Count] = []
 
         def local_worker():
             try:
@@ -430,18 +431,27 @@ def test_remote_ipc_scheduler_max_workers_shares_with_local_thread_calls():
             except BaseException as exc:
                 errors.append(exc)
 
+        def remote_worker():
+            try:
+                remote_result.append(remote.probe())
+            except BaseException as exc:
+                errors.append(exc)
+
         t1 = threading.Thread(target=local_worker)
         t1.start()
         assert resource.hold_entered.wait(timeout=1)
 
-        with pytest.raises(Exception, match='max_workers=1'):
-            remote.probe()
+        t2 = threading.Thread(target=remote_worker)
+        t2.start()
+        time.sleep(0.1)
 
+        assert t2.is_alive(), 'remote call should wait for shared worker capacity'
         assert resource.probe_calls == 0
         assert not errors
         resource.release.set()
-        _join_all([t1])
+        _join_all([t1, t2])
         assert local_result and local_result[0].end >= local_result[0].start
+        assert remote_result and remote_result[0].value == 1
     finally:
         cc.close(local)
         cc.close(remote)

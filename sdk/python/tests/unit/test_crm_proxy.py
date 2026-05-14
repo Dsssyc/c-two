@@ -30,15 +30,10 @@ class _MockClient:
 
     def __init__(self):
         self.calls: list[tuple] = []
-        self.relays: list[bytes] = []
 
-    def call(self, route_name: str, method_name: str, data: bytes = b'') -> bytes:
-        self.calls.append((route_name, method_name, data))
+    def call(self, method_name: str, data: bytes = b'') -> bytes:
+        self.calls.append((method_name, data))
         return b'result'
-
-    def relay(self, event_bytes: bytes) -> bytes:
-        self.relays.append(event_bytes)
-        return b'relay_result'
 
 
 # ---------------------------------------------------------------------------
@@ -71,9 +66,9 @@ class TestThreadLocalProxy:
         with pytest.raises(NotImplementedError, match='call_direct'):
             proxy.call('greet', b'data')
 
-    def test_relay_raises_not_implemented(self):
+    def test_raw_relay_entrypoint_is_not_available(self):
         proxy = CRMProxy.thread_local(_DummyCRM())
-        with pytest.raises(NotImplementedError):
+        with pytest.raises(AttributeError, match='relay'):
             proxy.relay(b'data')
 
     def test_terminate(self):
@@ -106,25 +101,28 @@ class TestIPCProxy:
         proxy = CRMProxy.ipc(_MockClient(), 'test.ns')
         assert proxy.supports_direct_call is False
 
+    def test_requires_explicit_non_empty_route_name(self):
+        with pytest.raises(ValueError, match='explicit non-empty route name'):
+            CRMProxy.ipc(_MockClient(), '')
+
     def test_call_delegates(self):
         client = _MockClient()
         proxy = CRMProxy.ipc(client, 'test.hello')
         result = proxy.call('greet', b'payload')
         assert result == b'result'
-        assert client.calls == [('test.hello', 'greet', b'payload')]
+        assert client.calls == [('greet', b'payload')]
 
     def test_call_none_data(self):
         client = _MockClient()
         proxy = CRMProxy.ipc(client, 'ns')
         proxy.call('method')
-        assert client.calls == [('ns', 'method', b'')]
+        assert client.calls == [('method', b'')]
 
-    def test_relay_delegates(self):
+    def test_raw_relay_entrypoint_is_not_available_on_route_bound_proxy(self):
         client = _MockClient()
         proxy = CRMProxy.ipc(client, 'ns')
-        result = proxy.relay(b'wire')
-        assert result == b'relay_result'
-        assert client.relays == [b'wire']
+        with pytest.raises(AttributeError, match='relay'):
+            proxy.relay(b'wire')
 
     def test_call_direct_raises(self):
         proxy = CRMProxy.ipc(_MockClient(), 'ns')

@@ -1,16 +1,16 @@
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
-use c2_server::scheduler::{Scheduler, SchedulerAcquireError, SchedulerGuard, SchedulerSnapshot};
+use c2_server::{RouteConcurrencyHandle, SchedulerAcquireError, SchedulerGuard, SchedulerSnapshot};
 
 #[pyclass(name = "RouteConcurrency", frozen, skip_from_py_object)]
 #[derive(Clone)]
 pub struct PyRouteConcurrency {
-    pub(crate) inner: Scheduler,
+    pub(crate) inner: RouteConcurrencyHandle,
 }
 
 impl PyRouteConcurrency {
-    pub(crate) fn new(inner: Scheduler) -> Self {
+    pub(crate) fn new(inner: RouteConcurrencyHandle) -> Self {
         Self { inner }
     }
 }
@@ -77,14 +77,6 @@ impl PyRouteConcurrency {
             .detach(move || sched.blocking_acquire(method_idx))
             .map_err(acquire_error_to_py)?;
         Ok(PyRouteConcurrencyGuard { inner: Some(guard) })
-    }
-
-    fn close(&self) {
-        self.inner.close();
-    }
-
-    fn shutdown(&self) {
-        self.inner.close();
     }
 
     #[getter]

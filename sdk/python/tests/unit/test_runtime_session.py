@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -194,6 +195,89 @@ def test_no_relay_register_unregister_ignores_bad_relay_proxy_env(monkeypatch) -
         cc.shutdown()
 
 
+def test_shutdown_records_bad_relay_env_file_and_closes_server(
+    monkeypatch,
+    tmp_path,
+    caplog,
+) -> None:
+    import c_two as cc
+    from c_two.config import settings
+
+    @cc.crm(namespace='cc.test.runtime_session_bad_shutdown_env', version='0.1.0')
+    class BadShutdownEnvCRM:
+        def ping(self) -> str:
+            ...
+
+    class BadShutdownEnvImpl:
+        def ping(self) -> str:
+            return 'pong'
+
+    cc.shutdown()
+    previous = settings.relay_anchor_address
+    bad_env_dir = tmp_path / 'env-dir'
+    bad_env_dir.mkdir()
+    try:
+        settings.relay_anchor_address = None
+        cc.register(BadShutdownEnvCRM, BadShutdownEnvImpl(), name='bad-shutdown-env')
+        assert cc.server_address() is not None
+
+        monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
+        monkeypatch.setenv('C2_ENV_FILE', str(bad_env_dir))
+        with caplog.at_level(logging.INFO):
+            cc.shutdown()
+
+        assert cc.server_address() is None
+        assert any(
+            'Relay unreachable during shutdown unregister of bad-shutdown-env' in record.message
+            and 'env file' in record.message
+            for record in caplog.records
+        )
+    finally:
+        settings.relay_anchor_address = previous
+        cc.shutdown()
+
+
+def test_shutdown_records_bad_relay_proxy_env_and_closes_server(
+    monkeypatch,
+    caplog,
+) -> None:
+    import c_two as cc
+    from c_two.config import settings
+
+    @cc.crm(namespace='cc.test.runtime_session_bad_shutdown_proxy', version='0.1.0')
+    class BadShutdownProxyCRM:
+        def ping(self) -> str:
+            ...
+
+    class BadShutdownProxyImpl:
+        def ping(self) -> str:
+            return 'pong'
+
+    cc.shutdown()
+    previous = settings.relay_anchor_address
+    try:
+        monkeypatch.setenv('C2_ENV_FILE', '')
+        monkeypatch.delenv('C2_RELAY_ANCHOR_ADDRESS', raising=False)
+        settings.relay_anchor_address = None
+        cc.register(BadShutdownProxyCRM, BadShutdownProxyImpl(), name='bad-shutdown-proxy')
+        assert cc.server_address() is not None
+
+        settings.relay_anchor_address = 'http://127.0.0.1:9'
+        monkeypatch.setenv('C2_RELAY_USE_PROXY', 'not-a-bool')
+        with caplog.at_level(logging.INFO):
+            cc.shutdown()
+
+        assert cc.server_address() is None
+        assert any(
+            'Relay unreachable during shutdown unregister of bad-shutdown-proxy' in record.message
+            and 'C2_RELAY_USE_PROXY' in record.message
+            for record in caplog.records
+        )
+    finally:
+        settings.relay_anchor_address = previous
+        cc.shutdown()
+
+
 def test_failed_first_route_registration_clears_native_identity(monkeypatch) -> None:
     import c_two as cc
     from c_two.transport.server.native import NativeServerBridge
@@ -256,6 +340,21 @@ def test_registry_does_not_construct_server_directly() -> None:
     source = inspect.getsource(registry)
     assert 'self._server = Server(' not in source
     assert 'server = Server(' not in source
+
+
+def test_native_runtime_session_register_errors_expose_structured_failure_attrs() -> None:
+    repo_root = Path(__file__).resolve().parents[4]
+    source = (
+        repo_root / 'sdk/python/native/src/runtime_session_ffi.rs'
+    ).read_text(encoding='utf-8')
+
+    assert 'registration_failure' in source
+    assert 'setattr("rollback"' in source
+    assert 'setattr("relay_cleanup_error"' in source
+    assert 'relay_cleanup_error_to_dict' in source
+    assert 'route_close_outcome_to_dict(py, rollback)' in source
+    assert 'registration_rollback_to_dict' not in source
+    assert 'RegisterFailure(' in source
 
 
 def test_registry_does_not_own_direct_ipc_client_pool() -> None:
@@ -604,6 +703,9 @@ def test_runtime_session_shutdown_drains_explicit_http_pool(monkeypatch) -> None
     outcome = dict(session.shutdown(None, route_names=[]))
 
     assert outcome['http_clients_drained'] is True
+    assert outcome['route_outcomes'] == []
+    assert outcome['route_close_error'] is None
+    assert outcome['runtime_barrier_error'] is None
     assert session.http_client_refcount(relay_url) == 0
 
 

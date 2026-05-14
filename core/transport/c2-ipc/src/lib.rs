@@ -7,9 +7,10 @@
 //!
 //! ```text
 //! HTTP handler
-//!     → IpcClient::call(route, method_idx, payload)
-//!         → send_task:  serialize frame → write UDS
-//!         → recv_task:  read UDS → match request_id → oneshot → caller
+//!     -> IpcClient::call(route, method, payload)
+//!         -> select inline / buddy SHM / chunked request transport
+//!         -> send_task:  serialize frame -> write UDS
+//!         -> recv_task:  read UDS -> match request_id -> oneshot -> caller
 //! ```
 
 pub mod client;
@@ -22,6 +23,7 @@ pub mod sync_client;
 #[cfg(test)]
 mod tests;
 
+pub use c2_wire::shutdown_control::{DirectShutdownAck, ShutdownControlRouteOutcome};
 pub use client::{ClientIpcConfig, IpcClient, IpcError, MethodTable, ServerPoolState};
 pub use control::{ping, shutdown, socket_path_from_ipc_address};
 pub use pool::ClientPool;

@@ -18,6 +18,7 @@ struct PoolEntry {
     ref_count: usize,
     use_proxy: bool,
     timeout_secs: f64,
+    remote_payload_chunk_size: u64,
     /// Set to `Some(Instant::now())` when `ref_count` drops to 0.
     last_release: Option<Instant>,
 }
@@ -33,7 +34,6 @@ struct PoolEntry {
 pub struct HttpClientPool {
     entries: Mutex<HashMap<String, PoolEntry>>,
     grace_period: Duration,
-    default_timeout: f64,
     default_max_connections: usize,
 }
 
@@ -53,34 +53,44 @@ impl HttpClientPool {
         Self {
             entries: Mutex::new(HashMap::new()),
             grace_period: Duration::from_secs_f64(grace_secs),
-            default_timeout: 300.0,
             default_max_connections: 100,
         }
     }
 
-    /// Acquire (or create) a client for `base_url` with an explicit proxy policy.
-    pub fn acquire_with_proxy_policy(
+    #[cfg(test)]
+    fn acquire_with_proxy_policy(
         &self,
         base_url: &str,
         use_proxy: bool,
     ) -> Result<Arc<HttpClient>, HttpError> {
-        self.acquire_with_options(base_url, use_proxy, self.default_timeout)
+        self.acquire_with_options(
+            base_url,
+            use_proxy,
+            300.0,
+            c2_config::DEFAULT_REMOTE_PAYLOAD_CHUNK_SIZE,
+        )
     }
 
-    /// Acquire (or create) a client for `base_url` with explicit proxy and timeout policy.
+    /// Acquire (or create) a client for `base_url` with explicit proxy, timeout,
+    /// and remote payload batching policy.
     pub fn acquire_with_options(
         &self,
         base_url: &str,
         use_proxy: bool,
         timeout_secs: f64,
+        remote_payload_chunk_size: u64,
     ) -> Result<Arc<HttpClient>, HttpError> {
+        crate::payload::validate_remote_payload_chunk_size(remote_payload_chunk_size)?;
         self.sweep_expired();
         let key = canonical_base_url(base_url);
 
         let mut entries = self.entries.lock();
 
         if let Some(entry) = entries.get_mut(&key) {
-            if entry.use_proxy == use_proxy && entry.timeout_secs == timeout_secs {
+            if entry.use_proxy == use_proxy
+                && entry.timeout_secs == timeout_secs
+                && entry.remote_payload_chunk_size == remote_payload_chunk_size
+            {
                 entry.ref_count += 1;
                 entry.last_release = None;
                 return Ok(Arc::clone(&entry.client));
@@ -90,19 +100,25 @@ impl HttpClientPool {
                     "active pooled HTTP client for {base_url} has proxy policy mismatch"
                 )));
             }
-            if entry.ref_count > 0 {
+            if entry.ref_count > 0 && entry.timeout_secs != timeout_secs {
                 return Err(HttpError::Transport(format!(
                     "active pooled HTTP client for {base_url} has timeout policy mismatch"
+                )));
+            }
+            if entry.ref_count > 0 && entry.remote_payload_chunk_size != remote_payload_chunk_size {
+                return Err(HttpError::Transport(format!(
+                    "active pooled HTTP client for {base_url} has remote payload chunk policy mismatch"
                 )));
             }
         }
 
         // Create a new client (lock held — HttpClient::new is fast).
-        let client = Arc::new(HttpClient::new_with_proxy_policy(
+        let client = Arc::new(HttpClient::new_with_transport_policy(
             &key,
             timeout_secs,
             self.default_max_connections,
             use_proxy,
+            remote_payload_chunk_size,
         )?);
 
         entries.insert(
@@ -112,6 +128,7 @@ impl HttpClientPool {
                 ref_count: 1,
                 use_proxy,
                 timeout_secs,
+                remote_payload_chunk_size,
                 last_release: None,
             },
         );
@@ -282,8 +299,10 @@ mod tests {
         let pool = HttpClientPool::new(60.0);
         let url = "http://localhost:9993";
 
-        let _client = pool.acquire_with_options(url, false, 300.0).unwrap();
-        let err = match pool.acquire_with_options(url, false, 900.0) {
+        let _client = pool
+            .acquire_with_options(url, false, 300.0, 1_048_576)
+            .unwrap();
+        let err = match pool.acquire_with_options(url, false, 900.0, 1_048_576) {
             Ok(_) => panic!("active client with different timeout policy must be rejected"),
             Err(err) => err,
         };
@@ -296,14 +315,39 @@ mod tests {
     }
 
     #[test]
+    fn active_remote_payload_chunk_policy_mismatch_is_rejected_without_refcount_change() {
+        let pool = HttpClientPool::new(60.0);
+        let url = "http://localhost:9994";
+
+        let _client = pool
+            .acquire_with_options(url, false, 300.0, 1_048_576)
+            .unwrap();
+        let err = match pool.acquire_with_options(url, false, 300.0, 2_097_152) {
+            Ok(_) => panic!("active client with different remote chunk policy must be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string()
+                .contains("remote payload chunk policy mismatch"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(pool.refcount(url), 1);
+    }
+
+    #[test]
     fn released_timeout_policy_mismatch_replaces_idle_entry() {
         let pool = HttpClientPool::new(60.0);
         let url = "http://localhost:9992";
 
-        let first = pool.acquire_with_options(url, false, 300.0).unwrap();
+        let first = pool
+            .acquire_with_options(url, false, 300.0, 1_048_576)
+            .unwrap();
         pool.release(url);
 
-        let second = pool.acquire_with_options(url, false, 900.0).unwrap();
+        let second = pool
+            .acquire_with_options(url, false, 900.0, 1_048_576)
+            .unwrap();
 
         assert!(
             !Arc::ptr_eq(&first, &second),

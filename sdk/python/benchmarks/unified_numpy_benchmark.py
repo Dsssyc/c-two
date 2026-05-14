@@ -26,6 +26,8 @@ import ray
 
 import c_two as cc
 
+BENCH_PICKLE_PROTOCOL = pickle.HIGHEST_PROTOCOL
+
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -86,7 +88,14 @@ def consume_structured(arr: np.ndarray) -> float:
 
 # --- pickle variant (separate arrays, full schema with strings) ---
 
-@cc.transferable
+@cc.transferable(
+    abi_schema=(
+        'c-two.bench.unified.np-payload;'
+        f'pickle-protocol={BENCH_PICKLE_PROTOCOL};'
+        'fields=row_id:uint32-array,x:float64-array,y:float64-array,'
+        'z:float64-array,name:list'
+    ),
+)
 class NpPayload:
     row_id: np.ndarray
     x: np.ndarray
@@ -121,7 +130,13 @@ class NpEchoCRM:
 
 # --- hold variant (structured array, zero-copy via from_buffer) ---
 
-@cc.transferable
+@cc.transferable(
+    abi_schema=(
+        'c-two.bench.unified.np-structured.raw;'
+        'dtype=[row_id:uint32,x:float64,y:float64,z:float64];'
+        'layout=native-byte-order-contiguous-record-array'
+    ),
+)
 class NpStructured:
     arr: np.ndarray
 

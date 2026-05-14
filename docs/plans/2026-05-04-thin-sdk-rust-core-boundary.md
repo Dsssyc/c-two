@@ -1,7 +1,8 @@
 # Thin SDK / Rust Core Boundary Reference
 
 **Date:** 2026-05-04
-**Status:** Architecture reference / implementation backlog
+**Status:** Architecture reference / implemented downshift ledger with future
+hardening notes
 **Scope:** Identify Python SDK runtime state and mechanisms that should move
 down into the Rust core so future language SDKs can stay thin.
 
@@ -54,10 +55,10 @@ C-Two already has the main language-neutral layers in Rust:
 - `core/runtime/c2-runtime`: process runtime session, route transactions,
   client pools, relay projection, and lifecycle outcomes.
 
-The Python SDK is already thinner than earlier versions, but it still owns
-several generic runtime mechanisms that future SDKs would otherwise have to
-reimplement. Those mechanisms should move to Rust without moving Python domain
-logic, CRM decorators, or transferable serialization semantics.
+The Python SDK is already thinner than earlier versions. The downshift ledger
+below records the generic runtime mechanisms that were identified here and have
+now moved to Rust ownership, while keeping Python domain logic, CRM decorators,
+and transferable serialization semantics in the SDK.
 
 ## Keep In Python SDKs
 
@@ -93,7 +94,7 @@ code, not merely planned in a separate implementation document.
 | 6 | Server route slot lifecycle and readiness | Implemented | See `docs/plans/2026-05-07-server-readiness-rust-authority.md`; `c2-server` owns readiness, lifecycle transitions, socket unlink authority, and shutdown barriers. |
 | 7 | Response allocation decision | Implemented | See `docs/plans/2026-05-07-response-allocation-rust-authority.md`; Python response-pool allocation was removed and low-copy response buffer preparation now lives in Rust native/core. |
 | 8 | IPC config validation duplication | Implemented | See `docs/plans/2026-05-07-ipc-config-validation-rust-authority.md`; Python now forwards IPC override mappings and Rust/native config parsing owns allowed-key, forbidden-key, and shape validation. |
-| 9 | CRM contract descriptor and route validation | In progress | Reframed from a narrow native method-table facade after cross-language SDK review. See `docs/plans/2026-05-08-crm-contract-rust-authority.md`; SDKs extract CRM descriptors, while Rust should own language-neutral CRM identity matching, route metadata projection, and method-index validity checks. |
+| 9 | CRM contract descriptor and route validation | Implemented | See `docs/plans/2026-05-08-crm-contract-rust-authority.md`; SDKs extract CRM descriptors, while Rust owns language-neutral CRM identity matching, route metadata projection, direct IPC/relay contract checks, and method-index validity checks. |
 
 ### 2026-05-08 Post-Review Addendum
 
@@ -113,12 +114,14 @@ Settled findings from that session:
 - Non-skip IPC validation now requires the candidate handshake to provide a real
   `server_instance_id`; only skip-validation tests may synthesize an instance.
 - Final relay route replacement remains a Rust authority decision guarded by
-  relay-local route state and `OwnerToken`.
-- The remaining relay robustness gap is not a Python SDK issue. It is a future
-  Rust relay/IPC owner-freshness problem: an old upstream owner can be probed as
-  dead or route-missing, recover externally before candidate commit, and still
-  be replaced if no relay-visible owner epoch/lease/fence changed. The follow-up
-  is tracked in `docs/issues/relay-stale-owner-revival-race.md`.
+  relay-local route state, `OwnerToken`, candidate IPC attestation, and an
+  opaque final owner proof created after candidate attestation.
+- The stale pre-attestation evidence reuse gap is closed in Rust relay authority:
+  preliminary owner probes may only allow a candidate IPC attempt, and final
+  commit can consume only a proof produced by the post-attestation final owner
+  probe. This is still a relay-local proof boundary, not a cross-process owner
+  fence; a stronger guarantee that an external owner cannot become live after
+  final proof would require a future IPC owner-fence protocol.
 
 This relay robustness note is not a downshift-ledger candidate. Treat it as a
 separate Rust relay/IPC hardening concern unless it becomes release-blocking.
@@ -149,8 +152,57 @@ client-side CRM matching, and method-index validity are language-neutral
 runtime contract concerns. They should live in Rust core so future Rust, Go,
 Fortran, and C++ SDKs do not each reimplement the same checks.
 
-The active repair is tracked in
-`docs/plans/2026-05-08-crm-contract-rust-authority.md`.
+The repair is tracked in
+`docs/plans/2026-05-08-crm-contract-rust-authority.md` and the fingerprint
+closure in
+`docs/superpowers/plans/2026-05-10-thin-sdk-boundary-gap-remediation.md`.
+Issue 9 no longer blocks the thin-SDK/Rust-core boundary: Python extracts a CRM
+descriptor from decorated classes and passes the descriptor hashes to native
+runtime entry points, while Rust `c2-contract`, `c2-wire`, `c2-server`,
+`c2-ipc`, `c2-http`, and `c2-runtime` own route metadata validation,
+handshake projection, direct IPC route contract validation, relay-aware contract
+filtering, explicit HTTP relay contract probing, relay registration
+attestation, and O(1) invalid-method-index rejection before scheduler
+acquisition or SDK callback invocation.
+
+### 2026-05-10 Coverage Audit And Remaining Gaps
+
+The current implementation covers all nine downshift candidates in this
+reference. The remaining items are not evidence that Python still owns generic
+runtime authority; they are either future protocol-safety work, relay hardening,
+or cleanup of narrow compatibility facades.
+
+Execution plan:
+`docs/superpowers/plans/2026-05-10-thin-sdk-boundary-gap-remediation.md`.
+
+1. **Strict cross-language ABI/IDL compatibility remains future work.** The
+   current implementation generates route `abi_hash` and `signature_hash` from
+   Python CRM descriptors and carries those hashes through registration,
+   handshakes, direct IPC, relay resolve/probe/call, and explicit HTTP relay
+   paths. It does not yet define a language-neutral annotation grammar,
+   required ABI declarations for custom transferable byte formats, or a
+   cross-SDK IDL/codegen story. That future work must not move Python-specific
+   `serialize`, `deserialize`, or `from_buffer` orchestration into Rust merely
+   for symmetry.
+
+2. **Relay stale-owner replacement is Rust-owned and now uses final proof.** The
+   relay no longer trusts route names alone: candidate upstreams must pass IPC
+   identity and route contract attestation, and relay-local replacement commits
+   use owner-token, owner-generation, owner-lease-epoch, route-identity, and
+   final-proof checks. The fixed gap was stale pre-attestation evidence reuse:
+   a dead or route-missing observation collected before candidate attestation can
+   no longer authorize final commit. This remains relay-local hardening; future
+   cross-process owner fencing, if needed, must live in Rust relay/IPC state and
+   must not add SDK-side route replay, retry, or route-name trust.
+
+3. **Narrow Python compatibility facades still exist but do not own runtime
+   authority.** `NativeServerBridge` still accepts constructor-time CRM
+   registration for old low-level call sites, and `transport/protocol.py` keeps
+   Python-compatible wrapper arguments around Rust codec calls. These facades
+   should be cleaned up under the 0.x clean-cut rule when their remaining tests
+   or internal users are migrated, but they are not boundary regressions: route
+   registration, wire validation, lifecycle, response allocation, and config
+   validation still execute through Rust/native authority.
 
 ### P1. Remote IPC scheduler config and execution semantics
 
@@ -608,29 +660,70 @@ Runtime-session storage remains Rust-owned, so mutating a caller mapping after
 
 ### P3. CRM contract descriptor and route validation
 
-**Planned ownership**
+**Implemented ownership**
+
+Status: implemented and verified by
+`docs/plans/2026-05-08-crm-contract-rust-authority.md`, with follow-up relay
+attestation hardening recorded in
+`docs/plans/2026-05-08-relay-crm-attestation-hardening.md`.
 
 `sdk/python/src/c_two/transport/wire.py` may retain a Python `MethodTable` only
-as a Python callback projection. It must not be the language-neutral contract
+as a Python callback projection. It is not the language-neutral contract
 authority for route metadata, method-index validity, or client CRM matching.
 
-**Implementation direction**
+Python method discovery stays in Python, but it now feeds a Rust-owned route
+contract descriptor and expected-route validator:
 
-Do not move Python method discovery into Rust. Instead:
-
-- SDKs extract `crm_ns`, `crm_ver`, method names, and access metadata from the
-  language-native CRM definition.
-- Rust stores that descriptor as route contract metadata.
-- Direct IPC handshakes project CRM identity next to route method entries.
-- Rust clients validate expected CRM identity before binding a proxy to a route.
-- Relay-aware route selection filters candidates by expected CRM identity before
-  choosing local IPC or HTTP targets.
+- SDKs extract `crm_ns`, `crm_name`, `crm_ver`, RPC method membership, access
+  metadata, Python signature metadata, and transfer metadata from the
+  language-native CRM definition, then ask native `c2-contract` to hash the
+  canonical descriptor JSON.
+- Rust stores `abi_hash` and `signature_hash` beside route CRM identity and
+  validates that native route metadata agrees with the runtime route spec at
+  registration time.
+- Direct IPC handshakes project CRM identity and descriptor hashes next to route
+  method entries.
+- Rust IPC clients validate a complete `ExpectedRouteContract` before the SDK
+  binds a proxy to a direct IPC route.
+- Relay-aware route selection filters candidates by complete expected route
+  contract before choosing local IPC or HTTP targets.
+- Explicit HTTP relay connects share the relay-aware contract-validation path and
+  probe/resolve with expected route hashes before returning a proxy.
+- Relay registration derives published contract metadata from IPC handshake
+  attestation. The old `skip_ipc_validation` path is removed rather than kept as
+  a production or test registration bypass.
 - Rust server dispatch rejects invalid method indexes before scheduler
-  acquisition and before invoking any SDK callback.
+  acquisition and before invoking any SDK callback on inline, SHM, and chunked
+  request paths.
 
-Transferable ABI hashes and full signature compatibility remain future work.
+**Verified coverage**
 
-## Suggested Execution Order
+- `RouteInfo` carries `crm_ns`, `crm_name`, `crm_ver`, `abi_hash`, and
+  `signature_hash` in the Rust handshake codec and PyO3 projection.
+- Native server registration rejects invalid CRM tags and mismatched
+  route/spec metadata, including malformed or mismatched descriptor hashes.
+- Direct IPC `cc.connect(..., address="ipc://...")` validates the expected CRM
+  contract through the Rust IPC client, returns a route-bound native client, and
+  remains relay-independent.
+- Relay-discovered local IPC validates both relay-advertised endpoint identity
+  and the complete route contract before use; contract mismatch is a hard error,
+  not an HTTP fallback trigger.
+- Relay `/_resolve`, `_probe`, and data-plane calls can carry expected CRM
+  identity plus descriptor hashes so stale or incompatible routes are filtered or
+  rejected before a CRM method call is sent.
+- Relay control registration publishes attested IPC handshake metadata in normal
+  mode; claim-only metadata is accepted only for explicit skip-validation test
+  paths and must still contain valid hashes.
+- Thread-local same-process connects still pass Python objects directly, but
+  compare the requested CRM contract against the registered local slot before
+  returning a zero-serialization proxy.
+
+Strict cross-language annotation grammar and custom transferable ABI declarations
+remain future work. The current Python descriptor hash is sufficient to prevent
+same-SDK half-upgrades from binding a route with different method/signature
+shape, but it is not a cross-language IDL contract.
+
+## Historical Execution Order
 
 1. Remote IPC scheduler config, with explicit zero-copy guardrails.
 2. Direct IPC probe/control helpers in `c2-ipc`.
@@ -647,7 +740,7 @@ Transferable ABI hashes and full signature compatibility remain future work.
 
 Every implementation spawned from this reference should preserve:
 
-- No relay direct IPC cross-process success.
+- No-relay direct IPC cross-process success.
 - Bad relay does not affect explicit `ipc://` connection.
 - Name-only connect without relay fails clearly when the resource is not local.
 - Relay-aware name resolution uses Rust relay-aware HTTP client when configured.
@@ -656,6 +749,14 @@ Every implementation spawned from this reference should preserve:
 - Relay-discovered IPC cannot be accepted from route names alone; the IPC
   handshake must prove the exact relay-advertised server instance before any
   CRM call is sent over that IPC client.
+- Named route clients returned by `cc.connect(...)` must remain bound to the
+  validated route contract; a validated direct IPC or relay client cannot reuse
+  the same native object to call a different named route without a fresh
+  expected contract.
+- Route contract hashes (`abi_hash`, `signature_hash`) must be present in named
+  route registration, IPC handshake metadata, relay route state, resolve/probe
+  expectations, and direct IPC validation. Empty or missing hashes are valid only
+  for route-less admin probes, not for named CRM routes.
 - Remote relay HTTP calls use the resolved route's `relay_url` directly rather
   than adding an anchor-relay forwarding hop.
 - Thread-local same-process calls do not serialize Python objects.
@@ -666,8 +767,10 @@ Every implementation spawned from this reference should preserve:
   server chunk assembly should rely on Python SDK cleanup, receive-loop natural
   exit, or process teardown as the only release path.
 - Relay stale-owner replacement remains Rust-owned and identity-attested:
-  future fixes must add owner freshness/fencing in relay/IPC state, not
-  route-name trust or SDK-side retry/replay behavior.
+  preliminary owner probes cannot authorize commit, final proof is created after
+  candidate IPC identity and route-contract attestation, and any future stronger
+  cross-process owner fencing must live in relay/IPC state rather than SDK-side
+  retry, replay, or route-name trust.
 
 ## Notes For Future SDK Authors
 

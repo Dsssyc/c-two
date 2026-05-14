@@ -54,12 +54,8 @@ def multi_crm_addr():
 def single_then_add_addr():
     """Start with one CRM, add second after start."""
     addr = f'ipc://{_unique_region()}'
-    server = Server(
-        bind_address=addr,
-        crm_class=Hello,
-        crm_instance=HelloImpl(),
-        name='hello',
-    )
+    server = Server(bind_address=addr)
+    server.register_crm(Hello, HelloImpl(), name='hello')
     server.start()
     _wait_for_server(addr)
     yield addr, server
@@ -196,14 +192,13 @@ class TestDynamicRegistration:
         finally:
             cc.close(proxy)
 
-    def test_unregister_default_shifts(self):
-        """Unregistering the default route shifts to the next one."""
+    def test_unregister_removes_only_named_route(self):
+        """Unregistering one route leaves the other named routes intact."""
         addr = f'ipc://{_unique_region()}'
         server = Server(bind_address=addr)
         server.register_crm(Hello, HelloImpl(), name='hello')
         server.register_crm(Counter, CounterImpl(), name='counter')
 
         server.unregister_crm('hello')
-        # Default should shift to counter.
         assert server.names == ['counter']
         server.shutdown()

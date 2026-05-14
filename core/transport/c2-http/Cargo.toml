@@ -9,17 +9,18 @@ default = []
 relay = [
     "dep:axum",
     "dep:tower-http",
-    "dep:c2-config",
     "dep:c2-error",
     "dep:c2-wire",
     "dep:c2-ipc",
     "dep:tracing",
-    "dep:futures",
+    "dep:sha2",
+    "dep:hex",
 ]
 
 [dependencies]
 # Always available (client)
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+bytes = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 parking_lot = { workspace = true }
@@ -27,16 +28,19 @@ percent-encoding = "2"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
+c2-contract = { path = "../../foundation/c2-contract" }
+c2-config = { path = "../../foundation/c2-config" }
+futures = { version = "0.3" }
 
 # Relay-only dependencies (behind feature gate)
 axum = { version = "0.8", optional = true }
 tower-http = { version = "0.6", features = ["cors"], optional = true }
-c2-config = { path = "../../foundation/c2-config", optional = true }
 c2-error = { path = "../../foundation/c2-error", optional = true }
 c2-wire = { path = "../../protocol/c2-wire", optional = true }
 c2-ipc = { path = "../c2-ipc", optional = true }
 tracing = { version = "0.1", optional = true }
-futures = { version = "0.3", optional = true }
+sha2 = { version = "0.10", optional = true }
+hex = { version = "0.4", optional = true }
 
 [dev-dependencies]
 c2-mem = { path = "../../foundation/c2-mem" }

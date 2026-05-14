@@ -3,7 +3,7 @@
 //! ## Client → Server
 //!
 //! ```text
-//! [1B version=9]
+//! [1B version=10]
 //! [1B prefix_len][prefix UTF-8]
 //! [2B seg_count LE]
 //! [per-segment: [4B size LE][1B name_len][name UTF-8]]
@@ -23,6 +23,9 @@
 //!     [1B crm_ns_len][crm_ns UTF-8]
 //!     [1B crm_name_len][crm_name UTF-8]
 //!     [1B crm_ver_len][crm_ver UTF-8]
+//!     [1B abi_hash_len][abi_hash UTF-8]
+//!     [1B signature_hash_len][signature_hash UTF-8]
+//!     [8B max_payload_size LE]
 //!     [2B method_count LE]
 //!     [per-method: [1B name_len][method_name UTF-8][2B method_idx LE]]
 //! ]
@@ -32,7 +35,7 @@ use crate::control::EncodeError;
 use crate::frame::DecodeError;
 
 /// Handshake version number.
-pub const HANDSHAKE_VERSION: u8 = 9;
+pub const HANDSHAKE_VERSION: u8 = 10;
 
 // ── Capability flags (2 bytes) ───────────────────────────────────────────
 
@@ -50,7 +53,7 @@ pub const CAP_CHUNKED: u16 = 1 << 2;
 pub const MAX_SEGMENTS: usize = 16;
 pub const MAX_ROUTES: usize = 64;
 pub const MAX_METHODS: usize = 256;
-pub const MAX_HANDSHAKE_NAME_BYTES: usize = u8::MAX as usize;
+const MAX_HANDSHAKE_NAME_BYTES: usize = c2_contract::MAX_WIRE_TEXT_BYTES;
 
 // ── Data types ───────────────────────────────────────────────────────────
 
@@ -68,6 +71,9 @@ pub struct RouteInfo {
     pub crm_ns: String,
     pub crm_name: String,
     pub crm_ver: String,
+    pub abi_hash: String,
+    pub signature_hash: String,
+    pub max_payload_size: u64,
     pub methods: Vec<MethodEntry>,
 }
 
@@ -157,9 +163,20 @@ pub fn encode_server_handshake(
     buf.extend_from_slice(&(routes.len() as u16).to_le_bytes());
     for route in routes {
         validate_name_len("route name", &route.name)?;
-        validate_name_len("crm namespace", &route.crm_ns)?;
-        validate_name_len("crm name", &route.crm_name)?;
-        validate_name_len("crm version", &route.crm_ver)?;
+        validate_crm_tag(&route.crm_ns, &route.crm_name, &route.crm_ver).map_err(|reason| {
+            EncodeError::InvalidText {
+                field: "crm tag",
+                reason,
+            }
+        })?;
+        validate_contract_hash("abi_hash", &route.abi_hash)?;
+        validate_contract_hash("signature_hash", &route.signature_hash)?;
+        if route.max_payload_size == 0 {
+            return Err(EncodeError::InvalidText {
+                field: "max_payload_size",
+                reason: "must be > 0".to_string(),
+            });
+        }
         if route.methods.len() > MAX_METHODS {
             return Err(EncodeError::FieldTooLong {
                 field: "method count",
@@ -179,6 +196,13 @@ pub fn encode_server_handshake(
         let crm_ver_b = route.crm_ver.as_bytes();
         buf.push(crm_ver_b.len() as u8);
         buf.extend_from_slice(crm_ver_b);
+        let abi_hash_b = route.abi_hash.as_bytes();
+        buf.push(abi_hash_b.len() as u8);
+        buf.extend_from_slice(abi_hash_b);
+        let signature_hash_b = route.signature_hash.as_bytes();
+        buf.push(signature_hash_b.len() as u8);
+        buf.extend_from_slice(signature_hash_b);
+        buf.extend_from_slice(&route.max_payload_size.to_le_bytes());
         buf.extend_from_slice(&(route.methods.len() as u16).to_le_bytes());
         for m in &route.methods {
             validate_name_len("method name", &m.name)?;
@@ -191,7 +215,7 @@ pub fn encode_server_handshake(
     Ok(buf)
 }
 
-pub fn validate_name_len(field: &'static str, value: &str) -> Result<(), EncodeError> {
+fn validate_name_len(field: &'static str, value: &str) -> Result<(), EncodeError> {
     let actual = value.as_bytes().len();
     if actual > MAX_HANDSHAKE_NAME_BYTES {
         return Err(EncodeError::FieldTooLong {
@@ -201,6 +225,19 @@ pub fn validate_name_len(field: &'static str, value: &str) -> Result<(), EncodeE
         });
     }
     Ok(())
+}
+
+fn validate_contract_hash(field: &'static str, value: &str) -> Result<(), EncodeError> {
+    validate_contract_hash_text(field, value)
+        .map_err(|reason| EncodeError::InvalidText { field, reason })
+}
+
+fn validate_contract_hash_text(_field: &'static str, value: &str) -> Result<(), String> {
+    c2_contract::validate_contract_hash(_field, value).map_err(|err| err.to_string())
+}
+
+fn validate_crm_tag(crm_ns: &str, crm_name: &str, crm_ver: &str) -> Result<(), String> {
+    c2_contract::validate_crm_tag(crm_ns, crm_name, crm_ver).map_err(|err| err.to_string())
 }
 
 // ── Decoding (both directions) ───────────────────────────────────────────
@@ -326,6 +363,48 @@ pub fn decode_handshake(buf: &[u8]) -> Result<Handshake, DecodeError> {
         check_remaining(buf, off, crm_ver_len, "crm version")?;
         let crm_ver = read_str(buf, off, crm_ver_len)?;
         off += crm_ver_len;
+        validate_crm_tag(&crm_ns, &crm_name, &crm_ver).map_err(|reason| {
+            DecodeError::InvalidText {
+                field: "crm tag",
+                reason,
+            }
+        })?;
+
+        check_remaining(buf, off, 1, "abi_hash length")?;
+        let abi_hash_len = buf[off] as usize;
+        off += 1;
+        check_remaining(buf, off, abi_hash_len, "abi_hash")?;
+        let abi_hash = read_str(buf, off, abi_hash_len)?;
+        off += abi_hash_len;
+        validate_contract_hash_text("abi_hash", &abi_hash).map_err(|reason| {
+            DecodeError::InvalidText {
+                field: "abi_hash",
+                reason,
+            }
+        })?;
+
+        check_remaining(buf, off, 1, "signature_hash length")?;
+        let signature_hash_len = buf[off] as usize;
+        off += 1;
+        check_remaining(buf, off, signature_hash_len, "signature_hash")?;
+        let signature_hash = read_str(buf, off, signature_hash_len)?;
+        off += signature_hash_len;
+        validate_contract_hash_text("signature_hash", &signature_hash).map_err(|reason| {
+            DecodeError::InvalidText {
+                field: "signature_hash",
+                reason,
+            }
+        })?;
+
+        check_remaining(buf, off, 8, "max_payload_size")?;
+        let max_payload_size = read_u64(buf, off);
+        off += 8;
+        if max_payload_size == 0 {
+            return Err(DecodeError::InvalidValue {
+                field: "max_payload_size",
+                value: max_payload_size,
+            });
+        }
 
         check_remaining(buf, off, 2, "method count")?;
         let m_count = read_u16(buf, off) as usize;
@@ -357,6 +436,9 @@ pub fn decode_handshake(buf: &[u8]) -> Result<Handshake, DecodeError> {
             crm_ns,
             crm_name,
             crm_ver,
+            abi_hash,
+            signature_hash,
+            max_payload_size,
             methods,
         });
     }
@@ -407,6 +489,20 @@ fn read_u16(buf: &[u8], off: usize) -> u16 {
 #[inline]
 fn read_u32(buf: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+}
+
+#[inline]
+fn read_u64(buf: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes([
+        buf[off],
+        buf[off + 1],
+        buf[off + 2],
+        buf[off + 3],
+        buf[off + 4],
+        buf[off + 5],
+        buf[off + 6],
+        buf[off + 7],
+    ])
 }
 
 #[inline]

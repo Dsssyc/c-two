@@ -1,6 +1,7 @@
 """Integration tests for the HTTP relay chain.
 
-Tests the full pipeline: RustHttpClient -> standalone c3 relay -> RustClient -> Server -> CRM
+Tests the full pipeline: route-bound relay-aware client -> standalone c3 relay
+-> RustClient -> Server -> CRM.
 
 Also tests ``cc.connect(address='http://...')`` end-to-end through the native
 relay-aware explicit HTTP projection.
@@ -16,14 +17,17 @@ import httpx
 
 import c_two as cc
 from c_two.config.settings import settings
+from c_two.config.ipc import _resolve_server_ipc_config
 from c_two.error import ResourceNotFound
 from c_two._native import RustHttpClientPool
-from c_two.transport.client.proxy import CRMProxy
+from c_two.crm.contract import crm_contract
 from c_two.transport.registry import _ProcessRegistry
 
 from tests.fixtures.hello import HelloImpl
 from tests.fixtures.ihello import Hello
 from tests.fixtures.counter import Counter, CounterImpl
+
+DEFAULT_MAX_PAYLOAD_SIZE = int(_resolve_server_ipc_config()['max_payload_size'])
 
 
 def _acquire_http(url: str):
@@ -36,9 +40,20 @@ def _release_http(url: str):
     RustHttpClientPool.instance().release(url)
 
 
-def _server_instance_id_for(registry: _ProcessRegistry, address: str) -> str:
+def _server_instance_id_for(
+    registry: _ProcessRegistry,
+    address: str,
+    *,
+    route_name: str = 'hello',
+    crm_class: type = Hello,
+) -> str:
     """Read the IPC server instance identity from the native handshake."""
-    client = registry._runtime_session.acquire_ipc_client(address)  # noqa: SLF001
+    expected = crm_contract(crm_class)
+    client = registry._runtime_session.acquire_ipc_client(  # noqa: SLF001
+        address,
+        route_name,
+        *expected.native_args(),
+    )
     try:
         instance_id = client.server_instance_id
         assert isinstance(instance_id, str)
@@ -46,6 +61,17 @@ def _server_instance_id_for(registry: _ProcessRegistry, address: str) -> str:
         return instance_id
     finally:
         registry._runtime_session.release_ipc_client(address)  # noqa: SLF001
+
+
+def _expected_contract_headers(crm_class: type = Hello) -> dict[str, str]:
+    expected = crm_contract(crm_class)
+    return {
+        "x-c2-expected-crm-ns": expected.crm_ns,
+        "x-c2-expected-crm-name": expected.crm_name,
+        "x-c2-expected-crm-ver": expected.crm_ver,
+        "x-c2-expected-abi-hash": expected.abi_hash,
+        "x-c2-expected-signature-hash": expected.signature_hash,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -86,9 +112,10 @@ def relay_stack(start_c3_relay):
                     'server_id': server_id,
                     'server_instance_id': server_instance_id,
                     'address': ipc_addr,
+                    'max_payload_size': DEFAULT_MAX_PAYLOAD_SIZE,
                 },
             )
-            assert resp.status_code == 201
+            assert resp.status_code == 201, resp.text
 
     yield relay_url, ipc_addr
 
@@ -103,70 +130,57 @@ class TestHttpRelayFullChain:
     def test_hello_via_http(self, relay_stack):
         """Simple string call through HTTP relay."""
         relay_url, _ = relay_stack
-        client = _acquire_http(relay_url)
+        crm = cc.connect(Hello, name='hello', address=relay_url)
         try:
-            crm = Hello()
-            crm.client = CRMProxy.http(client, 'hello')
             result = crm.greeting('HTTP')
             assert result == 'Hello, HTTP!'
         finally:
-            _release_http(relay_url)
+            cc.close(crm)
 
     def test_add_via_http(self, relay_stack):
         """Numeric call through HTTP relay."""
         relay_url, _ = relay_stack
-        client = _acquire_http(relay_url)
+        crm = cc.connect(Hello, name='hello', address=relay_url)
         try:
-            crm = Hello()
-            crm.client = CRMProxy.http(client, 'hello')
             result = crm.add(42, 58)
             assert result == 100
         finally:
-            _release_http(relay_url)
+            cc.close(crm)
 
     def test_get_items_via_http(self, relay_stack):
         """List return through HTTP relay."""
         relay_url, _ = relay_stack
-        client = _acquire_http(relay_url)
+        crm = cc.connect(Hello, name='hello', address=relay_url)
         try:
-            crm = Hello()
-            crm.client = CRMProxy.http(client, 'hello')
             result = crm.get_items([10, 20, 30])
             assert result == ['item-10', 'item-20', 'item-30']
         finally:
-            _release_http(relay_url)
+            cc.close(crm)
 
     def test_get_data_transferable_via_http(self, relay_stack):
         """Custom transferable round-trip through HTTP relay."""
         relay_url, _ = relay_stack
-        client = _acquire_http(relay_url)
+        crm = cc.connect(Hello, name='hello', address=relay_url)
         try:
-            crm = Hello()
-            crm.client = CRMProxy.http(client, 'hello')
             result = crm.get_data(5)
             assert result.name == 'data-5'
             assert result.value == 50
         finally:
-            _release_http(relay_url)
+            cc.close(crm)
 
     def test_multi_crm_routing(self, relay_stack):
         """Route to different CRMs by name through HTTP relay."""
         relay_url, _ = relay_stack
-        client = _acquire_http(relay_url)
+        hello = cc.connect(Hello, name='hello', address=relay_url)
+        counter = cc.connect(Counter, name='counter', address=relay_url)
         try:
-            # Hello CRM
-            hello = HelloImpl()
-            hello.client = CRMProxy.http(client, 'hello')
             assert hello.greeting('Route') == 'Hello, Route!'
-
-            # Counter CRM
-            counter = CounterImpl()
-            counter.client = CRMProxy.http(client, 'counter')
             counter.increment(1)
             counter.increment(1)
             assert counter.get() == 2
         finally:
-            _release_http(relay_url)
+            cc.close(hello)
+            cc.close(counter)
 
     def test_health_endpoint(self, relay_stack):
         """GET /health returns OK."""
@@ -175,21 +189,21 @@ class TestHttpRelayFullChain:
         try:
             health = client.health()
             assert health is True
+            with pytest.raises(RuntimeError, match='route-bound relay-aware client'):
+                client.call('greeting', b'')
         finally:
             _release_http(relay_url)
 
     def test_concurrent_http_calls(self, relay_stack):
         """Multiple threads calling through HTTP relay."""
         relay_url, _ = relay_stack
-        client = _acquire_http(relay_url)
+        crm = cc.connect(Hello, name='hello', address=relay_url)
         errors: list[str] = []
         n_threads = 8
         n_calls = 5
 
         def worker(tid: int) -> None:
             try:
-                crm = Hello()
-                crm.client = CRMProxy.http(client, 'hello')
                 for i in range(n_calls):
                     result = crm.add(tid, i)
                     if result != tid + i:
@@ -205,7 +219,7 @@ class TestHttpRelayFullChain:
                 t.join(timeout=60)
             assert errors == [], f'Errors: {errors}'
         finally:
-            _release_http(relay_url)
+            cc.close(crm)
 
 
 # ---------------------------------------------------------------------------
@@ -252,8 +266,24 @@ class TestCcConnectHttp:
     def test_connect_http_rejects_crm_contract_mismatch_before_call(self, relay_stack):
         relay_url, _ = relay_stack
 
-        with pytest.raises(RuntimeError, match='CRM contract mismatch'):
+        with pytest.raises(ResourceNotFound, match="Resource 'hello' not found"):
             cc.connect(Counter, name='hello', address=relay_url)
+
+    def test_relay_call_rejects_invalid_expected_crm_header(self, start_c3_relay):
+        relay = start_c3_relay()
+        with httpx.Client(trust_env=False, timeout=5.0) as http:
+            resp = http.post(
+                f"{relay.url}/grid/get",
+                content=b"",
+                headers={
+                    "x-c2-expected-crm-ns": "test/grid",
+                    "x-c2-expected-crm-name": "Grid",
+                    "x-c2-expected-crm-ver": "0.1.0",
+                },
+            )
+
+        assert resp.status_code == 400
+        assert resp.json()["error"] == "InvalidCrmTag"
 
     def test_connect_http_close_closes_relay_aware_client(self, relay_stack):
         """cc.close closes the relay-aware explicit HTTP client."""
@@ -267,7 +297,7 @@ class TestCcConnectHttp:
 
         cc.close(crm)
         with pytest.raises(RuntimeError, match='closed'):
-            native_client.call('hello', 'greeting', b'')
+            native_client.call('greeting', b'')
         assert registry._runtime_session.http_client_refcount(relay_url) == 0
 
     def test_connect_http_with_slash_in_name(self, start_c3_relay):
@@ -282,7 +312,11 @@ class TestCcConnectHttp:
         cc.register(Hello, HelloImpl(), name=slashed_name)
         ipc_addr = cc.server_address()
         server_id = cc.server_id()
-        server_instance_id = _server_instance_id_for(_ProcessRegistry.get(), ipc_addr)
+        server_instance_id = _server_instance_id_for(
+            _ProcessRegistry.get(),
+            ipc_addr,
+            route_name=slashed_name,
+        )
 
         relay = start_c3_relay()
         relay_url = relay.url
@@ -294,9 +328,10 @@ class TestCcConnectHttp:
                     'server_id': server_id,
                     'server_instance_id': server_instance_id,
                     'address': ipc_addr,
+                    'max_payload_size': DEFAULT_MAX_PAYLOAD_SIZE,
                 },
             )
-            assert resp.status_code == 201
+            assert resp.status_code == 201, resp.text
 
         # Forced HTTP mode (address explicitly set).
         crm = cc.connect(Hello, name=slashed_name, address=relay_url)
@@ -382,7 +417,7 @@ class TestCcConnectHttp:
 
     def test_relay_local_ipc_contract_mismatch_does_not_fallback_to_http(self, start_c3_relay):
         name = 'identity/local-ipc-contract-mismatch'
-        relay = start_c3_relay(skip_ipc_validation=True)
+        relay = start_c3_relay()
         relay_url = relay.url
         previous_relay = settings.relay_anchor_address
         registrar = _ProcessRegistry()
@@ -393,8 +428,13 @@ class TestCcConnectHttp:
             server_id = registrar.get_server_id()
             assert ipc_addr is not None
             assert server_id is not None
-            server_instance_id = _server_instance_id_for(registrar, ipc_addr)
+            server_instance_id = _server_instance_id_for(
+                registrar,
+                ipc_addr,
+                route_name=name,
+            )
 
+            wrong_contract = crm_contract(Counter)
             with httpx.Client(trust_env=False, timeout=5.0) as http:
                 resp = http.post(
                     f'{relay_url}/_register',
@@ -403,16 +443,16 @@ class TestCcConnectHttp:
                         'server_id': server_id,
                         'server_instance_id': server_instance_id,
                         'address': ipc_addr,
-                        'crm_ns': 'test.counter',
-                        'crm_name': 'Counter',
-                        'crm_ver': '0.1.0',
+                        'crm_ns': wrong_contract.crm_ns,
+                        'crm_name': wrong_contract.crm_name,
+                        'crm_ver': wrong_contract.crm_ver,
+                        'abi_hash': wrong_contract.abi_hash,
+                        'signature_hash': wrong_contract.signature_hash,
+                        'max_payload_size': DEFAULT_MAX_PAYLOAD_SIZE,
                     },
                 )
-                assert resp.status_code == 201
-
-            resolver.set_relay_anchor(relay_url)
-            with pytest.raises(RuntimeError, match='CRM contract mismatch'):
-                resolver.connect(Counter, name=name)
+                assert resp.status_code == 400
+                assert 'CRM contract mismatch' in resp.text
         finally:
             resolver.shutdown()
             settings.relay_anchor_address = previous_relay
@@ -483,16 +523,13 @@ class TestCcConnectHttp:
 class TestRelayControlPlane:
     """Test the relay control-plane endpoints (/_register, /_unregister, /_routes)."""
 
-    def test_native_control_client_exposes_status_code_for_missing_route(self, start_c3_relay):
+    def test_native_control_client_does_not_expose_name_only_resolve(self, start_c3_relay):
         from c_two._native import RustRelayControlClient
 
         relay = start_c3_relay()
         client = RustRelayControlClient(relay.url)
 
-        with pytest.raises(Exception) as exc_info:
-            client.resolve('missing/native')
-
-        assert getattr(exc_info.value, 'status_code', None) == 404
+        assert not hasattr(client, 'resolve')
 
     def test_register_via_http_control(self, start_c3_relay):
         """POST /_register adds an upstream and allows calls."""
@@ -513,9 +550,10 @@ class TestRelayControlPlane:
                     'server_id': server_id,
                     'server_instance_id': server_instance_id,
                     'address': ipc_addr,
+                    'max_payload_size': DEFAULT_MAX_PAYLOAD_SIZE,
                 },
             )
-            assert resp.status_code == 201
+            assert resp.status_code == 201, resp.text
             assert resp.json()['registered'] == 'hello'
 
             # Verify route appears in /_routes.
@@ -528,14 +566,12 @@ class TestRelayControlPlane:
             assert 'server_instance_id' not in route
             assert 'ipc_address' not in route
 
-        # Verify data-plane call works.
-        client = _acquire_http(relay_url)
+        # Verify route-bound data-plane call works.
+        crm = cc.connect(Hello, name='hello', address=relay_url)
         try:
-            crm = Hello()
-            crm.client = CRMProxy.http(client, 'hello')
             assert crm.greeting('Control') == 'Hello, Control!'
         finally:
-            _release_http(relay_url)
+            cc.close(crm)
 
     def test_register_duplicate_upsert(self, start_c3_relay):
         """POST /_register with same name upserts (returns 201)."""
@@ -555,9 +591,10 @@ class TestRelayControlPlane:
                     'server_id': server_id,
                     'server_instance_id': server_instance_id,
                     'address': ipc_addr,
+                    'max_payload_size': DEFAULT_MAX_PAYLOAD_SIZE,
                 },
             )
-            assert resp.status_code == 201
+            assert resp.status_code == 201, resp.text
 
             # Same-relay duplicate registration uses upsert semantics.
             resp = http.post(
@@ -567,6 +604,7 @@ class TestRelayControlPlane:
                     'server_id': server_id,
                     'server_instance_id': server_instance_id,
                     'address': ipc_addr,
+                    'max_payload_size': DEFAULT_MAX_PAYLOAD_SIZE,
                 },
             )
             assert resp.status_code == 200
@@ -590,6 +628,7 @@ class TestRelayControlPlane:
                     'server_id': server_id,
                     'server_instance_id': server_instance_id,
                     'address': ipc_addr,
+                    'max_payload_size': DEFAULT_MAX_PAYLOAD_SIZE,
                 },
             )
             resp = http.post(
@@ -607,12 +646,13 @@ class TestRelayControlPlane:
             resp = http.post(
                 f'{relay_url}/hello/greeting',
                 content=b'test',
+                headers=_expected_contract_headers(),
             )
             assert resp.status_code == 404
 
     def test_unregister_missing_404(self, start_c3_relay):
         """POST /_unregister for unknown name returns 404."""
-        relay = start_c3_relay(skip_ipc_validation=True)
+        relay = start_c3_relay()
         relay_url = relay.url
 
         with httpx.Client(trust_env=False, timeout=5.0) as http:
@@ -642,9 +682,10 @@ class TestRelayControlPlane:
                         'server_id': server_id,
                         'server_instance_id': server_instance_id,
                         'address': ipc_addr,
+                        'max_payload_size': DEFAULT_MAX_PAYLOAD_SIZE,
                     },
                 )
-                assert resp.status_code == 201
+                assert resp.status_code == 201, resp.text
 
             resp = http.get(f'{relay_url}/health')
             health = resp.json()
@@ -653,13 +694,14 @@ class TestRelayControlPlane:
 
     def test_call_unknown_route_404(self, start_c3_relay):
         """POST /{route}/{method} for unregistered route returns 404."""
-        relay = start_c3_relay(skip_ipc_validation=True)
+        relay = start_c3_relay()
         relay_url = relay.url
 
         with httpx.Client(trust_env=False, timeout=5.0) as http:
             resp = http.post(
                 f'{relay_url}/nonexistent/method',
                 content=b'data',
+                headers=_expected_contract_headers(),
             )
             assert resp.status_code == 404
             data = resp.json()

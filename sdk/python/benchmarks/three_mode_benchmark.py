@@ -32,11 +32,18 @@ import urllib.error
 import urllib.request
 
 import c_two as cc
+from c_two.config.ipc import _resolve_server_ipc_config
+from c_two.crm.contract import CRMContract, crm_contract
 from c_two.transport.registry import _ProcessRegistry
 
 # Configurable via CLI --segment-size (bytes)
 _SEGMENT_SIZE: int = 2 * 1024 * 1024 * 1024  # default 2GB
 _MAX_SEGMENTS: int = 8
+
+RELAY_CLIENT_REQUEST_BODY_PATH = 'materialized'
+RELAY_RELAY_REQUEST_BODY_PATH = 'streamed_to_upstream_ipc'
+RELAY_RESPONSE_BODY_PATH = 'materialized'
+RELAY_TRANSPORT_LABEL = 'relay_http_request_stream_to_shm_response_materialized'
 
 # ---------------------------------------------------------------------------
 # Echo CRMs — bytes (identity fast path) vs dict (pickle path)
@@ -53,10 +60,10 @@ class EchoImpl:
 
 @cc.crm(namespace='bench.three_mode_dict', version='0.1.0')
 class DictEcho:
-    def echo(self, data: dict) -> dict: ...
+    def echo(self, data: dict[str, bytes]) -> dict[str, bytes]: ...
 
 class DictEchoImpl:
-    def echo(self, data: dict) -> dict:
+    def echo(self, data: dict[str, bytes]) -> dict[str, bytes]:
         return data
 
 
@@ -112,7 +119,7 @@ def _require_external_relay(relay_url: str) -> None:
         raise SystemExit(_relay_help(relay_url)) from exc
 
 
-def _post_json(url: str, payload: dict[str, str], timeout: float = 5.0) -> int:
+def _post_json(url: str, payload: dict[str, object], timeout: float = 5.0) -> int:
     data = json.dumps(payload).encode('utf-8')
     req = urllib.request.Request(
         url,
@@ -131,10 +138,24 @@ def _register_relay_upstream(
     name: str,
     address: str,
     server_id: str,
+    server_instance_id: str,
+    expected: CRMContract,
+    max_payload_size: int,
 ) -> None:
     _post_json(
         f'{relay_url}/_register',
-        {'name': name, 'server_id': server_id, 'address': address},
+        {
+            'name': name,
+            'server_id': server_id,
+            'server_instance_id': server_instance_id,
+            'address': address,
+            'crm_ns': expected.crm_ns,
+            'crm_name': expected.crm_name,
+            'crm_ver': expected.crm_ver,
+            'abi_hash': expected.abi_hash,
+            'signature_hash': expected.signature_hash,
+            'max_payload_size': max_payload_size,
+        },
     )
 
 
@@ -156,11 +177,32 @@ def _best_effort_unregister_relay_upstream(
         print(f'Warning: failed to unregister relay route {name!r}: {exc}', file=sys.stderr)
 
 
+def _should_run_relay(_payload_size: int) -> bool:
+    return True
+
+
 def _best_effort_unregister_local(name: str) -> None:
     try:
         cc.unregister(name)
     except Exception as exc:
         print(f'Warning: failed to unregister local route {name!r}: {exc}', file=sys.stderr)
+
+
+def _server_instance_id_for(name: str, address: str, crm_class: type) -> str:
+    expected = crm_contract(crm_class)
+    registry = _ProcessRegistry.get()
+    client = registry._runtime_session.acquire_ipc_client(  # noqa: SLF001
+        address,
+        name,
+        *expected.native_args(),
+    )
+    try:
+        instance_id = client.server_instance_id
+        if not isinstance(instance_id, str) or not instance_id:
+            raise RuntimeError('registered server did not expose server_instance_id')
+        return instance_id
+    finally:
+        registry._runtime_session.release_ipc_client(address)  # noqa: SLF001
 
 
 def _cleanup():
@@ -277,6 +319,8 @@ def bench_relay(payload_size: int) -> float | None:
             'pool_segment_size': _SEGMENT_SIZE,
             'max_pool_segments': _MAX_SEGMENTS,
         }
+        server_config = _resolve_server_ipc_config(ipc_overrides)
+        max_payload_size = int(server_config['max_payload_size'])
         cc.set_server(ipc_overrides=ipc_overrides)
         cc.set_client(ipc_overrides=ipc_overrides)
         cc.register(Echo, EchoImpl(), name=route_name)
@@ -286,8 +330,18 @@ def bench_relay(payload_size: int) -> float | None:
         if server_id is None:
             raise RuntimeError('registered server did not expose server_id')
         _wait_sock(address)
+        server_instance_id = _server_instance_id_for(route_name, address, Echo)
+        expected = crm_contract(Echo)
 
-        _register_relay_upstream(relay_url, route_name, address, server_id)
+        _register_relay_upstream(
+            relay_url,
+            route_name,
+            address,
+            server_id,
+            server_instance_id,
+            expected,
+            max_payload_size,
+        )
         route_registered = True
 
         payload = b'\xAB' * payload_size
@@ -399,6 +453,13 @@ def main():
     print('Three-Mode Benchmark: Thread-local vs IPC vs Relay (HTTP)')
     print(f'Payload types: bytes (identity fast path) | dict (pickle serde)')
     print(f'Warmup: {WARMUP}  |  Adaptive rounds (100/20/5)  |  Segment: {seg_label}×{_MAX_SEGMENTS}')
+    print(
+        'Relay path: '
+        f'{RELAY_TRANSPORT_LABEL} '
+        f'(client_request_http={RELAY_CLIENT_REQUEST_BODY_PATH}, '
+        f'relay_request_to_ipc={RELAY_RELAY_REQUEST_BODY_PATH}, '
+        f'response_http={RELAY_RESPONSE_BODY_PATH})'
+    )
     print(f'Python: {sys.version}')
     print('=' * 120)
     header = (f'{"Size":>8s}  {"Rounds":>6s}  {"Thread (ms)":>12s}  '
@@ -415,7 +476,8 @@ def main():
         t_ms = bench_thread(size_bytes)
         i_ms = bench_ipc(size_bytes)
         d_ms = bench_ipc_dict(size_bytes)
-        r_ms = bench_relay(size_bytes) if size_bytes <= 100 * 1024 * 1024 else None
+        r_ms = bench_relay(size_bytes) if _should_run_relay(size_bytes) else None
+        relay_path = RELAY_TRANSPORT_LABEL if r_ms is not None else 'N/A'
 
         ipc_ratio = f'{i_ms / t_ms:.1f}×' if t_ms > 0 else '—'
         dict_ratio = f'{d_ms / i_ms:.1f}×' if (d_ms is not None and i_ms > 0) else '—'
@@ -427,6 +489,7 @@ def main():
         results.append({
             'size': label, 'size_bytes': size_bytes, 'rounds': rounds,
             'thread_ms': t_ms, 'ipc_ms': i_ms, 'ipc_dict_ms': d_ms, 'relay_ms': r_ms,
+            'relay_path': relay_path,
         })
 
     # Summary
@@ -449,11 +512,20 @@ def main():
         os.makedirs(results_dir, exist_ok=True)
         tsv_path = os.path.join(results_dir, f'benchmark_{seg_label.lower()}.tsv')
     with open(tsv_path, 'w') as f:
-        f.write('size\tsize_bytes\trounds\tthread_ms\tipc_bytes_ms\tipc_dict_ms\trelay_ms\n')
+        f.write(
+            'size\tsize_bytes\trounds\tthread_ms\tipc_bytes_ms\tipc_dict_ms\t'
+            'relay_ms\trelay_path\trelay_client_request_http\t'
+            'relay_request_to_ipc\trelay_response_http\n'
+        )
         for r in results:
             dict_str = f'{r["ipc_dict_ms"]:.4f}' if r['ipc_dict_ms'] is not None else 'N/A'
             relay_str = f'{r["relay_ms"]:.4f}' if r['relay_ms'] is not None else 'N/A'
-            f.write(f'{r["size"]}\t{r["size_bytes"]}\t{r["rounds"]}\t{r["thread_ms"]:.4f}\t{r["ipc_ms"]:.4f}\t{dict_str}\t{relay_str}\n')
+            f.write(
+                f'{r["size"]}\t{r["size_bytes"]}\t{r["rounds"]}\t'
+                f'{r["thread_ms"]:.4f}\t{r["ipc_ms"]:.4f}\t{dict_str}\t{relay_str}\t'
+                f'{r["relay_path"]}\t{RELAY_CLIENT_REQUEST_BODY_PATH}\t'
+                f'{RELAY_RELAY_REQUEST_BODY_PATH}\t{RELAY_RESPONSE_BODY_PATH}\n'
+            )
     print(f'\nResults written to {os.path.abspath(tsv_path)}')
 
     _cleanup()

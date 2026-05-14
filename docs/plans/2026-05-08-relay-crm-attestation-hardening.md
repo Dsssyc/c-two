@@ -4,7 +4,11 @@
 
 **Goal:** Harden relay CRM contract authority after the Phase 9 CRM metadata migration.
 
-**Architecture:** Python continues to provide only expected CRM identity from decorated CRM classes. Rust relay/runtime code owns IPC handshake attestation, route metadata publication, relay target selection, contract-mismatch fallback policy, and route-cache refresh behavior.
+**Architecture:** Python provides the expected route contract derived from
+decorated CRM classes, including the route name, CRM identity, ABI descriptor
+hash, and signature descriptor hash. Rust relay/runtime code owns IPC handshake
+attestation, route metadata publication, relay target selection,
+contract-mismatch fallback policy, and route-cache refresh behavior.
 
 **Tech Stack:** Rust `c2-http`, `c2-ipc`, `c2-runtime`, PyO3 native bindings, Python registry integration tests, `cargo test`, `uv run pytest`.
 
@@ -27,9 +31,28 @@ This plan implements the strict-review findings from session
   the relay-aware contract-validation path or kept as a documented follow-up
   with a clear reason.
 
+2026-05-11 closure update:
+
+- Relay registration and routing now carry a full `ExpectedRouteContract`
+  rather than a CRM triplet. The contract includes `route_name`, `crm_ns`,
+  `crm_name`, `crm_ver`, `abi_hash`, and `signature_hash`.
+- Normal HTTP `/_register` and CLI upstream registration derive the published
+  route contract from the IPC handshake. If the caller also supplies contract
+  fields, Rust treats them as expected values and rejects mismatches before
+  commit.
+- The old `skip_ipc_validation` path is removed instead of retained as a
+  production or test registration bypass.
+- Relay resolve, route cache keys, route probes, relay-aware calls, digest
+  entries, peer route announcements, and local IPC fallback decisions are keyed
+  or checked with the full route contract.
+- Python still derives hashes from the current Python CRM descriptor. A strict
+  cross-language IDL/ABI grammar remains separate future work and must not be
+  described as already complete.
+
 Out of scope:
 
-- Transferable ABI hashes and full method-signature compatibility.
+- A canonical cross-language IDL/ABI grammar for transferable types and method
+  signatures beyond the current Python descriptor hash.
 - Python-owned relay route selection or HTTP retry policy.
 - Compatibility aliases for stale or empty production CRM route metadata.
 
@@ -66,8 +89,8 @@ Out of scope:
   preparation and before final commit.
 - [x] Use the helper in command-loop registration after candidate IPC
   attestation and before final commit.
-- [x] Keep `skip_ipc_validation` restricted to tests; do not add production
-  fallbacks for missing or empty route CRM metadata.
+- [x] Remove `skip_ipc_validation` instead of keeping a test-only bypass; do not
+  add production fallbacks for missing or empty route CRM metadata.
 - [x] Run targeted cargo tests and perform a strict review of relay authority,
   stale-owner replacement, and TOCTOU behavior before moving on.
 

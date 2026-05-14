@@ -2,7 +2,7 @@ import pickle
 import c_two as cc
 
 
-@cc.transferable
+@cc.transferable(abi_id='c-two.tests.hello-data.pickle-dict.v1')
 class HelloData:
     """A simple transferable data type for testing custom serialization."""
     name: str
@@ -16,7 +16,7 @@ class HelloData:
         return HelloData(name=d['name'], value=d['value'])
 
 
-@cc.transferable
+@cc.transferable(abi_id='c-two.tests.hello-items.pickle-list-str.v1')
 class HelloItems:
     """Transferable for list[str] used as return type of get_items."""
     def serialize(items: list[str]) -> bytes:

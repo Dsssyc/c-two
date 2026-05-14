@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "foundation/c2-contract",
     "foundation/c2-config",
     "foundation/c2-error",
     "foundation/c2-mem",

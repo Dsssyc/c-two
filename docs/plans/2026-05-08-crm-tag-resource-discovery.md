@@ -104,8 +104,10 @@ two concrete gaps:
 
 - Add `crm_name` to `RouteEntry`, `RouteInfo`, peer gossip, anti-entropy digest
   hashes, snapshot merge, and route table replacement.
-- Add expected-tag query support to resolve APIs while preserving name-only
-  low-level control behavior where no expected tag is supplied.
+- Add expected-tag query support to resolve APIs and remove name-only runtime
+  resolve behavior. Any future resource-search diagnostic must be a separate
+  discovery surface that returns route plus CRM tag/hash metadata, not a call
+  routing fallback.
 - Relay-aware clients pass expected `CrmTag` into resolve, cache filtering, and
   route ordering. Cache remains name-keyed only if mismatch still triggers a
   forced refresh; otherwise key by `(name, CrmTag)`.
@@ -214,16 +216,19 @@ Follow up on the strict recovery review performed after session
 - Peer `RouteAnnounce`, `DigestDiffEntry::Active`, and full snapshot merge
   reject empty, oversized, or control-character CrmTag fields before mutating
   the route table.
-- Relay control resolve cache uses structured identity so name-only and typed
-  entries cannot collide through embedded delimiters; route/tag validators
-  reject control-character identities at boundaries.
+- Relay control resolve cache uses the complete expected route contract as its
+  key, so entries for different CRM tags or hashes cannot collide through route
+  name reuse; route/tag validators reject control-character identities at
+  boundaries.
 
 ### Implementation Notes
 
 - Prefer a small Rust-side CrmTag validation helper in the relay route-table
   authority layer before considering wider shared-crate movement.
-- Keep low-level name-only resolve behavior for callers that do not supply an
-  expected CrmTag, but do not allow partial or malformed CrmTag data.
+- Do not keep low-level name-only resolve behavior on runtime relay resolution
+  paths. A future resource-search diagnostic may query by name, but it must be
+  a separate surface that returns candidate route metadata instead of producing
+  a callable route without a full expected contract.
 - Avoid a per-call network resolve. Post-acquire validation should compare the
   already acquired `RouteEntry` snapshot.
 

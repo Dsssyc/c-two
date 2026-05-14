@@ -4,7 +4,12 @@
 
 **Goal:** Replace the flat `UpstreamPool` with a gossip-replicated `RouteTable` so clients can do `cc.connect(IGrid, name='grid')` without knowing IPC/HTTP addresses.
 
-**Architecture:** Each relay maintains a `RouteTable` (LOCAL + PEER routes) + `ConnectionPool` (IPC client lifecycle). Relays discover peers via seed URLs, synchronize route state via HTTP gossip (`/_peer/*` endpoints), and expose `/_resolve/{name}` for client-side name resolution. Python's `cc.connect()` queries the local relay and connects directly to the resolved target relay (single hop). All mesh logic is gated behind the existing `relay` Cargo feature flag.
+**2026-05-11 update:** runtime relay resolution is contract-bound. `cc.connect()`
+uses the routing name plus expected CRM tag, ABI hash, and signature hash; do
+not restore a name-only `/_resolve` or registry CLI resolve path from this
+historical plan.
+
+**Architecture:** Each relay maintains a `RouteTable` (LOCAL + PEER routes) + `ConnectionPool` (IPC client lifecycle). Relays discover peers via seed URLs, synchronize route state via HTTP gossip (`/_peer/*` endpoints), and expose contract-bound `/_resolve/{route}` for client-side route resolution. Python's `cc.connect()` queries the local relay with the full expected route contract and connects directly to the resolved target relay (single hop). All mesh logic is gated behind the existing `relay` Cargo feature flag.
 
 **Tech Stack:** Rust (axum, tokio, serde_json, parking_lot), Python (urllib, threading, click), PyO3/maturin
 
@@ -32,12 +37,12 @@
 |------|---------|
 | `relay/config.rs` | Extend `RelayConfig` with `relay_id`, `advertise_url`, `seeds`, mesh params |
 | `relay/state.rs` | Replace `UpstreamPool` + old `RelayState` → new `RelayState` with `RouteTable` + `ConnectionPool` + transactional methods. Old `UpstreamPool` deleted. |
-| `relay/router.rs` | Rewrite handlers to use new state; add `/_resolve/{name}`, `/_peers`; mount `/_peer/*` routes |
+| `relay/router.rs` | Rewrite handlers to use new state; add contract-bound `/_resolve/{route}`, `/_peers`; mount `/_peer/*` routes |
 | `relay/server.rs` | Accept new config; spawn background tasks; `CancellationToken` for shutdown |
 | `relay/mod.rs` | Export new modules |
 | `c2-http/Cargo.toml` | Add `serde` + `tokio-util` (for `CancellationToken`) dependencies under `relay` feature |
 | `c2-config/src/relay.rs` | Extended `RelayConfig` struct |
-| `c2-ffi/src/relay_ffi.rs` | New `PyNativeRelay` constructor params (`seeds`, `relay_id`, `advertise_url`) |
+| `cli/src/relay.rs` | Rust `c3 relay` owns relay process configuration (`--seeds`, `--relay-id`, `--advertise-url`) |
 
 ### Python — modified files
 
@@ -98,8 +103,6 @@ pub struct RelayConfig {
     pub dead_peer_probe_interval: Duration,
     /// Seed retry interval when no peers available.
     pub seed_retry_interval: Duration,
-    /// Skip IPC validation in `/_register`. For testing only.
-    pub skip_ipc_validation: bool,
 }
 
 impl Default for RelayConfig {
@@ -115,7 +118,6 @@ impl Default for RelayConfig {
             heartbeat_miss_threshold: 3,
             dead_peer_probe_interval: Duration::from_secs(30),
             seed_retry_interval: Duration::from_secs(10),
-            skip_ipc_validation: false,
         }
     }
 }
@@ -336,9 +338,10 @@ impl RouteTable {
         self.routes.get(&(name.to_string(), self.relay_id.clone()))
     }
 
-    /// Resolve a name → ordered list of RouteInfo.
+    /// Resolve one expected route contract → ordered list of RouteInfo.
     /// LOCAL first, then PEER sorted by (registered_at, relay_id).
-    pub fn resolve(&self, name: &str) -> Vec<RouteInfo> {
+    pub fn resolve_matching(&self, expected: &ExpectedRouteContract) -> Vec<RouteInfo> {
+        let name = expected.route_name.as_str();
         let mut local = Vec::new();
         let mut peers = Vec::new();
 
@@ -986,8 +989,8 @@ impl RelayState {
 
     // -- Route-only operations --
 
-    pub fn resolve(&self, name: &str) -> Vec<RouteInfo> {
-        self.route_table.read().resolve(name)
+    pub fn resolve_matching(&self, expected: &ExpectedRouteContract) -> Vec<RouteInfo> {
+        self.route_table.read().resolve_matching(expected)
     }
 
     pub fn has_local_route(&self, name: &str) -> bool {
@@ -1185,7 +1188,7 @@ Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 **Files:**
 - Modify: `src/c_two/_native/transport/c2-http/src/relay/router.rs`
 
-Rewrite all existing HTTP handlers to use the new `RelayState` API. Add `/_resolve/{name}` and `/_peers` endpoints. Keep existing endpoint behavior identical — this is a refactor with new additions.
+Rewrite all existing HTTP handlers to use the new `RelayState` API. Add contract-bound `/_resolve/{route}` and `/_peers` endpoints. Keep existing endpoint behavior identical — this is a refactor with new additions.
 
 - [ ] **Step 1: Rewrite router.rs handlers**
 
@@ -1213,12 +1216,14 @@ Key changes:
 **New handlers:**
 
 ```rust
-/// GET /_resolve/{name} → Vec<RouteInfo>
+/// GET /_resolve/{route}?crm_ns=...&crm_name=...&crm_ver=...&abi_hash=...&signature_hash=... → Vec<RouteInfo>
 async fn handle_resolve(
-    Path(name): Path<String>,
+    Path(route): Path<String>,
+    Query(query): Query<ResolveQuery>,
     State(state): State<Arc<RelayState>>,
 ) -> impl IntoResponse {
-    let routes = state.resolve(&name);
+    let expected = expected_contract_from_query(route, query)?;
+    let routes = state.resolve_matching(&expected);
     if routes.is_empty() {
         return (StatusCode::NOT_FOUND, Json(serde_json::json!({
             "error": "ResourceNotFound", "name": name,
@@ -1243,7 +1248,7 @@ pub fn build_router(state: Arc<RelayState>) -> axum::Router {
         .route("/_register", post(handle_register))
         .route("/_unregister", post(handle_unregister))
         .route("/_routes", get(handle_list_routes))
-        .route("/_resolve/{name}", get(handle_resolve))
+        .route("/_resolve/{route}", get(handle_resolve))
         .route("/_peers", get(handle_peers))
         .route("/health", get(handle_health))
         .route("/_echo", post(handle_echo))
@@ -1296,22 +1301,24 @@ Expected: Clean compilation.
 git add -A
 git commit -m "feat(relay): migrate router to new RelayState + add resolve/peers
 
-Rewrite handlers to use RelayState API. Add /_resolve/{name} → Vec<RouteInfo>
-and /_peers endpoints. Existing behavior preserved.
+Rewrite handlers to use RelayState API. Add contract-bound /_resolve/{route}
+→ Vec<RouteInfo> and /_peers endpoints. Existing behavior preserved.
 
 Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 ```
 
 ---
 
-## Task 6: Update RelayServer + FFI + Compatibility Gate
+## Task 6: Update RelayServer + Rust CLI Compatibility Gate
 
 **Files:**
 - Modify: `src/c_two/_native/transport/c2-http/src/relay/server.rs`
-- Modify: `src/c_two/_native/bridge/c2-ffi/src/relay_ffi.rs`
+- Modify: `cli/src/relay.rs`
 - Modify: `src/c_two/_native/transport/c2-http/Cargo.toml`
 
-Update server lifecycle for `RelayConfig` and `RelayState`. Update PyO3 bridge. **ALL existing tests must pass after this task.**
+Update server lifecycle for `RelayConfig` and `RelayState`. Relay process
+lifecycle remains in the Rust `c3 relay` CLI, not a Python FFI bridge. **ALL
+existing tests must pass after this task.**
 
 - [ ] **Step 1: Add dependencies to Cargo.toml**
 
@@ -1362,32 +1369,12 @@ impl RelayServer {
 }
 ```
 
-- [ ] **Step 3: Update relay_ffi.rs with new constructor params**
+- [x] **Step 3: Keep relay lifecycle out of Python FFI**
 
-```rust
-#[pymethods]
-impl PyNativeRelay {
-    #[new]
-    #[pyo3(signature = (bind, relay_id=None, advertise_url=None, seeds=None, idle_timeout=0))]
-    fn new(
-        bind: String,
-        relay_id: Option<String>,
-        advertise_url: Option<String>,
-        seeds: Option<Vec<String>>,
-        idle_timeout: u64,
-    ) -> Self {
-        let config = RelayConfig {
-            bind,
-            relay_id: relay_id.unwrap_or_else(RelayConfig::generate_relay_id),
-            advertise_url: advertise_url.unwrap_or_default(),
-            seeds: seeds.unwrap_or_default(),
-            idle_timeout_secs: idle_timeout,
-            ..Default::default()
-        };
-        Self { state: Mutex::new(ServerState::Stopped), config }
-    }
-}
-```
+There is no `NativeRelay` / `PyNativeRelay` SDK surface. Relay lifecycle and
+mesh configuration belong to the Rust `c3 relay` process, not to Python FFI.
+Python tests start real relays through the `start_c3_relay` fixture instead of
+embedding a relay server in the SDK.
 
 - [ ] **Step 4: Run ALL existing tests (compatibility gate)**
 
@@ -1405,7 +1392,7 @@ git add -A
 git commit -m "feat(relay): update server + FFI for new config/state model
 
 RelayServer accepts RelayConfig with mesh parameters.
-PyNativeRelay takes optional relay_id, advertise_url, seeds.
+Relay lifecycle remains in the Rust c3 relay process, not Python FFI.
 Compatibility gate: all existing tests pass.
 
 Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
@@ -1900,7 +1887,7 @@ pub fn build_router(state: Arc<RelayState>) -> axum::Router {
         .route("/_register", post(handle_register))
         .route("/_unregister", post(handle_unregister))
         .route("/_routes", get(handle_list_routes))
-        .route("/_resolve/{name}", get(handle_resolve))
+        .route("/_resolve/{route}", get(handle_resolve))
         .route("/_peers", get(handle_peers))
         .route("/health", get(handle_health))
         .route("/_echo", post(handle_echo))
@@ -2411,13 +2398,10 @@ async fn handle_register(
     let icrm_ns = payload.icrm_ns.unwrap_or_default();
     let icrm_ver = payload.icrm_ver.unwrap_or_default();
 
-    // IPC validation: skip when configured for testing (H-8).
-    let client = if state.config().skip_ipc_validation {
-        None
-    } else {
-        Some(Arc::new(IpcClient::connect(&payload.address).await
-            .map_err(|e| (StatusCode::BAD_GATEWAY, format!("IPC connect failed: {e}")))?))
-    };
+    // IPC validation is mandatory. Tests must start a real IPC server and
+    // cannot bypass route contract attestation through relay config.
+    let client = Some(Arc::new(IpcClient::connect(&payload.address).await
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("IPC connect failed: {e}")))?));
 
     let entry = state.register_upstream(
         name.clone(), address.clone(), icrm_ns, icrm_ver, client,
@@ -2617,13 +2601,13 @@ class _RouteCache:
             self._cache.clear()
 ```
 
-- [ ] **Step 2: Add _resolve_via_relay method**
+- [ ] **Step 2: Add contract-bound _resolve_via_relay method**
 
 ```python
-def _resolve_via_relay(self, name: str) -> list[dict]:
-    """Resolve a resource name via the local relay's /_resolve endpoint."""
+def _resolve_via_relay(self, route: str, expected_contract: dict) -> list[dict]:
+    """Resolve a route via the local relay's contract-bound /_resolve endpoint."""
     # Check cache first.
-    cached = self._route_cache.get(name)
+    cached = self._route_cache.get(route)
     if cached is not None:
         return cached
 
@@ -2631,7 +2615,8 @@ def _resolve_via_relay(self, name: str) -> list[dict]:
     if not relay_addr:
         raise RegistryUnavailable("No relay configured (set C2_RELAY_ANCHOR_ADDRESS)")
 
-    url = f"{relay_addr}/_resolve/{name}"
+    query = _expected_contract_query(expected_contract)
+    url = f"{relay_addr}/_resolve/{route}?{query}"
     try:
         import urllib.request
         import json
@@ -2699,7 +2684,7 @@ Expected: All tests pass (existing tests use `address=` escape hatch or thread-l
 git add -A
 git commit -m "feat: add relay-based name resolution to cc.connect()
 
-cc.connect(IGrid, name='grid') now resolves via /_resolve/{name}.
+cc.connect(IGrid, name='grid') now resolves via contract-bound /_resolve/{route}.
 Thread-safe route cache with 30s TTL. Falls back to existing
 address= escape hatch. Thread-local preference still takes priority.
 
@@ -2873,98 +2858,39 @@ Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 ## Task 14: CLI Updates
 
 **Files:**
-- Modify: `src/c_two/cli.py`
+- Modify: `cli/src/relay.rs`
+- Modify: `cli/src/registry.rs`
 
-Add `--seeds` flag to `c3 relay` and a new `c3 registry` subcommand.
+Add relay mesh flags to the Rust `c3 relay` command and keep registry commands
+diagnostic-only.
 
-- [ ] **Step 1: Add --seeds to c3 relay**
+- [x] **Step 1: Add mesh flags to c3 relay**
 
-```python
-@relay.command()
-@click.option("--upstream", "-u", required=False, default=None, help="Upstream IPC address")
-@click.option("--bind", "-b", default="0.0.0.0:8080", help="HTTP bind address")
-@click.option("--seeds", "-s", default="", help="Comma-separated seed relay URLs")
-@click.option("--relay-id", default=None, help="Stable relay identifier")
-@click.option("--advertise-url", default=None, help="Publicly reachable relay URL")
-def start(upstream, bind, seeds, relay_id, advertise_url):
-    """Start the relay server."""
-    from c_two._native import NativeRelay
-    seed_list = [s.strip() for s in seeds.split(",") if s.strip()] if seeds else []
-    relay = NativeRelay(
-        bind=bind,
-        relay_id=relay_id,
-        advertise_url=advertise_url,
-        seeds=seed_list,
-    )
-    relay.start()
-    if upstream:
-        relay.register_upstream(upstream)
-    # ... signal handling ...
-```
+`cli/src/relay.rs` owns `--seeds`, `--relay-id`, and `--advertise-url`.
+`--upstream` uses `NAME=SERVER_ID@ADDRESS`; the relay then validates the real
+IPC server identity and reads the CRM route contract from the IPC handshake.
 
-- [ ] **Step 2: Add c3 registry subcommand**
+- [x] **Step 2: Keep c3 registry diagnostic-only**
 
-```python
-@cli.group()
-def registry():
-    """Resource registry commands."""
-    pass
+`cli/src/registry.rs` exposes `list-routes` and `peers`. It intentionally does
+not expose a name-only `resolve` command; runtime resolution requires a full
+expected route contract and belongs to `cc.connect()`.
 
-@registry.command()
-@click.option("--relay", "-r", required=True, help="Relay HTTP address")
-def list_routes(relay):
-    """List all registered routes."""
-    import urllib.request, json
-    with urllib.request.urlopen(f"{relay}/_routes", timeout=5) as resp:
-        routes = json.loads(resp.read())
-        for name in routes:
-            click.echo(name)
-
-@registry.command()
-@click.option("--relay", "-r", required=True, help="Relay HTTP address")
-@click.argument("name")
-def resolve(relay, name):
-    """Resolve a resource name to route info."""
-    import urllib.request, json
-    try:
-        with urllib.request.urlopen(f"{relay}/_resolve/{name}", timeout=5) as resp:
-            routes = json.loads(resp.read())
-            for route in routes:
-                click.echo(json.dumps(route, indent=2))
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            click.echo(f"Resource '{name}' not found", err=True)
-        else:
-            click.echo(f"Error: {e.code}", err=True)
-
-@registry.command()
-@click.option("--relay", "-r", required=True, help="Relay HTTP address")
-def peers(relay):
-    """List known peer relays."""
-    import urllib.request, json
-    with urllib.request.urlopen(f"{relay}/_peers", timeout=5) as resp:
-        peer_list = json.loads(resp.read())
-        for peer in peer_list:
-            click.echo(f"{peer['relay_id']} ({peer['url']}) - {peer['status']}")
-```
-
-- [ ] **Step 3: Run CLI smoke test**
+- [x] **Step 3: Run CLI smoke test**
 
 ```bash
-uv run c3 --help
-uv run c3 relay --help
-uv run c3 registry --help
+cargo test --manifest-path cli/Cargo.toml -- --nocapture
 ```
-Expected: All help texts render correctly.
+Expected: CLI help, relay args, and registry command tests pass.
 
 - [ ] **Step 4: Commit**
 
 ```bash
 git add -A
-git commit -m "feat(cli): add --seeds to c3 relay + c3 registry subcommand
+git commit -m "feat(cli): add relay mesh flags and registry diagnostics
 
-c3 relay now accepts --seeds, --relay-id, --advertise-url.
-New c3 registry command with list-routes, resolve, peers subcommands.
+c3 relay now accepts --seeds, --relay-id, and --advertise-url.
+c3 registry exposes list-routes and peers diagnostics only.
 
 Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 ```
@@ -2978,180 +2904,28 @@ Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 
 End-to-end tests for the relay mesh: two relays, gossip sync, name resolution, and failure detection.
 
-Tests use `skip_ipc_validation: true` in `RelayConfig` to avoid needing real IPC servers.
-The flag is defined in Task 1 (`RelayConfig`) and checked in Task 10 (`handle_register`).
+Tests start real IPC servers so registration exercises the same route contract
+attestation path as production. Do not add a relay-side validation bypass.
 
-- [ ] **Step 1: Create integration test file**
+- [x] **Step 1: Keep the integration test file aligned with production contracts**
 
-```python
-import pytest
-import time
-import json
-import urllib.request
-import c_two as cc
-from c_two._native import NativeRelay
+Current coverage lives in `sdk/python/tests/integration/test_relay_mesh.py`.
+It uses real `c3 relay` instances through the `start_c3_relay` fixture and real
+Python CRM resource registration. The test helper obtains `server_instance_id`
+from the IPC handshake and builds `/_resolve/{route}` URLs from the CRM
+contract hashes computed by `c_two.crm.contract.crm_contract(...)`.
 
-# Skip if relay feature not available.
-pytestmark = pytest.mark.skipif(
-    not hasattr(cc._native, "NativeRelay"),
-    reason="relay feature not compiled",
-)
+The required runtime shape is:
 
+- `/_register` receives `name`, `server_id`, `server_instance_id`, and IPC
+  `address`; optional CRM fields, when supplied, must be complete.
+- `/_resolve/{route}?crm_ns=...&crm_name=...&crm_ver=...&abi_hash=...&signature_hash=...`
+  is used for every runtime resolve assertion.
+- `/_unregister` receives `name` and `server_id`.
 
-class TestSingleRelay:
-    """Tests with one relay — backward compatibility."""
-
-    def test_register_and_resolve(self, tmp_path):
-        relay = NativeRelay(bind="127.0.0.1:0")
-        relay.start()
-        try:
-            port = relay.bind_address().split(":")[-1]
-            base = f"http://127.0.0.1:{port}"
-
-            # Register a mock upstream.
-            # (Real upstream needs IPC; test just verifies HTTP API.)
-            data = json.dumps({"name": "grid", "address": "ipc://test_grid"}).encode()
-            req = urllib.request.Request(
-                f"{base}/_register", data=data,
-                headers={"Content-Type": "application/json"}, method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                assert resp.status == 200
-
-            # Resolve.
-            with urllib.request.urlopen(f"{base}/_resolve/grid", timeout=5) as resp:
-                routes = json.loads(resp.read())
-                assert len(routes) >= 1
-                assert routes[0]["name"] == "grid"
-
-            # Unregister.
-            data = json.dumps({"name": "grid"}).encode()
-            req = urllib.request.Request(
-                f"{base}/_unregister", data=data,
-                headers={"Content-Type": "application/json"}, method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                assert resp.status == 200
-
-            # Resolve should now 404.
-            try:
-                urllib.request.urlopen(f"{base}/_resolve/grid", timeout=5)
-                assert False, "Expected 404"
-            except urllib.error.HTTPError as e:
-                assert e.code == 404
-        finally:
-            relay.stop()
-
-    def test_peers_empty(self, tmp_path):
-        relay = NativeRelay(bind="127.0.0.1:0")
-        relay.start()
-        try:
-            port = relay.bind_address().split(":")[-1]
-            with urllib.request.urlopen(
-                f"http://127.0.0.1:{port}/_peers", timeout=5
-            ) as resp:
-                peers = json.loads(resp.read())
-                assert peers == []
-        finally:
-            relay.stop()
-
-
-class TestTwoRelayMesh:
-    """Tests with two relays in a mesh."""
-
-    def test_gossip_route_propagation(self):
-        # Start relay A.
-        relay_a = NativeRelay(
-            bind="127.0.0.1:0",
-            relay_id="relay-a",
-            advertise_url="http://127.0.0.1:0",  # Will be updated after start.
-        )
-        relay_a.start()
-        port_a = relay_a.bind_address().split(":")[-1]
-        url_a = f"http://127.0.0.1:{port_a}"
-
-        # Start relay B with relay A as seed.
-        relay_b = NativeRelay(
-            bind="127.0.0.1:0",
-            relay_id="relay-b",
-            seeds=[url_a],
-        )
-        relay_b.start()
-        port_b = relay_b.bind_address().split(":")[-1]
-        url_b = f"http://127.0.0.1:{port_b}"
-
-        try:
-            # Wait for join to complete.
-            time.sleep(2)
-
-            # Register on relay A.
-            data = json.dumps({"name": "grid", "address": "ipc://grid_a"}).encode()
-            req = urllib.request.Request(
-                f"{url_a}/_register", data=data,
-                headers={"Content-Type": "application/json"}, method="POST",
-            )
-            urllib.request.urlopen(req, timeout=5)
-
-            # Wait for gossip propagation.
-            time.sleep(3)
-
-            # Resolve on relay B should find "grid".
-            with urllib.request.urlopen(f"{url_b}/_resolve/grid", timeout=5) as resp:
-                routes = json.loads(resp.read())
-                assert len(routes) >= 1
-                assert routes[0]["name"] == "grid"
-
-            # Both relays should see each other as peers.
-            with urllib.request.urlopen(f"{url_a}/_peers", timeout=5) as resp:
-                peers_a = json.loads(resp.read())
-                assert any(p["relay_id"] == "relay-b" for p in peers_a)
-
-        finally:
-            relay_b.stop()
-            relay_a.stop()
-
-    def test_route_withdraw_propagation(self):
-        relay_a = NativeRelay(bind="127.0.0.1:0", relay_id="relay-a")
-        relay_a.start()
-        port_a = relay_a.bind_address().split(":")[-1]
-        url_a = f"http://127.0.0.1:{port_a}"
-
-        relay_b = NativeRelay(bind="127.0.0.1:0", relay_id="relay-b", seeds=[url_a])
-        relay_b.start()
-        port_b = relay_b.bind_address().split(":")[-1]
-        url_b = f"http://127.0.0.1:{port_b}"
-
-        try:
-            time.sleep(2)
-
-            # Register on A.
-            data = json.dumps({"name": "net", "address": "ipc://net_a"}).encode()
-            req = urllib.request.Request(
-                f"{url_a}/_register", data=data,
-                headers={"Content-Type": "application/json"}, method="POST",
-            )
-            urllib.request.urlopen(req, timeout=5)
-            time.sleep(2)
-
-            # Unregister on A.
-            data = json.dumps({"name": "net"}).encode()
-            req = urllib.request.Request(
-                f"{url_a}/_unregister", data=data,
-                headers={"Content-Type": "application/json"}, method="POST",
-            )
-            urllib.request.urlopen(req, timeout=5)
-            time.sleep(2)
-
-            # Resolve on B should 404.
-            try:
-                urllib.request.urlopen(f"{url_b}/_resolve/net", timeout=5)
-                assert False, "Expected 404"
-            except urllib.error.HTTPError as e:
-                assert e.code == 404
-        finally:
-            relay_b.stop()
-            relay_a.stop()
-```
+Do not recreate the old `NativeRelay`/mock-upstream snippet that posted only
+`{"name": ..., "address": ...}` to `/_register` or resolved by name alone; that
+path is intentionally invalid after CRM contract attestation became mandatory.
 
 - [ ] **Step 2: Run integration tests**
 
@@ -3195,7 +2969,7 @@ Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 - [x] §1.6 Failure Detection → Task 9 (heartbeat + failure_detection_loop + dead_peer_probe)
 - [x] §1.7 Config → Tasks 1, 11 (RelayConfig, C2_RELAY_SEEDS)
 - [x] §1.8 Address Auto-UUID → Task 13 (remove set_ipc_address)
-- [x] §1.9 Registry Integration → Tasks 12-13 (cc.connect + cc.register updates). H-8 IPC validation skip wired into Task 1 `RelayConfig` + Task 10 `handle_register`.
+- [x] §1.9 Registry Integration → Tasks 12-13 (cc.connect + cc.register updates). IPC validation is mandatory; the removed H-8 skip-validation idea must not be reintroduced into `RelayConfig` or `handle_register`.
 - [x] §1.10 CLI → Task 14 (--seeds, c3 registry)
 
 ### Type Consistency
@@ -3209,4 +2983,3 @@ Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 - No TBD/TODO found
 - All steps have code or specific commands
 - All test commands have expected output
-

@@ -40,6 +40,7 @@ import threading
 from collections.abc import Mapping
 from typing import TypeVar
 
+from c_two.crm.contract import CRMContract, crm_contract, crm_contract_identity
 from c_two.config.ipc import ClientIPCOverrides, ServerIPCOverrides
 from c_two.config.settings import settings
 from c_two.error import (
@@ -53,6 +54,18 @@ from .server.native import NativeServerBridge as Server
 
 CRM = TypeVar('CRM')
 log = logging.getLogger(__name__)
+_UNSET = object()
+
+
+def _runtime_session_kwargs_from_settings() -> dict[str, int]:
+    kwargs: dict[str, int] = {}
+    shm_overrides = settings._shm_overrides()  # noqa: SLF001
+    if 'shm_threshold' in shm_overrides:
+        kwargs['shm_threshold'] = shm_overrides['shm_threshold']
+    remote_chunk_size = settings._remote_payload_chunk_size_override()  # noqa: SLF001
+    if remote_chunk_size is not None:
+        kwargs['remote_payload_chunk_size'] = remote_chunk_size
+    return kwargs
 
 
 def _relay_control_error_status(exc: BaseException) -> int | None:
@@ -64,34 +77,20 @@ def _is_crm_contract_mismatch(exc: BaseException) -> bool:
     return isinstance(exc, RuntimeError) and "CRM contract mismatch" in str(exc)
 
 
-def _crm_contract_identity(crm_class: type) -> tuple[str, str, str]:
-    return (
-        getattr(crm_class, '__cc_namespace__', ''),
-        getattr(crm_class, '__cc_name__', crm_class.__name__),
-        getattr(crm_class, '__cc_version__', ''),
-    )
-
-
 def _ensure_crm_contract_match(
     *,
     route_name: str,
-    expected: tuple[str, str, str],
-    actual: tuple[str, str, str],
+    expected: CRMContract,
+    actual: CRMContract,
 ) -> None:
-    expected_ns, expected_name, expected_ver = expected
-    actual_ns, actual_name, actual_ver = actual
-    if not expected_ns and not expected_name and not expected_ver:
-        return
-    if (
-        expected_ns == actual_ns
-        and expected_name == actual_name
-        and expected_ver == actual_ver
-    ):
+    if expected == actual:
         return
     raise TypeError(
         f'CRM contract mismatch for route {route_name!r}: '
-        f'expected {expected_ns}/{expected_name}/{expected_ver}, '
-        f'got {actual_ns}/{actual_name}/{actual_ver}',
+        f'expected {expected.crm_ns}/{expected.crm_name}/{expected.crm_ver} '
+        f'abi={expected.abi_hash} signature={expected.signature_hash}, '
+        f'got {actual.crm_ns}/{actual.crm_name}/{actual.crm_ver} '
+        f'abi={actual.abi_hash} signature={actual.signature_hash}',
     )
 
 
@@ -141,7 +140,7 @@ class _ProcessRegistry:
         self._lock = threading.Lock()
         from c_two._native import RuntimeSession
         self._server: Server | None = None
-        self._runtime_session = RuntimeSession(shm_threshold=settings.shm_threshold)
+        self._runtime_session = RuntimeSession(**_runtime_session_kwargs_from_settings())
 
     # ------------------------------------------------------------------
     # Public API
@@ -155,7 +154,12 @@ class _ProcessRegistry:
         settings.relay_anchor_address = address
         self._runtime_session.set_relay_anchor_address(settings._relay_anchor_address)  # noqa: SLF001
 
-    def set_transport_policy(self, *, shm_threshold: int | None = None) -> None:
+    def set_transport_policy(
+        self,
+        *,
+        shm_threshold: int | None | object = _UNSET,
+        remote_payload_chunk_size: int | None | object = _UNSET,
+    ) -> None:
         """Set process transport policy. Must be called before use."""
         with self._lock:
             if self._server is not None or self._runtime_session.client_config_frozen:
@@ -167,7 +171,11 @@ class _ProcessRegistry:
                     stacklevel=3,
                 )
                 return
-            settings.shm_threshold = shm_threshold
+            if shm_threshold is not _UNSET:
+                settings.shm_threshold = shm_threshold  # type: ignore[assignment]
+            if remote_payload_chunk_size is not _UNSET:
+                settings.remote_payload_chunk_size = remote_payload_chunk_size  # type: ignore[assignment]
+            runtime_session_kwargs = _runtime_session_kwargs_from_settings()
             runtime_session = self._runtime_session.__class__(
                 server_id=(
                     self._runtime_session.server_id
@@ -175,7 +183,7 @@ class _ProcessRegistry:
                 ),
                 server_ipc_overrides=self._runtime_session.server_ipc_overrides,
                 client_ipc_overrides=self._runtime_session.client_ipc_overrides,
-                shm_threshold=shm_threshold,
+                **runtime_session_kwargs,
             )
             runtime_session.set_relay_anchor_address(settings._relay_anchor_address)  # noqa: SLF001
             self._runtime_session = runtime_session
@@ -257,6 +265,7 @@ class _ProcessRegistry:
         str
             The *name* string (echoed back for convenience).
         """
+        crm_contract_identity(crm_class)
         with self._lock:
             created_server = False
             try:
@@ -333,7 +342,7 @@ class _ProcessRegistry:
             A CRM instance with ``.client`` set to an
             :class:`CRMProxy`.
         """
-        expected_contract = _crm_contract_identity(crm_class)
+        expected_contract = crm_contract(crm_class)
         with self._lock:
             server = self._server
             local = (
@@ -345,11 +354,11 @@ class _ProcessRegistry:
 
         if address is None and local is not None:
             # Thread preference — same process, no serialization.
-            crm_instance, scheduler, actual_ns, actual_name, actual_ver = local
+            crm_instance, scheduler, actual_contract = local
             _ensure_crm_contract_match(
                 route_name=name,
                 expected=expected_contract,
-                actual=(actual_ns, actual_name, actual_ver),
+                actual=actual_contract,
             )
             proxy = CRMProxy.thread_local(
                 crm_instance,
@@ -358,13 +367,21 @@ class _ProcessRegistry:
             )
         elif address is not None and address.startswith(('http://', 'https://')):
             # HTTP mode — cross-node via relay server.
-            client = self._runtime_session.connect_explicit_relay_http(
-                address,
-                name,
-                expected_contract[0],
-                expected_contract[1],
-                expected_contract[2],
-            )
+            try:
+                client = self._runtime_session.connect_explicit_relay_http(
+                    address,
+                    name,
+                    *expected_contract.native_args(),
+                )
+            except Exception as exc:
+                if _is_crm_contract_mismatch(exc):
+                    raise
+                status = _relay_control_error_status(exc)
+                if status == 404:
+                    raise ResourceNotFound(f"Resource '{name}' not found") from exc
+                if status is not None:
+                    raise ResourceUnavailable(f"Relay error: {status}") from exc
+                raise
             proxy = CRMProxy.http(
                 client,
                 name,
@@ -376,9 +393,7 @@ class _ProcessRegistry:
             client = self._runtime_session.acquire_ipc_client(
                 address,
                 name,
-                expected_contract[0],
-                expected_contract[1],
-                expected_contract[2],
+                *expected_contract.native_args(),
             )
             proxy = CRMProxy.ipc(
                 client,
@@ -391,9 +406,7 @@ class _ProcessRegistry:
             try:
                 client = self._runtime_session.connect_via_relay(
                     name,
-                    expected_contract[0],
-                    expected_contract[1],
-                    expected_contract[2],
+                    *expected_contract.native_args(),
                 )
             except Exception as exc:
                 if _is_crm_contract_mismatch(exc):
@@ -493,7 +506,7 @@ class _ProcessRegistry:
             server = self._server
             runtime_session = self._runtime_session
             from c_two._native import RuntimeSession
-            self._runtime_session = RuntimeSession(shm_threshold=settings.shm_threshold)
+            self._runtime_session = RuntimeSession(**_runtime_session_kwargs_from_settings())
             self._server = None
 
         runtime_session.set_relay_anchor_address(settings._relay_anchor_address)  # noqa: SLF001
@@ -650,9 +663,16 @@ class _ProcessRegistry:
 # Module-level API (delegates to singleton)
 # ------------------------------------------------------------------
 
-def set_transport_policy(*, shm_threshold: int | None = None) -> None:
+def set_transport_policy(
+    *,
+    shm_threshold: int | None | object = _UNSET,
+    remote_payload_chunk_size: int | None | object = _UNSET,
+) -> None:
     """Set process transport policy. Call before register()/connect()."""
-    _ProcessRegistry.get().set_transport_policy(shm_threshold=shm_threshold)
+    _ProcessRegistry.get().set_transport_policy(
+        shm_threshold=shm_threshold,
+        remote_payload_chunk_size=remote_payload_chunk_size,
+    )
 
 
 def set_server(

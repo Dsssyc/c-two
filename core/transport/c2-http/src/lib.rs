@@ -4,6 +4,7 @@
 //! - `relay`: HTTP relay server bridging HTTP→IPC (requires `relay` feature)
 
 pub mod client;
+mod payload;
 
 #[cfg(feature = "relay")]
 pub mod relay;

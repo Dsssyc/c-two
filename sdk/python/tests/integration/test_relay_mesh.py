@@ -11,9 +11,41 @@ from __future__ import annotations
 import json
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import pytest
+
+import c_two as cc
+from c_two.config.ipc import _resolve_server_ipc_config
+from c_two.config.settings import settings
+from c_two.crm.contract import crm_contract
+from c_two.transport.registry import _ProcessRegistry
+
+
+@cc.crm(namespace="test.mesh", version="0.1.0")
+class MeshResource:
+    def ping(self) -> str:
+        ...
+
+
+class MeshImpl:
+    def ping(self) -> str:
+        return "pong"
+
+
+MESH_CONTRACT = crm_contract(MeshResource)
+DEFAULT_MAX_PAYLOAD_SIZE = int(_resolve_server_ipc_config()['max_payload_size'])
+
+
+@pytest.fixture(autouse=True)
+def _clean_registry():
+    previous_relay = settings.relay_anchor_address
+    settings.relay_anchor_address = None
+    _ProcessRegistry.reset()
+    yield
+    _ProcessRegistry.reset()
+    settings.relay_anchor_address = previous_relay
 
 
 def _http_post(url: str, body: dict) -> urllib.request.Request:
@@ -25,21 +57,56 @@ def _http_post(url: str, body: dict) -> urllib.request.Request:
     )
 
 
-def _register_body(name: str, server_id: str, address: str) -> dict[str, str]:
+def _server_instance_id_for(route_name: str, address: str) -> str:
+    registry = _ProcessRegistry.get()
+    client = registry._runtime_session.acquire_ipc_client(  # noqa: SLF001
+        address,
+        route_name,
+        *MESH_CONTRACT.native_args(),
+    )
+    try:
+        instance_id = client.server_instance_id
+        assert isinstance(instance_id, str)
+        assert instance_id
+        return instance_id
+    finally:
+        registry._runtime_session.release_ipc_client(address)  # noqa: SLF001
+
+
+def _register_body(name: str, server_id: str) -> dict[str, object]:
+    cc.set_server(server_id=server_id)
+    cc.register(MeshResource, MeshImpl(), name=name)
+    address = cc.server_address()
+    actual_server_id = cc.server_id()
+    assert address is not None
+    assert actual_server_id == server_id
+    server_instance_id = _server_instance_id_for(name, address)
     return {
         "name": name,
         "server_id": server_id,
-        "server_instance_id": f"{server_id}-instance",
+        "server_instance_id": server_instance_id,
         "address": address,
-        "crm_ns": "test.mesh",
-        "crm_name": "MeshResource",
-        "crm_ver": "0.1.0",
+        "max_payload_size": DEFAULT_MAX_PAYLOAD_SIZE,
     }
 
 
 def _http_get_json(url: str):
     with urllib.request.urlopen(url, timeout=5) as resp:
         return json.loads(resp.read())
+
+
+def _resolve_url(base_url: str, name: str) -> str:
+    quoted_name = urllib.parse.quote(name, safe="")
+    query = urllib.parse.urlencode(
+        {
+            "crm_ns": "test.mesh",
+            "crm_name": "MeshResource",
+            "crm_ver": "0.1.0",
+            "abi_hash": MESH_CONTRACT.abi_hash,
+            "signature_hash": MESH_CONTRACT.signature_hash,
+        }
+    )
+    return f"{base_url}/_resolve/{quoted_name}?{query}"
 
 
 def _wait_for_json(getter, predicate, *, timeout: float = 8.0, interval: float = 0.1):
@@ -62,7 +129,7 @@ def _wait_for_json(getter, predicate, *, timeout: float = 8.0, interval: float =
 
 def _wait_for_route(url: str, name: str, *, timeout: float = 8.0):
     return _wait_for_json(
-        lambda: _http_get_json(f"{url}/_resolve/{name}"),
+        lambda: _http_get_json(_resolve_url(url, name)),
         lambda routes: any(route["name"] == name for route in routes),
         timeout=timeout,
     )
@@ -73,7 +140,7 @@ def _wait_for_route_missing(url: str, name: str, *, timeout: float = 8.0) -> Non
     last_routes = None
     while time.monotonic() < deadline:
         try:
-            last_routes = _http_get_json(f"{url}/_resolve/{name}")
+            last_routes = _http_get_json(_resolve_url(url, name))
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
                 return
@@ -96,19 +163,19 @@ class TestSingleRelay:
     """Tests with one relay."""
 
     def test_register_and_resolve(self, start_c3_relay):
-        relay = start_c3_relay(skip_ipc_validation=True)
+        relay = start_c3_relay()
         base = relay.url
 
         # Register a mock upstream.
         req = _http_post(
             f"{base}/_register",
-            _register_body("grid", "test-grid", "ipc://test_grid"),
+            _register_body("grid", "test-grid"),
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
             assert resp.status == 201
 
         # Resolve.
-        routes = _http_get_json(f"{base}/_resolve/grid")
+        routes = _http_get_json(_resolve_url(base, "grid"))
         assert len(routes) >= 1
         assert routes[0]["name"] == "grid"
 
@@ -122,13 +189,36 @@ class TestSingleRelay:
 
         # Resolve should now 404.
         with pytest.raises(urllib.error.HTTPError, match="404"):
-            urllib.request.urlopen(f"{base}/_resolve/grid", timeout=5)
+            urllib.request.urlopen(_resolve_url(base, "grid"), timeout=5)
 
     def test_peers_empty(self, start_c3_relay):
-        relay = start_c3_relay(skip_ipc_validation=True)
+        relay = start_c3_relay()
 
         peers = _http_get_json(f"{relay.url}/_peers")
         assert peers == []
+
+    def test_register_rejects_incomplete_crm_tag_before_ipc_connect(self, start_c3_relay):
+        relay = start_c3_relay()
+        req = _http_post(
+            f"{relay.url}/_register",
+            {
+                "name": "grid",
+                "server_id": "grid-a",
+                "server_instance_id": "grid-a-instance",
+                "address": "ipc://grid_a",
+                "crm_ns": "test.mesh",
+                "crm_name": "",
+                "crm_ver": "0.1.0",
+                "abi_hash": MESH_CONTRACT.abi_hash,
+                "signature_hash": MESH_CONTRACT.signature_hash,
+                "max_payload_size": DEFAULT_MAX_PAYLOAD_SIZE,
+            },
+        )
+
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(req, timeout=5)
+
+        assert exc.value.code == 400
 
 
 class TestTwoRelayMesh:
@@ -137,14 +227,12 @@ class TestTwoRelayMesh:
     def test_gossip_route_propagation(self, start_c3_relay):
         relay_a = start_c3_relay(
             relay_id="relay-a",
-            skip_ipc_validation=True,
         )
         url_a = relay_a.url
 
         relay_b = start_c3_relay(
             relay_id="relay-b",
             seeds=[url_a],
-            skip_ipc_validation=True,
         )
         url_b = relay_b.url
         _wait_for_peer(url_a, "relay-b")
@@ -152,7 +240,7 @@ class TestTwoRelayMesh:
         # Register on relay A.
         req = _http_post(
             f"{url_a}/_register",
-            _register_body("grid", "grid-a", "ipc://grid_a"),
+            _register_body("grid", "grid-a"),
         )
         urllib.request.urlopen(req, timeout=5)
 
@@ -169,14 +257,12 @@ class TestTwoRelayMesh:
     def test_route_withdraw_propagation(self, start_c3_relay):
         relay_a = start_c3_relay(
             relay_id="relay-a",
-            skip_ipc_validation=True,
         )
         url_a = relay_a.url
 
         relay_b = start_c3_relay(
             relay_id="relay-b",
             seeds=[url_a],
-            skip_ipc_validation=True,
         )
         url_b = relay_b.url
         _wait_for_peer(url_a, "relay-b")
@@ -184,7 +270,7 @@ class TestTwoRelayMesh:
         # Register on A.
         req = _http_post(
             f"{url_a}/_register",
-            _register_body("net", "net-a", "ipc://net_a"),
+            _register_body("net", "net-a"),
         )
         urllib.request.urlopen(req, timeout=5)
 
@@ -206,14 +292,12 @@ class TestTwoRelayMesh:
         """Both relays should discover each other after join."""
         relay_a = start_c3_relay(
             relay_id="relay-a",
-            skip_ipc_validation=True,
         )
         url_a = relay_a.url
 
         relay_b = start_c3_relay(
             relay_id="relay-b",
             seeds=[url_a],
-            skip_ipc_validation=True,
         )
         url_b = relay_b.url
 
@@ -229,14 +313,12 @@ class TestTwoRelayMesh:
         """/_resolve response includes the relay_url of the registering relay."""
         relay_a = start_c3_relay(
             relay_id="relay-a",
-            skip_ipc_validation=True,
         )
         url_a = relay_a.url
 
         relay_b = start_c3_relay(
             relay_id="relay-b",
             seeds=[url_a],
-            skip_ipc_validation=True,
         )
         url_b = relay_b.url
         _wait_for_peer(url_a, "relay-b")
@@ -244,7 +326,7 @@ class TestTwoRelayMesh:
         # Register on A.
         req = _http_post(
             f"{url_a}/_register",
-            _register_body("solver", "solver-a", "ipc://solver_a"),
+            _register_body("solver", "solver-a"),
         )
         urllib.request.urlopen(req, timeout=5)
 

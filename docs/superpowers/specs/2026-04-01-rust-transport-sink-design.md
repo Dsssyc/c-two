@@ -453,7 +453,7 @@ impl Server {
     pub fn start(&self) -> JoinHandle<()>;
 
     /// 优雅关闭
-    pub fn shutdown(&self);
+    pub fn request_shutdown_signal(&self);
 }
 ```
 

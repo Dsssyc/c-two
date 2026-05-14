@@ -111,7 +111,7 @@ class TestUnregisterRelayAbsence:
     def test_register_surfaces_relay_http_error_from_native_session(self):
         self.registry.set_relay_anchor('http://127.0.0.1:9')
 
-        with pytest.raises(RuntimeError, match='relay error'):
+        with pytest.raises(RuntimeError, match='relay_prepare'):
             self.registry.register(IRelayShutdownCRM, RelayShutdownCRM(), name='test_relay_fail')
 
         assert 'test_relay_fail' not in self.registry.names
