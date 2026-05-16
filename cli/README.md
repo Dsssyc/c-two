@@ -168,13 +168,23 @@ python tools/dev/generate_banner.py
 
 ## Release
 
-`c3` is released by `.github/workflows/cli-release.yml`. The release pipeline
-builds native binaries for:
+`c3` is released by `.github/workflows/cli-release.yml`. The release pipeline builds native binaries for:
 
 - `x86_64-unknown-linux-gnu`
 - `aarch64-unknown-linux-gnu`
 - `aarch64-apple-darwin`
 - `x86_64-apple-darwin`
 
-Each release asset is named `c3-${target}` and is accompanied by a
-`c3-${target}.sha256` checksum.
+Each release asset is named `c3-${target}` and is accompanied by a `c3-${target}.sha256` checksum.
+
+Install the latest released binary with the installer asset:
+
+```bash
+curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh
+```
+
+The installer auto-detects Linux/macOS and x86_64/aarch64 targets, verifies the downloaded checksum, and installs to `/usr/local/bin` when run as root or `~/.local/bin` otherwise. Pass `-b` to choose another directory:
+
+```bash
+curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh -s -- -b /usr/local/bin
+```

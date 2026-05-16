@@ -196,26 +196,13 @@ cc.serve()                                     # blocks; Ctrl-C triggers gracefu
 
 An **HTTP relay** (`c3 relay`) is a lightweight broker that lets clients reach servers **by route name and CRM contract**, across machines. Servers announce their IPC address plus CRM tag and contract fingerprints to the relay when they register; clients ask the relay with the route name and the expected CRM contract derived from `cc.connect(CRMClass, name='...')`.
 
-The `c3` command is C-Two's cross-language native CLI. From a source checkout,
-build and link a local development binary with
-`python tools/dev/c3_tool.py --build --link`.
-The Python SDK does not embed or start the relay server; start `c3 relay`,
-Docker Compose, or your orchestrator separately, then point Python code at its
-relay anchor with `C2_RELAY_ANCHOR_ADDRESS` or `cc.set_relay_anchor()`.
-The anchor is the control-plane registration/name-resolution endpoint. Remote
-HTTP calls still go directly to the resolved route's `relay_url`; local direct
-IPC is used only when the anchor endpoint is loopback/local.
-Relay-aware clients preflight routes before the first call and re-resolve
-structured stale-route responses; set `C2_RELAY_ROUTE_MAX_ATTEMPTS` to tune the
-maximum route acquisition attempts (default `3`, valid range `1..=32`, `0` is
-treated as `1`). Set `C2_RELAY_CALL_TIMEOUT` to tune CRM call timeout seconds
-(default `300`; `0` disables the reqwest total timeout). Set
-`C2_REMOTE_PAYLOAD_CHUNK_SIZE` to tune C-Two remote payload batching for relay
-HTTP and future remote protocols (default `1048576`; max `134217728`). This is
-not a TCP packet, HTTP/1 chunk, or HTTP/2 DATA frame guarantee. Ambiguous
-data-plane failures are not replayed. Relay resolve, probe, and call paths
-reject name-only lookups and CRM contract mismatches instead of falling back to
-an untyped route with the same name.
+The `c3` command is C-Two's cross-language native CLI. From a source checkout, build and link a local development binary with `python tools/dev/c3_tool.py --build --link`. For released binaries, install the latest `c3` with:
+
+```bash
+curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh
+```
+
+The Python SDK does not embed or start the relay server; start `c3 relay`, Docker Compose, or your orchestrator separately, then point Python code at its relay anchor with `C2_RELAY_ANCHOR_ADDRESS` or `cc.set_relay_anchor()`. The anchor is the control-plane registration/name-resolution endpoint. Remote HTTP calls still go directly to the resolved route's `relay_url`; local direct IPC is used only when the anchor endpoint is loopback/local. Relay-aware clients preflight routes before the first call and re-resolve structured stale-route responses; set `C2_RELAY_ROUTE_MAX_ATTEMPTS` to tune the maximum route acquisition attempts (default `3`, valid range `1..=32`, `0` is treated as `1`). Set `C2_RELAY_CALL_TIMEOUT` to tune CRM call timeout seconds (default `300`; `0` disables the reqwest total timeout). Set `C2_REMOTE_PAYLOAD_CHUNK_SIZE` to tune C-Two remote payload batching for relay HTTP and future remote protocols (default `1048576`; max `134217728`). This is not a TCP packet, HTTP/1 chunk, or HTTP/2 DATA frame guarantee. Ambiguous data-plane failures are not replayed. Relay resolve, probe, and call paths reject name-only lookups and CRM contract mismatches instead of falling back to an untyped route with the same name.
 
 ```bash
 # Start a relay anywhere reachable on your network
@@ -571,10 +558,13 @@ The Rust workspace contains 9 core crates organized in 4 layers (foundation → 
 
 The Rust extension is compiled automatically during `pip install c-two` (from pre-built wheels) or `uv sync` (from source).
 
-The `c3` command is distributed as a native CLI binary and built from the root
-`cli/` package. Source checkouts can link a local development binary with
-`python tools/dev/c3_tool.py --build --link`; published CLI artifacts are owned
-by the CLI release pipeline rather than by any language SDK.
+The `c3` command is distributed as a native CLI binary and built from the root `cli/` package. Install released binaries with:
+
+```bash
+curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh
+```
+
+Source checkouts can link a local development binary with `python tools/dev/c3_tool.py --build --link`; published CLI artifacts are owned by the CLI release pipeline rather than by any language SDK.
 
 ---
 

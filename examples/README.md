@@ -6,9 +6,13 @@ These examples use the optional examples dependencies. Install them first:
 uv sync --group examples
 ```
 
-Relay examples also require the standalone `c3` CLI. From a source checkout,
-build and link it once before running relay examples, integration tests, or SDK
-development flows that depend on relay behavior:
+Relay examples also require the standalone `c3` CLI. Install the latest released binary with:
+
+```bash
+curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh
+```
+
+From a source checkout, build and link it once before running relay examples, integration tests, or SDK development flows that depend on relay behavior:
 
 ```bash
 python tools/dev/c3_tool.py --build --link

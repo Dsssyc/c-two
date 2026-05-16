@@ -637,5 +637,6 @@ shared mutable state, and GIL assumptions.
   and finish each phase with docs that make the remaining work explicit.
 - Do not revert unrelated user changes in a dirty worktree.
 - Avoid destructive git commands unless the user explicitly asks for them.
+- When editing Markdown prose such as README or AGENTS content, keep each paragraph on one physical line and let editors/renderers handle visual wrapping; do not hard-wrap prose unless a table, list, code block, or generated artifact requires it.
 - For reviews, lead with concrete findings ordered by severity and include file
   and line references.
