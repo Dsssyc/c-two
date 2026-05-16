@@ -28,7 +28,7 @@
 
 - **Zero-copy from process to data** — Same-process calls skip serialization entirely. Cross-process IPC can hold shared-memory buffers alive, letting you read columnar data (NumPy, Arrow, …) directly from SHM — no deserialization, no copies.
 
-- **Built for scientific workloads** — The Python SDK has native support for Apache Arrow, NumPy arrays, and large payloads (chunked streaming for data beyond 256 MB). Designed for computational workloads, not microservices.
+- **Built for scientific workloads** — The Python SDK has native support for Apache Arrow, NumPy arrays, and large payloads (chunked payload transfer for data beyond 256 MB). Designed for computational workloads, not microservices.
 
 - **Rust-powered core** — Shared transport, memory, wire codec, route-contract validation, relay, and configuration live in Rust so future SDKs reuse one runtime contract.
 
@@ -606,7 +606,7 @@ uv run pytest sdk/python/tests/unit/test_python_examples_syntax.py::test_python_
 | IPC transport with SHM buddy allocator | ✅ Stable |
 | HTTP relay (Rust-powered) | ✅ Stable |
 | Relay mesh with gossip-based discovery | ✅ Stable |
-| Chunked streaming (payloads > 256 MB) | ✅ Stable |
+| Chunked payload transfer (payloads > 256 MB) | ✅ Stable |
 | Heartbeat & connection management | ✅ Stable |
 | Read/write concurrency control | ✅ Stable |
 | Unified config architecture (Rust resolver SSOT) | ✅ Stable |
@@ -614,10 +614,16 @@ uv run pytest sdk/python/tests/unit/test_python_examples_syntax.py::test_python_
 | Disk spill for extreme payloads | ✅ Stable |
 | Hold mode with `from_buffer` zero-copy | ✅ Stable |
 | SHM residence monitoring (`cc.hold_stats()`) | ✅ Stable |
+| Contract version compatibility negotiation | 🔜 Planned |
+| `auth_hook` + call metadata | 🔜 Planned |
+| Dry-run hooks | 🔜 Planned |
 | Async interfaces | 🔜 Planned |
-| Cross-language clients (TypeScript/Rust) | 🔮 Future |
+| Adaptive memory lifecycle policy | 🔜 Planned |
+| Streaming RPC / pipeline semantics | 🔜 Planned |
+| Cross-language clients (Rust first, TypeScript later) | 🔮 Future |
+| Global discovery & namespace governance | 🔮 Future |
 
-See the [full roadmap](docs/plans/c-two-rpc-v2-roadmap.md) for details.
+See the [current roadmap](docs/roadmap.md) for details. Historical roadmap notes remain archived under `docs/plans/`.
 
 ---
 

@@ -28,7 +28,7 @@
 
 - **从进程到数据的零拷贝** — 同进程调用完全跳过序列化。跨进程 IPC 可以保持共享内存缓冲区存活，让你直接从 SHM 读取列式数据（NumPy、Arrow 等）— 无需反序列化，无需拷贝。
 
-- **为科学计算而生** — 原生支持 Apache Arrow、NumPy 数组和大体量载荷（超过 256 MB 自动分块流式传输）。专为计算密集型场景设计，而非微服务。
+- **为科学计算而生** — 原生支持 Apache Arrow、NumPy 数组和大体量载荷（超过 256 MB 自动分块载荷传输）。专为计算密集型场景设计，而非微服务。
 
 - **Rust 驱动的传输层** — IPC 层使用 Rust buddy 分配器管理共享内存，HTTP 中继基于 Rust 实现高吞吐网络转发。
 
@@ -194,7 +194,7 @@ cc.serve()                                     # 阻塞；Ctrl-C 触发优雅关
 
 ### Relay — 分布式发现
 
-**HTTP 中继**（`c3 relay`）是一个轻量级代理，让客户端可以**按名称**跨机器访问服务端。服务端在注册时把自己的 IPC 地址通告给中继；客户端只需查询中继即可被透明路由到目标。
+**HTTP 中继**（`c3 relay`）是一个轻量级代理，让客户端可以按**路由名和 CRM 契约**跨机器访问服务端。服务端在注册时向中继通告自己的 IPC 地址、CRM tag 和契约指纹；客户端使用路由名以及从 `cc.connect(CRMClass, name='...')` 派生出的预期 CRM 契约查询中继。
 
 `c3` 是 C-Two 的跨语言原生 CLI。从源码 checkout 开发时，可以用 `python tools/dev/c3_tool.py --build --link` 构建并链接本地开发二进制。正式发布版可以通过 installer 安装最新 `c3`：
 
@@ -202,7 +202,7 @@ cc.serve()                                     # 阻塞；Ctrl-C 触发优雅关
 curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c3-installer.sh | sh
 ```
 
-Python SDK 不内嵌也不启动中继服务器；请单独启动 `c3 relay`、Docker Compose 或编排系统中的中继，再通过 `C2_RELAY_ANCHOR_ADDRESS` 或 `cc.set_relay_anchor()` 让 Python 代码连接它的 relay anchor。anchor 只负责注册和按名称解析；远程 HTTP 调用仍会直连解析得到的 `relay_url`，只有 anchor 是 loopback/local 端点时才会选择本地 direct IPC。relay-aware 客户端会在首次调用前预检 route，并在收到结构化 stale-route 响应时重新解析路由；可通过 `C2_RELAY_ROUTE_MAX_ATTEMPTS` 调整最大 route acquisition 尝试次数（默认 `3`，有效范围 `1..=32`，`0` 按 `1` 处理）。语义不明确的数据面失败不会被自动重放。
+Python SDK 不内嵌也不启动中继服务器；请单独启动 `c3 relay`、Docker Compose 或编排系统中的中继，再通过 `C2_RELAY_ANCHOR_ADDRESS` 或 `cc.set_relay_anchor()` 让 Python 代码连接它的 relay anchor。anchor 是控制面注册和名称解析端点；远程 HTTP 调用仍会直连解析得到的 `relay_url`，只有 anchor 是 loopback/local 端点时才会选择本地 direct IPC。relay-aware 客户端会在首次调用前预检 route，并在收到结构化 stale-route 响应时重新解析路由；可通过 `C2_RELAY_ROUTE_MAX_ATTEMPTS` 调整最大 route acquisition 尝试次数（默认 `3`，有效范围 `1..=32`，`0` 按 `1` 处理）。可通过 `C2_RELAY_CALL_TIMEOUT` 调整 CRM 调用超时秒数（默认 `300`；`0` 禁用 reqwest 总超时）。可通过 `C2_REMOTE_PAYLOAD_CHUNK_SIZE` 调整 relay HTTP 和未来远程协议的 C-Two 远程载荷批大小（默认 `1048576`；最大 `134217728`）。这不是 TCP packet、HTTP/1 chunk 或 HTTP/2 DATA frame 保证。语义不明确的数据面失败不会被自动重放。relay resolve、probe 和 call 路径会拒绝 name-only lookup 和 CRM 契约不匹配，而不是回退到同名非类型化路由。
 
 ```bash
 # 在网络可达的任意节点启动中继
@@ -217,14 +217,14 @@ cc.set_relay_anchor('http://relay-host:8080')
 cc.register(MeshStore, MeshStoreImpl(), name='mesh')
 cc.serve()
 
-# 客户端 — 按名称解析，无需显式地址
+# 客户端 — 按路由名和 CRM 契约解析，无需显式地址
 cc.set_relay_anchor('http://relay-host:8080')
 mesh = cc.connect(MeshStore, name='mesh')
 ```
 
 多个中继可以通过 gossip 协议组成**网格集群** — 网格中任意中继都能解析整个集群内注册的任何资源。详见下方的 [中继网格示例](#中继网格--多中继集群)。
 
-> **何时需要中继？** 仅用于跨机器或按名称发现的场景。同进程和同主机（IPC）用法完全不需要中继。
+> **何时需要中继？** 仅用于跨机器或按路由名与 CRM 契约发现的场景。同进程和同主机（IPC）用法完全不需要中继。
 
 ### @transferable — 自定义序列化
 
@@ -434,7 +434,7 @@ cc.close(mesh_store)
 
 ### 跨机器 — HTTP 中继
 
-HTTP 中继将网络请求桥接到运行在 IPC 上的 CRM 进程。CRM 进程向中继注册，客户端通过**名称**发现资源。
+HTTP 中继将网络请求桥接到运行在 IPC 上的 CRM 进程。CRM 进程向中继注册，客户端通过**路由名加预期 CRM 契约**发现资源。CRM tag 和契约哈希可以避免 relay mesh 中存在旧路由或同名其他资源时发生误配。
 
 **CRM 服务端** (`resource.py`)：
 ```python
@@ -599,7 +599,7 @@ uv run pytest                      # 运行测试套件
 | IPC 传输 + SHM 伙伴分配器 | ✅ 稳定 |
 | HTTP 中继（Rust 驱动） | ✅ 稳定 |
 | 中继网格与 gossip 路由发现 | ✅ 稳定 |
-| 分块流式传输（载荷 > 256 MB） | ✅ 稳定 |
+| 分块载荷传输（载荷 > 256 MB） | ✅ 稳定 |
 | 心跳与连接管理 | ✅ 稳定 |
 | 读/写并发控制 | ✅ 稳定 |
 | 统一配置架构（Rust resolver 单一事实源） | ✅ 稳定 |
@@ -607,10 +607,16 @@ uv run pytest                      # 运行测试套件
 | 极端载荷磁盘溢出 | ✅ 稳定 |
 | 持有模式与 `from_buffer` 零拷贝 | ✅ 稳定 |
 | 共享内存驻留监控（`cc.hold_stats()`） | ✅ 稳定 |
+| 契约版本兼容协商 | 🔜 规划中 |
+| `auth_hook` 与 call metadata | 🔜 规划中 |
+| dry-run 钩子 | 🔜 规划中 |
 | 异步接口 | 🔜 规划中 |
-| 跨语言客户端（TypeScript/Rust） | 🔮 远期 |
+| 自适应内存生命周期策略 | 🔜 规划中 |
+| Streaming RPC / pipeline 语义 | 🔜 规划中 |
+| 跨语言客户端（Rust 优先，TypeScript 随后） | 🔮 远期 |
+| 全局发现与命名空间治理 | 🔮 远期 |
 
-详见[完整路线图](docs/plans/c-two-rpc-v2-roadmap.md)。
+详见[当前路线图](docs/roadmap.zh-CN.md)。历史路线图笔记仍归档在 `docs/plans/` 下。
 
 ---
 
