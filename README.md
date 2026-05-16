@@ -209,10 +209,7 @@ The Python SDK does not embed or start the relay server; start `c3 relay`, Docke
 c3 relay --bind 0.0.0.0:8080
 ```
 
-Relay HTTP and mesh endpoints are intended for a trusted network boundary. Do
-not expose them directly to the public internet; production deployments should
-restrict access with infrastructure such as private networking, firewalls,
-Kubernetes NetworkPolicy, service mesh policy, or ingress authentication.
+Relay HTTP and mesh endpoints are intended for a trusted network boundary. Do not expose them directly to the public internet; production deployments should restrict access with infrastructure such as private networking, firewalls, Kubernetes NetworkPolicy, service mesh policy, or ingress authentication.
 
 ```python
 # Server side — announce resources to the relay
@@ -454,9 +451,7 @@ cc.serve()  # blocks until Ctrl-C
 c3 relay --bind 0.0.0.0:8080
 ```
 
-Expose relay HTTP only inside a trusted deployment boundary. The relay mesh
-protocol assumes infrastructure-level access control, not public internet
-reachability.
+Expose relay HTTP only inside a trusted deployment boundary. The relay mesh protocol assumes infrastructure-level access control, not public internet reachability.
 
 **Client** (`client.py`):
 ```python
@@ -484,8 +479,7 @@ c3 relay --bind 0.0.0.0:8080 --relay-id relay-b \
     --advertise-url http://relay-b:8080 --seeds http://relay-a:8080
 ```
 
-Mesh peer endpoints (`/_peer/*`) accept route gossip from configured peers and
-must be protected by the same trusted network boundary as the relay HTTP API.
+Mesh peer endpoints (`/_peer/*`) accept route gossip from configured peers and must be protected by the same trusted network boundary as the relay HTTP API.
 
 CRM processes register with their local relay; the mesh propagates routes automatically. Clients can connect through **any** relay in the mesh using the same CRM class and route name.
 

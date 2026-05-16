@@ -209,9 +209,7 @@ Python SDK 不内嵌也不启动中继服务器；请单独启动 `c3 relay`、D
 c3 relay --bind 0.0.0.0:8080
 ```
 
-Relay HTTP 与 mesh 端点应只暴露在可信网络边界内。不要将其直接暴露到公网；
-生产部署应通过私有网络、防火墙、Kubernetes NetworkPolicy、service mesh
-策略或 ingress 认证等基础设施限制访问。
+Relay HTTP 与 mesh 端点应只暴露在可信网络边界内。不要将其直接暴露到公网；生产部署应通过私有网络、防火墙、Kubernetes NetworkPolicy、service mesh 策略或 ingress 认证等基础设施限制访问。
 
 ```python
 # 服务端 — 将资源通告给中继
@@ -453,8 +451,7 @@ cc.serve()  # 阻塞，直到 Ctrl-C
 c3 relay --bind 0.0.0.0:8080
 ```
 
-Relay HTTP 只应暴露在可信部署边界内。中继 mesh 协议依赖基础设施层访问控制，
-不应被直接放到公网可达的位置。
+Relay HTTP 只应暴露在可信部署边界内。中继 mesh 协议依赖基础设施层访问控制，不应被直接放到公网可达的位置。
 
 **客户端** (`client.py`)：
 ```python
@@ -482,8 +479,7 @@ c3 relay --bind 0.0.0.0:8080 --relay-id relay-b \
     --advertise-url http://relay-b:8080 --seeds http://relay-a:8080
 ```
 
-Mesh peer 端点（`/_peer/*`）会接收来自已配置 peer 的路由 gossip，应与 relay
-HTTP API 一样由可信网络边界保护。
+Mesh peer 端点（`/_peer/*`）会接收来自已配置 peer 的路由 gossip，应与 relay HTTP API 一样由可信网络边界保护。
 
 CRM 进程向本地中继注册，网格自动传播路由。客户端可通过网格中的**任意**中继连接。
 
