@@ -1,6 +1,6 @@
 # C-Two Current Roadmap
 
-Last reviewed and ordered: 2026-05-16.
+Last reviewed and ordered: 2026-05-17.
 
 This is the maintained roadmap for C-Two's current 0.x line. Historical design notes under `docs/plans/`, `docs/spikes/`, and `docs/superpowers/` are frozen archives; they may use older terminology such as ICRM, Component, `@cc.runtime.connect`, or old package paths.
 
@@ -15,23 +15,24 @@ This is the maintained roadmap for C-Two's current 0.x line. Historical design n
 
 ## Implementation Sequence
 
-Roadmap work should be picked up in this order unless a later review explicitly supersedes it. The ordering is part of the roadmap: it minimizes protocol churn by stabilizing contract identity and call envelopes before adding new call shapes, language SDKs, or governance surfaces.
+Roadmap work should be picked up in this order unless a later review explicitly supersedes it. The ordering is part of the roadmap: it minimizes protocol churn by stabilizing contract identity, codec identity, and call envelopes before adding new call shapes, language SDKs, or governance surfaces.
 
 | Order | Workstream | Why it comes here | Exit criteria |
 | --- | --- | --- | --- |
-| 1 | Contract version compatibility and descriptor stability | Cross-language clients, relay resolution, codegen, and future compatibility all depend on a stable contract descriptor story. | Exact contract validation remains the safety floor; semver or range matching is Rust-owned; ambiguous or ABI-incompatible matches fail with structured errors. |
-| 2 | `auth_hook` and call metadata for unary calls | Metadata changes every call envelope, so it must land before async, streaming, or SDK expansion multiply the number of call paths. | Thread-local, direct IPC, and HTTP relay paths can pass metadata; hooks can accept or reject calls; policy remains outside C-Two. |
-| 3 | Dry-run hooks for unary calls | Dry-run depends on the hook/metadata surface and should be defined before more call shapes need the same semantics. | Dry-run does not execute resource side effects; unsupported call shapes fail explicitly; hook-visible metadata is documented. |
-| 4 | Async unary API | Async should extend a stable unary envelope instead of becoming a second protocol design. | `cc.connect_async()` and async proxy/context-manager behavior exist for thread-local, direct IPC, and HTTP relay without regressing the sync API. |
-| 5 | Rust-owned telemetry, backpressure, and adaptive memory lifecycle policy | Streaming will amplify memory retention and cancellation risks, so runtime policy needs to exist first. | Buddy decay, dedicated segment timeout, and chunk assembler timeout are separately modeled; telemetry is testable; Python remains a thin facade. |
-| 6 | Streaming RPC and pipeline semantics | Streaming depends on async, metadata, cancellation, and backpressure. Existing chunked payload transfer is only a transport primitive. | Stream identity, lifecycle frames, cancellation, ordering, error propagation, and resource release are specified and covered by end-to-end tests. |
-| 7 | Rust SDK first real slice | Rust can reuse the existing core crates directly and is the lowest-friction proof that the cross-language contract is usable. | A Rust client can call a Python-hosted CRM through a supported transport; contract mismatch fails; docs include runnable commands. |
-| 8 | TypeScript client with fastdb codec | Browser-facing SDK work depends on stable descriptors, codec annotations, metadata, and compatibility semantics. | Node/browser support boundaries are explicit; only eligible codecs are exposed; relay/control-plane rules are not reimplemented differently in TypeScript. |
-| 9 | Global discovery and namespace governance | Relay mesh already propagates routes; broader discovery is a governance/admin layer and must not weaken production contract-scoped resolution. | Discovery returns candidate route metadata through an explicit admin surface; normal calls still reject name-only or contract-mismatched resolution. |
+| 1 | Language-neutral contract descriptor and codec registry | Cross-language clients cannot depend on Python annotations, pickle fallback, or ad hoc transferable hooks. Contract identity must be split from payload codec identity before SDK expansion. | `c-two.contract.v1` is specified, canonically hashed, and Rust-validated; pickle is marked Python-only; codec refs can identify built-in, fastdb, standard external, and opaque custom families. |
+| 2 | Contract version compatibility and descriptor stability | Semver and range matching need the language-neutral descriptor from order 1; otherwise compatibility rules would hard-code Python descriptor details. | Exact contract validation remains the safety floor; semver or range matching is Rust-owned; ambiguous or ABI-incompatible matches fail with structured errors. |
+| 3 | `auth_hook` and call metadata for unary calls | Metadata changes every call envelope, so it must land before async, streaming, or SDK expansion multiply the number of call paths. | Thread-local, direct IPC, and HTTP relay paths can pass metadata; hooks can accept or reject calls; policy remains outside C-Two. |
+| 4 | Dry-run hooks for unary calls | Dry-run depends on the hook/metadata surface and should be defined before more call shapes need the same semantics. | Dry-run does not execute resource side effects; unsupported call shapes fail explicitly; hook-visible metadata is documented. |
+| 5 | Async unary API | Async should extend a stable unary envelope instead of becoming a second protocol design. | `cc.connect_async()` and async proxy/context-manager behavior exist for thread-local, direct IPC, and HTTP relay without regressing the sync API. |
+| 6 | Rust-owned telemetry, backpressure, and adaptive memory lifecycle policy | Streaming will amplify memory retention and cancellation risks, so runtime policy needs to exist first. | Buddy decay, dedicated segment timeout, and chunk assembler timeout are separately modeled; telemetry is testable; Python remains a thin facade. |
+| 7 | Streaming RPC and pipeline semantics | Streaming depends on async, metadata, cancellation, and backpressure. Existing chunked payload transfer is only a transport primitive. | Stream identity, lifecycle frames, cancellation, ordering, error propagation, and resource release are specified and covered by end-to-end tests. |
+| 8 | Rust SDK first real slice | Rust can reuse the existing core crates directly and is the lowest-friction proof that the cross-language contract is usable. | A Rust client can call a Python-hosted CRM through a supported transport; contract mismatch fails; docs include runnable commands. |
+| 9 | TypeScript client with fastdb codec | Browser-facing SDK work depends on stable descriptors, codec annotations, metadata, and compatibility semantics. | Node/browser support boundaries are explicit; only eligible codecs are exposed; relay/control-plane rules are not reimplemented differently in TypeScript. |
+| 10 | Global discovery and namespace governance | Relay mesh already propagates routes; broader discovery is a governance/admin layer and must not weaken production contract-scoped resolution. | Discovery returns candidate route metadata through an explicit admin surface; normal calls still reject name-only or contract-mismatched resolution. |
 
 ## Handoff Rules
 
-Future agents and human developers should start from the first incomplete workstream in the sequence above unless the user explicitly redirects the scope. Before implementation, read this roadmap, the relevant current code, and the vision docs; treat `docs/plans/`, `docs/spikes/`, and `docs/superpowers/` as historical evidence, not as the current source of truth.
+Future agents and human developers should start from the first incomplete workstream in the sequence above unless the user explicitly redirects the scope. Before implementation, read this roadmap, the relevant current code, and the vision docs, especially [`docs/vision/cross-language-contract-codec-architecture.md`](./vision/cross-language-contract-codec-architecture.md) for cross-language contract work; treat `docs/plans/`, `docs/spikes/`, and `docs/superpowers/` as historical evidence, not as the current source of truth.
 
 Keep language-neutral runtime mechanisms in Rust core or FFI. Python and future SDKs should stay thin: typed facades, transferable serialization, and language ergonomics only. Do not put config resolution, relay routing, retries, caching, contract authority, scheduler policy, backpressure, or memory lifecycle policy in a single SDK.
 
@@ -60,6 +61,7 @@ Each workstream should be split into small reviewable slices. For call-path chan
 
 | Capability | What remains | Implementation direction |
 | --- | --- | --- |
+| Language-neutral contract descriptor and codec registry | The current descriptor path is Python-derived and still treats pickle fallback as a normal default wire reference for Python. C-Two does not yet have a portable descriptor/codec split that future SDKs can use for codegen. | Specify `c-two.contract.v1`, move canonical hash and validation authority into Rust `c2-contract`, mark pickle as Python-only, and add codec refs for built-in, fastdb, standard external, and opaque custom families. |
 | Contract version compatibility | Exact CRM contract validation exists, but semver or range-based compatibility negotiation does not. | Keep exact route validation as the safety floor. Add compatibility matching above it in Rust `c2-contract`, then expose a thin Python facade such as a version requirement on `cc.connect(...)`. |
 | `auth_hook` and call metadata | C-Two does not yet provide the metadata pass-through and hook surface needed by upper layers to implement AuthN/AuthZ. | Put mechanism in C-Two, keep policy in downstream systems such as Toodle. Metadata must remain explicit and contract-scoped. |
 | Dry-run hooks | The endgame architecture names dry-run hooks as an M1 closing item, but the public contract is not specified yet. | Specify the hook semantics before implementation: what is simulated, what metadata is visible, and what side effects are forbidden. |
@@ -72,13 +74,14 @@ Each workstream should be split into small reviewable slices. For call-path chan
 | Capability | Direction |
 | --- | --- |
 | Rust SDK first real slice | Start with a real Rust SDK slice that reuses `c2-wire`, `c2-ipc`, `c2-http`, and `c2-contract` instead of creating placeholder directories. |
-| TypeScript client with fastdb codec | This is an endgame prerequisite for browser-native CRM clients, but it depends on codec annotations, cross-language descriptors, and a stable compatibility story. |
+| TypeScript client with fastdb codec | This is an endgame prerequisite for browser-native CRM clients, but it depends on codec annotations, cross-language descriptors, and a stable compatibility story. fastdb should be the first codec pilot, not the CRM IDL itself. |
 | Global discovery and namespace governance | Relay mesh already handles route propagation. A broader discovery/admin surface should return candidate route metadata and must not replace production contract-scoped resolution with name-only lookup. |
 
 ## Historical References
 
 | Document | How to use it now |
 | --- | --- |
+| [`docs/vision/cross-language-contract-codec-architecture.md`](./vision/cross-language-contract-codec-architecture.md) | Current architecture direction for splitting CRM contracts from payload codecs and using fastdb as the first codec pilot. |
 | [`docs/plans/c-two-rpc-v2-roadmap.md`](./plans/c-two-rpc-v2-roadmap.md) | Historical roadmap archive. It contains useful context, but old terminology and old paths are expected. |
 | [`docs/vision/endgame-architecture.md`](./vision/endgame-architecture.md) | Long-term architecture boundary and milestone direction. Use it to understand why a capability matters, not as an implementation checklist. |
 | [`docs/vision/sota-patterns.md`](./vision/sota-patterns.md) | Design-pattern reference for the RPC model and remaining high-level gaps. |
