@@ -1,23 +1,34 @@
 from __future__ import annotations
+import json
+import math
 import pickle
 import inspect
 import logging
 import sys
 import threading
+import types
 import warnings
 from abc import ABCMeta
 from functools import wraps
 from dataclasses import dataclass, is_dataclass
-from typing import get_type_hints, Any, Callable, TypeVar, Type
+from typing import get_args, get_origin, get_type_hints, Any, Callable, TypeVar, Type, Union
 
 import struct as _struct
 
 from .. import error
-from .codec import normalize_codec_ref, resolve_codec
+from .codec import CodecRef, normalize_codec_ref, resolve_codec
 
 
 R = TypeVar('R')
 DEFAULT_PICKLE_PROTOCOL = 4
+CONTROL_JSON_SCHEMA = 'c-two.control.json.v1'
+CONTROL_JSON_CODEC_REF = CodecRef(
+    id='c-two.control.json',
+    version='1',
+    schema=CONTROL_JSON_SCHEMA,
+    capabilities=('bytes',),
+    media_type='application/json',
+)
 
 
 def _pickle_dumps_default(value: object) -> bytes:
@@ -203,6 +214,336 @@ def _default_deserialize_func(data: memoryview | None):
     if data is None or len(data) == 0:
         return None
     return pickle.loads(data)
+
+
+def create_control_json_transferable(func, is_input: bool):
+    """Create a portable JSON control-plane transferable for JSON-safe signatures."""
+    if is_input:
+        param_specs = _extract_func_params(func)
+        param_annotations = [annotation for _name, annotation, _default in param_specs]
+        class_name = f'ControlJson{func.__name__.title()}InputTransferable'
+
+        def serialize(*args) -> bytes:
+            if len(args) > len(param_annotations):
+                raise ValueError(
+                    f'{func.__name__} expected at most {len(param_annotations)} '
+                    f'control arguments, got {len(args)}',
+                )
+            return _control_json_dump(
+                args,
+                param_annotations[:len(args)],
+                f'{func.__name__}.input',
+            )
+
+        def deserialize(data: memoryview | bytes):
+            values = _control_json_load(data, f'{func.__name__}.input')
+            if values is None:
+                return tuple()
+            if len(values) > len(param_annotations):
+                raise ValueError(
+                    f'{func.__name__} decoded too many control arguments: '
+                    f'{len(values)} > {len(param_annotations)}',
+                )
+            restored = [
+                _control_from_json_safe(value, annotation, f'{func.__name__}.input[{index}]')
+                for index, (value, annotation) in enumerate(
+                    zip(values, param_annotations, strict=False),
+                )
+            ]
+            return tuple(restored)
+
+        ControlJsonInputTransferable = type(
+            class_name,
+            (Transferable,),
+            {
+                '__module__': 'c_two.control',
+                '__cc_codec_ref__': CONTROL_JSON_CODEC_REF,
+                'serialize': serialize,
+                'deserialize': deserialize,
+            },
+        )
+        ControlJsonInputTransferable._is_input = True
+        ControlJsonInputTransferable._original_func = func
+        ControlJsonInputTransferable._param_names = [name for name, _annotation, _default in param_specs]
+        ControlJsonInputTransferable._type_hints = _safe_type_hints(func)
+        return ControlJsonInputTransferable
+
+    type_hints = _safe_type_hints(func)
+    return_annotation = type_hints.get('return')
+    class_name = f'ControlJson{func.__name__.title()}OutputTransferable'
+
+    def serialize(*args) -> bytes:
+        annotations = _control_output_value_annotations(return_annotation, len(args), func.__name__)
+        return _control_json_dump(args, annotations, f'{func.__name__}.output')
+
+    def deserialize(data: memoryview | bytes):
+        values = _control_json_load(data, f'{func.__name__}.output')
+        if values is None:
+            return None
+        annotations = _control_output_value_annotations(
+            return_annotation,
+            len(values),
+            func.__name__,
+        )
+        restored = [
+            _control_from_json_safe(value, annotation, f'{func.__name__}.output[{index}]')
+            for index, (value, annotation) in enumerate(zip(values, annotations, strict=False))
+        ]
+        if _is_tuple_annotation(return_annotation):
+            return tuple(restored)
+        if len(restored) != 1:
+            raise ValueError(
+                f'{func.__name__} decoded {len(restored)} values for non-tuple output.',
+            )
+        return restored[0]
+
+    ControlJsonOutputTransferable = type(
+        class_name,
+        (Transferable,),
+        {
+            '__module__': 'c_two.control',
+            '__cc_codec_ref__': CONTROL_JSON_CODEC_REF,
+            'serialize': serialize,
+            'deserialize': deserialize,
+        },
+    )
+    ControlJsonOutputTransferable._is_input = False
+    ControlJsonOutputTransferable._original_func = func
+    ControlJsonOutputTransferable._return_type = return_annotation
+    return ControlJsonOutputTransferable
+
+
+def _safe_type_hints(func) -> dict[str, Any]:
+    try:
+        return get_type_hints(func)
+    except (NameError, ValueError, TypeError):
+        return {}
+
+
+def _control_output_value_annotations(
+    return_annotation: Any,
+    value_count: int,
+    method_name: str,
+) -> list[Any]:
+    if _is_tuple_annotation(return_annotation):
+        args = get_args(return_annotation)
+        if len(args) == 2 and args[1] is Ellipsis:
+            return [args[0]] * value_count
+        if len(args) != value_count:
+            raise ValueError(
+                f'{method_name} expected {len(args)} tuple output values, got {value_count}',
+            )
+        return list(args)
+    if value_count != 1:
+        raise ValueError(f'{method_name} expected one output value, got {value_count}')
+    return [return_annotation]
+
+
+def _control_json_dump(values: tuple[Any, ...], annotations: list[Any], path: str) -> bytes:
+    wire_values = [
+        _control_to_json_safe(value, annotation, f'{path}[{index}]')
+        for index, (value, annotation) in enumerate(zip(values, annotations, strict=False))
+    ]
+    payload = {
+        'schema': CONTROL_JSON_SCHEMA,
+        'values': wire_values,
+    }
+    return json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()
+
+
+def _control_json_load(data: memoryview | bytes | None, path: str) -> list[Any] | None:
+    if data is None or len(data) == 0:
+        return None
+    try:
+        payload = json.loads(bytes(data))
+    except Exception as exc:
+        raise ValueError(f'{path} is not valid JSON control data: {exc}') from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f'{path} control payload must be an object.')
+    if payload.get('schema') != CONTROL_JSON_SCHEMA:
+        raise ValueError(f'{path} control payload schema must be {CONTROL_JSON_SCHEMA}.')
+    values = payload.get('values')
+    if not isinstance(values, list):
+        raise ValueError(f'{path} control payload values must be a list.')
+    return values
+
+
+def _is_control_json_annotation(annotation: Any) -> bool:
+    if annotation is inspect.Signature.empty or annotation is Any:
+        return False
+    if annotation is None or annotation is type(None):
+        return True
+    if annotation in {bool, int, float, str}:
+        return True
+    if annotation in {bytes, memoryview, bytearray}:
+        return False
+    origin = get_origin(annotation)
+    args = get_args(annotation)
+    if origin in {Union, types.UnionType}:
+        return bool(args) and all(_is_control_json_annotation(arg) for arg in args)
+    if origin is list:
+        return len(args) == 1 and _is_control_json_annotation(args[0])
+    if origin is dict:
+        return len(args) == 2 and args[0] is str and _is_control_json_annotation(args[1])
+    if origin is tuple:
+        if not args:
+            return False
+        if len(args) == 2 and args[1] is Ellipsis:
+            return _is_control_json_annotation(args[0])
+        return all(_is_control_json_annotation(arg) for arg in args)
+    return False
+
+
+def _is_tuple_annotation(annotation: Any) -> bool:
+    return get_origin(annotation) is tuple
+
+
+def _control_to_json_safe(value: Any, annotation: Any, path: str) -> Any:
+    if annotation is None or annotation is type(None):
+        if value is not None:
+            raise ValueError(f'{path} must be None.')
+        return None
+    origin = get_origin(annotation)
+    args = get_args(annotation)
+    if origin in {Union, types.UnionType}:
+        if value is None and type(None) in args:
+            return None
+        failures = []
+        for arg in args:
+            if arg is type(None):
+                continue
+            try:
+                return _control_to_json_safe(value, arg, path)
+            except (TypeError, ValueError) as exc:
+                failures.append(str(exc))
+        raise ValueError(f'{path} does not match any union item: {"; ".join(failures)}')
+    if annotation is bool:
+        if not isinstance(value, bool):
+            raise TypeError(f'{path} must be bool.')
+        return value
+    if annotation is int:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f'{path} must be int.')
+        return value
+    if annotation is float:
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise TypeError(f'{path} must be float.')
+        converted = float(value)
+        if not math.isfinite(converted):
+            raise ValueError(f'{path} must be finite.')
+        return converted
+    if annotation is str:
+        if not isinstance(value, str):
+            raise TypeError(f'{path} must be str.')
+        return value
+    if origin is list:
+        if not isinstance(value, list):
+            raise TypeError(f'{path} must be list.')
+        item_annotation = args[0]
+        return [
+            _control_to_json_safe(item, item_annotation, f'{path}[{index}]')
+            for index, item in enumerate(value)
+        ]
+    if origin is dict:
+        if args[0] is not str:
+            raise TypeError(f'{path} only supports dict[str, T].')
+        if not isinstance(value, dict):
+            raise TypeError(f'{path} must be dict.')
+        value_annotation = args[1]
+        result = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise TypeError(f'{path} keys must be str.')
+            result[key] = _control_to_json_safe(item, value_annotation, f'{path}.{key}')
+        return result
+    if origin is tuple:
+        if not isinstance(value, tuple):
+            raise TypeError(f'{path} must be tuple.')
+        if len(args) == 2 and args[1] is Ellipsis:
+            return [
+                _control_to_json_safe(item, args[0], f'{path}[{index}]')
+                for index, item in enumerate(value)
+            ]
+        if len(value) != len(args):
+            raise ValueError(f'{path} expected tuple length {len(args)}, got {len(value)}.')
+        return [
+            _control_to_json_safe(item, item_annotation, f'{path}[{index}]')
+            for index, (item, item_annotation) in enumerate(zip(value, args, strict=True))
+        ]
+    raise TypeError(f'{path} has unsupported control annotation {annotation!r}.')
+
+
+def _control_from_json_safe(value: Any, annotation: Any, path: str) -> Any:
+    if annotation is None or annotation is type(None):
+        if value is not None:
+            raise ValueError(f'{path} must be None.')
+        return None
+    origin = get_origin(annotation)
+    args = get_args(annotation)
+    if origin in {Union, types.UnionType}:
+        if value is None and type(None) in args:
+            return None
+        failures = []
+        for arg in args:
+            if arg is type(None):
+                continue
+            try:
+                return _control_from_json_safe(value, arg, path)
+            except (TypeError, ValueError) as exc:
+                failures.append(str(exc))
+        raise ValueError(f'{path} does not match any union item: {"; ".join(failures)}')
+    if annotation is bool:
+        if not isinstance(value, bool):
+            raise TypeError(f'{path} must be bool.')
+        return value
+    if annotation is int:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f'{path} must be int.')
+        return value
+    if annotation is float:
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise TypeError(f'{path} must be float.')
+        converted = float(value)
+        if not math.isfinite(converted):
+            raise ValueError(f'{path} must be finite.')
+        return converted
+    if annotation is str:
+        if not isinstance(value, str):
+            raise TypeError(f'{path} must be str.')
+        return value
+    if origin is list:
+        if not isinstance(value, list):
+            raise TypeError(f'{path} must be list.')
+        item_annotation = args[0]
+        return [
+            _control_from_json_safe(item, item_annotation, f'{path}[{index}]')
+            for index, item in enumerate(value)
+        ]
+    if origin is dict:
+        if args[0] is not str:
+            raise TypeError(f'{path} only supports dict[str, T].')
+        if not isinstance(value, dict):
+            raise TypeError(f'{path} must be dict.')
+        value_annotation = args[1]
+        return {
+            key: _control_from_json_safe(item, value_annotation, f'{path}.{key}')
+            for key, item in value.items()
+        }
+    if origin is tuple:
+        if not isinstance(value, list):
+            raise TypeError(f'{path} tuple wire value must be list.')
+        if len(args) == 2 and args[1] is Ellipsis:
+            return tuple(
+                _control_from_json_safe(item, args[0], f'{path}[{index}]')
+                for index, item in enumerate(value)
+            )
+        if len(value) != len(args):
+            raise ValueError(f'{path} expected tuple length {len(args)}, got {len(value)}.')
+        return tuple(
+            _control_from_json_safe(item, item_annotation, f'{path}[{index}]')
+            for index, (item, item_annotation) in enumerate(zip(value, args, strict=True))
+        )
+    raise TypeError(f'{path} has unsupported control annotation {annotation!r}.')
 
 
 def create_default_transferable(func, is_input: bool):
@@ -661,6 +1002,13 @@ def auto_transfer(func=None, *, input=None, output=None, buffer=None):
                     if binding is not None:
                         input_transferable = binding.transferable
 
+            if (
+                input_transferable is None
+                and not is_empty_input
+                and all(_is_control_json_annotation(param_type) for _name, param_type, _default in func_params)
+            ):
+                input_transferable = create_control_json_transferable(func, is_input=True)
+
             if input_transferable is None and not is_empty_input:
                 input_transferable = create_default_transferable(func, is_input=True)
 
@@ -686,6 +1034,8 @@ def auto_transfer(func=None, *, input=None, output=None, buffer=None):
                         binding = resolve_codec(return_type, {'function': func, 'position': 'output'})
                         if binding is not None:
                             output_transferable = binding.transferable
+                    if output_transferable is None and _is_control_json_annotation(return_type):
+                        output_transferable = create_control_json_transferable(func, is_input=False)
                     if output_transferable is None and not (return_type is None or return_type is type(None)):
                         output_transferable = create_default_transferable(func, is_input=False)
 

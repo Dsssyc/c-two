@@ -216,7 +216,7 @@ def test_provider_codec_binding_supplies_ref_for_plain_transferable_adapter():
 def test_portable_descriptor_rejects_pickle_only_wire_refs():
     @cc.crm(namespace='test.codec-provider', version='0.1.0')
     class PickleOnlyContract:
-        def echo(self, value: int) -> int:
+        def echo(self, value: bytes) -> bytes:
             ...
 
     from c_two.crm.descriptor import build_contract_descriptor

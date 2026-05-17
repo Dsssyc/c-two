@@ -16,14 +16,30 @@ def clear_codec_registry():
         _clear_codec_registry_for_tests()
 
 
-def test_export_contract_descriptor_uses_c_two_contract_schema_and_rejects_pickle():
+def test_export_contract_descriptor_uses_c_two_contract_schema_and_rejects_pickle_for_unsupported_bytes():
     @cc.crm(namespace='test.contract-export', version='0.1.0')
     class PickleOnly:
-        def echo(self, value: int) -> int:
+        def echo(self, value: bytes) -> bytes:
             ...
 
     with pytest.raises(ValueError, match='python-pickle-default'):
         cc.export_contract_descriptor(PickleOnly)
+
+
+def test_export_contract_descriptor_uses_portable_control_json_for_primitives():
+    @cc.crm(namespace='test.contract-export', version='0.1.0')
+    class Control:
+        def echo(self, values: list[int], label: str | None = None) -> list[str | None]:
+            ...
+
+    exported = cc.export_contract_descriptor(Control)
+    descriptor = json.loads(exported)
+    method = descriptor['methods'][0]
+
+    assert descriptor['schema'] == 'c-two.contract.v1'
+    assert method['wire']['input']['id'] == 'c-two.control.json'
+    assert method['wire']['output']['id'] == 'c-two.control.json'
+    assert 'python-pickle-default' not in exported
 
 
 def test_export_contract_descriptor_returns_canonical_portable_json():

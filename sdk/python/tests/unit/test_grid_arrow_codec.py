@@ -38,7 +38,7 @@ def test_grid_arrow_payloads_emit_explicit_codec_refs(monkeypatch):
     assert methods['get_grid_infos']['return']['kind'] == 'list'
     assert methods['get_grid_infos']['return']['item']['abi_ref']['id'] == arrow_id
     assert methods['get_schema']['wire']['output']['id'] == arrow_id
-    assert methods['get_grid_infos']['wire']['input']['family'] == 'python-pickle-default'
+    assert methods['get_grid_infos']['wire']['input']['id'] == 'c-two.control.json'
     assert 'custom_schema' not in json.dumps(descriptor, sort_keys=True)
 
 
@@ -52,8 +52,28 @@ def test_grid_schema_method_can_export_as_portable_arrow_subset(monkeypatch):
     assert 'python-pickle-default' not in json.dumps(descriptor, sort_keys=True)
 
 
-def test_grid_control_params_still_block_full_portable_export(monkeypatch):
+def test_grid_control_params_export_with_portable_control_json(monkeypatch):
     Grid, _arrow_id, _schema_ref, _attribute_batch_ref = _load_grid_contract(monkeypatch)
 
-    with pytest.raises(ValueError, match='get_grid_infos.*input uses python-pickle-default'):
-        cc.export_contract_descriptor(Grid, methods=['get_grid_infos'])
+    descriptor = json.loads(cc.export_contract_descriptor(Grid, methods=['get_grid_infos']))
+    method = descriptor['methods'][0]
+
+    assert method['wire']['input']['id'] == 'c-two.control.json'
+    assert 'python-pickle-default' not in json.dumps(descriptor, sort_keys=True)
+
+
+def test_full_grid_contract_exports_as_portable_descriptor(monkeypatch):
+    Grid, _arrow_id, schema_ref, attribute_batch_ref = _load_grid_contract(monkeypatch)
+
+    descriptor = json.loads(cc.export_contract_descriptor(Grid))
+    methods = {method['name']: method for method in descriptor['methods']}
+    encoded = json.dumps(descriptor, sort_keys=True)
+
+    assert descriptor['schema'] == 'c-two.contract.v1'
+    assert methods['get_schema']['wire']['output'] == schema_ref.to_wire_ref()
+    assert methods['get_grid_infos']['wire']['output'] == attribute_batch_ref.to_wire_ref()
+    assert methods['subdivide_grids']['wire']['input']['id'] == 'c-two.control.json'
+    assert methods['subdivide_grids']['wire']['output']['id'] == 'c-two.control.json'
+    assert methods['hello']['wire']['input']['id'] == 'c-two.control.json'
+    assert methods['none_hello']['wire']['output']['id'] == 'c-two.control.json'
+    assert 'python-pickle-default' not in encoded
