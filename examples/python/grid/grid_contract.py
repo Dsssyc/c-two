@@ -1,6 +1,6 @@
 import c_two as cc
 
-from grid.transferables import GridSchema, GridAttribute
+from grid.transferables import GridAttribute, GridAttributeBatch, GridSchema
 
 @cc.crm(namespace='demo.grid', version='0.1.0')
 class Grid:
@@ -34,6 +34,7 @@ class Grid:
     def get_parent_keys(self, levels: list[int], global_ids: list[int]) -> list[str | None]:
         ...
 
+    @cc.transfer(output=GridAttributeBatch)
     def get_grid_infos(self, level: int, global_ids: list[int]) -> list[GridAttribute]:
         """Method to get all attributes for provided grids having same level
 

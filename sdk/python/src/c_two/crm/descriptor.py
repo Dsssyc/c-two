@@ -260,17 +260,6 @@ def _annotation_descriptor(
         return {'kind': 'primitive', 'name': _PRIMITIVES[annotation]}
     if annotation in _BARE_CONTAINERS:
         raise TypeError(f'{method_name} uses a bare container annotation.')
-    if codec_ref is not None:
-        return {
-            'codec': codec_ref.to_wire_ref(),
-            'kind': 'codec',
-        }
-    if _is_transferable_type(annotation):
-        return {
-            'abi_ref': _transferable_abi_ref(annotation),
-            'kind': 'transferable',
-        }
-
     origin = get_origin(annotation)
     args = get_args(annotation)
     if origin in {Union, types.UnionType}:
@@ -309,6 +298,17 @@ def _annotation_descriptor(
                 for arg in args
             ],
             'kind': 'tuple',
+        }
+
+    if codec_ref is not None:
+        return {
+            'codec': codec_ref.to_wire_ref(),
+            'kind': 'codec',
+        }
+    if _is_transferable_type(annotation):
+        return {
+            'abi_ref': _transferable_abi_ref(annotation),
+            'kind': 'transferable',
         }
 
     raise TypeError(

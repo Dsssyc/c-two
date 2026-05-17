@@ -61,7 +61,7 @@
 
 | 能力 | 尚未完成 | 实现方向 |
 | --- | --- | --- |
-| 资源优先 contract descriptor、codec refs 与 provider resolution | 当前 descriptor 路径仍由 Python 推导，并且仍把 pickle fallback 作为 Python 的常规默认 wire reference。C-Two 还没有未来 SDK 可用于 codegen 的可移植 descriptor/codec 分层、provider resolution、resource/CRM conformance check 或 portable export 诊断。 | 规范化 `c-two.contract.v1` 和 `CodecRef`，把 canonical hash 和 validation authority 放进 Rust `c2-contract`，把 pickle 标记为 Python-only，增加 built-in、py-arrow、fastdb、标准外部格式和 opaque custom families 的 provider resolution，并让 portable export 对 unresolved codec fail-fast。 |
+| 资源优先 contract descriptor、codec refs 与 provider resolution | Python 侧现在已经有 `CodecRef`、`@cc.transferable(codec_ref=...)`、`cc.use_codec(...)`、`cc.bind_codec(...)`、resource/CRM conformance check、对 pickle-only wire ref fail-fast 的 portable export、使用 codec ref 表达的 grid Arrow IPC payload，以及可选 fastdb provider 冒烟覆盖。剩余缺口是 Rust `c2-contract` 对完整 `c-two.contract.v1` 的校验、primitive/control portable envelope、可复用通用 py-arrow 与 fastdb provider 打包、resource-to-CRM infer、`c3 contract infer/export` 和 SDK codegen。 | 保持 C-Two core codec-neutral。把 portable descriptor 的 canonical validation 移到 Rust `c2-contract`，定义 primitive/control 的 portable envelope，把示例/provider pilot 升级为有文档的 provider package，并继续把 pickle 限定为 Python-only fallback。 |
 | 契约版本兼容 | 精确 CRM 契约校验已经存在，但还没有 semver 或 range-based 兼容协商。 | 保留精确 route validation 作为安全底线。在 Rust `c2-contract` 中增加兼容匹配，再通过 Python 薄 facade 暴露，例如在 `cc.connect(...)` 上支持版本要求。 |
 | `auth_hook` 与 call metadata | C-Two 还没有提供上层实现 AuthN/AuthZ 所需的 metadata 透传和 hook 表面。 | C-Two 提供机制，下游系统如 Toodle 保留策略。metadata 必须显式且保持契约作用域。 |
 | dry-run 钩子 | endgame 架构把 dry-run hooks 列为 M1 收尾项，但公开契约还没有定义。 | 先定义 hook 语义：模拟什么、能看到哪些 metadata、哪些副作用必须禁止。 |

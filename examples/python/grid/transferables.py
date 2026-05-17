@@ -1,12 +1,59 @@
 import c_two as cc
 import pyarrow as pa
 
+ARROW_IPC_CODEC_ID = 'org.apache.arrow.ipc'
+ARROW_IPC_CODEC_VERSION = '1'
+ARROW_IPC_SCHEMA = 'arrow.ipc.schema.v1'
+ARROW_IPC_MEDIA_TYPE = 'application/vnd.apache.arrow.stream'
+ARROW_IPC_CAPABILITIES = ('bytes', 'buffer-view')
+
+GRID_SCHEMA_ARROW_SCHEMA = (
+    'c-two.examples.grid-schema.arrow-ipc.v1;'
+    'fields=epsg:int32,bounds:list<float64>,first_size:list<float64>,'
+    'subdivide_rules:list<list<int32>>'
+)
+GRID_ATTRIBUTE_ARROW_SCHEMA = (
+    'c-two.examples.grid-attribute.arrow-ipc.v1;'
+    'fields=deleted:bool,activate:bool,type:int8,level:int8,'
+    'global_id:int32,local_id:int32?,elevation:float64,'
+    'min_x:float64?,min_y:float64?,max_x:float64?,max_y:float64?'
+)
+GRID_ATTRIBUTE_BATCH_ARROW_SCHEMA = (
+    'c-two.examples.grid-attribute-batch.arrow-ipc.v1;'
+    'items=c-two.examples.grid-attribute.arrow-ipc.v1;'
+    'fields=deleted:bool,activate:bool,type:int8,level:int8,'
+    'global_id:int32,local_id:int32?,elevation:float64,'
+    'min_x:float64?,min_y:float64?,max_x:float64?,max_y:float64?'
+)
+
+GRID_SCHEMA_CODEC_REF = cc.CodecRef.from_schema(
+    id=ARROW_IPC_CODEC_ID,
+    version=ARROW_IPC_CODEC_VERSION,
+    schema=ARROW_IPC_SCHEMA,
+    schema_text=GRID_SCHEMA_ARROW_SCHEMA,
+    capabilities=ARROW_IPC_CAPABILITIES,
+    media_type=ARROW_IPC_MEDIA_TYPE,
+)
+GRID_ATTRIBUTE_CODEC_REF = cc.CodecRef.from_schema(
+    id=ARROW_IPC_CODEC_ID,
+    version=ARROW_IPC_CODEC_VERSION,
+    schema=ARROW_IPC_SCHEMA,
+    schema_text=GRID_ATTRIBUTE_ARROW_SCHEMA,
+    capabilities=ARROW_IPC_CAPABILITIES,
+    media_type=ARROW_IPC_MEDIA_TYPE,
+)
+GRID_ATTRIBUTE_BATCH_CODEC_REF = cc.CodecRef.from_schema(
+    id=ARROW_IPC_CODEC_ID,
+    version=ARROW_IPC_CODEC_VERSION,
+    schema=ARROW_IPC_SCHEMA,
+    schema_text=GRID_ATTRIBUTE_BATCH_ARROW_SCHEMA,
+    capabilities=ARROW_IPC_CAPABILITIES,
+    media_type=ARROW_IPC_MEDIA_TYPE,
+)
+
+
 @cc.transferable(
-    abi_schema=(
-        'c-two.examples.grid-schema.arrow-ipc.v1;'
-        'fields=epsg:int32,bounds:list<float64>,first_size:list<float64>,'
-        'subdivide_rules:list<list<int32>>'
-    ),
+    codec_ref=GRID_SCHEMA_CODEC_REF,
 )
 class GridSchema:
     """
@@ -23,13 +70,6 @@ class GridSchema:
     subdivide_rules: list[list[int]]  # [(sub_width, sub_height), ...]
         
     def serialize(grid_schema: 'GridSchema') -> bytes:
-        arrow_schema = pa.schema([
-            pa.field('epsg', pa.int32()),
-            pa.field('bounds', pa.list_(pa.float64())),
-            pa.field('first_size', pa.list_(pa.float64())),
-            pa.field('subdivide_rules', pa.list_(pa.list_(pa.int32())))
-        ])
-        
         data = {
             'epsg': grid_schema.epsg,
             'bounds': grid_schema.bounds,
@@ -37,7 +77,7 @@ class GridSchema:
             'subdivide_rules': grid_schema.subdivide_rules
         }
         
-        table = pa.Table.from_pylist([data], schema=arrow_schema)
+        table = pa.Table.from_pylist([data], schema=grid_schema_arrow_schema())
         return serialize_from_table(table)
 
     def deserialize(arrow_bytes: bytes) -> 'GridSchema':
@@ -50,12 +90,7 @@ class GridSchema:
         )
 
 @cc.transferable(
-    abi_schema=(
-        'c-two.examples.grid-attribute.arrow-ipc.v1;'
-        'fields=deleted:bool,activate:bool,type:int8,level:int8,'
-        'global_id:int32,local_id:int32?,elevation:float64,'
-        'min_x:float64?,min_y:float64?,max_x:float64?,max_y:float64?'
-    ),
+    codec_ref=GRID_ATTRIBUTE_CODEC_REF,
 )
 class GridAttribute:
     """
@@ -86,21 +121,7 @@ class GridAttribute:
     max_y: float | None = None
     
     def serialize(data: 'GridAttribute') -> bytes:
-        schema = pa.schema([
-            pa.field('deleted', pa.bool_()),
-            pa.field('activate', pa.bool_()),
-            pa.field('type', pa.int8()),
-            pa.field('level', pa.int8()),
-            pa.field('global_id', pa.int32()),
-            pa.field('local_id', pa.int32(), nullable=True),
-            pa.field('elevation', pa.float64()),
-            pa.field('min_x', pa.float64(), nullable=True),
-            pa.field('min_y', pa.float64(), nullable=True),
-            pa.field('max_x', pa.float64(), nullable=True),
-            pa.field('max_y', pa.float64(), nullable=True),
-        ])
-        
-        table = pa.Table.from_pylist([data.__dict__], schema=schema)
+        table = pa.Table.from_pylist([data.__dict__], schema=grid_attribute_arrow_schema())
         return serialize_from_table(table)
     
     def deserialize(arrow_bytes: bytes) -> 'GridAttribute':
@@ -119,7 +140,61 @@ class GridAttribute:
             max_y=row['max_y']
         )
 
+
+@cc.transferable(
+    codec_ref=GRID_ATTRIBUTE_BATCH_CODEC_REF,
+)
+class GridAttributeBatch:
+    def serialize(items: list[GridAttribute]) -> bytes:
+        rows = [item.__dict__ for item in items]
+        table = pa.Table.from_pylist(rows, schema=grid_attribute_arrow_schema())
+        return serialize_from_table(table)
+
+    def deserialize(arrow_bytes: bytes) -> list[GridAttribute]:
+        rows = deserialize_to_rows(arrow_bytes)
+        return [
+            GridAttribute(
+                deleted=row['deleted'],
+                activate=row['activate'],
+                type=row['type'],
+                level=row['level'],
+                global_id=row['global_id'],
+                local_id=row['local_id'],
+                elevation=row['elevation'],
+                min_x=row['min_x'],
+                min_y=row['min_y'],
+                max_x=row['max_x'],
+                max_y=row['max_y'],
+            )
+            for row in rows
+        ]
+
 # Helpers ##################################################
+
+
+def grid_schema_arrow_schema() -> pa.Schema:
+    return pa.schema([
+        pa.field('epsg', pa.int32()),
+        pa.field('bounds', pa.list_(pa.float64())),
+        pa.field('first_size', pa.list_(pa.float64())),
+        pa.field('subdivide_rules', pa.list_(pa.list_(pa.int32()))),
+    ])
+
+
+def grid_attribute_arrow_schema() -> pa.Schema:
+    return pa.schema([
+        pa.field('deleted', pa.bool_()),
+        pa.field('activate', pa.bool_()),
+        pa.field('type', pa.int8()),
+        pa.field('level', pa.int8()),
+        pa.field('global_id', pa.int32()),
+        pa.field('local_id', pa.int32(), nullable=True),
+        pa.field('elevation', pa.float64()),
+        pa.field('min_x', pa.float64(), nullable=True),
+        pa.field('min_y', pa.float64(), nullable=True),
+        pa.field('max_x', pa.float64(), nullable=True),
+        pa.field('max_y', pa.float64(), nullable=True),
+    ])
 
 
 def serialize_from_table(table: pa.Table) -> bytes:
@@ -135,7 +210,7 @@ def deserialize_to_table(serialized_data: bytes) -> pa.Table:
         table = reader.read_all()
     return table
 
-def deserialize_to_rows(serialized_data: bytes) -> dict:
+def deserialize_to_rows(serialized_data: bytes) -> list[dict]:
     buffer = pa.py_buffer(serialized_data)
 
     with pa.ipc.open_stream(buffer) as reader:

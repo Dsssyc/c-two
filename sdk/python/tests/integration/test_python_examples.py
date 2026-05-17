@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 import pytest
+from c_two.transport.client.util import ping
 
 
 def _repo_root() -> Path:
@@ -39,6 +40,20 @@ def _extract_ipc_address(output: str) -> str:
         if token.startswith("ipc://"):
             return token
     raise AssertionError(f"No ipc:// address found in output:\n{output}")
+
+
+def _wait_for_ipc_ready(address: str, timeout: float = 10.0) -> None:
+    deadline = time.monotonic() + timeout
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            if ping(address, timeout=0.5):
+                return
+        except Exception as exc:
+            last_error = exc
+        time.sleep(0.05)
+    detail = f': {last_error}' if last_error is not None else ''
+    raise AssertionError(f'Timed out waiting for IPC server {address}{detail}')
 
 
 def _stop_process(proc: subprocess.Popen[str]) -> None:
@@ -83,6 +98,7 @@ def test_ipc_example():
         )
         output = _wait_for_stdout(crm_proc, "Grid CRM registered")
         ipc_address = _extract_ipc_address(output)
+        _wait_for_ipc_ready(ipc_address)
 
         client = subprocess.run(
             [
