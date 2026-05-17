@@ -1,121 +1,161 @@
-# 跨语言契约与 Codec 架构
+# 资源优先 CRM 契约与 Codec 架构
 
 > **Status:** Vision（当前方向）
-> **Date:** 2026-05-17
-> **Scope:** 定义 C-Two 在扩展 Rust、TypeScript、C++ 或其他 SDK 前，如何拆分语言中立 CRM 契约与高性能 payload codec。
-> **Audience:** C-Two 核心开发者、未来 SDK 作者、fastdb 贡献者，以及接手 roadmap 工作的 agents。
+> **Date:** 2026-05-18
+> **Scope:** 定义 C-Two 如何从已有资源类投影出可远程调用的 CRM 契约，并通过 opaque `CodecRef` 与第三方 codec provider 支撑 py-arrow、fastdb、Protobuf、Arrow 等 payload 格式，而不把任何具体格式写入 C-Two core。
+> **Audience:** C-Two 核心开发者、未来 SDK 作者、fastdb 贡献者、py-arrow/Arrow codec 作者，以及接手 roadmap 工作的 agents。
 
 ## 决策摘要
 
-C-Two 应先稳定语言中立的 CRM contract descriptor，再扩展更多语言 SDK；fastdb 应作为第一个高性能 payload codec 试点，而不是成为 CRM 契约系统本身。
+C-Two 的长期方向是资源优先：已有 GIS、科学计算、模型和工具库中的资源类是事实来源，CRM contract 是这些资源对远程世界暴露的稳定投影，payload codec 是参数和返回值的 ABI。C-Two runtime 负责 route、transport、scheduler、buffer、relay、contract matching 和 adapter 调用；它不理解 fastdb schema、py-arrow schema、Protobuf descriptor 或 Arrow IPC 内部结构。
 
-长期分层应该是：CRM contract 描述资源的可调用行为，codec 描述 payload 的布局和运行时传输机制。CRM 层负责 method name、namespace、version、read/write access、参数和返回值位置、buffer 语义、route identity、compatibility matching 和 error surface。codec 层负责一个值如何在线上或共享内存中表达，包括 fastdb feature buffer、Arrow/GeoArrow array、WKB geometry bytes、Protobuf message，或显式 custom transfer hooks。
+跨语言能力的核心 artifact 应分成两类：`c-two.contract.v1` 描述可调用资源边界，`CodecRef` 描述每个参数和返回值所使用的 payload ABI 身份。`CodecRef` 是 opaque identity：C-Two 可以验证它结构稳定、hash 确定、能力声明合法，但不能把某个 codec family 的字段布局或 schema 规则硬编码进 core。
 
-JSON 或另一种确定性的文本格式适合承载 contract descriptor 和 codec manifest，但不应成为高吞吐 GIS payload 的默认数据格式。大型科学计算和地理数据仍应优先使用二进制、列式、零拷贝友好的格式。
+普通资源作者不应该在每个 CRM 方法上手写 serializer wrapper。主路径应是 codec provider 自动识别类型并生成 `CodecRef`，`cc.bind_codec(Type, Codec)` 只作为歧义和自定义格式的 escape hatch，`@cc.transfer(...)` 保留为方法级覆盖机制。Python pickle 可以继续服务 Python-only 快速开发，但 portable contract export 必须在遇到 unresolved codec 或 pickle-only wire ref 时 fail-fast。
+
+## 当前实现状态
+
+本文档是当前方向和阶段计划，不表示所有示例 API 已经可用。今天已经存在的基础包括 Python CRM、`@cc.transferable(abi_id=..., abi_schema=...)`、descriptor hashing、custom ABI 引用、Python-only pickle fallback、direct IPC、relay 和 grid 示例中的 Arrow IPC transferable；尚未实现的部分包括 `CodecRef` 公共数据模型、`cc.use_codec(...)`、`cc.bind_codec(...)`、provider 自动解析、resource/CRM conformance check、portable contract export 以及 `c3 contract infer/export` 命令。
 
 ## 背景
 
-当前 Python SDK 可以用 pickle 作为默认 transferable fallback。这对 Python-only 工作流很方便，但不能自然推广到 C++、Rust、TypeScript 或浏览器客户端。这些 SDK 不能依赖 Python 运行时 serializer；如果要求用户为每个复杂 CRM 类型手写 `serialize`、`deserialize` 和 `from_buffer`，跨语言 CRM 的作者成本和 review 成本都会迅速上升。
+C-Two 与 gRPC 的主要差异是入口顺序不同。gRPC 通常从 service IDL 开始，再生成实现 skeleton；C-Two 面向大量已经存在的 GIS/科学计算资源，目标是基于资源构造可达服务，而不是为了服务定义资源。CRM 与资源类解耦的意义正是在这里：资源类可以保持领域模型和本地库形态，CRM 则承诺哪些方法、类型和 ABI 会成为远程稳定边界。
 
-当前 `transferable` 概念也同时承担了太多职责：Python 类型标记、运行时 serializer hook、ABI identity 来源，有时还是零拷贝 buffer adapter。这很灵活，但也意味着公开 CRM contract 不是 Protobuf/gRPC 用户熟悉的那种 plain text、codegen-friendly artifact。
+当前 Python SDK 已经具备一部分雏形：`@cc.transferable(abi_id=..., abi_schema=...)` 能声明 custom ABI，descriptor path 会把 custom hooks 变成 ABI 引用，默认 pickle transferable 支撑 Python-only 工作流。问题是这些概念仍围绕 Python transferable class 展开，缺少明确的 `CodecRef`/provider 分层，也缺少 portable export 的 fail-fast 规则。
 
-C-Two 应借鉴成熟 RPC 系统的 IDL/codegen 纪律，但不应整体接受它们的 payload 模型。Protobuf 和 gRPC 证明了显式 service contract 与 generated stubs 的价值；但 C-Two 还包含普通 service IDL 覆盖不到的运行时语义：resource identity、same-process direct call、direct IPC、relay routing、SHM lease、hold/view mode、任意 payload wire format，以及 Rust-owned route validation。
+静态语言 SDK 不能依赖 Python 资源类，也不能在运行时猜测 Python serializer。C++、Rust、TypeScript 和浏览器客户端必须消费确定的 contract descriptor 和 codec identity；服务端则在 `cc.register(CRM, resource)` 时证明资源实现符合 CRM 投影。
 
-## 架构形态
+## 分层模型
 
-第一类 artifact 应是确定性的 `c-two.contract.v1` descriptor。它可以从当前 SDK 定义导出，但 canonical hash、结构校验和跨语言语义应进入 Rust `c2-contract`，并作为 codegen 与 compatibility check 的权威输入。
+资源类是事实来源。它可以是已有 Python 类、C++ binding、GIS 模型对象、科学计算工具类或下游框架封装。C-Two 不要求资源继承 CRM，也不要求资源为了 RPC 改写内部 API。
 
-示例形态：
+CRM contract 是远程投影。它声明 remotely callable 方法、参数和返回值类型、method access、buffer mode、namespace、version、route matching identity 和错误边界。静态 SDK、relay route validation 和 codegen 只面向 CRM contract，不面向资源类实现。
 
-```json
-{
-  "schema": "c-two.contract.v1",
-  "crm": {"namespace": "cc.geo", "name": "VectorLayer", "version": "0.2.0"},
-  "methods": [
-    {
-      "name": "query",
-      "access": "read",
-      "buffer": "hold",
-      "params": [
-        {"name": "bbox", "type": {"kind": "builtin", "name": "bbox2d_f64"}}
-      ],
-      "returns": {
-        "kind": "codec",
-        "codec": "fastdb.feature_set.v1",
-        "schema_ref": "cc.geo.FeatureBatch"
-      }
-    }
-  ]
-}
+`c-two.contract.v1` 是导出的语言中立 descriptor。它应由 Rust `c2-contract` 负责 canonical validation 和 hashing，Python 只作为 exporter/facade。descriptor 可以从 Python CRM 派生，但不能包含 Python-only class names 作为 portable ABI 的事实来源。
+
+`CodecRef` 是 payload ABI identity。它应包含 codec id、version、schema hash 或 opaque ABI hash、buffer capabilities、portable/Python-only 标记和可选 media type。C-Two 只比较和传播这些 identity，不解析 codec 内部 schema。
+
+Codec adapter 是 SDK/第三方包里的实际 encode/decode/from_buffer 实现。py-arrow provider 可以把 Python/Arrow 类型映射到 Arrow IPC codec；fastdb provider 可以把 `@feature` schema 映射到 fastdb codec；Protobuf provider 可以识别 generated message 类型。C-Two core 不 import 这些包。
+
+## 资源优先工作流
+
+已有资源类可以先存在：
+
+```python
+class Rasterizer:
+    def rasterize(self, points: PointCloud, style: Style) -> Tile:
+        ...
 ```
 
-第二类 artifact 应是 codec descriptor。对 fastdb 来说，可以先从 `fastdb.schema.v1` 开始，描述 feature name、field order、scalar/list/ref kinds、WKB geometry 等 semantic annotations，以及 C-Two 期望使用的 binary codec family。
+C-Two 应支持从资源类推断 CRM 草案：
 
-示例形态：
-
-```json
-{
-  "schema": "fastdb.feature.v1",
-  "name": "cc.geo.FeatureBatch",
-  "fields": [
-    {"name": "id", "type": "u32"},
-    {"name": "geometry", "type": "bytes", "semantic": "wkb"},
-    {"name": "value", "type": "f64"}
-  ]
-}
+```bash
+c3 contract infer mypkg.raster:Rasterizer --methods rasterize --codec-provider fastdb --out contracts/rasterizer.py
 ```
 
-SDK codegen 应消费 contract descriptor 和它引用的 codec descriptors。生成出来的 SDK 应知道 method envelope 和 eligible codec adapters。custom `transferable` hooks 仍然应该保留，但它们应成为显式 opaque-codec escape hatch，而不是 portable CRM contract 的默认作者路径。
+推断命令只能生成草案和诊断报告，不能自动把所有 public 方法变成稳定远程 API。公共边界必须由人确认，避免把资源内部偶然 API 固化成远程契约。
 
-## fastdb 的角色
+确认后的 CRM 才是跨语言边界：
 
-fastdb 是正确的第一个试点，因为它已经具备 C-Two 需要的 serious codec family 雏形：C++ core、Python bindings、TypeScript/WASM bindings、typed feature declarations、codegen、Python-to-TypeScript serializer interop tests、compact binary transport、ref-graph support 和 columnar numeric storage。
+```python
+@cc.crm(namespace="gis.raster", version="0.1.0")
+class RasterizerCRM:
+    def rasterize(self, points: PointCloud, style: Style) -> Tile:
+        ...
+```
 
-fastdb 不应成为 CRM IDL。它描述 data layout 和 transfer behavior，不描述 method access、route identity、relay validation、call metadata、resource lifecycle 或 compatibility policy。把 fastdb 提升为 CRM contract 会让 C-Two 过度绑定到一种数据模型，也会让非 GIS 或非 feature payload 变成二等公民。
+服务端注册时执行 conformance check：
 
-合理的第一个集成目标是：Python-hosted CRM 接收或返回 fastdb-described payload，非 Python client 使用 generated code 调用它，双方都通过 Rust-owned validation 拒绝 contract 或 codec mismatch。
+```python
+cc.register(RasterizerCRM, Rasterizer(), name="rasterizer")
+```
 
-## Codec 分层
+注册检查应验证资源方法存在、参数兼容、返回值兼容、codec 可解析、buffer mode 合法，并在需要时要求显式 adapter。静态 SDK 不依赖资源类；它只依赖导出的 CRM descriptor。
 
-Tier 0 是 built-in contract types：scalar values、simple lists、tuples、optional values、byte buffers，以及每个 SDK 都可以直接实现的小型 JSON-compatible structs。
+## Codec Provider 工作流
 
-Tier 1 是 fastdb-backed feature data：GIS feature batches、typed object graphs、numeric lists，以及 C-Two 希望高性能处理、但不希望每个 SDK 作者都手写 transfer hooks 的 buffer-heavy resource payloads。
+主路径是启用 provider，而不是逐类型手写绑定：
 
-Tier 2 是标准外部 schema 与格式：Arrow/GeoArrow 用于 columnar arrays 和 geospatial extension types，GeoParquet 用于持久化 interchange，WKB 用于 geometry bytes，Protobuf/Avro/FlatBuffers 用于下游生态已经明确要求这些格式的场景。
+```python
+import c_two as cc
+import fastdb_c2
 
-Tier 3 是 opaque custom transferables：显式 `serialize`、`deserialize` 和可选 `from_buffer` 实现，必须声明 ABI identity 和 SDK availability。它们保留 C-Two 的中立性和性能逃生口，但应是 portable contracts 的 opt-in 路径。
+cc.use_codec(fastdb_c2.provider)
+```
 
-## 工业界参考
+导出或注册时，C-Two 询问 provider：这个类型是否有 portable codec candidate。provider 返回一个或多个 `CodecRef` 和对应 adapter。没有 candidate 时，Python-only 调用可以退回 pickle；portable export 必须失败并给出修复建议。
 
-gRPC 和 Protobuf 是显式 service definition 与 generated client/server code 的参考对象，但它们的默认 message model 不应替代 C-Two 的 resource runtime 与 zero-copy payload path。官方参考：gRPC core concepts https://grpc.io/docs/what-is-grpc/core-concepts/ ，Proto3 guide https://protobuf.dev/programming-guides/proto3/ 。
+手写绑定只处理歧义：
 
-Apache Arrow 和 GeoArrow 是 language-independent columnar memory 与 geospatial extension types 的参考对象，比 JSON payload 更接近 C-Two 的 GIS 数据面需求。官方参考：Apache Arrow Columnar Format https://arrow.apache.org/docs/format/Columnar.html ，GeoArrow extension types https://geoarrow.org/extension-types.html 。
+```python
+cc.bind_codec(PointCloud, FastdbColumnarCodec)
+```
 
-GeoParquet 是 persisted geospatial table interchange 的参考对象，不一定是 hot-path RPC payload。官方参考：https://geoparquet.org/releases/v1.1.0/ 。
+方法级覆盖仍然保留：
 
-Avro 和 FlatBuffers 对 schema evolution rules 与 generated code boundaries 有参考价值。官方参考：Avro specification https://avro.apache.org/docs/%2B%2Bversion%2B%2B/specification/ ，FlatBuffers evolution https://flatbuffers.dev/evolution/ 。
+```python
+@cc.transfer(input=PointCloudFastdbCodec, output=TileArrowCodec)
+def render(self, points: PointCloud) -> Tile:
+    ...
+```
 
-JSON Schema 适合验证 descriptor documents 和低容量 JSON-compatible structs，但不应被当作高吞吐 GIS call 的默认 data-plane format。官方参考：https://json-schema.org/understanding-json-schema/basics 。
+这个层级让普通 CRM 作者只关心业务类型，codec 包作者承担 schema/adapter 细节，C-Two 负责把结果变成可验证的 `CodecRef`。
+
+## Portable Export 规则
+
+`c3 contract export` 必须生成确定的 `c-two.contract.v1`，其中每个参数和返回值的 wire entry 都有 resolved `CodecRef`。如果某个类型只能走 `python-pickle-default`，portable export 必须失败。
+
+错误应直指问题：
+
+```text
+Cannot export portable contract:
+  RasterizerCRM.rasterize(points: PointCloud)
+
+No portable codec found for PointCloud.
+Available:
+  - python-pickle-default: Python-only, not portable
+
+Hints:
+  - install fastdb-c2
+  - enable cc.use_codec(fastdb_c2.provider)
+  - add explicit cc.bind_codec(...)
+```
+
+descriptor hash 必须把 callable contract 和 codec identity 纳入 ABI hash，但不能把 provider implementation details、runtime caches、Python object ids 或 performance-only plans 纳入 hash。
+
+## Codegen 位置
+
+codegen 的正确顺序是 resource infer -> confirmed CRM -> contract export -> SDK codegen。codegen 不应该替开发者决定公共 API，也不应该先于 descriptor 稳定化。
+
+SDK codegen 应从 `c-two.contract.v1` 生成 client stubs、server skeletons、adapter skeletons、contract hash constants 和 codec diagnostics。某个 SDK 只应暴露它能支持的 codec；如果 descriptor 引用的 codec 在该语言不可用，生成器应失败或生成明确的 unsupported stub。
+
+## fastdb 与 py-arrow 的角色
+
+fastdb 是第一个 domain-specific provider pilot，而不是 CRM IDL。fastdb 应提供 `fastdb.schema.v1`、ColumnEngine/ObjectEngine capability profiles、codec adapters 和可选 codegen plugin。C-Two 只看到 `CodecRef(id="org.fastdb.columnar", schema_sha256="...")` 这样的 opaque identity。
+
+py-arrow 是第一个 mature external format provider pilot。C-Two examples 已经用 Arrow IPC transferable 表达 grid payload，因此 py-arrow provider 可以从现有例子演进：把手写 `@cc.transferable(abi_schema=...)` 收敛为 provider 解析出的 Arrow IPC `CodecRef` 和 adapter。
+
+Protobuf、FlatBuffers、Avro、JSON Schema、GeoArrow、WKB 等都应作为 provider families 进入，不应让某一种格式成为 C-Two core 的内置 worldview。
 
 ## 实现顺序
 
-1. 从当前 Python descriptor model 出发定义 canonical `c-two.contract.v1`，但从 portable schema 中移除 Python-only naming。
-2. 将 canonical descriptor hashing 和 validation authority 放入 Rust `c2-contract`，Python 只作为 exporter 和 facade。
-3. 将 pickle 标记为 Python-only codec reference：允许 Python-local convenience，但不能作为 portable cross-language CRM contract。
-4. 增加 codec registry 概念，用于识别 built-in、fastdb、standard external 和 opaque custom codec families。
-5. 在 fastdb 中增加 `fastdb.schema.v1` export，再把它作为 C-Two 第一个 nontrivial codec descriptor。
-6. 在创建大范围 SDK 脚手架前先做一个真实 cross-language slice，例如 Python resource 到 Rust 或 TypeScript client，并覆盖 fastdb payload validation 和 explicit mismatch failures。
-7. 只有当 descriptor 与 codec identity 稳定后，C-Two 才应继续推进 semver/range compatibility、auth metadata、async APIs、streaming 和更大的 SDK surface。
+1. 文档先落地资源优先 CRM 投影、opaque `CodecRef`、provider 自动解析、portable export fail-fast 和 pickle Python-only 边界。
+2. 在现有 Python transferable/descriptor 基础上引入最小 `CodecRef` 表达和 provider resolution，不改变底层 transport。
+3. 给 `cc.register(CRM, resource)` 增加服务端 conformance check，确保资源实现符合 CRM 投影。
+4. 增加 portable contract export，先能稳定导出 Python CRM 的 language-neutral descriptor 并拒绝 unresolved codecs。
+5. 在 fastdb 侧实现 `fastdb.schema.v1` 与 provider pilot，验证 C-Two 不 import fastdb。
+6. 在 py-arrow 侧实现 provider pilot，迁移 grid 示例中的 Arrow IPC transferable 使用方式。
+7. 用 grid 资源验证 thread-local、direct IPC 和 relay 三条路径。
+8. 只有 descriptor 和 codec identity 稳定后，再推进 C++/Rust/TypeScript SDK codegen。
 
 ## 非目标
 
-不要把 JSON 做成大 payload 数据格式。
+不要把 fastdb schema、py-arrow schema、Protobuf descriptor 或 Arrow IPC internals 放进 C-Two core。
 
-不要让 fastdb 成为所有 transferable 的强制选择。
+不要把 `cc.bind_codec(...)` 变成普通用户的主路径。
 
 不要把 Python pickle fallback 保留为 portable ABI。
 
-不要在可运行 cross-language slice 之前创建 placeholder SDK directories。
+不要自动暴露资源类的所有 public 方法。
 
-不要把 contract authority 放进单一 SDK。语言中立的 validation、compatibility、relay matching 和 route identity 属于 Rust core 或 FFI。
-
+不要在没有真实可运行 slice 前创建投机性 SDK 目录。

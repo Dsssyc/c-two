@@ -1,6 +1,6 @@
 # C-Two 当前路线图
 
-最后审阅和排序日期：2026-05-17。
+最后审阅和排序日期：2026-05-18。
 
 这是 C-Two 当前 0.x 线的维护版路线图。`docs/plans/`、`docs/spikes/`、`docs/superpowers/` 下的历史设计文档是冻结档案，里面可能仍使用 ICRM、Component、`@cc.runtime.connect` 或旧包路径等过期术语。
 
@@ -15,11 +15,11 @@
 
 ## 实现顺序
 
-路线图工作应按以下顺序接手，除非后续 review 明确取代这个排序。这个顺序本身就是路线图的一部分：先稳定契约身份、codec 身份和调用 envelope，再扩展调用形态、语言 SDK 和治理表面，可以最大限度减少协议返工。
+路线图工作应按以下顺序接手，除非后续 review 明确取代这个排序。这个顺序本身就是路线图的一部分：先稳定资源到 CRM 的投影、契约身份、codec 身份和调用 envelope，再扩展调用形态、语言 SDK 和治理表面，可以最大限度减少协议返工。
 
 | 顺序 | 工作流 | 为什么排在这里 | 完成标准 |
 | --- | --- | --- | --- |
-| 1 | 语言中立 contract descriptor 与 codec registry | 跨语言客户端不能依赖 Python annotation、pickle fallback 或临时 transferable hooks。SDK 扩张前必须把契约身份和 payload codec 身份分开。 | `c-two.contract.v1` 已规范化、可 canonical hash、由 Rust 校验；pickle 标记为 Python-only；codec ref 能识别 built-in、fastdb、标准外部格式和 opaque custom families。 |
+| 1 | 资源优先 contract descriptor、codec refs 与 provider resolution | 跨语言客户端不能依赖 Python annotation、pickle fallback 或临时 transferable hooks。已有资源类需要低侵入地投影为 CRM，同时 SDK 扩张前必须把契约身份和 payload codec 身份分开。 | `c-two.contract.v1` 已规范化、可 canonical hash、由 Rust 校验；`CodecRef` 作为 opaque payload ABI identity 已规范化；pickle 标记为 Python-only；provider resolution 能识别 built-in、py-arrow、fastdb、标准外部格式和 opaque custom families；portable export 对 unresolved codec fail-fast。 |
 | 2 | 契约版本兼容与 descriptor 稳定化 | semver 与 range matching 需要第 1 项的语言中立 descriptor，否则兼容规则会固化 Python descriptor 细节。 | 精确契约校验仍是安全底线；semver 或 range matching 由 Rust 所有；歧义匹配或 ABI 不兼容匹配返回结构化错误。 |
 | 3 | unary 调用的 `auth_hook` 与 call metadata | metadata 会改变每一次调用的 envelope，所以必须在 async、streaming 或 SDK 扩张前落地。 | thread-local、direct IPC 和 HTTP relay 都能传递 metadata；hook 能接受或拒绝调用；策略仍留在 C-Two 之外。 |
 | 4 | unary 调用的 dry-run hooks | dry-run 依赖 hook/metadata 表面，应该在更多调用形态需要同样语义前定义清楚。 | dry-run 不执行资源副作用；不支持的调用形态显式失败；hook 可见 metadata 已文档化。 |
@@ -32,7 +32,7 @@
 
 ## 接手规则
 
-后续 agent 和人类开发者应从上面第一个尚未完成的工作流开始，除非用户明确重定向范围。实现前先读这个路线图、相关当前代码和 vision 文档；跨语言契约工作尤其要先读 [`docs/vision/cross-language-contract-codec-architecture.md`](./vision/cross-language-contract-codec-architecture.md)；`docs/plans/`、`docs/spikes/`、`docs/superpowers/` 只作为历史证据，不作为当前事实源。
+后续 agent 和人类开发者应从上面第一个尚未完成的工作流开始，除非用户明确重定向范围。实现前先读这个路线图、相关当前代码和 vision 文档；资源优先契约和 codec-provider 工作尤其要先读 [`docs/vision/cross-language-contract-codec-architecture.md`](./vision/cross-language-contract-codec-architecture.md)；`docs/plans/`、`docs/spikes/`、`docs/superpowers/` 只作为历史证据，不作为当前事实源。
 
 语言无关的运行时机制必须留在 Rust core 或 FFI 中。Python 和未来 SDK 应保持薄层：typed facade、transferable serialization 和语言 ergonomics。不要把 config resolution、relay routing、retries、caching、contract authority、scheduler policy、backpressure 或 memory lifecycle policy 放进单一 SDK。
 
@@ -61,7 +61,7 @@
 
 | 能力 | 尚未完成 | 实现方向 |
 | --- | --- | --- |
-| 语言中立 contract descriptor 与 codec registry | 当前 descriptor 路径仍由 Python 推导，并且仍把 pickle fallback 作为 Python 的常规默认 wire reference。C-Two 还没有未来 SDK 可用于 codegen 的可移植 descriptor/codec 分层。 | 规范化 `c-two.contract.v1`，把 canonical hash 和 validation authority 放进 Rust `c2-contract`，把 pickle 标记为 Python-only，并增加 built-in、fastdb、标准外部格式和 opaque custom families 的 codec refs。 |
+| 资源优先 contract descriptor、codec refs 与 provider resolution | 当前 descriptor 路径仍由 Python 推导，并且仍把 pickle fallback 作为 Python 的常规默认 wire reference。C-Two 还没有未来 SDK 可用于 codegen 的可移植 descriptor/codec 分层、provider resolution、resource/CRM conformance check 或 portable export 诊断。 | 规范化 `c-two.contract.v1` 和 `CodecRef`，把 canonical hash 和 validation authority 放进 Rust `c2-contract`，把 pickle 标记为 Python-only，增加 built-in、py-arrow、fastdb、标准外部格式和 opaque custom families 的 provider resolution，并让 portable export 对 unresolved codec fail-fast。 |
 | 契约版本兼容 | 精确 CRM 契约校验已经存在，但还没有 semver 或 range-based 兼容协商。 | 保留精确 route validation 作为安全底线。在 Rust `c2-contract` 中增加兼容匹配，再通过 Python 薄 facade 暴露，例如在 `cc.connect(...)` 上支持版本要求。 |
 | `auth_hook` 与 call metadata | C-Two 还没有提供上层实现 AuthN/AuthZ 所需的 metadata 透传和 hook 表面。 | C-Two 提供机制，下游系统如 Toodle 保留策略。metadata 必须显式且保持契约作用域。 |
 | dry-run 钩子 | endgame 架构把 dry-run hooks 列为 M1 收尾项，但公开契约还没有定义。 | 先定义 hook 语义：模拟什么、能看到哪些 metadata、哪些副作用必须禁止。 |
@@ -81,7 +81,7 @@
 
 | 文档 | 现在应如何使用 |
 | --- | --- |
-| [`docs/vision/cross-language-contract-codec-architecture.md`](./vision/cross-language-contract-codec-architecture.md) | 当前跨语言 CRM 契约与 payload codec 分层方向，明确 fastdb 作为第一个 codec 试点。 |
+| [`docs/vision/cross-language-contract-codec-architecture.md`](./vision/cross-language-contract-codec-architecture.md) | 当前资源优先 CRM 投影、opaque codec refs、provider resolution、portable export，以及 fastdb/py-arrow codec 试点方向。 |
 | [`docs/plans/c-two-rpc-v2-roadmap.md`](./plans/c-two-rpc-v2-roadmap.md) | 历史路线图档案。仍有上下文价值，但旧术语和旧路径是预期现象。 |
 | [`docs/vision/endgame-architecture.md`](./vision/endgame-architecture.md) | 长期架构边界和里程碑方向。用它理解能力为什么重要，不要把它当成逐项实现清单。 |
 | [`docs/vision/sota-patterns.md`](./vision/sota-patterns.md) | RPC 模型和剩余高层缺口的设计模式参考。 |
