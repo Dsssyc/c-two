@@ -43,6 +43,28 @@ class UndecoratedHello:
         ...
 
 
+class MissingGreetingImpl:
+    def other(self, name: str) -> str:
+        return name
+
+
+class BadGreetingAnnotationImpl:
+    def greeting(self, name: bytes) -> str:
+        return name.decode()
+
+    def add(self, a: int, b: int) -> int:
+        return a + b
+
+    def echo_none(self, msg: str) -> str | None:
+        return msg
+
+    def get_items(self, ids: list[int]) -> list[str]:
+        return []
+
+    def get_data(self, id: int):
+        return None
+
+
 @pytest.fixture(autouse=True)
 def _clean_registry():
     """Ensure a clean registry for every test."""
@@ -65,6 +87,18 @@ class TestRegisterConnect:
     def test_register_rejects_undecorated_contract_before_server_creation(self):
         with pytest.raises(ValueError, match='decorate it with @cc.crm'):
             cc.register(UndecoratedHello, HelloImpl(), name='hello')
+
+        assert cc.server_address() is None
+
+    def test_register_rejects_resource_missing_crm_method_before_server_creation(self):
+        with pytest.raises(TypeError, match='missing method'):
+            cc.register(Hello, MissingGreetingImpl(), name='hello')
+
+        assert cc.server_address() is None
+
+    def test_register_rejects_resource_annotation_mismatch_before_server_creation(self):
+        with pytest.raises(TypeError, match='greeting.name.*str.*bytes'):
+            cc.register(Hello, BadGreetingAnnotationImpl(), name='hello')
 
         assert cc.server_address() is None
 

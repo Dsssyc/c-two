@@ -13,6 +13,7 @@ from .methods import rpc_method_names
 from .transferable import DEFAULT_PICKLE_PROTOCOL, Transferable
 
 _DESCRIPTOR_SCHEMA = 'c-two.python.crm.descriptor.v2'
+_PORTABLE_CONTRACT_SCHEMA = 'c-two.contract.v1'
 _ABI_SCHEMA = 'c-two.python.crm.abi.v2'
 _SIGNATURE_SCHEMA = 'c-two.python.crm.signature.v2'
 _PICKLE_DEFAULT_REF = {
@@ -90,6 +91,48 @@ def build_contract_fingerprints(
         'schema': _SIGNATURE_SCHEMA,
     }
     return (_hash_descriptor(abi_descriptor), _hash_descriptor(signature_descriptor))
+
+
+def build_portable_contract_descriptor(
+    crm_class: type,
+    methods: list[str] | None = None,
+) -> dict[str, Any]:
+    descriptor = build_contract_descriptor(crm_class, methods, portable=True)
+    return {
+        'crm': descriptor['crm'],
+        'methods': [
+            {
+                'access': method['access'],
+                'buffer': method['buffer'],
+                'name': method['name'],
+                'parameters': [
+                    {
+                        'default': param['default'],
+                        'kind': param['kind'],
+                        'name': param['name'],
+                        'type': param['annotation'],
+                    }
+                    for param in method['parameters']
+                ],
+                'return': method['return'],
+                'wire': method['wire'],
+            }
+            for method in descriptor['methods']
+        ],
+        'schema': _PORTABLE_CONTRACT_SCHEMA,
+    }
+
+
+def export_contract_descriptor(
+    crm_class: type,
+    methods: list[str] | None = None,
+    *,
+    pretty: bool = False,
+) -> str:
+    descriptor = build_portable_contract_descriptor(crm_class, methods)
+    if pretty:
+        return json.dumps(descriptor, sort_keys=True, indent=2) + '\n'
+    return json.dumps(descriptor, sort_keys=True, separators=(',', ':'))
 
 
 def _hash_descriptor(descriptor: dict[str, Any]) -> str:

@@ -41,6 +41,7 @@ from collections.abc import Mapping
 from typing import TypeVar
 
 from c_two.crm.contract import CRMContract, crm_contract, crm_contract_identity
+from c_two.crm.conformance import validate_resource_conformance
 from c_two.config.ipc import ClientIPCOverrides, ServerIPCOverrides
 from c_two.config.settings import settings
 from c_two.error import (
@@ -266,6 +267,7 @@ class _ProcessRegistry:
             The *name* string (echoed back for convenience).
         """
         crm_contract_identity(crm_class)
+        validate_resource_conformance(crm_class, crm_instance)
         with self._lock:
             created_server = False
             try:
