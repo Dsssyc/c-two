@@ -1,3 +1,4 @@
+from .codec import CodecBinding, CodecRef, bind_codec, use_codec
 from .meta import CRMMeta, MethodAccess, get_method_access, read, write
 from .contract import CRMContract, crm_contract, crm_contract_identity
 from .descriptor import build_contract_descriptor, build_contract_fingerprints

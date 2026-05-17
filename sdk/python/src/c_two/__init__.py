@@ -3,6 +3,7 @@ __version__ = version('c-two')
 
 from . import error
 from .config import BaseIPCOverrides, ClientIPCOverrides, ServerIPCOverrides
+from .crm.codec import CodecBinding, CodecRef, bind_codec, use_codec
 from .crm.meta import crm, read, write, on_shutdown
 from .crm.transferable import transferable
 from .crm.transferable import transfer, hold, HeldResult
@@ -29,6 +30,10 @@ __all__ = [
     'BaseIPCOverrides',
     'ClientIPCOverrides',
     'ServerIPCOverrides',
+    'CodecBinding',
+    'CodecRef',
+    'bind_codec',
+    'use_codec',
     'crm',
     'read',
     'write',

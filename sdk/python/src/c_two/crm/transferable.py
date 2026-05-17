@@ -13,6 +13,7 @@ from typing import get_type_hints, Any, Callable, TypeVar, Type
 import struct as _struct
 
 from .. import error
+from .codec import normalize_codec_ref, resolve_codec
 
 
 R = TypeVar('R')
@@ -325,27 +326,38 @@ def get_transferable(full_name: str) -> Transferable | None:
 def _validate_transferable_abi(
     abi_id: str | None,
     abi_schema: str | None,
-) -> tuple[str | None, str | None]:
+    codec_ref: object | None,
+) -> tuple[str | None, str | None, object | None]:
     if abi_id is not None and not isinstance(abi_id, str):
         raise TypeError('abi_id must be a string.')
     if abi_schema is not None and not isinstance(abi_schema, str):
         raise TypeError('abi_schema must be a string.')
     if abi_id is not None and abi_schema is not None:
         raise ValueError('Declare either abi_id or abi_schema, not both.')
+    if codec_ref is not None and (abi_id is not None or abi_schema is not None):
+        raise ValueError('Declare either codec_ref or legacy abi_id/abi_schema, not both.')
     if abi_id is not None and not abi_id.strip():
         raise ValueError('abi_id cannot be empty.')
     if abi_schema is not None and not abi_schema.strip():
         raise ValueError('abi_schema cannot be empty.')
-    return abi_id, abi_schema
+    normalized_codec_ref = normalize_codec_ref(codec_ref) if codec_ref is not None else None
+    return abi_id, abi_schema, normalized_codec_ref
 
 
-def transferable(cls=None, *, abi_id: str | None = None, abi_schema: str | None = None):
+def transferable(
+    cls=None,
+    *,
+    abi_id: str | None = None,
+    abi_schema: str | None = None,
+    codec_ref: object | None = None,
+):
     """Decorator to make a class inherit from Transferable.
 
     Supports ``@cc.transferable``, ``@cc.transferable()``, and explicit ABI
-    declarations for custom byte formats via ``abi_id`` or ``abi_schema``.
+    declarations for custom byte formats via ``abi_id``, ``abi_schema``, or
+    ``codec_ref``.
     """
-    abi_id, abi_schema = _validate_transferable_abi(abi_id, abi_schema)
+    abi_id, abi_schema, codec_ref = _validate_transferable_abi(abi_id, abi_schema, codec_ref)
 
     def wrap(cls):
         new_cls = type(cls.__name__, (cls, Transferable), dict(cls.__dict__))
@@ -355,6 +367,7 @@ def transferable(cls=None, *, abi_id: str | None = None, abi_schema: str | None 
             'abi_id': abi_id,
             'abi_schema': abi_schema,
         }
+        new_cls.__cc_codec_ref__ = codec_ref
         return new_cls
 
     if cls is not None:
@@ -643,6 +656,10 @@ def auto_transfer(func=None, *, input=None, output=None, buffer=None):
                 param_name = getattr(param_type, '__name__', str(param_type))
                 full_name = f'{param_module}.{param_name}' if param_module else param_name
                 input_transferable = get_transferable(full_name)
+                if input_transferable is None:
+                    binding = resolve_codec(param_type, {'function': func, 'position': 'input'})
+                    if binding is not None:
+                        input_transferable = binding.transferable
 
             if input_transferable is None and not is_empty_input:
                 input_transferable = create_default_transferable(func, is_input=True)
@@ -665,6 +682,10 @@ def auto_transfer(func=None, *, input=None, output=None, buffer=None):
                     return_type_module = getattr(return_type, '__module__', None)
                     return_type_full_name = f'{return_type_module}.{return_type_name}' if return_type_module else return_type_name
                     output_transferable = get_transferable(return_type_full_name)
+                    if output_transferable is None:
+                        binding = resolve_codec(return_type, {'function': func, 'position': 'output'})
+                        if binding is not None:
+                            output_transferable = binding.transferable
                     if output_transferable is None and not (return_type is None or return_type is type(None)):
                         output_transferable = create_default_transferable(func, is_input=False)
 
