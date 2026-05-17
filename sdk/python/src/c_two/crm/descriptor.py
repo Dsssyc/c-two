@@ -130,9 +130,13 @@ def export_contract_descriptor(
     pretty: bool = False,
 ) -> str:
     descriptor = build_portable_contract_descriptor(crm_class, methods)
+    compact = json.dumps(descriptor, sort_keys=True, separators=(',', ':'))
+    from c_two._native import validate_portable_contract_descriptor
+
+    validate_portable_contract_descriptor(compact.encode())
     if pretty:
         return json.dumps(descriptor, sort_keys=True, indent=2) + '\n'
-    return json.dumps(descriptor, sort_keys=True, separators=(',', ':'))
+    return compact
 
 
 def _hash_descriptor(descriptor: dict[str, Any]) -> str:

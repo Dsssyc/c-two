@@ -13,6 +13,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 ctrlc = { version = "3", features = ["termination"] }
 c2-config = { path = "../core/foundation/c2-config" }
+c2-contract = { path = "../core/foundation/c2-contract" }
 c2-http = { path = "../core/transport/c2-http", features = ["relay"] }
 percent-encoding = "2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }

@@ -560,6 +560,13 @@ curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c
 
 Source checkouts can link a local development binary with `python tools/dev/c3_tool.py --build --link`; published CLI artifacts are owned by the CLI release pipeline rather than by any language SDK.
 
+Portable CRM descriptors can be exported from Python CRM classes and validated by the Rust CLI before they are used as codegen input:
+
+```bash
+uv run python -m c_two.cli.contract export mypkg.contracts:Grid --out grid.contract.json
+c3 contract validate grid.contract.json
+```
+
 ---
 
 ## Installation

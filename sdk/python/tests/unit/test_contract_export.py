@@ -57,6 +57,27 @@ def test_export_contract_descriptor_returns_canonical_portable_json():
     assert 'python-pickle-default' not in exported
 
 
+def test_export_contract_descriptor_rejects_legacy_custom_abi_after_native_validation():
+    @cc.transferable(abi_id='org.example.legacy.raw.v1')
+    class LegacyCodec:
+        value: int
+
+        def serialize(value: 'LegacyCodec') -> bytes:
+            return b''
+
+        def deserialize(data: bytes) -> 'LegacyCodec':
+            return LegacyCodec(1)
+
+    @cc.crm(namespace='test.contract-export', version='0.1.0')
+    class LegacyPortable:
+        @cc.transfer(input=LegacyCodec, output=LegacyCodec)
+        def echo(self, value: LegacyCodec) -> LegacyCodec:
+            ...
+
+    with pytest.raises(ValueError, match='codec_ref'):
+        cc.export_contract_descriptor(LegacyPortable)
+
+
 def test_contract_export_cli_writes_descriptor(tmp_path, monkeypatch):
     module_path = tmp_path / 'portable_contract_module.py'
     module_path.write_text(

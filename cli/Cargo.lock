@@ -206,6 +206,7 @@ dependencies = [
  "anyhow",
  "assert_cmd",
  "c2-config",
+ "c2-contract",
  "c2-http",
  "clap",
  "ctrlc",

@@ -558,6 +558,13 @@ curl -fsSL https://github.com/world-in-progress/c-two/releases/latest/download/c
 
 源码 checkout 开发时可以通过 `python tools/dev/c3_tool.py --build --link` 链接本地开发二进制；正式 CLI 产物由独立的 CLI release 流水线负责，不归属于任何单一语言 SDK。
 
+Portable CRM descriptor 可以从 Python CRM 类导出，并在作为 codegen 输入前交给 Rust CLI 校验：
+
+```bash
+uv run python -m c_two.cli.contract export mypkg.contracts:Grid --out grid.contract.json
+c3 contract validate grid.contract.json
+```
+
 ---
 
 ## 安装
