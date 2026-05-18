@@ -106,8 +106,6 @@ py-arrow provider 把示例中的手写 adapter 压缩成记录类型声明：
 ```python
 from c_two.providers import arrow
 
-arrow.use_arrow()
-
 @arrow.record
 class GridAttribute:
     level: int
@@ -115,7 +113,7 @@ class GridAttribute:
     activate: bool
 ```
 
-provider 是可选 Python 模块，不由 `import c_two as cc` 隐式导入，也不把 py-arrow 依赖推进 Rust core、CLI 或 SDK 顶层。它负责把被 `@arrow.record` 标记的 dataclass 生成 Arrow IPC `CodecRef` 和 transfer adapter，并负责为 `list[Record]` 生成批量 adapter；默认 schema identity 在 CRM 解析绑定 transferable 时由 `crm_namespace.crm_name.record_name.arrow-ipc.vcrm_version` 生成，canonical schema text 同时包含 CRM namespace/name/version、record name、single/batch mode、字段名、字段类型和 nullable 信息。CRM 作者不需要再为了 `list[GridAttribute]` 手写 `GridAttributeBatch`、方法级 `@cc.transfer(output=...)`、record 级 `schema_id` 或 record 级版本；`@arrow.record(name=...)` 只用于覆盖公开 record 名，`@arrow.record(schema_id=...)` 只留给少数跨 CRM 共享 payload 的显式 identity。不在 provider 支持范围内的 annotation 要么继续走 `c-two.control.json`，要么在 portable export 时明确失败，不能静默回退为 portable-looking pickle。
+provider 是可选 Python 模块，不由 `import c_two as cc` 隐式导入，也不把 py-arrow 依赖推进 Rust core、CLI 或 SDK 顶层。它负责把被 `@arrow.record` 标记的 dataclass 生成 Arrow IPC `CodecRef` 和 transfer adapter，并负责为 `list[Record]` 生成批量 adapter；`@arrow.record` 是完整 opt-in，会标记 record 并为当前进程注册默认 Arrow provider，不再要求额外的 provider 开关。默认 schema identity 在 CRM 解析绑定 transferable 时由 `crm_namespace.crm_name.record_name.arrow-ipc.vcrm_version` 生成，canonical schema text 同时包含 CRM namespace/name/version、record name、single/batch mode、字段名、字段类型和 nullable 信息。CRM 作者不需要再为了 `list[GridAttribute]` 手写 `GridAttributeBatch`、方法级 `@cc.transfer(output=...)`、record 级 `schema_id` 或 record 级版本；`@arrow.record(name=...)` 只用于覆盖公开 record 名，`@arrow.record(schema_id=...)` 只留给少数跨 CRM 共享 payload 的显式 identity。不在 provider 支持范围内的 annotation 要么继续走 `c-two.control.json`，要么在 portable export 时明确失败，不能静默回退为 portable-looking pickle。
 
 ## Portable Export 规则
 

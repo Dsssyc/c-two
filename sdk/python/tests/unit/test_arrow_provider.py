@@ -23,6 +23,8 @@ def clear_codec_registry():
 def test_arrow_record_provider_generates_deterministic_codec_and_round_trips():
     from c_two.providers import arrow
 
+    assert not hasattr(arrow, 'use_arrow')
+
     @arrow.record(schema_id='test.point.arrow-ipc.v1')
     class Point:
         x: float
@@ -83,8 +85,6 @@ def test_arrow_provider_supports_list_record_wire_without_manual_transfer():
         level: int
         global_id: int
         active: bool
-
-    arrow.use_arrow()
 
     @cc.crm(namespace='test.arrow-provider', version='0.1.0')
     class CellStore:
@@ -178,8 +178,6 @@ def test_arrow_provider_descriptor_helper_keeps_plain_dataclass_portable():
     class Sample:
         value: int
 
-    arrow.use_arrow()
-
     @cc.crm(namespace='test.arrow-provider', version='0.1.0')
     class SampleStore:
         def echo(self, sample: Sample) -> Sample:
@@ -199,8 +197,6 @@ def test_arrow_default_schema_identity_uses_crm_version():
     @arrow.record
     class Versioned:
         value: int
-
-    arrow.use_arrow()
 
     def make_store(version: str):
         @cc.crm(namespace='test.arrow-version', version=version)
@@ -234,8 +230,6 @@ def test_arrow_record_name_and_schema_id_overrides():
     @arrow.record(schema_id='org.example.shared-cell.arrow-ipc')
     class ExplicitCell:
         value: int
-
-    arrow.use_arrow()
 
     @cc.crm(namespace='test.arrow-overrides', version='1.2.3')
     class OverrideStore:

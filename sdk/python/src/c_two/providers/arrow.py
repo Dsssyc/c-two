@@ -110,6 +110,7 @@ def record(
                 schema_id=schema_id.strip() if schema_id is not None else None,
             ),
         )
+        use_codec(_DEFAULT_PROVIDER)
         return record_cls
 
     if cls is not None:
@@ -219,13 +220,6 @@ class ArrowCodecProvider:
 
 
 _DEFAULT_PROVIDER = ArrowCodecProvider()
-
-
-def use_arrow(provider: ArrowCodecProvider | None = None) -> ArrowCodecProvider:
-    """Register the Arrow IPC provider with C-Two's codec registry."""
-    selected = provider or _DEFAULT_PROVIDER
-    use_codec(selected)
-    return selected
 
 
 def _make_transferable(
@@ -414,5 +408,4 @@ __all__ = [
     'ArrowCodecProvider',
     'ArrowRecordOptions',
     'record',
-    'use_arrow',
 ]

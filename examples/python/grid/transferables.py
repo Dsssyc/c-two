@@ -1,7 +1,5 @@
 from c_two.providers import arrow
 
-arrow.use_arrow()
-
 
 @arrow.record
 class GridSchema:

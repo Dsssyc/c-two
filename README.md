@@ -588,12 +588,10 @@ c3 contract infer mypkg.resources:GridResource \
   --out grid.contract.json
 ```
 
-Payload codecs are enabled through providers, not by making C-Two core understand every wire format. The py-arrow provider is the optional `c_two.providers.arrow` module: import it only in projects that need Arrow IPC, call `arrow.use_arrow()`, mark dataclass payloads with `@arrow.record`, and let CRM-bound provider resolution generate both single-record and `list[record]` batch codec refs for portable descriptors. By default, Arrow schema identity is derived from the CRM namespace, CRM name, CRM version, and record name, so per-record `schema_id` or per-record versions are not the normal path.
+Payload codecs are enabled through providers, not by making C-Two core understand every wire format. The py-arrow provider is the optional `c_two.providers.arrow` module: import it only in projects that need Arrow IPC, mark dataclass payloads with `@arrow.record`, and let CRM-bound provider resolution generate both single-record and `list[record]` batch codec refs for portable descriptors. `@arrow.record` is the complete opt-in: it marks the record and registers the default Arrow provider for the current process. By default, Arrow schema identity is derived from the CRM namespace, CRM name, CRM version, and record name, so per-record `schema_id` or per-record versions are not the normal path.
 
 ```python
 from c_two.providers import arrow
-
-arrow.use_arrow()
 
 @arrow.record
 class GridAttribute:

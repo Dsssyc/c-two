@@ -586,6 +586,18 @@ c3 contract infer mypkg.resources:GridResource \
   --out grid.contract.json
 ```
 
+Payload codec 通过 provider 启用，而不是让 C-Two core 理解每一种 wire format。py-arrow provider 是可选的 `c_two.providers.arrow` 模块：只在需要 Arrow IPC 的项目里导入它，用 `@arrow.record` 标记 dataclass payload，然后让 CRM 绑定阶段自动生成 single-record 和 `list[record]` batch 的 codec ref。`@arrow.record` 是完整 opt-in：它会标记 record，并为当前进程注册默认 Arrow provider。默认 Arrow schema identity 由 CRM namespace、CRM name、CRM version 和 record name 派生，因此主路径不需要为每个 record 手写 `schema_id` 或 record 级版本。
+
+```python
+from c_two.providers import arrow
+
+@arrow.record
+class GridAttribute:
+    level: int
+    global_id: int
+    activate: bool
+```
+
 ---
 
 ## 安装
