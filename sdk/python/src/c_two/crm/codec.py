@@ -136,10 +136,8 @@ def use_codec(provider: Any) -> Any:
 
 
 def resolve_codec(python_type: object, context: object | None = None) -> CodecBinding | None:
-    if not isinstance(python_type, type):
-        return None
     with _CODEC_LOCK:
-        explicit = _CODEC_BINDINGS.get(python_type)
+        explicit = _CODEC_BINDINGS.get(python_type) if isinstance(python_type, type) else None
         providers = tuple(_CODEC_PROVIDERS)
     if explicit is not None:
         return explicit
@@ -152,7 +150,7 @@ def resolve_codec(python_type: object, context: object | None = None) -> CodecBi
     if len(matches) > 1:
         names = ', '.join(binding.codec_ref.id for binding in matches)
         raise ValueError(
-            f'Multiple codec candidates found for {python_type.__name__}: {names}. '
+            f'Multiple codec candidates found for {_type_label(python_type)}: {names}. '
             'Use cc.bind_codec(...) to choose one explicitly.',
         )
     if not matches:
@@ -166,14 +164,14 @@ def _clear_codec_registry_for_tests() -> None:
         _CODEC_PROVIDERS.clear()
 
 
-def _query_provider(provider: Any, python_type: type, context: object | None) -> Any:
+def _query_provider(provider: Any, python_type: object, context: object | None) -> Any:
     method = getattr(provider, 'candidates_for_type', None)
     if callable(method):
         return _call_provider(method, python_type, context)
     return _call_provider(provider, python_type, context)
 
 
-def _call_provider(provider: Any, python_type: type, context: object | None) -> Any:
+def _call_provider(provider: Any, python_type: object, context: object | None) -> Any:
     try:
         signature = inspect.signature(provider)
     except (TypeError, ValueError):
@@ -205,6 +203,12 @@ def _candidate_iter(result: Any) -> Iterable[Any]:
     if isinstance(result, Iterable) and not isinstance(result, (str, bytes, bytearray)):
         return tuple(result)
     raise TypeError(f'codec provider returned unsupported candidate {result!r}.')
+
+
+def _type_label(value: object) -> str:
+    if isinstance(value, type):
+        return value.__name__
+    return repr(value)
 
 
 def _binding_from_candidate(candidate: CodecBinding | type | dict[str, Any]) -> CodecBinding:

@@ -7,7 +7,7 @@ import types
 from typing import Any, ForwardRef, Union, get_args, get_origin, get_type_hints
 
 from .contract import crm_contract_identity
-from .codec import CodecRef, codec_ref_for_transferable
+from .codec import CodecRef, codec_ref_for_transferable, resolve_codec
 from .meta import MethodAccess, get_method_access
 from .methods import rpc_method_names
 from .transferable import DEFAULT_PICKLE_PROTOCOL, Transferable
@@ -171,8 +171,10 @@ def _method_descriptor(
         if not (index == 0 and param.name in {'self', 'cls'})
     ]
     input_annotation_ref = _codec_ref_for_annotation(input_transferable)
+    input_annotation_transferable = input_transferable
     if len(signature_params) != 1:
         input_annotation_ref = None
+        input_annotation_transferable = None
 
     params = []
     for param in signature_params:
@@ -194,6 +196,7 @@ def _method_descriptor(
                 annotation,
                 method_name,
                 codec_ref=input_annotation_ref,
+                transferable_cls=input_annotation_transferable,
             ),
             'default': _default_descriptor(param.default, method_name, param.name),
             'kind': param.kind.name,
@@ -219,6 +222,7 @@ def _method_descriptor(
             return_annotation,
             method_name,
             codec_ref=_codec_ref_for_annotation(output_transferable),
+            transferable_cls=output_transferable,
         ),
         'transfer': {
             'input': _transfer_annotation_descriptor(input_transferable),
@@ -249,6 +253,7 @@ def _annotation_descriptor(
     method_name: str,
     *,
     codec_ref: CodecRef | None = None,
+    transferable_cls: type | None = None,
 ) -> dict[str, Any]:
     if annotation is inspect.Signature.empty:
         raise TypeError(f'{method_name} contains a missing annotation.')
@@ -276,8 +281,13 @@ def _annotation_descriptor(
     if origin is list:
         if not args:
             raise TypeError(f'{method_name} uses a bare container annotation.')
+        item_codec_ref = _item_codec_ref_for_transferable(transferable_cls)
         return {
-            'item': _annotation_descriptor(args[0], method_name),
+            'item': _annotation_descriptor(
+                args[0],
+                method_name,
+                codec_ref=item_codec_ref,
+            ),
             'kind': 'list',
         }
     if origin is dict:
@@ -314,10 +324,27 @@ def _annotation_descriptor(
             'abi_ref': _transferable_abi_ref(annotation),
             'kind': 'transferable',
         }
+    binding = resolve_codec(annotation, {'method': method_name, 'position': 'annotation'})
+    if binding is not None:
+        return {
+            'codec': binding.codec_ref.to_wire_ref(),
+            'kind': 'codec',
+        }
 
     raise TypeError(
         f'{method_name} contains unsupported annotation {annotation!r}.',
     )
+
+
+def _item_codec_ref_for_transferable(transferable_cls: type | None) -> CodecRef | None:
+    if transferable_cls is None:
+        return None
+    ref = getattr(transferable_cls, '_c2_item_codec_ref', None)
+    if ref is None:
+        return None
+    if isinstance(ref, CodecRef):
+        return ref
+    return None
 
 
 def _default_descriptor(value: object, method_name: str, param_name: str) -> dict[str, Any]:

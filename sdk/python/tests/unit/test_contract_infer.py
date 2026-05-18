@@ -147,6 +147,7 @@ def test_grid_resource_infer_smoke_exports_portable_subset(monkeypatch):
 
     methods = [
         'get_schema',
+        'get_grid_infos',
         'subdivide_grids',
         'get_active_grid_infos',
         'hello',
@@ -165,6 +166,9 @@ def test_grid_resource_infer_smoke_exports_portable_subset(monkeypatch):
 
     assert [method['name'] for method in descriptor['methods']] == methods
     assert by_name['get_schema']['wire']['output']['id'] == 'org.apache.arrow.ipc'
+    assert by_name['get_grid_infos']['wire']['output']['id'] == 'org.apache.arrow.ipc'
+    assert by_name['get_grid_infos']['return']['kind'] == 'list'
+    assert by_name['get_grid_infos']['return']['item']['kind'] == 'codec'
     assert by_name['subdivide_grids']['wire']['input']['id'] == 'c-two.control.json'
     assert by_name['subdivide_grids']['wire']['output']['id'] == 'c-two.control.json'
     assert by_name['get_active_grid_infos']['wire']['output']['id'] == 'c-two.control.json'
