@@ -1,7 +1,9 @@
+from dataclasses import dataclass
 from c_two.providers import arrow
 
 
 @arrow.record
+@dataclass
 class GridSchema:
     """
     Grid Schema
@@ -18,6 +20,7 @@ class GridSchema:
 
 
 @arrow.record
+@dataclass
 class GridAttribute:
     """
     Attributes of Grid
