@@ -65,6 +65,17 @@ class BadGreetingAnnotationImpl:
         return None
 
 
+@cc.crm(namespace='test.direct_error', version='0.1.0')
+class DirectError:
+    def fail(self) -> str:
+        ...
+
+
+class DirectErrorImpl:
+    def fail(self) -> str:
+        raise RuntimeError('direct resource failed')
+
+
 @pytest.fixture(autouse=True)
 def _clean_registry():
     """Ensure a clean registry for every test."""
@@ -119,6 +130,16 @@ class TestRegisterConnect:
         try:
             result = crm.greeting('World')
             assert result == 'Hello, World!'
+        finally:
+            cc.close(crm)
+
+    def test_connect_thread_local_resource_error_is_classified(self):
+        """Thread-local resource errors should not be masked by client wrapper state."""
+        cc.register(DirectError, DirectErrorImpl(), name='direct-error')
+        crm = cc.connect(DirectError, name='direct-error')
+        try:
+            with pytest.raises(cc.error.ResourceExecuteFunction, match='direct resource failed'):
+                crm.fail()
         finally:
             cc.close(crm)
 

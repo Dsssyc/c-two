@@ -759,6 +759,7 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view', codec_
     method_name = func.__name__
 
     def com_to_crm(*args, _c2_buffer=None):
+        stage = 'call_crm'
         input_transferable = input.serialize if input else None
         # Output construction hook: from_buffer when hold mode and available
         if output is not None:
@@ -781,6 +782,7 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view', codec_
             request = args[1:] if len(args) > 1 else None
             # Thread fast path — skip all serialization/deserialization
             if getattr(client, 'supports_direct_call', False):
+                stage = 'execute_direct'
                 result = client.call_direct(method_name, request or ())
                 if _c2_buffer == 'hold':
                     return HeldResult(result, None)
@@ -856,6 +858,8 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view', codec_
                 raise error.ClientSerializeInput(str(e)) from e
             elif stage == 'call_crm':
                 raise error.ClientCallResource(str(e)) from e
+            elif stage == 'execute_direct':
+                raise error.ResourceExecuteFunction(str(e)) from e
             elif output_hook == 'from_buffer':
                 raise error.ClientOutputFromBuffer(str(e)) from e
             else:

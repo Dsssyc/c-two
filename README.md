@@ -600,6 +600,8 @@ class GridAttribute:
     activate: bool
 ```
 
+To disable Arrow for a Python-only local fallback, replace `@arrow.record` with `@dataclass` so the payload remains a normal constructible Python object; unmarked payloads can use pickle in non-portable local/IPC paths, but portable export will still fail on `python-pickle-default`.
+
 ---
 
 ## Installation

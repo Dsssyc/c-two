@@ -598,6 +598,8 @@ class GridAttribute:
     activate: bool
 ```
 
+如果要临时关闭 Arrow、回退到 Python-only 本地路径，请把 `@arrow.record` 替换成 `@dataclass`，确保 payload 仍然是普通可构造的 Python 对象；未标记的 payload 可以在非 portable 的本地/IPC 路径中走 pickle，但 portable export 仍会因为 `python-pickle-default` 失败。
+
 ---
 
 ## 安装

@@ -198,6 +198,7 @@ def _method_descriptor(
                 method_name,
                 codec_ref=input_annotation_ref,
                 codec_context=codec_context,
+                portable=portable,
                 transferable_cls=input_annotation_transferable,
             ),
             'default': _default_descriptor(param.default, method_name, param.name),
@@ -225,6 +226,7 @@ def _method_descriptor(
             method_name,
             codec_ref=_codec_ref_for_annotation(output_transferable),
             codec_context=codec_context,
+            portable=portable,
             transferable_cls=output_transferable,
         ),
         'transfer': {
@@ -257,6 +259,7 @@ def _annotation_descriptor(
     *,
     codec_ref: CodecRef | None = None,
     codec_context: dict[str, Any] | None = None,
+    portable: bool = False,
     transferable_cls: type | None = None,
 ) -> dict[str, Any]:
     if annotation is inspect.Signature.empty:
@@ -277,7 +280,7 @@ def _annotation_descriptor(
     args = get_args(annotation)
     if origin in {Union, types.UnionType}:
         items = [
-            _annotation_descriptor(arg, method_name, codec_context=codec_context)
+            _annotation_descriptor(arg, method_name, codec_context=codec_context, portable=portable)
             for arg in args
         ]
         items.sort(key=_canonical_json)
@@ -292,6 +295,7 @@ def _annotation_descriptor(
                 method_name,
                 codec_ref=item_codec_ref,
                 codec_context=codec_context,
+                portable=portable,
             ),
             'kind': 'list',
         }
@@ -299,21 +303,36 @@ def _annotation_descriptor(
         if len(args) != 2:
             raise TypeError(f'{method_name} uses a bare container annotation.')
         return {
-            'key': _annotation_descriptor(args[0], method_name, codec_context=codec_context),
+            'key': _annotation_descriptor(
+                args[0],
+                method_name,
+                codec_context=codec_context,
+                portable=portable,
+            ),
             'kind': 'dict',
-            'value': _annotation_descriptor(args[1], method_name, codec_context=codec_context),
+            'value': _annotation_descriptor(
+                args[1],
+                method_name,
+                codec_context=codec_context,
+                portable=portable,
+            ),
         }
     if origin is tuple:
         if not args:
             raise TypeError(f'{method_name} uses a bare container annotation.')
         if len(args) == 2 and args[1] is Ellipsis:
             return {
-                'item': _annotation_descriptor(args[0], method_name, codec_context=codec_context),
+                'item': _annotation_descriptor(
+                    args[0],
+                    method_name,
+                    codec_context=codec_context,
+                    portable=portable,
+                ),
                 'kind': 'tuple_variadic',
             }
         return {
             'items': [
-                _annotation_descriptor(arg, method_name, codec_context=codec_context)
+                _annotation_descriptor(arg, method_name, codec_context=codec_context, portable=portable)
                 for arg in args
             ],
             'kind': 'tuple',
@@ -339,10 +358,26 @@ def _annotation_descriptor(
             'codec': binding.codec_ref.to_wire_ref(),
             'kind': 'codec',
         }
+    if not portable and isinstance(annotation, type):
+        return _python_type_descriptor(annotation)
 
     raise TypeError(
         f'{method_name} contains unsupported annotation {annotation!r}.',
     )
+
+
+def _python_type_descriptor(annotation: type) -> dict[str, str]:
+    module = getattr(annotation, '__module__', None)
+    name = getattr(annotation, '__name__', None)
+    if not isinstance(module, str) or not module:
+        module = '<unknown>'
+    if not isinstance(name, str) or not name:
+        name = '<anonymous>'
+    return {
+        'kind': 'python_type',
+        'module': module,
+        'name': name,
+    }
 
 
 def _item_codec_ref_for_transferable(transferable_cls: type | None) -> CodecRef | None:
