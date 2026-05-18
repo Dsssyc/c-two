@@ -5,6 +5,7 @@ from . import error
 from .config import BaseIPCOverrides, ClientIPCOverrides, ServerIPCOverrides
 from .crm.codec import CodecBinding, CodecRef, bind_codec, use_codec
 from .crm.descriptor import export_contract_descriptor
+from .crm.infer import infer_crm_from_resource
 from .crm.meta import crm, read, write, on_shutdown
 from .crm.transferable import transferable
 from .crm.transferable import transfer, hold, HeldResult
@@ -35,6 +36,7 @@ __all__ = [
     'CodecRef',
     'bind_codec',
     'export_contract_descriptor',
+    'infer_crm_from_resource',
     'use_codec',
     'crm',
     'read',

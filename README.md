@@ -564,7 +564,21 @@ Portable CRM descriptors can be exported from Python CRM classes and validated b
 
 ```bash
 uv run python -m c_two.cli.contract export mypkg.contracts:Grid --out grid.contract.json
+c3 contract export mypkg.contracts:Grid --python .venv/bin/python --out grid.contract.json
 c3 contract validate grid.contract.json
+```
+
+For resource-first projects, `infer` can build a CRM projection descriptor from explicitly selected Python resource methods. Inference does not expose all public methods and it still requires every selected method to resolve to portable control envelopes or explicit codec refs:
+
+```bash
+c3 contract infer mypkg.resources:GridResource \
+  --python .venv/bin/python \
+  --namespace mypkg.grid \
+  --version 0.1.0 \
+  --name Grid \
+  --method get_schema \
+  --method subdivide_grids \
+  --out grid.contract.json
 ```
 
 ---
