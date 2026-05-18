@@ -3,7 +3,7 @@ from c_two.providers import arrow
 arrow.use_arrow()
 
 
-@arrow.record(schema_id='c-two.examples.grid-schema.arrow-ipc.v1')
+@arrow.record
 class GridSchema:
     """
     Grid Schema
@@ -19,7 +19,7 @@ class GridSchema:
     subdivide_rules: list[list[int]]  # [(sub_width, sub_height), ...]
 
 
-@arrow.record(schema_id='c-two.examples.grid-attribute.arrow-ipc.v1')
+@arrow.record
 class GridAttribute:
     """
     Attributes of Grid

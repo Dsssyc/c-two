@@ -161,6 +161,7 @@ def _method_descriptor(
     sig = inspect.signature(signature_target)
     type_hints = _resolved_type_hints(signature_target, method_name)
     transfer = getattr(method, '__cc_transfer__', None) or {}
+    codec_context = getattr(method, '_codec_context', None) or {}
     input_transferable = getattr(method, '_input_transferable', None)
     output_transferable = getattr(method, '_output_transferable', None)
     buffer_mode = getattr(method, '_input_buffer_mode', transfer.get('buffer', 'view'))
@@ -196,6 +197,7 @@ def _method_descriptor(
                 annotation,
                 method_name,
                 codec_ref=input_annotation_ref,
+                codec_context=codec_context,
                 transferable_cls=input_annotation_transferable,
             ),
             'default': _default_descriptor(param.default, method_name, param.name),
@@ -222,6 +224,7 @@ def _method_descriptor(
             return_annotation,
             method_name,
             codec_ref=_codec_ref_for_annotation(output_transferable),
+            codec_context=codec_context,
             transferable_cls=output_transferable,
         ),
         'transfer': {
@@ -253,6 +256,7 @@ def _annotation_descriptor(
     method_name: str,
     *,
     codec_ref: CodecRef | None = None,
+    codec_context: dict[str, Any] | None = None,
     transferable_cls: type | None = None,
 ) -> dict[str, Any]:
     if annotation is inspect.Signature.empty:
@@ -273,7 +277,7 @@ def _annotation_descriptor(
     args = get_args(annotation)
     if origin in {Union, types.UnionType}:
         items = [
-            _annotation_descriptor(arg, method_name)
+            _annotation_descriptor(arg, method_name, codec_context=codec_context)
             for arg in args
         ]
         items.sort(key=_canonical_json)
@@ -287,6 +291,7 @@ def _annotation_descriptor(
                 args[0],
                 method_name,
                 codec_ref=item_codec_ref,
+                codec_context=codec_context,
             ),
             'kind': 'list',
         }
@@ -294,21 +299,21 @@ def _annotation_descriptor(
         if len(args) != 2:
             raise TypeError(f'{method_name} uses a bare container annotation.')
         return {
-            'key': _annotation_descriptor(args[0], method_name),
+            'key': _annotation_descriptor(args[0], method_name, codec_context=codec_context),
             'kind': 'dict',
-            'value': _annotation_descriptor(args[1], method_name),
+            'value': _annotation_descriptor(args[1], method_name, codec_context=codec_context),
         }
     if origin is tuple:
         if not args:
             raise TypeError(f'{method_name} uses a bare container annotation.')
         if len(args) == 2 and args[1] is Ellipsis:
             return {
-                'item': _annotation_descriptor(args[0], method_name),
+                'item': _annotation_descriptor(args[0], method_name, codec_context=codec_context),
                 'kind': 'tuple_variadic',
             }
         return {
             'items': [
-                _annotation_descriptor(arg, method_name)
+                _annotation_descriptor(arg, method_name, codec_context=codec_context)
                 for arg in args
             ],
             'kind': 'tuple',
@@ -324,7 +329,11 @@ def _annotation_descriptor(
             'abi_ref': _transferable_abi_ref(annotation),
             'kind': 'transferable',
         }
-    binding = resolve_codec(annotation, {'method': method_name, 'position': 'annotation'})
+    resolution_context = dict(codec_context or {})
+    resolution_context['method'] = method_name
+    resolution_context['method_name'] = method_name
+    resolution_context['position'] = 'annotation'
+    binding = resolve_codec(annotation, resolution_context)
     if binding is not None:
         return {
             'codec': binding.codec_ref.to_wire_ref(),

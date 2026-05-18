@@ -750,7 +750,7 @@ def transfer(*, input=None, output=None, buffer=None):
     return decorator
 
 
-def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
+def _build_transfer_wrapper(func, input=None, output=None, buffer='view', codec_context=None):
     """Build the com_to_crm / crm_to_com / transfer_wrapper closure.
 
     This is the internal implementation that was previously inside transfer().
@@ -969,9 +969,10 @@ def _build_transfer_wrapper(func, input=None, output=None, buffer='view'):
     transfer_wrapper._input_buffer_mode = buffer
     transfer_wrapper._input_transferable = input
     transfer_wrapper._output_transferable = output
+    transfer_wrapper._codec_context = dict(codec_context or {})
     return transfer_wrapper
 
-def auto_transfer(func=None, *, input=None, output=None, buffer=None):
+def auto_transfer(func=None, *, input=None, output=None, buffer=None, codec_context=None):
     """Auto-wrap a function with transfer logic.
 
     When called without kwargs, performs auto-matching:
@@ -984,6 +985,9 @@ def auto_transfer(func=None, *, input=None, output=None, buffer=None):
     - buffer='view'/'hold': explicit override
     """
     def create_wrapper(func):
+        base_codec_context = dict(codec_context or {})
+        base_codec_context.setdefault('method_name', func.__name__)
+
         # --- Input Matching ---
         input_transferable = input
 
@@ -998,7 +1002,10 @@ def auto_transfer(func=None, *, input=None, output=None, buffer=None):
                 full_name = f'{param_module}.{param_name}' if param_module else param_name
                 input_transferable = get_transferable(full_name)
                 if input_transferable is None:
-                    binding = resolve_codec(param_type, {'function': func, 'position': 'input'})
+                    binding = resolve_codec(
+                        param_type,
+                        _codec_resolution_context(base_codec_context, func, 'input'),
+                    )
                     if binding is not None:
                         input_transferable = binding.transferable
 
@@ -1031,7 +1038,10 @@ def auto_transfer(func=None, *, input=None, output=None, buffer=None):
                     return_type_full_name = f'{return_type_module}.{return_type_name}' if return_type_module else return_type_name
                     output_transferable = get_transferable(return_type_full_name)
                     if output_transferable is None:
-                        binding = resolve_codec(return_type, {'function': func, 'position': 'output'})
+                        binding = resolve_codec(
+                            return_type,
+                            _codec_resolution_context(base_codec_context, func, 'output'),
+                        )
                         if binding is not None:
                             output_transferable = binding.transferable
                     if output_transferable is None and _is_control_json_annotation(return_type):
@@ -1071,7 +1081,13 @@ def auto_transfer(func=None, *, input=None, output=None, buffer=None):
                 )
 
         # --- Wrapping ---
-        wrapped_func = _build_transfer_wrapper(func, input=input_transferable, output=output_transferable, buffer=effective_buffer)
+        wrapped_func = _build_transfer_wrapper(
+            func,
+            input=input_transferable,
+            output=output_transferable,
+            buffer=effective_buffer,
+            codec_context=base_codec_context,
+        )
         return wrapped_func
 
     if func is None:
@@ -1082,6 +1098,18 @@ def auto_transfer(func=None, *, input=None, output=None, buffer=None):
         return create_wrapper(func)
 
 # Helpers #########################################################################
+
+def _codec_resolution_context(
+    base_context: dict[str, Any],
+    func: Callable,
+    position: str,
+) -> dict[str, Any]:
+    context = dict(base_context)
+    context['function'] = func
+    context['position'] = position
+    context.setdefault('method_name', func.__name__)
+    return context
+
 
 def _extract_func_params(func: Callable) -> list[tuple[str, type, Any]]:
     """

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import types
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, ForwardRef, Union, get_args, get_origin, get_type_hints
 
@@ -28,7 +30,8 @@ _GENERATED_MODULE = 'c_two.providers.arrow.generated'
 
 @dataclass(frozen=True)
 class ArrowRecordOptions:
-    schema_id: str
+    name: str | None = None
+    schema_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -42,24 +45,39 @@ class _ArrowFieldSpec:
 @dataclass(frozen=True)
 class _ArrowRecordSpec:
     record_type: type
+    record_name: str
     schema_id: str
+    crm_namespace: str | None
+    crm_name: str | None
+    crm_version: str | None
     fields: tuple[_ArrowFieldSpec, ...]
 
-    @property
-    def schema_text(self) -> str:
-        fields = ','.join(
-            f'{field.name}:{field.type_text}{"?" if field.nullable else ""}'
-            for field in self.fields
-        )
-        return f'{self.schema_id};fields={fields}'
-
-    @property
-    def batch_schema_text(self) -> str:
-        fields = ','.join(
-            f'{field.name}:{field.type_text}{"?" if field.nullable else ""}'
-            for field in self.fields
-        )
-        return f'{self.schema_id}.batch;items={self.schema_id};fields={fields}'
+    def schema_text(self, mode: str) -> str:
+        if mode not in {'single', 'batch'}:
+            raise ValueError(f'unsupported Arrow schema mode: {mode!r}')
+        payload: dict[str, object] = {
+            'codec': ARROW_IPC_CODEC_ID,
+            'codec_version': ARROW_IPC_CODEC_VERSION,
+            'fields': [
+                {
+                    'name': field.name,
+                    'nullable': field.nullable,
+                    'type': field.type_text,
+                }
+                for field in self.fields
+            ],
+            'mode': mode,
+            'record': self.record_name,
+            'schema': 'c-two.arrow.record.v1',
+            'schema_id': self.schema_id,
+        }
+        if self.crm_namespace is not None:
+            payload['crm'] = {
+                'name': self.crm_name,
+                'namespace': self.crm_namespace,
+                'version': self.crm_version,
+            }
+        return json.dumps(payload, sort_keys=True, separators=(',', ':'))
 
     def arrow_schema(self) -> Any:
         return pa.schema([
@@ -68,20 +86,35 @@ class _ArrowRecordSpec:
         ])
 
 
-def record(cls: type | None = None, *, schema_id: str | None = None):
+def record(
+    cls: type | None = None,
+    *,
+    name: str | None = None,
+    schema_id: str | None = None,
+):
     """Mark a dataclass-like record as an Arrow IPC payload type."""
 
     def wrap(target: type) -> type:
         if not isinstance(target, type):
             raise TypeError('@arrow.record must decorate a class.')
+        if name is not None and (not isinstance(name, str) or not name.strip()):
+            raise ValueError('name must be a non-empty string.')
         if schema_id is not None and (not isinstance(schema_id, str) or not schema_id.strip()):
             raise ValueError('schema_id must be a non-empty string.')
         record_cls = target if dataclasses.is_dataclass(target) else dataclasses.dataclass(target)
-        effective_schema_id = schema_id or f'{record_cls.__module__}.{record_cls.__qualname__}.arrow-ipc.v1'
-        setattr(record_cls, _RECORD_MARKER, ArrowRecordOptions(schema_id=effective_schema_id))
+        setattr(
+            record_cls,
+            _RECORD_MARKER,
+            ArrowRecordOptions(
+                name=name.strip() if name is not None else None,
+                schema_id=schema_id.strip() if schema_id is not None else None,
+            ),
+        )
         return record_cls
 
     if cls is not None:
+        if not isinstance(cls, type):
+            raise TypeError('@arrow.record must decorate a class.')
         return wrap(cls)
     return wrap
 
@@ -90,8 +123,8 @@ class ArrowCodecProvider:
     """C-Two codec provider for dataclass records encoded as Arrow IPC streams."""
 
     def __init__(self) -> None:
-        self._single_cache: dict[type, CodecBinding] = {}
-        self._batch_cache: dict[type, CodecBinding] = {}
+        self._single_cache: dict[tuple[type, str, str], CodecBinding] = {}
+        self._batch_cache: dict[tuple[type, str, str], CodecBinding] = {}
 
     def candidates_for_type(
         self,
@@ -99,20 +132,21 @@ class ArrowCodecProvider:
         context: object | None = None,
     ) -> CodecBinding | None:
         if _is_arrow_record(annotation):
-            return self._single_binding(annotation)
+            return self._single_binding(annotation, context)
         origin = get_origin(annotation)
         args = get_args(annotation)
         if origin is list and len(args) == 1 and _is_arrow_record(args[0]):
-            return self._batch_binding(args[0])
+            return self._batch_binding(args[0], context)
         return None
 
-    def _single_binding(self, record_type: type) -> CodecBinding:
-        cached = self._single_cache.get(record_type)
+    def _single_binding(self, record_type: type, context: object | None) -> CodecBinding:
+        spec = _record_spec(record_type, context)
+        schema_text = spec.schema_text('single')
+        cached = self._single_cache.get((record_type, 'single', schema_text))
         if cached is not None:
             return cached
-        spec = _record_spec(record_type)
         schema = spec.arrow_schema()
-        codec_ref = _codec_ref_for_schema(spec.schema_text)
+        codec_ref = _codec_ref_for_schema(schema_text)
 
         def serialize(value: object) -> bytes:
             if not isinstance(value, record_type):
@@ -131,23 +165,25 @@ class ArrowCodecProvider:
             return record_type(**rows[0])
 
         transferable = _make_transferable(
-            f'Arrow{record_type.__name__}Transferable',
+            _generated_class_name(record_type, 'Transferable', codec_ref),
             codec_ref,
             serialize,
             deserialize,
+            schema_text=schema_text,
         )
         binding = CodecBinding(transferable=transferable, codec_ref=codec_ref)
-        self._single_cache[record_type] = binding
+        self._single_cache[(record_type, 'single', schema_text)] = binding
         return binding
 
-    def _batch_binding(self, record_type: type) -> CodecBinding:
-        cached = self._batch_cache.get(record_type)
+    def _batch_binding(self, record_type: type, context: object | None) -> CodecBinding:
+        spec = _record_spec(record_type, context)
+        schema_text = spec.schema_text('batch')
+        cached = self._batch_cache.get((record_type, 'batch', schema_text))
         if cached is not None:
             return cached
-        spec = _record_spec(record_type)
         schema = spec.arrow_schema()
-        item_binding = self._single_binding(record_type)
-        codec_ref = _codec_ref_for_schema(spec.batch_schema_text)
+        item_binding = self._single_binding(record_type, context)
+        codec_ref = _codec_ref_for_schema(schema_text)
 
         def serialize(values: list[object]) -> bytes:
             if not isinstance(values, list):
@@ -170,14 +206,15 @@ class ArrowCodecProvider:
             ]
 
         transferable = _make_transferable(
-            f'Arrow{record_type.__name__}BatchTransferable',
+            _generated_class_name(record_type, 'BatchTransferable', codec_ref),
             codec_ref,
             serialize,
             deserialize,
             item_codec_ref=item_binding.codec_ref,
+            schema_text=schema_text,
         )
         binding = CodecBinding(transferable=transferable, codec_ref=codec_ref)
-        self._batch_cache[record_type] = binding
+        self._batch_cache[(record_type, 'batch', schema_text)] = binding
         return binding
 
 
@@ -198,16 +235,23 @@ def _make_transferable(
     deserialize,
     *,
     item_codec_ref: CodecRef | None = None,
+    schema_text: str,
 ) -> type:
     attrs: dict[str, object] = {
         '__module__': _GENERATED_MODULE,
         '__cc_codec_ref__': codec_ref,
+        '_c2_schema_text': schema_text,
         'serialize': serialize,
         'deserialize': deserialize,
     }
     if item_codec_ref is not None:
         attrs['_c2_item_codec_ref'] = item_codec_ref
     return type(class_name, (Transferable,), attrs)
+
+
+def _generated_class_name(record_type: type, suffix: str, codec_ref: CodecRef) -> str:
+    digest = codec_ref.schema_sha256[:12] if codec_ref.schema_sha256 is not None else 'unspecified'
+    return f'Arrow{record_type.__name__}{suffix}_{digest}'
 
 
 def _codec_ref_for_schema(schema_text: str) -> CodecRef:
@@ -225,12 +269,45 @@ def _is_arrow_record(value: object) -> bool:
     return isinstance(value, type) and hasattr(value, _RECORD_MARKER)
 
 
-def _record_spec(record_type: type) -> _ArrowRecordSpec:
+def _record_spec(record_type: type, context: object | None = None) -> _ArrowRecordSpec:
     if not dataclasses.is_dataclass(record_type):
         raise TypeError(f'{record_type.__name__} must be a dataclass.')
     options = getattr(record_type, _RECORD_MARKER, None)
     if not isinstance(options, ArrowRecordOptions):
         raise TypeError(f'{record_type.__name__} is not marked with @arrow.record.')
+    record_name = options.name or record_type.__name__
+    crm_namespace = _context_str(context, 'crm_namespace')
+    crm_name = _context_str(context, 'crm_name')
+    crm_version = _context_str(context, 'crm_version')
+    crm_values = (crm_namespace, crm_name, crm_version)
+    if any(value is not None for value in crm_values) and not all(
+        value is not None for value in crm_values
+    ):
+        raise TypeError(
+            'Arrow codec context must include crm_namespace, crm_name, and '
+            'crm_version together.',
+        )
+    if options.schema_id is not None:
+        schema_id = options.schema_id
+    else:
+        missing = [
+            label
+            for label, value in (
+                ('crm_namespace', crm_namespace),
+                ('crm_name', crm_name),
+                ('crm_version', crm_version),
+            )
+            if value is None
+        ]
+        if missing:
+            joined = ', '.join(missing)
+            raise TypeError(
+                f'@arrow.record type {record_type.__name__} requires CRM codec context '
+                f'to derive a default schema identity; missing {joined}. '
+                'Use it from a @cc.crm method or pass schema_id=... for an explicit '
+                'shared payload identity.',
+            )
+        schema_id = f'{crm_namespace}.{crm_name}.{record_name}.arrow-ipc.v{crm_version}'
     try:
         type_hints = get_type_hints(record_type, include_extras=True)
     except (NameError, TypeError) as exc:
@@ -252,9 +329,24 @@ def _record_spec(record_type: type) -> _ArrowRecordSpec:
         fields.append(_ArrowFieldSpec(field.name, arrow_type, type_text, nullable))
     return _ArrowRecordSpec(
         record_type=record_type,
-        schema_id=options.schema_id,
+        record_name=record_name,
+        schema_id=schema_id,
+        crm_namespace=crm_namespace,
+        crm_name=crm_name,
+        crm_version=crm_version,
         fields=tuple(fields),
     )
+
+
+def _context_str(context: object | None, key: str) -> str | None:
+    if not isinstance(context, Mapping):
+        return None
+    value = context.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise TypeError(f'Arrow codec context {key} must be a non-empty string.')
+    return value
 
 
 def _arrow_type_for_annotation(annotation: object, path: str) -> tuple[object, str, bool]:

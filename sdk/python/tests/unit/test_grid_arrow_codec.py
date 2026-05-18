@@ -35,10 +35,14 @@ def _load_grid_contract(monkeypatch):
 
 def test_grid_arrow_payloads_emit_provider_codec_refs(monkeypatch):
     Grid, arrow_id = _load_grid_contract(monkeypatch)
+    root = Path(__file__).resolve().parents[4]
+    transferables_source = (root / 'examples/python/grid/transferables.py').read_text()
 
     descriptor = build_contract_descriptor(Grid, methods=['get_schema', 'get_grid_infos'])
     methods = {method['name']: method for method in descriptor['methods']}
 
+    assert 'schema_id=' not in transferables_source
+    assert 'GridAttributeBatch' not in transferables_source
     assert methods['get_schema']['wire']['output']['id'] == arrow_id
     assert methods['get_grid_infos']['wire']['output']['id'] == arrow_id
     assert methods['get_grid_infos']['return']['kind'] == 'list'

@@ -108,14 +108,14 @@ from c_two.providers import arrow
 
 arrow.use_arrow()
 
-@arrow.record(schema_id="c-two.examples.grid-attribute.arrow-ipc.v1")
+@arrow.record
 class GridAttribute:
     level: int
     global_id: int
     activate: bool
 ```
 
-provider 是可选 Python 模块，不由 `import c_two as cc` 隐式导入，也不把 py-arrow 依赖推进 Rust core、CLI 或 SDK 顶层。它负责把被 `@arrow.record(...)` 标记的 dataclass 生成 Arrow IPC `CodecRef` 和 transfer adapter，并负责为 `list[Record]` 生成批量 adapter；CRM 作者不需要再为了 `list[GridAttribute]` 手写 `GridAttributeBatch` 或方法级 `@cc.transfer(output=...)`。不在 provider 支持范围内的 annotation 要么继续走 `c-two.control.json`，要么在 portable export 时明确失败，不能静默回退为 portable-looking pickle。
+provider 是可选 Python 模块，不由 `import c_two as cc` 隐式导入，也不把 py-arrow 依赖推进 Rust core、CLI 或 SDK 顶层。它负责把被 `@arrow.record` 标记的 dataclass 生成 Arrow IPC `CodecRef` 和 transfer adapter，并负责为 `list[Record]` 生成批量 adapter；默认 schema identity 在 CRM 解析绑定 transferable 时由 `crm_namespace.crm_name.record_name.arrow-ipc.vcrm_version` 生成，canonical schema text 同时包含 CRM namespace/name/version、record name、single/batch mode、字段名、字段类型和 nullable 信息。CRM 作者不需要再为了 `list[GridAttribute]` 手写 `GridAttributeBatch`、方法级 `@cc.transfer(output=...)`、record 级 `schema_id` 或 record 级版本；`@arrow.record(name=...)` 只用于覆盖公开 record 名，`@arrow.record(schema_id=...)` 只留给少数跨 CRM 共享 payload 的显式 identity。不在 provider 支持范围内的 annotation 要么继续走 `c-two.control.json`，要么在 portable export 时明确失败，不能静默回退为 portable-looking pickle。
 
 ## Portable Export 规则
 
@@ -149,7 +149,7 @@ SDK codegen 应从 `c-two.contract.v1` 生成 client stubs、server skeletons、
 
 fastdb 是第一个 domain-specific provider pilot，而不是 CRM IDL。fastdb 应提供 `fastdb.schema.v1`、ColumnEngine/ObjectEngine capability profiles、codec adapters 和可选 codegen plugin。C-Two 只看到 `CodecRef(id="org.fastdb.columnar", schema_sha256="...")` 这样的 opaque identity。
 
-py-arrow 是第一个 mature external format provider pilot。C-Two examples 已经把 grid Arrow IPC payload 收敛为可复用 `c_two.providers.arrow` provider，控制参数也已经能通过 `c-two.control.json.v1` 脱离 pickle；grid 现在只声明领域 payload 类型，provider/codegen 自动组合能力仍保留为后续清晰边界。
+py-arrow 是第一个 mature external format provider pilot。C-Two examples 已经把 grid Arrow IPC payload 收敛为可复用 `c_two.providers.arrow` provider，控制参数也已经能通过 `c-two.control.json.v1` 脱离 pickle；grid 现在只声明领域 payload 类型，Arrow schema identity 由 CRM context 默认生成，provider/codegen 自动组合能力仍保留为后续清晰边界。
 
 Protobuf、FlatBuffers、Avro、JSON Schema、GeoArrow、WKB 等都应作为 provider families 进入，不应让某一种格式成为 C-Two core 的内置 worldview。
 
@@ -168,7 +168,7 @@ Protobuf、FlatBuffers、Avro、JSON Schema、GeoArrow、WKB 等都应作为 pro
 11. 已完成：实现首个 SDK codegen 切片，优先 TypeScript，因为 fastdb 已有 TS 工具链；生成器只生成 contract skeleton、typed call surface、contract hash constants 和 codec requirement declarations，不伪造未知 codec 的实现。
 12. 已完成：在 fastdb 侧实现 provider-owned codegen helper，把 `fastdb.schema.v1` 生成 TypeScript payload codec helper stub 或明确的 unsupported diagnostic，应用层组合 c-two RPC skeleton 与 fastdb payload helper。
 13. 已完成：用 grid 资源导出、Rust 校验、生成 TypeScript artifact，并继续验证 Python thread-local、direct IPC 和 relay 三条运行时路径。
-14. 已完成：把 py-arrow provider 从 grid 示例手写 adapter 升级为可复用 `c_two.providers.arrow` 可选模块，支持记录类型和 `list[record]` 批量 payload，不让 C-Two core 理解 Arrow schema 内部结构。
+14. 已完成：把 py-arrow provider 从 grid 示例手写 adapter 升级为可复用 `c_two.providers.arrow` 可选模块，支持记录类型和 `list[record]` 批量 payload，并让默认 Arrow schema identity 从 CRM namespace/name/version 与 record 信息生成，不让 C-Two core 理解 Arrow schema 内部结构。
 15. 下一步：把 fastdb provider 从可选 wrapper 升级为可复用 package，并为 TypeScript/WASM payload codec runtime 补齐真实 encode/decode/from-buffer 实现。
 
 ## 非目标
