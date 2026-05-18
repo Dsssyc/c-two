@@ -568,6 +568,13 @@ c3 contract export mypkg.contracts:Grid --python .venv/bin/python --out grid.con
 c3 contract validate grid.contract.json
 ```
 
+Validated descriptors can generate dependency-neutral TypeScript client skeletons. External payload codecs are emitted as opaque `C2CodecValue<"...">` types plus `*_CODEC_REQUIREMENTS`; use `--strict-codecs` when CI should fail until every external codec has a provider-backed TypeScript implementation:
+
+```bash
+c3 contract codegen typescript grid.contract.json --out grid.client.ts
+c3 contract codegen typescript grid.contract.json --strict-codecs
+```
+
 For resource-first projects, `infer` can build a CRM projection descriptor from explicitly selected Python resource methods. Inference does not expose all public methods and it still requires every selected method to resolve to portable control envelopes or explicit codec refs:
 
 ```bash

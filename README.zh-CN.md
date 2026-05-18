@@ -566,6 +566,13 @@ c3 contract export mypkg.contracts:Grid --python .venv/bin/python --out grid.con
 c3 contract validate grid.contract.json
 ```
 
+通过校验的 descriptor 可以生成 dependency-neutral TypeScript client skeleton。外部 payload codec 会被生成为 opaque `C2CodecValue<"...">` 类型和 `*_CODEC_REQUIREMENTS`；如果 CI 需要在所有外部 codec 都有 provider-backed TypeScript 实现前失败，可以使用 `--strict-codecs`：
+
+```bash
+c3 contract codegen typescript grid.contract.json --out grid.client.ts
+c3 contract codegen typescript grid.contract.json --strict-codecs
+```
+
 对于资源优先项目，`infer` 可以从显式选择的 Python 资源方法构造 CRM 投影 descriptor。推断不会自动暴露所有 public 方法，并且每个被选择的方法仍然必须能解析成 portable control envelope 或显式 codec ref：
 
 ```bash

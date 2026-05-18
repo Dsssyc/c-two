@@ -110,6 +110,7 @@ fn contract_help_lists_descriptor_commands() {
     cmd.args(["contract", "--help"])
         .assert()
         .success()
+        .stdout(predicate::str::contains("codegen"))
         .stdout(predicate::str::contains("export"))
         .stdout(predicate::str::contains("infer"))
         .stdout(predicate::str::contains("validate"));
@@ -222,4 +223,50 @@ fn contract_export_rejects_invalid_python_descriptor() {
     .assert()
     .failure()
     .stderr(predicate::str::contains("python-pickle-default"));
+}
+
+#[test]
+fn contract_codegen_typescript_writes_output() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let contract = tempdir.path().join("contract.json");
+    let output = tempdir.path().join("client.ts");
+    std::fs::write(&contract, valid_contract_json()).unwrap();
+
+    let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.args([
+        "contract",
+        "codegen",
+        "typescript",
+        contract.to_str().unwrap(),
+        "--out",
+        output.to_str().unwrap(),
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::is_empty());
+
+    let generated = std::fs::read_to_string(output).unwrap();
+    assert!(generated.contains("export class PortableClient"));
+    assert!(generated.contains("export const PORTABLE_CODEC_REQUIREMENTS"));
+}
+
+#[test]
+fn contract_codegen_typescript_strict_rejects_external_codec() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let contract = tempdir.path().join("contract.json");
+    std::fs::write(&contract, valid_contract_json()).unwrap();
+
+    let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.args([
+        "contract",
+        "codegen",
+        "typescript",
+        contract.to_str().unwrap(),
+        "--strict-codecs",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains(
+        "unsupported codec org.example.codec",
+    ));
 }

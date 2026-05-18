@@ -205,6 +205,7 @@ version = "0.1.2"
 dependencies = [
  "anyhow",
  "assert_cmd",
+ "c2-codegen",
  "c2-config",
  "c2-contract",
  "c2-http",
@@ -216,6 +217,15 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "c2-codegen"
+version = "0.1.0"
+dependencies = [
+ "c2-contract",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

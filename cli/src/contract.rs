@@ -11,6 +11,8 @@ pub struct ContractArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum ContractCommand {
+    /// Generate SDK artifacts from a portable descriptor.
+    Codegen(CodegenArgs),
     /// Export a portable descriptor from a Python CRM class.
     Export(PythonExportArgs),
     /// Infer and export a portable descriptor from a Python resource class.
@@ -23,6 +25,30 @@ pub enum ContractCommand {
 pub struct ValidateArgs {
     /// Descriptor JSON path, or "-" to read from stdin.
     pub path: String,
+}
+
+#[derive(Debug, Args)]
+pub struct CodegenArgs {
+    #[command(subcommand)]
+    pub command: CodegenCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CodegenCommand {
+    /// Generate a dependency-neutral TypeScript client skeleton.
+    Typescript(TypeScriptCodegenArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct TypeScriptCodegenArgs {
+    /// Descriptor JSON path, or "-" to read from stdin.
+    pub path: String,
+    /// Write generated TypeScript to this file instead of stdout.
+    #[arg(long)]
+    pub out: Option<String>,
+    /// Fail when the descriptor references codecs without built-in TypeScript support.
+    #[arg(long)]
+    pub strict_codecs: bool,
 }
 
 #[derive(Debug, Args)]
@@ -72,6 +98,7 @@ pub struct PythonInferArgs {
 
 pub fn run(args: ContractArgs) -> Result<()> {
     match args.command {
+        ContractCommand::Codegen(args) => codegen(args),
         ContractCommand::Export(args) => export(args),
         ContractCommand::Infer(args) => infer(args),
         ContractCommand::Validate(args) => validate(&args.path),
@@ -87,6 +114,24 @@ fn validate(path: &str) -> Result<()> {
     let label = if path == "-" { "stdin" } else { path };
     println!("{label}: valid c-two.contract.v1 sha256={digest}");
     Ok(())
+}
+
+fn codegen(args: CodegenArgs) -> Result<()> {
+    match args.command {
+        CodegenCommand::Typescript(args) => codegen_typescript(args),
+    }
+}
+
+fn codegen_typescript(args: TypeScriptCodegenArgs) -> Result<()> {
+    let payload = read_payload(&args.path)?;
+    let generated = c2_codegen::generate_typescript_client(
+        payload.as_bytes(),
+        c2_codegen::TypeScriptOptions {
+            strict_codecs: args.strict_codecs,
+        },
+    )
+    .map_err(|err| anyhow!("{err}"))?;
+    write_payload(&generated, args.out.as_deref())
 }
 
 fn export(args: PythonExportArgs) -> Result<()> {
