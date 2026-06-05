@@ -1,3 +1,4 @@
+mod catalog;
 pub mod config;
 pub mod connection;
 mod dispatcher;

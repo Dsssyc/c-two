@@ -61,8 +61,15 @@ use c2_wire::registration_control::{
     decode_pending_route_attestation_request, decode_route_contract_request,
     encode_pending_route_attestation_response, encode_route_contract_response,
 };
+use c2_wire::route_catalog_control::{
+    RouteContractWire, RouteLookupRequest, RouteLookupResponse, RouteNack, RouteRecordWire,
+    RouteSelector, RouteStateReasonWire, RouteWatchEvent, decode_route_list_request,
+    decode_route_lookup_request, decode_route_watch_request, encode_route_list_response,
+    encode_route_lookup_response, encode_route_nack, encode_route_watch_event,
+};
 use c2_wire::shutdown_control::{DirectShutdownAck, decode_shutdown_initiate, encode_shutdown_ack};
 
+use crate::catalog::{RouteCatalog, RouteWatchBatch};
 use crate::config::ServerIpcConfig;
 use crate::connection::Connection;
 use crate::dispatcher::{
@@ -84,6 +91,13 @@ const POST_SHUTDOWN_DUPLICATE_INITIATE_READ_TIMEOUT_MS: u64 = 100;
 
 fn error_wire(code: ErrorCode, message: impl Into<String>) -> Vec<u8> {
     C2Error::new(code, message).to_wire_bytes()
+}
+
+fn close_reason_to_route_state_reason(closed_reason: &str) -> RouteStateReasonWire {
+    match closed_reason {
+        "shutdown" | "direct_ipc_shutdown" => RouteStateReasonWire::Shutdown,
+        _ => RouteStateReasonWire::ExplicitUnregister,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +175,9 @@ pub struct Server {
     /// **tokio async RwLock** — guards CRM dispatch table; requires `.read().await`
     /// / `.write().await`.  Do NOT confuse with `parking_lot::RwLock` below.
     dispatcher: RwLock<Dispatcher>,
+    /// **parking_lot sync RwLock** — guards authoritative route metadata and
+    /// revisioned watch history. It must not be held across awaits.
+    route_catalog: parking_lot::RwLock<RouteCatalog>,
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
     lifecycle_tx: watch::Sender<ServerLifecycleState>,
@@ -310,6 +327,7 @@ impl Server {
         let (lifecycle_tx, _lifecycle_rx) = watch::channel(ServerLifecycleState::Initialized);
         let pending_requests = Arc::new(Semaphore::new(config.max_pending_requests as usize));
         let chunk_processing_permits = Arc::new(Semaphore::new(config.max_total_chunks as usize));
+        let route_catalog = RouteCatalog::new(identity.clone(), config.max_payload_size);
         let execution_scheduler = Scheduler::with_limits(
             crate::scheduler::ConcurrencyMode::Parallel,
             HashMap::new(),
@@ -322,6 +340,7 @@ impl Server {
             ipc_address: address.to_string(),
             socket_path,
             dispatcher: RwLock::new(Dispatcher::new()),
+            route_catalog: parking_lot::RwLock::new(route_catalog),
             shutdown_tx,
             shutdown_rx,
             lifecycle_tx,
@@ -426,16 +445,32 @@ impl Server {
         &self,
         closed_reason: &str,
     ) -> Vec<ServerRouteCloseOutcome> {
+        let reason = close_reason_to_route_state_reason(closed_reason);
         let routes = {
             let _guard = self.route_registration.lock().await;
             let mut dispatcher = self.dispatcher.write().await;
             let routes = dispatcher.routes_snapshot();
+            let mut catalog = self.route_catalog.write();
             for route in &routes {
+                let _ = catalog.close_route(&route.name, reason.clone());
                 route.scheduler.close();
             }
             dispatcher.take_all()
         };
-        Self::wait_closed_routes_drained(routes, closed_reason).await
+        let outcomes = Self::wait_closed_routes_drained(routes, closed_reason).await;
+        self.remove_catalog_routes(&outcomes, reason);
+        outcomes
+    }
+
+    fn remove_catalog_routes(
+        &self,
+        outcomes: &[ServerRouteCloseOutcome],
+        reason: RouteStateReasonWire,
+    ) {
+        let mut catalog = self.route_catalog.write();
+        for outcome in outcomes {
+            let _ = catalog.remove_route(&outcome.route_name, reason.clone());
+        }
     }
 
     async fn wait_closed_routes_drained(
@@ -531,6 +566,16 @@ impl Server {
         }
         let mut pending_routes = self.pending_routes.lock();
         if pending_routes.contains_key(&route_name) {
+            return Err(ServerError::Protocol(format!(
+                "route already registered: {}",
+                route_name
+            )));
+        }
+        if self
+            .route_catalog
+            .read()
+            .contains_current_route(&route_name)
+        {
             return Err(ServerError::Protocol(format!(
                 "route already registered: {}",
                 route_name
@@ -638,7 +683,16 @@ impl Server {
             reservation.close_scheduler_for_abort();
         }
         reservation.resolve();
-        dispatcher.register(reservation.into_route());
+        let route = reservation.into_route();
+        if let Err(err) = self
+            .route_catalog
+            .write()
+            .register_ready(&route, admission_open)
+        {
+            route.scheduler.close();
+            return Err(ServerError::Protocol(err));
+        }
+        dispatcher.register(route);
         Ok(token)
     }
 
@@ -662,6 +716,10 @@ impl Server {
             )));
         };
         route.scheduler.open_admission_for_registration();
+        self.route_catalog
+            .write()
+            .open_route(&name)
+            .map_err(ServerError::Protocol)?;
         Ok(())
     }
 
@@ -698,15 +756,24 @@ impl Server {
     /// that removes the route, so local handle clones and remote route lookup
     /// cannot observe an open-but-unregistered window.
     pub async fn unregister_route(&self, name: &str) -> bool {
-        let _guard = self.route_registration.lock().await;
-        let mut dispatcher = self.dispatcher.write().await;
-        if let Some(route) = dispatcher.resolve(name) {
-            route.scheduler.close();
-        }
-        let removed = dispatcher.unregister(name);
-        drop(dispatcher);
+        let removed = {
+            let _guard = self.route_registration.lock().await;
+            let mut dispatcher = self.dispatcher.write().await;
+            if let Some(route) = dispatcher.resolve(name) {
+                let _ = self
+                    .route_catalog
+                    .write()
+                    .close_route(name, RouteStateReasonWire::ExplicitUnregister);
+                route.scheduler.close();
+            }
+            dispatcher.unregister(name)
+        };
         if let Some(route) = removed {
             route.scheduler.wait_drained_async().await;
+            let _ = self
+                .route_catalog
+                .write()
+                .remove_route(name, RouteStateReasonWire::ExplicitUnregister);
             true
         } else {
             false
@@ -722,16 +789,19 @@ impl Server {
         names: &[String],
         closed_reason: &str,
     ) -> Vec<ServerRouteCloseOutcome> {
+        let reason = close_reason_to_route_state_reason(closed_reason);
         let routes = {
             let _guard = self.route_registration.lock().await;
             let mut dispatcher = self.dispatcher.write().await;
             let mut seen = HashSet::new();
             let mut routes = Vec::new();
+            let mut catalog = self.route_catalog.write();
             for name in names {
                 if !seen.insert(name.as_str()) {
                     continue;
                 }
                 if let Some(route) = dispatcher.resolve(name) {
+                    let _ = catalog.close_route(name, reason.clone());
                     route.scheduler.close();
                     routes.push(route);
                 }
@@ -741,7 +811,9 @@ impl Server {
             }
             routes
         };
-        Self::wait_closed_routes_drained(routes, closed_reason).await
+        let outcomes = Self::wait_closed_routes_drained(routes, closed_reason).await;
+        self.remove_catalog_routes(&outcomes, reason);
+        outcomes
     }
 
     /// Filesystem path of the bound UDS socket.
@@ -1583,32 +1655,15 @@ async fn handle_handshake(
         (segs, prefix)
     };
 
-    let dispatcher = server.dispatcher.read().await;
-    let routes: Vec<RouteInfo> = dispatcher
-        .routes_snapshot()
-        .iter()
-        .map(|r| RouteInfo {
-            name: r.name.clone(),
-            route_uid: r.route_uid.clone(),
-            route_revision: r.route_revision,
-            crm_ns: r.crm_ns.clone(),
-            crm_name: r.crm_name.clone(),
-            crm_ver: r.crm_ver.clone(),
-            abi_hash: r.abi_hash.clone(),
-            signature_hash: r.signature_hash.clone(),
-            max_payload_size: server.config.max_payload_size,
-            methods: r
-                .method_names
-                .iter()
-                .enumerate()
-                .map(|(i, n)| MethodEntry {
-                    name: n.clone(),
-                    index: i as u16,
-                })
-                .collect(),
-        })
+    let routes: Vec<RouteInfo> = server
+        .route_catalog
+        .read()
+        .list(&RouteSelector::All)
+        .map_err(ServerError::Protocol)?
+        .routes
+        .into_iter()
+        .map(route_info_from_record)
         .collect();
-    drop(dispatcher);
 
     let cap = CAP_CALL_V2 | CAP_METHOD_IDX | CAP_CHUNKED;
     let hs_bytes = encode_server_handshake(
@@ -1693,15 +1748,20 @@ async fn handle_ctrl(
     let Some(msg_type) = payload.first().and_then(|&b| MsgType::from_byte(b)) else {
         return;
     };
-    let response = match msg_type {
-        MsgType::PendingRouteAttest => pending_route_attestation_payload(server, payload),
-        MsgType::RouteContract => route_contract_payload(server, payload).await,
+    let responses = match msg_type {
+        MsgType::PendingRouteAttest => vec![pending_route_attestation_payload(server, payload)],
+        MsgType::RouteContract => vec![route_contract_payload(server, payload).await],
+        MsgType::RouteList => vec![route_list_payload(server, payload)],
+        MsgType::RouteLookup => vec![route_lookup_payload(server, payload)],
+        MsgType::RouteWatch => route_watch_payloads(server, payload),
         _ => {
             debug!(request_id, "unknown ctrl frame ignored");
             return;
         }
     };
-    write_ctrl_response(writer, request_id, &response).await;
+    for response in responses {
+        write_ctrl_response(writer, request_id, &response).await;
+    }
 }
 
 fn route_attestation_from_parts(
@@ -1727,6 +1787,47 @@ fn route_attestation_from_parts(
         signature_hash,
         method_names,
         max_payload_size,
+    }
+}
+
+fn route_info_from_record(record: RouteRecordWire) -> RouteInfo {
+    RouteInfo {
+        name: record.route_name,
+        route_uid: record.route_uid,
+        route_revision: record.route_revision,
+        crm_ns: record.contract.crm_ns,
+        crm_name: record.contract.crm_name,
+        crm_ver: record.contract.crm_ver,
+        abi_hash: record.contract.abi_hash,
+        signature_hash: record.contract.signature_hash,
+        max_payload_size: record.max_payload_size,
+        methods: record
+            .methods
+            .into_iter()
+            .map(|method| MethodEntry {
+                name: method.name,
+                index: method.index,
+            })
+            .collect(),
+    }
+}
+
+fn route_attestation_from_record(record: RouteRecordWire) -> PendingRouteAttestation {
+    PendingRouteAttestation {
+        route_name: record.route_name,
+        route_uid: record.route_uid,
+        route_revision: record.route_revision,
+        crm_ns: record.contract.crm_ns,
+        crm_name: record.contract.crm_name,
+        crm_ver: record.contract.crm_ver,
+        abi_hash: record.contract.abi_hash,
+        signature_hash: record.contract.signature_hash,
+        method_names: record
+            .methods
+            .into_iter()
+            .map(|method| method.name)
+            .collect(),
+        max_payload_size: record.max_payload_size,
     }
 }
 
@@ -1769,24 +1870,129 @@ fn pending_route_attestation_payload(server: &Server, payload: &[u8]) -> Vec<u8>
     }
 }
 
+fn route_catalog_nack_payload(server: &Server, rejected_revision: u64, message: String) -> Vec<u8> {
+    let current_revision = server.route_catalog.read().catalog_revision();
+    let nack = RouteNack {
+        nonce: 0,
+        rejected_revision: rejected_revision.max(current_revision),
+        error: C2Error::new(ErrorCode::ProtocolViolation, message).envelope(),
+    };
+    encode_route_nack(&nack).unwrap_or_default()
+}
+
+fn route_list_payload(server: &Server, payload: &[u8]) -> Vec<u8> {
+    let request = match decode_route_list_request(payload) {
+        Ok(request) => request,
+        Err(err) => return route_catalog_nack_payload(server, 0, err),
+    };
+    let response = match server.route_catalog.read().list(&request.selector) {
+        Ok(response) => response,
+        Err(err) => {
+            return route_catalog_nack_payload(server, request.min_revision.unwrap_or(0), err);
+        }
+    };
+    encode_route_list_response(&response)
+        .unwrap_or_else(|err| route_catalog_nack_payload(server, response.catalog_revision, err))
+}
+
+fn route_lookup_payload(server: &Server, payload: &[u8]) -> Vec<u8> {
+    let request = match decode_route_lookup_request(payload) {
+        Ok(request) => request,
+        Err(err) => return route_catalog_nack_payload(server, 0, err),
+    };
+    let response = match server.route_catalog.read().lookup(&request) {
+        Ok(response) => response,
+        Err(err) => {
+            return route_catalog_nack_payload(
+                server,
+                request.observed_route_revision.unwrap_or(0),
+                err,
+            );
+        }
+    };
+    encode_route_lookup_response(&response).unwrap_or_else(|err| {
+        route_catalog_nack_payload(server, request.observed_route_revision.unwrap_or(0), err)
+    })
+}
+
+fn route_watch_payloads(server: &Server, payload: &[u8]) -> Vec<Vec<u8>> {
+    let request = match decode_route_watch_request(payload) {
+        Ok(request) => request,
+        Err(err) => return vec![route_catalog_nack_payload(server, 0, err)],
+    };
+    match server
+        .route_catalog
+        .read()
+        .watch_from(request.from_revision, &request.selector)
+    {
+        RouteWatchBatch::Compacted {
+            compacted_revision,
+            current_revision,
+        } => vec![
+            encode_route_watch_event(&RouteWatchEvent::Compacted {
+                compacted_revision,
+                current_revision,
+            })
+            .unwrap_or_else(|err| route_catalog_nack_payload(server, current_revision, err)),
+        ],
+        RouteWatchBatch::Events {
+            current_revision,
+            events,
+        } => {
+            if events.is_empty() && request.allow_heartbeat {
+                return vec![
+                    encode_route_watch_event(&RouteWatchEvent::Heartbeat {
+                        catalog_revision: current_revision,
+                    })
+                    .unwrap_or_else(|err| {
+                        route_catalog_nack_payload(server, current_revision, err)
+                    }),
+                ];
+            }
+            events
+                .into_iter()
+                .map(|event| {
+                    let revision = event_revision_for_nack(&event);
+                    encode_route_watch_event(&event)
+                        .unwrap_or_else(|err| route_catalog_nack_payload(server, revision, err))
+                })
+                .collect()
+        }
+    }
+}
+
+fn event_revision_for_nack(event: &RouteWatchEvent) -> u64 {
+    match event {
+        RouteWatchEvent::Added { record } | RouteWatchEvent::Updated { record } => {
+            record.catalog_revision
+        }
+        RouteWatchEvent::Removed {
+            catalog_revision, ..
+        }
+        | RouteWatchEvent::Closed {
+            catalog_revision, ..
+        }
+        | RouteWatchEvent::Heartbeat {
+            catalog_revision, ..
+        } => *catalog_revision,
+        RouteWatchEvent::Compacted {
+            current_revision, ..
+        } => *current_revision,
+    }
+}
+
 async fn route_contract_payload(server: &Server, payload: &[u8]) -> Vec<u8> {
     let response = match decode_route_contract_request(payload) {
         Ok(request) => {
-            let dispatcher = server.dispatcher.read().await;
-            match dispatcher.resolve(&request.route_name) {
-                Some(route) => RouteContractResponse::Attested {
-                    contract: route_attestation_from_parts(
-                        route.name.clone(),
-                        route.route_uid.clone(),
-                        route.route_revision,
-                        route.crm_ns.clone(),
-                        route.crm_name.clone(),
-                        route.crm_ver.clone(),
-                        route.abi_hash.clone(),
-                        route.signature_hash.clone(),
-                        route.method_names.clone(),
-                        server.config.max_payload_size,
-                    ),
+            let catalog_response = server.route_catalog.read().list(&RouteSelector::RouteName {
+                route_name: request.route_name.clone(),
+            });
+            match catalog_response
+                .ok()
+                .and_then(|response| response.routes.into_iter().next())
+            {
+                Some(record) => RouteContractResponse::Attested {
+                    contract: route_attestation_from_record(record),
                 },
                 None => RouteContractResponse::Rejected {
                     code: ROUTE_CONTRACT_REJECT_NOT_FOUND.to_string(),
@@ -1831,6 +2037,15 @@ struct ChunkRouteAdmission {
 
 enum RouteAdmissionError {
     RouteNotFound(String),
+    RouteRemoved {
+        route_name: String,
+        route_uid: Option<String>,
+    },
+    RouteClosed {
+        route_name: String,
+        route_uid: String,
+        reason: RouteStateReasonWire,
+    },
     RouteStale {
         route_name: String,
         expected_uid: String,
@@ -1908,6 +2123,66 @@ async fn reserve_route_execution(
     identity: &RouteCallIdentity,
     method_idx: u16,
 ) -> Result<RouteExecutionAdmission, RouteAdmissionError> {
+    let lookup_request = RouteLookupRequest {
+        expected: RouteContractWire {
+            route_name: identity.route_name.clone(),
+            crm_ns: identity.crm_ns.clone(),
+            crm_name: identity.crm_name.clone(),
+            crm_ver: identity.crm_ver.clone(),
+            abi_hash: identity.abi_hash.clone(),
+            signature_hash: identity.signature_hash.clone(),
+        },
+        observed_route_uid: Some(identity.route_uid.clone()),
+        observed_route_revision: Some(identity.observed_route_revision),
+    };
+    match server
+        .route_catalog
+        .read()
+        .lookup(&lookup_request)
+        .map_err(|reason| RouteAdmissionError::ContractMismatch {
+            route_name: identity.route_name.clone(),
+            reason,
+        })? {
+        RouteLookupResponse::Ready { .. } => {}
+        RouteLookupResponse::NotFound { route_name } => {
+            return Err(RouteAdmissionError::RouteNotFound(route_name));
+        }
+        RouteLookupResponse::Removed {
+            route_name,
+            route_uid,
+        } => {
+            return Err(RouteAdmissionError::RouteRemoved {
+                route_name,
+                route_uid,
+            });
+        }
+        RouteLookupResponse::Closed {
+            route_name,
+            route_uid,
+            reason,
+        } => {
+            return Err(RouteAdmissionError::RouteClosed {
+                route_name,
+                route_uid,
+                reason,
+            });
+        }
+        RouteLookupResponse::Stale { current } => {
+            return Err(RouteAdmissionError::RouteStale {
+                route_name: identity.route_name.clone(),
+                expected_uid: identity.route_uid.clone(),
+                expected_revision: identity.observed_route_revision,
+                actual_uid: current.route_uid,
+                actual_revision: current.route_revision,
+            });
+        }
+        RouteLookupResponse::ContractMismatch { .. } => {
+            return Err(RouteAdmissionError::ContractMismatch {
+                route_name: identity.route_name.clone(),
+                reason: "expected route contract does not match current catalog record".to_string(),
+            });
+        }
+    }
     let route = match server.dispatcher.read().await.resolve(&identity.route_name) {
         Some(route) => route,
         None => {
@@ -2042,6 +2317,37 @@ async fn write_route_admission_error(
     match err {
         RouteAdmissionError::RouteNotFound(route_name) => {
             write_reply(writer, request_id, &ReplyControl::RouteNotFound(route_name)).await;
+        }
+        RouteAdmissionError::RouteRemoved {
+            route_name,
+            route_uid,
+        } => {
+            let message = match route_uid {
+                Some(route_uid) => {
+                    format!("route {route_name} was removed: route_uid {route_uid}")
+                }
+                None => format!("route {route_name} was removed"),
+            };
+            write_reply(
+                writer,
+                request_id,
+                &ReplyControl::Error(error_wire(ErrorCode::ResourceRemoved, message)),
+            )
+            .await;
+        }
+        RouteAdmissionError::RouteClosed {
+            route_name,
+            route_uid,
+            reason,
+        } => {
+            let message =
+                format!("route {route_name} is closed: route_uid {route_uid}, reason {reason:?}");
+            write_reply(
+                writer,
+                request_id,
+                &ReplyControl::Error(error_wire(ErrorCode::ResourceClosed, message)),
+            )
+            .await;
         }
         RouteAdmissionError::RouteStale {
             route_name,
@@ -3559,6 +3865,155 @@ mod tests {
             scheduler.try_acquire(0).unwrap_err(),
             crate::scheduler::SchedulerAcquireError::Closed,
         );
+    }
+
+    #[tokio::test]
+    async fn route_list_ctrl_reads_authoritative_catalog() {
+        use c2_wire::route_catalog_control::{
+            RouteListRequest, RouteSelector, decode_route_list_response, encode_route_list_request,
+        };
+
+        let server =
+            Arc::new(Server::new("ipc://route_list_catalog", ServerIpcConfig::default()).unwrap());
+        server.register_route(make_route("grid")).await.unwrap();
+        let request = RouteListRequest {
+            selector: RouteSelector::All,
+            min_revision: None,
+        };
+
+        let payload = route_list_payload(&server, &encode_route_list_request(&request).unwrap());
+        let response = decode_route_list_response(&payload).unwrap();
+
+        assert_eq!(response.catalog_revision, 1);
+        assert_eq!(response.min_watch_revision, 1);
+        assert_eq!(response.routes.len(), 1);
+        assert_eq!(response.routes[0].route_name, "grid");
+        assert_eq!(response.routes[0].owner_server_id, "route_list_catalog");
+    }
+
+    #[tokio::test]
+    async fn route_lookup_ctrl_returns_ready_from_catalog() {
+        use c2_wire::route_catalog_control::{
+            RouteLookupRequest, RouteLookupResponse, decode_route_lookup_response,
+            encode_route_lookup_request,
+        };
+
+        let server =
+            Arc::new(Server::new("ipc://route_lookup_ready", ServerIpcConfig::default()).unwrap());
+        server.register_route(make_route("grid")).await.unwrap();
+        let identity = call_identity("grid");
+        let request = RouteLookupRequest {
+            expected: RouteContractWire {
+                route_name: identity.route_name,
+                crm_ns: identity.crm_ns,
+                crm_name: identity.crm_name,
+                crm_ver: identity.crm_ver,
+                abi_hash: identity.abi_hash,
+                signature_hash: identity.signature_hash,
+            },
+            observed_route_uid: Some(identity.route_uid),
+            observed_route_revision: Some(identity.observed_route_revision),
+        };
+
+        let payload =
+            route_lookup_payload(&server, &encode_route_lookup_request(&request).unwrap());
+        let response = decode_route_lookup_response(&payload).unwrap();
+
+        match response {
+            RouteLookupResponse::Ready { current } => {
+                assert_eq!(current.route_name, "grid");
+                assert_eq!(current.catalog_revision, 1);
+            }
+            other => panic!("expected ready lookup, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn route_lookup_ctrl_returns_removed_tombstone_after_unregister() {
+        use c2_wire::route_catalog_control::{
+            RouteLookupRequest, RouteLookupResponse, decode_route_lookup_response,
+            encode_route_lookup_request,
+        };
+
+        let server = Arc::new(
+            Server::new("ipc://route_lookup_removed", ServerIpcConfig::default()).unwrap(),
+        );
+        server.register_route(make_route("grid")).await.unwrap();
+        let identity = call_identity("grid");
+        assert!(server.unregister_route("grid").await);
+        let request = RouteLookupRequest {
+            expected: RouteContractWire {
+                route_name: identity.route_name,
+                crm_ns: identity.crm_ns,
+                crm_name: identity.crm_name,
+                crm_ver: identity.crm_ver,
+                abi_hash: identity.abi_hash,
+                signature_hash: identity.signature_hash,
+            },
+            observed_route_uid: Some(identity.route_uid),
+            observed_route_revision: Some(identity.observed_route_revision),
+        };
+
+        let payload =
+            route_lookup_payload(&server, &encode_route_lookup_request(&request).unwrap());
+        let response = decode_route_lookup_response(&payload).unwrap();
+
+        match response {
+            RouteLookupResponse::Removed {
+                route_name,
+                route_uid,
+            } => {
+                assert_eq!(route_name, "grid");
+                assert_eq!(route_uid.as_deref(), Some("grid-uid-0001"));
+            }
+            other => panic!("expected removed lookup, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reserve_rejects_same_name_while_removed_route_is_draining() {
+        let server = Arc::new(
+            Server::new(
+                "ipc://route_reuse_while_draining",
+                ServerIpcConfig::default(),
+            )
+            .unwrap(),
+        );
+        let route = make_route("grid");
+        let scheduler = route.scheduler.as_ref().clone();
+        server.register_route(route).await.unwrap();
+        let active_guard = scheduler.try_acquire(0).unwrap();
+        let unregister_task = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { server.unregister_route("grid").await })
+        };
+        while server.contains_route("grid").await {
+            tokio::task::yield_now().await;
+        }
+
+        let replacement = make_route("grid");
+        let replacement_handle =
+            RouteConcurrencyHandle::new(replacement.scheduler.as_ref().clone());
+        let err = match server
+            .reserve_route(BuiltRoute::new(replacement, replacement_handle))
+            .await
+        {
+            Ok(_) => panic!("catalog must reject same-name replacement while old route drains"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("route already registered"));
+        drop(active_guard);
+        assert!(unregister_task.await.unwrap());
+
+        let replacement = make_route("grid");
+        let replacement_handle =
+            RouteConcurrencyHandle::new(replacement.scheduler.as_ref().clone());
+        let reservation = server
+            .reserve_route(BuiltRoute::new(replacement, replacement_handle))
+            .await
+            .expect("same-name reserve should succeed after old route is removed");
+        server.abort_reserved_route(reservation).await;
     }
 
     #[tokio::test]

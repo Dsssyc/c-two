@@ -1,7 +1,7 @@
 # Route Catalog Watch Redesign Implementation Plan
 
 **Date:** 2026-06-05
-**Status:** Phase 1 implemented; Phase 2 call-token foundation implemented; Phase 3 wire-control slice implemented; server/client RouteCatalog/watch pending
+**Status:** Phase 1 implemented; Phase 2 call-token foundation implemented; Phase 3 wire-control and server catalog/control slices implemented; client RouteDirectory/watch pending
 **Scope:** IPC route lifecycle, relay route authority, relay upstream pools, relay-aware HTTP fallback, Rust error taxonomy, Python SDK error facade
 **Supersedes:** `docs/issues/ipc-route-contract-stale-snapshot.md` as the long-term design
 
@@ -845,8 +845,12 @@ Implementation status:
 - added canonical fixtures and validation for route identity, owner identity,
   contract consistency, duplicate route records, watch compaction boundaries,
   complete observed route tokens, and `C2ErrorEnvelope` code/name consistency;
-- server-side catalog storage, watch dispatch, client `RouteDirectory`, and
-  removal of lazy snapshot refresh APIs remain pending in this phase.
+- implemented server-side `RouteCatalog` storage, removed-route tombstones,
+  bounded watch compaction, handshake projection from catalog state, call-time
+  catalog lookup, and `RouteList` / `RouteLookup` / one-shot `RouteWatch`
+  control payload handling;
+- client `RouteDirectory`, long-lived client watch lifecycle, and removal of
+  lazy snapshot refresh APIs remain pending in this phase.
 
 Acceptance:
 
