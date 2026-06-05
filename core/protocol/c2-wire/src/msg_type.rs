@@ -18,6 +18,8 @@ pub enum MsgType {
     DisconnectAck = 0x09,
     PendingRouteAttest = 0x0A,
     PendingRouteAttestAck = 0x0B,
+    RouteContract = 0x0C,
+    RouteContractAck = 0x0D,
 }
 
 impl MsgType {
@@ -35,6 +37,8 @@ impl MsgType {
             0x09 => Some(Self::DisconnectAck),
             0x0A => Some(Self::PendingRouteAttest),
             0x0B => Some(Self::PendingRouteAttestAck),
+            0x0C => Some(Self::RouteContract),
+            0x0D => Some(Self::RouteContractAck),
             _ => None,
         }
     }
@@ -91,6 +95,8 @@ mod tests {
             (0x09, MsgType::DisconnectAck),
             (0x0A, MsgType::PendingRouteAttest),
             (0x0B, MsgType::PendingRouteAttestAck),
+            (0x0C, MsgType::RouteContract),
+            (0x0D, MsgType::RouteContractAck),
         ] {
             let parsed = MsgType::from_byte(byte).unwrap();
             assert_eq!(parsed, expected);

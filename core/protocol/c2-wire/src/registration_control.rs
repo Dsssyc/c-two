@@ -5,11 +5,18 @@ use crate::msg_type::MsgType;
 pub const PENDING_ROUTE_REJECT_NOT_FOUND: &str = "not_found";
 pub const PENDING_ROUTE_REJECT_TOKEN_MISMATCH: &str = "token_mismatch";
 pub const PENDING_ROUTE_REJECT_INVALID: &str = "invalid";
+pub const ROUTE_CONTRACT_REJECT_NOT_FOUND: &str = "not_found";
+pub const ROUTE_CONTRACT_REJECT_INVALID: &str = "invalid";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingRouteAttestationRequest {
     pub route_name: String,
     pub registration_token: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteContractRequest {
+    pub route_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,6 +34,13 @@ pub struct PendingRouteAttestation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum PendingRouteAttestationResponse {
+    Attested { contract: PendingRouteAttestation },
+    Rejected { code: String, message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RouteContractResponse {
     Attested { contract: PendingRouteAttestation },
     Rejected { code: String, message: String },
 }
@@ -71,6 +85,39 @@ pub fn decode_pending_route_attestation_response(
     let response: PendingRouteAttestationResponse =
         serde_json::from_slice(body).map_err(|err| err.to_string())?;
     if let PendingRouteAttestationResponse::Attested { contract } = &response {
+        validate_attested_contract(contract)?;
+    }
+    Ok(response)
+}
+
+pub fn encode_route_contract_request(route_name: &str) -> Result<Vec<u8>, String> {
+    validate_route_name(route_name)?;
+    let request = RouteContractRequest {
+        route_name: route_name.to_string(),
+    };
+    encode_json_payload(MsgType::RouteContract, &request)
+}
+
+pub fn decode_route_contract_request(payload: &[u8]) -> Result<RouteContractRequest, String> {
+    let body = split_tag(payload, MsgType::RouteContract)?;
+    let request: RouteContractRequest =
+        serde_json::from_slice(body).map_err(|err| err.to_string())?;
+    validate_route_name(&request.route_name)?;
+    Ok(request)
+}
+
+pub fn encode_route_contract_response(response: &RouteContractResponse) -> Result<Vec<u8>, String> {
+    if let RouteContractResponse::Attested { contract } = response {
+        validate_attested_contract(contract)?;
+    }
+    encode_json_payload(MsgType::RouteContractAck, response)
+}
+
+pub fn decode_route_contract_response(payload: &[u8]) -> Result<RouteContractResponse, String> {
+    let body = split_tag(payload, MsgType::RouteContractAck)?;
+    let response: RouteContractResponse =
+        serde_json::from_slice(body).map_err(|err| err.to_string())?;
+    if let RouteContractResponse::Attested { contract } = &response {
         validate_attested_contract(contract)?;
     }
     Ok(response)
@@ -232,5 +279,45 @@ mod tests {
     #[test]
     fn pending_route_request_rejects_empty_token() {
         assert!(encode_pending_route_attestation_request("grid", "").is_err());
+    }
+
+    #[test]
+    fn route_contract_request_matches_canonical_fixture() {
+        let encoded = encode_route_contract_request("grid").unwrap();
+        let expected = b"\x0c{\"route_name\":\"grid\"}".to_vec();
+
+        assert_eq!(encoded, expected);
+        assert_eq!(
+            decode_route_contract_request(&expected).unwrap(),
+            RouteContractRequest {
+                route_name: "grid".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn route_contract_response_matches_canonical_fixture() {
+        let response = RouteContractResponse::Attested {
+            contract: contract(),
+        };
+        let encoded = encode_route_contract_response(&response).unwrap();
+        let expected = concat!(
+            "\x0d",
+            "{\"status\":\"attested\",\"contract\":{",
+            "\"route_name\":\"grid\",",
+            "\"crm_ns\":\"test.echo\",",
+            "\"crm_name\":\"Echo\",",
+            "\"crm_ver\":\"0.1.0\",",
+            "\"abi_hash\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\",",
+            "\"signature_hash\":\"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210\",",
+            "\"method_names\":[\"ping\"],",
+            "\"max_payload_size\":1024",
+            "}}",
+        )
+        .as_bytes()
+        .to_vec();
+
+        assert_eq!(encoded, expected);
+        assert_eq!(decode_route_contract_response(&expected).unwrap(), response);
     }
 }

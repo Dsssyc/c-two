@@ -172,9 +172,8 @@ impl SyncClient {
         data_size: usize,
     ) -> Result<ResponseData, IpcError> {
         let method_idx = match (|| {
-            let table = self
-                .inner
-                .route_tables
+            let route_tables = self.inner.route_tables.read();
+            let table = route_tables
                 .get(route_name)
                 .ok_or_else(|| IpcError::Handshake(format!("unknown route: {route_name}")))?;
             let method_idx = table
@@ -222,12 +221,12 @@ impl SyncClient {
     }
 
     /// Get the route table for a named route.
-    pub fn route_table(&self, name: &str) -> Option<&MethodTable> {
+    pub fn route_table(&self, name: &str) -> Option<MethodTable> {
         self.inner.route_table(name)
     }
 
     /// Get all route names.
-    pub fn route_names(&self) -> Vec<&str> {
+    pub fn route_names(&self) -> Vec<String> {
         self.inner.route_names()
     }
 
@@ -237,6 +236,14 @@ impl SyncClient {
         expected: &c2_contract::ExpectedRouteContract,
     ) -> Result<(), IpcError> {
         self.inner.validate_route_contract(expected)
+    }
+
+    /// Ensure the connected server currently exports a route matching an expected CRM contract.
+    pub fn ensure_route_contract(
+        &self,
+        expected: &c2_contract::ExpectedRouteContract,
+    ) -> Result<(), IpcError> {
+        self.rt.block_on(self.inner.ensure_route_contract(expected))
     }
 
     /// CRM tag advertised by a route, if present.
@@ -366,8 +373,8 @@ pub(crate) mod tests {
             ..ClientIpcConfig::default()
         };
         let pool = Arc::new(Mutex::new(MemPool::new(c2_mem::PoolConfig::default())));
-        let mut inner = IpcClient::with_pool("ipc://sync_payload_limit", pool.clone(), config);
-        inner.route_tables.insert(
+        let inner = IpcClient::with_pool("ipc://sync_payload_limit", pool.clone(), config);
+        inner.route_tables.write().insert(
             "grid".to_string(),
             MethodTable::from_entries(
                 &[c2_wire::handshake::MethodEntry {

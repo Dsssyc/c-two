@@ -66,6 +66,17 @@ pub enum UpstreamAcquireError {
     },
 }
 
+fn expected_contract_for_route(route: &RouteEntry) -> c2_contract::ExpectedRouteContract {
+    c2_contract::ExpectedRouteContract {
+        route_name: route.name.clone(),
+        crm_ns: route.crm_ns.clone(),
+        crm_name: route.crm_name.clone(),
+        crm_ver: route.crm_ver.clone(),
+        abi_hash: route.abi_hash.clone(),
+        signature_hash: route.signature_hash.clone(),
+    }
+}
+
 impl RelayState {
     pub fn new(
         config: Arc<RelayConfig>,
@@ -271,21 +282,10 @@ impl RelayState {
                             expected.server_instance_id.as_deref().unwrap_or(""),
                         )));
                     }
-                    let expected_contract = c2_contract::ExpectedRouteContract {
-                        route_name: route_name.clone(),
-                        crm_ns: expected.crm_ns.clone(),
-                        crm_name: expected.crm_name.clone(),
-                        crm_ver: expected.crm_ver.clone(),
-                        abi_hash: expected.abi_hash.clone(),
-                        signature_hash: expected.signature_hash.clone(),
-                    };
-                    if let Err(err) = client.validate_route_contract(&expected_contract) {
+                    let expected_contract = expected_contract_for_route(&expected);
+                    if let Err(err) = client.ensure_route_contract(&expected_contract).await {
                         client.close().await;
                         return Err(err);
-                    }
-                    if !client.has_route(&route_name) {
-                        client.close().await;
-                        return Err(c2_ipc::IpcError::RouteNotFound(route_name));
                     }
                     Ok(Arc::new(client))
                 }
@@ -302,6 +302,24 @@ impl RelayState {
                 });
             }
         };
+
+        let lease_address = lease.address();
+        let expected_contract = expected_contract_for_route(&expected);
+        if let Err(error) = lease
+            .client()
+            .ensure_route_contract(&expected_contract)
+            .await
+        {
+            if let Some(old_client) = lease.evict_current_client() {
+                old_client.close_shared().await;
+            }
+            drop(lease);
+            return Err(UpstreamAcquireError::Unreachable {
+                route: expected,
+                address: lease_address,
+                error,
+            });
+        }
 
         let lease_address = lease.address();
         let route_matches_lease =
@@ -487,6 +505,8 @@ impl RelayState {
 mod tests {
     use super::*;
     use crate::relay::authority::RegisterPreparation;
+    use crate::relay::test_support::{shutdown_live_server, start_live_server_with_routes};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     const TEST_CRM_NS: &str = "test.relay";
     const TEST_CRM_NAME: &str = "RelayGrid";
@@ -494,6 +514,7 @@ mod tests {
     const TEST_ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const TEST_SIGNATURE_HASH: &str =
         "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    static NEXT_IPC_SUFFIX: AtomicU64 = AtomicU64::new(0);
 
     struct NullDisseminator;
     impl crate::relay::disseminator::Disseminator for NullDisseminator {
@@ -516,6 +537,15 @@ mod tests {
 
     fn null_disseminator() -> Arc<dyn crate::relay::disseminator::Disseminator> {
         Arc::new(NullDisseminator)
+    }
+
+    fn unique_ipc_address(label: &str) -> String {
+        let suffix = NEXT_IPC_SUFFIX.fetch_add(1, Ordering::Relaxed);
+        format!(
+            "ipc://relay_state_{label}_{}_{}",
+            std::process::id(),
+            suffix
+        )
     }
 
     fn register_local(
@@ -1236,20 +1266,27 @@ mod tests {
     #[tokio::test]
     async fn replacement_proof_is_rejected_after_successful_upstream_acquire() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let old = Arc::new(IpcClient::new("ipc://old"));
+        let old_address = unique_ipc_address("replacement_acquire_old");
+        let replacement_address = unique_ipc_address("replacement_acquire_new");
+        let old = Arc::new(IpcClient::new(&old_address));
         old.force_connected(true);
-        register_local(&state, "grid", "server-old", "ipc://old", old);
+        register_local(&state, "grid", "server-old", &old_address, old);
         state.evict_connection("grid");
         let replacement_proof = confirmed_dead_replacement(
             &state,
             "grid",
             "server-new",
             "server-new-instance",
-            "ipc://replacement",
+            &replacement_address,
         )
         .await;
-        let reconnected = Arc::new(IpcClient::new("ipc://old"));
-        reconnected.force_connected(true);
+        let old_server = start_live_server_with_routes(&old_address, "server-old", &["grid"]).await;
+        let mut reconnected = IpcClient::with_config(&old_address, ClientIpcConfig::default());
+        reconnected
+            .connect()
+            .await
+            .expect("test upstream should connect");
+        let reconnected = Arc::new(reconnected);
         state.reconnect("grid", reconnected);
 
         let (lease, route) = match state.acquire_upstream("grid").await {
@@ -1260,13 +1297,13 @@ mod tests {
         drop(lease);
 
         state.evict_connection("grid");
-        let replacement = Arc::new(IpcClient::new("ipc://replacement"));
+        let replacement = Arc::new(IpcClient::new(&replacement_address));
         replacement.force_connected(true);
         let result = state.commit_register_upstream(
             "grid".into(),
             "server-new".into(),
             "server-new-instance".into(),
-            "ipc://replacement".into(),
+            replacement_address,
             TEST_CRM_NS.to_string(),
             TEST_CRM_NAME.to_string(),
             TEST_CRM_VER.to_string(),
@@ -1280,9 +1317,13 @@ mod tests {
             result,
             RegisterCommitResult::Duplicate {
                 existing_address
-            } if existing_address == "ipc://old"
+            } if existing_address == old_address
         ));
-        assert_eq!(state.get_address("grid").as_deref(), Some("ipc://old"));
+        assert_eq!(
+            state.get_address("grid").as_deref(),
+            Some(old_address.as_str())
+        );
+        shutdown_live_server(&old_server).await;
     }
 
     #[test]

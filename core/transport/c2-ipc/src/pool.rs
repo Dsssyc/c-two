@@ -266,9 +266,82 @@ impl ClientPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::io::{Read, Write};
     use std::os::unix::net::UnixListener;
+    use std::sync::Arc;
     use std::thread;
+
+    use c2_server::{
+        ConcurrencyMode, CrmCallback, CrmError, RequestData, ResponseMeta, RouteBuildSpec,
+        SchedulerLimits, Server, ServerIpcConfig,
+    };
+
+    struct Echo;
+
+    impl CrmCallback for Echo {
+        fn invoke(
+            &self,
+            _route_name: &str,
+            _method_idx: u16,
+            _request: RequestData,
+            _response_pool: Arc<parking_lot::RwLock<c2_mem::MemPool>>,
+        ) -> Result<ResponseMeta, CrmError> {
+            Ok(ResponseMeta::Inline(b"ok".to_vec()))
+        }
+    }
+
+    fn unique_ipc_address(prefix: &str) -> String {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "ipc://{}_{}_{}",
+            prefix,
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    fn expected_contract(name: &str) -> c2_contract::ExpectedRouteContract {
+        c2_contract::ExpectedRouteContract {
+            route_name: name.to_string(),
+            crm_ns: "test.pool".to_string(),
+            crm_name: "Grid".to_string(),
+            crm_ver: "0.1.0".to_string(),
+            abi_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_string(),
+            signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                .to_string(),
+        }
+    }
+
+    async fn register_test_route(server: &Server, name: &str) {
+        let expected = expected_contract(name);
+        let built = server
+            .build_route(
+                RouteBuildSpec {
+                    name: name.to_string(),
+                    crm_ns: expected.crm_ns,
+                    crm_name: expected.crm_name,
+                    crm_ver: expected.crm_ver,
+                    abi_hash: expected.abi_hash,
+                    signature_hash: expected.signature_hash,
+                    method_names: vec!["ping".to_string()],
+                    access_map: HashMap::new(),
+                    concurrency_mode: ConcurrencyMode::ReadParallel,
+                    limits: SchedulerLimits::default(),
+                },
+                Arc::new(Echo),
+            )
+            .expect("test route should build");
+        let reservation = server
+            .reserve_route(built)
+            .await
+            .expect("test route should reserve");
+        server
+            .commit_reserved_route(reservation)
+            .await
+            .expect("test route should commit");
+    }
 
     #[test]
     fn test_pool_new() {
@@ -497,11 +570,63 @@ mod tests {
 
         let pool = ClientPool::new(Duration::from_secs(60));
         let client = pool.acquire(&address, None).unwrap();
-        assert_eq!(client.route_names(), vec!["grid"]);
+        assert_eq!(client.route_names(), vec!["grid".to_string()]);
         pool.release(&address);
 
         server_thread.join().unwrap();
         let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[test]
+    fn pooled_direct_client_refreshes_route_registered_after_handshake() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let address = unique_ipc_address("pool_live_route_refresh");
+            let server = Arc::new(Server::new(&address, ServerIpcConfig::default()).unwrap());
+            register_test_route(&server, "manager").await;
+            let runner = {
+                let server = Arc::clone(&server);
+                tokio::spawn(async move { server.run().await })
+            };
+            server
+                .wait_until_responsive(Duration::from_secs(2))
+                .await
+                .expect("server should be responsive");
+
+            let pool = Arc::new(ClientPool::new(Duration::from_secs(60)));
+            let acquire_pool = Arc::clone(&pool);
+            let acquire_address = address.clone();
+            let client =
+                tokio::task::spawn_blocking(move || acquire_pool.acquire(&acquire_address, None))
+                    .await
+                    .expect("acquire task should complete")
+                    .expect("manager client");
+            assert!(client.route_names().contains(&"manager".to_string()));
+            assert!(!client.route_names().contains(&"builder".to_string()));
+
+            register_test_route(&server, "builder").await;
+            let builder_contract = expected_contract("builder");
+            client
+                .validate_route_contract(&builder_contract)
+                .expect_err("old handshake snapshot must not already know builder");
+
+            let ensure_client = Arc::clone(&client);
+            let ensure_contract = builder_contract.clone();
+            tokio::task::spawn_blocking(move || {
+                ensure_client.ensure_route_contract(&ensure_contract)
+            })
+            .await
+            .expect("ensure task should complete")
+            .expect("direct pooled IPC client should refresh builder route from server");
+            assert!(client.route_names().contains(&"builder".to_string()));
+            pool.release(&address);
+
+            server
+                .shutdown_and_wait(Duration::from_secs(2))
+                .await
+                .expect("server should shut down");
+            runner.await.unwrap().unwrap();
+        });
     }
 
     #[test]

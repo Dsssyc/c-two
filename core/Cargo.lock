@@ -167,6 +167,7 @@ dependencies = [
  "c2-config",
  "c2-contract",
  "c2-mem",
+ "c2-server",
  "c2-wire",
  "futures-util",
  "libc",

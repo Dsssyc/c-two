@@ -498,16 +498,23 @@ impl RelayServer {
                                     let _ = reply.send(Err(RelayControlError::Other(reason)));
                                     continue;
                                 }
-                                if !client.has_route(&name) {
+                                if let Err(err) = client.refresh_route_contract(&name).await {
+                                    let reason = match err {
+                                        c2_ipc::IpcError::RouteNotFound(_) => {
+                                            "route_not_exported".to_string()
+                                        }
+                                        c2_ipc::IpcError::Handshake(reason) => reason,
+                                        other => format!("route_attestation_failed: {other}"),
+                                    };
                                     close_client(client);
                                     eprintln!(
-                                        "[relay] Register command rejected: name={name} server_id={server_id} address={address} reason=route_not_exported"
+                                        "[relay] Register command rejected: name={name} server_id={server_id} address={address} reason={reason}"
                                     );
                                     let _ = reply.send(Err(RelayControlError::Other(format!(
                                         "IPC upstream at {address} does not export route '{name}'"
                                     ))));
                                     continue;
-                                };
+                                }
                                 let contract =
                                     match crate::relay::authority::read_ipc_route_contract(
                                         &client, &name,

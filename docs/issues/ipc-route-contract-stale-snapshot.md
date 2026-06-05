@@ -1,0 +1,112 @@
+# IPC Route Contract Stale Snapshot
+
+**Date**: 2026-06-05
+**Status**: Transitional baseline; superseded by the planned route catalog/watch redesign for full route lifecycle consistency
+**Severity**: High for long-lived multi-route IPC servers
+**Scope**: `c2-ipc` client route catalog, direct IPC acquisition, relay upstream IPC acquisition, relay registration attestation
+
+## Summary
+
+An IPC client learns the server's route table during the initial handshake. That
+handshake is a snapshot. When a long-lived IPC server registers another route
+after a client connection already exists, the existing client can still report
+`route missing` for the newly committed route.
+
+This affected two production-relevant paths:
+
+- direct IPC clients reused from the address-keyed `ClientPool`;
+- HTTP relay data-plane calls when the relay reused an upstream `IpcClient`.
+
+The repair is a single IPC-owned live route contract query. Direct IPC and relay
+upstream IPC now share `c2_ipc::IpcClient::ensure_route_contract(...)` before a
+route-bound client is accepted for dispatch.
+
+## Reproduced Failure
+
+The failing sequence is:
+
+1. IPC server exports `manager`.
+2. A client connects to the IPC address and caches a handshake snapshot with
+   only `manager`.
+3. The same server later commits `builder`.
+4. The client pool reuses the existing IPC client for `builder`.
+5. Local cached validation reports `route missing: builder` even though the
+   server is alive and the route is committed.
+6. Relay-aware SDK paths can then fall back to HTTP, making the real IPC cache
+   defect look like a relay upstream reconnect problem.
+
+## Decision
+
+`c2-ipc` owns the route-catalog refresh mechanism.
+
+- `validate_route_contract(...)` remains a cache-only check.
+- `refresh_route_contract(route_name)` asks the connected server for the current
+  committed route contract and method table, then updates the client cache.
+- `ensure_route_contract(expected)` first tries the cache and only performs a
+  live query on cache miss or contract mismatch.
+- When `refresh_route_contract(...)` is called, a live `RouteNotFound` response
+  is the semantic proof that the connected server does not currently export the
+  committed route.
+
+This keeps the fast path cheap while removing the assumption that the handshake
+route list is a permanent catalog.
+
+## Known Remaining Gaps
+
+This repair intentionally does not provide complete route lifecycle
+consistency. It is a tested baseline that fixes stale snapshots missing a route
+that was registered after connection handshake. It does not fully solve these
+cases:
+
+- a cached route that later becomes closed, removed, or replaced can still pass
+  cache-only validation until a call reaches server-side dispatch;
+- `IpcError::Handshake` still represents protocol/decode failures as well as
+  semantic identity and contract failures, so relay withdraw decisions cannot
+  safely use it as a single route-invalid signal;
+- clients and relay upstream pools do not subscribe to route catalog updates,
+  so they cannot proactively invalidate stale route entries.
+
+The long-term fix is a clean-cut route catalog protocol with revisions, watch
+events, route instance identity, typed transport/semantic errors, and
+server-side call-time route validation.
+
+## HTTP Client Boundary
+
+External HTTP relay clients do not have the same snapshot shape.
+
+`RelayControlClient` caches resolution results by the full
+`ExpectedRouteContract`, not by route name or server address. `HttpClient` calls
+and probes also send the expected CRM contract headers on every request. Reusing
+an HTTP connection pool entry for the same relay URL does not reuse an IPC
+server route table.
+
+The HTTP relay data plane still depends on IPC behind the relay. A request such
+as `POST /builder/ping` can acquire a relay-owned upstream `IpcClient`. That
+upstream client is subject to the same IPC handshake snapshot issue, so
+`RelayState::acquire_upstream(...)` now calls the shared IPC
+`ensure_route_contract(...)` both when creating a new upstream client and when
+the connection pool returns an existing client.
+
+## Registration Boundary
+
+Relay registration still connects to the IPC server for identity and route
+contract attestation. That validation no longer treats `has_route(...)` from the
+handshake snapshot as authoritative. Committed route registration uses the live
+route contract query; pending route registration continues to use the pending
+route attestation token path.
+
+## Non-Goals
+
+- No Python-side route refresh logic.
+- No separate relay-specific IPC refresh implementation.
+- No route subscription, route generation, or pushed route-table invalidation.
+- No compatibility shim for accepting name-only CRM dispatch.
+- No change to ordinary external HTTP client pooling semantics.
+
+## Regression Coverage
+
+- `c2-ipc`: a pooled direct IPC client connected before `builder` is registered
+  must refresh and validate `builder` after the server commits it.
+- `c2-http` relay: an HTTP relay data-plane request must succeed when the relay
+  upstream slot contains an `IpcClient` whose original handshake snapshot lacks
+  the later committed route.

@@ -29,8 +29,10 @@ use c2_wire::handshake::{
     encode_client_handshake,
 };
 use c2_wire::registration_control::{
-    PENDING_ROUTE_REJECT_NOT_FOUND, PendingRouteAttestationResponse,
-    decode_pending_route_attestation_response, encode_pending_route_attestation_request,
+    PENDING_ROUTE_REJECT_NOT_FOUND, PendingRouteAttestation, PendingRouteAttestationResponse,
+    ROUTE_CONTRACT_REJECT_NOT_FOUND, RouteContractResponse,
+    decode_pending_route_attestation_response, decode_route_contract_response,
+    encode_pending_route_attestation_request, encode_route_contract_request,
 };
 
 use c2_mem::config::PoolConfig;
@@ -380,7 +382,7 @@ pub struct IpcClient {
     writer: Arc<Mutex<Option<tokio::io::WriteHalf<UnixStream>>>>,
     pending: Arc<StdMutex<PendingMap>>,
     rid_counter: AtomicU32,
-    pub(crate) route_tables: HashMap<String, MethodTable>,
+    pub(crate) route_tables: RwLock<HashMap<String, MethodTable>>,
     server_segments: Vec<(String, u32)>,
     pub(crate) server_identity: Option<c2_wire::handshake::ServerIdentity>,
     /// Server SHM pool state for reading buddy reply responses.
@@ -457,7 +459,7 @@ impl IpcClient {
             writer: Arc::new(Mutex::new(None)),
             pending: Arc::new(StdMutex::new(HashMap::new())),
             rid_counter: AtomicU32::new(1),
-            route_tables: HashMap::new(),
+            route_tables: RwLock::new(HashMap::new()),
             server_segments: Vec::new(),
             server_identity: None,
             server_pool: Arc::new(StdMutex::new(None)),
@@ -537,7 +539,7 @@ impl IpcClient {
         // Store method tables from the handshake response.
         for route in &hs.routes {
             let table = MethodTable::from_route(route);
-            self.route_tables.insert(route.name.clone(), table);
+            self.route_tables.write().insert(route.name.clone(), table);
         }
         self.server_segments = hs.segments.clone();
         self.server_identity = Some(server_identity);
@@ -692,8 +694,8 @@ impl IpcClient {
     }
 
     fn method_idx_for(&self, route_name: &str, method_name: &str) -> Result<u16, IpcError> {
-        let table = self
-            .route_tables
+        let route_tables = self.route_tables.read();
+        let table = route_tables
             .get(route_name)
             .ok_or_else(|| IpcError::Handshake(format!("unknown route: {route_name}")))?;
         table
@@ -702,8 +704,8 @@ impl IpcClient {
     }
 
     fn ensure_route_payload_size(&self, route_name: &str, data_len: u64) -> Result<(), IpcError> {
-        let table = self
-            .route_tables
+        let route_tables = self.route_tables.read();
+        let table = route_tables
             .get(route_name)
             .ok_or_else(|| IpcError::Handshake(format!("unknown route: {route_name}")))?;
         let max_payload_size = table.max_payload_size();
@@ -1427,27 +1429,11 @@ impl IpcClient {
         Ok(())
     }
 
-    /// Get the method table for a route.
-    pub fn route_table(&self, name: &str) -> Option<&MethodTable> {
-        self.route_tables.get(name)
-    }
-
-    /// Whether the handshake route table contains a route.
-    pub fn has_route(&self, name: &str) -> bool {
-        self.route_tables.contains_key(name)
-    }
-
-    /// Validate that the connected route matches the complete expected route contract.
-    pub fn validate_route_contract(
-        &self,
+    fn validate_method_table_contract(
+        route_name: &str,
+        table: &MethodTable,
         expected: &c2_contract::ExpectedRouteContract,
     ) -> Result<(), IpcError> {
-        c2_contract::validate_expected_route_contract(expected)
-            .map_err(|err| IpcError::Handshake(err.to_string()))?;
-        let table = self
-            .route_tables
-            .get(&expected.route_name)
-            .ok_or_else(|| IpcError::RouteNotFound(expected.route_name.clone()))?;
         if table.crm_ns() == expected.crm_ns
             && table.crm_name() == expected.crm_name
             && table.crm_ver() == expected.crm_ver
@@ -1458,7 +1444,7 @@ impl IpcClient {
         }
         Err(IpcError::Handshake(format!(
             "CRM contract mismatch for route {}: expected {}/{}/{} abi_hash={} signature_hash={}, got {}/{}/{} abi_hash={} signature_hash={}",
-            expected.route_name,
+            route_name,
             expected.crm_ns,
             expected.crm_name,
             expected.crm_ver,
@@ -1472,34 +1458,52 @@ impl IpcClient {
         )))
     }
 
-    /// CRM tag advertised by a route, if present.
-    pub fn route_contract(&self, route_name: &str) -> Option<c2_contract::ExpectedRouteContract> {
-        self.route_tables
-            .get(route_name)
-            .map(|table| c2_contract::ExpectedRouteContract {
-                route_name: route_name.to_string(),
-                crm_ns: table.crm_ns().to_string(),
-                crm_name: table.crm_name().to_string(),
-                crm_ver: table.crm_ver().to_string(),
-                abi_hash: table.abi_hash().to_string(),
-                signature_hash: table.signature_hash().to_string(),
+    fn method_table_from_attestation(contract: &PendingRouteAttestation) -> MethodTable {
+        let method_entries = contract
+            .method_names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| MethodEntry {
+                name: name.clone(),
+                index: index as u16,
             })
+            .collect::<Vec<_>>();
+        MethodTable::from_entries(
+            &method_entries,
+            contract.crm_ns.clone(),
+            contract.crm_name.clone(),
+            contract.crm_ver.clone(),
+            contract.abi_hash.clone(),
+            contract.signature_hash.clone(),
+            contract.max_payload_size,
+        )
     }
 
-    /// Maximum logical payload size advertised by a route, if present.
-    pub fn route_max_payload_size(&self, route_name: &str) -> Option<u64> {
-        self.route_tables
-            .get(route_name)
-            .map(MethodTable::max_payload_size)
+    fn expected_contract_from_attestation(
+        contract: PendingRouteAttestation,
+    ) -> c2_contract::ExpectedRouteContract {
+        c2_contract::ExpectedRouteContract {
+            route_name: contract.route_name,
+            crm_ns: contract.crm_ns,
+            crm_name: contract.crm_name,
+            crm_ver: contract.crm_ver,
+            abi_hash: contract.abi_hash,
+            signature_hash: contract.signature_hash,
+        }
     }
 
-    pub async fn pending_route_contract(
-        &mut self,
-        route_name: &str,
-        registration_token: &str,
-    ) -> Result<c2_contract::ExpectedRouteContract, IpcError> {
-        let payload = encode_pending_route_attestation_request(route_name, registration_token)
-            .map_err(IpcError::Handshake)?;
+    fn cache_attested_contract(&self, contract: &PendingRouteAttestation) {
+        self.route_tables.write().insert(
+            contract.route_name.clone(),
+            Self::method_table_from_attestation(contract),
+        );
+    }
+
+    async fn send_control_inline(
+        &self,
+        payload: Vec<u8>,
+        description: &str,
+    ) -> Result<Vec<u8>, IpcError> {
         let rid = self.rid_counter.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         {
@@ -1523,45 +1527,123 @@ impl IpcClient {
             Ok(result) => result?,
             Err(_) => return Err(IpcError::Closed),
         };
-        let payload = match response {
-            ResponseData::Inline(payload) => payload,
-            _ => {
-                return Err(IpcError::Handshake(
-                    "pending route attestation returned non-inline response".to_string(),
-                ));
+        match response {
+            ResponseData::Inline(payload) => Ok(payload),
+            _ => Err(IpcError::Handshake(format!(
+                "{description} returned non-inline response"
+            ))),
+        }
+    }
+
+    /// Get the method table for a route.
+    pub fn route_table(&self, name: &str) -> Option<MethodTable> {
+        self.route_tables.read().get(name).cloned()
+    }
+
+    /// Whether the cached route table contains a route.
+    pub fn has_route(&self, name: &str) -> bool {
+        self.route_tables.read().contains_key(name)
+    }
+
+    /// Validate that the cached route matches the complete expected route contract.
+    pub fn validate_route_contract(
+        &self,
+        expected: &c2_contract::ExpectedRouteContract,
+    ) -> Result<(), IpcError> {
+        c2_contract::validate_expected_route_contract(expected)
+            .map_err(|err| IpcError::Handshake(err.to_string()))?;
+        let route_tables = self.route_tables.read();
+        let table = route_tables
+            .get(&expected.route_name)
+            .ok_or_else(|| IpcError::RouteNotFound(expected.route_name.clone()))?;
+        Self::validate_method_table_contract(&expected.route_name, table, expected)
+    }
+
+    /// Refresh one route's committed contract from the connected server.
+    pub async fn refresh_route_contract(
+        &self,
+        route_name: &str,
+    ) -> Result<c2_contract::ExpectedRouteContract, IpcError> {
+        let request = encode_route_contract_request(route_name).map_err(IpcError::Handshake)?;
+        let payload = self
+            .send_control_inline(request, "route contract attestation")
+            .await?;
+        match decode_route_contract_response(&payload).map_err(IpcError::Handshake)? {
+            RouteContractResponse::Attested { contract } => {
+                self.cache_attested_contract(&contract);
+                Ok(Self::expected_contract_from_attestation(contract))
             }
-        };
+            RouteContractResponse::Rejected { code, message } => {
+                if code == ROUTE_CONTRACT_REJECT_NOT_FOUND {
+                    Err(IpcError::RouteNotFound(route_name.to_string()))
+                } else {
+                    Err(IpcError::Handshake(message))
+                }
+            }
+        }
+    }
+
+    /// Ensure the connected server currently exports a route matching the
+    /// expected CRM contract, refreshing the local route cache when the
+    /// handshake snapshot is stale.
+    pub async fn ensure_route_contract(
+        &self,
+        expected: &c2_contract::ExpectedRouteContract,
+    ) -> Result<(), IpcError> {
+        c2_contract::validate_expected_route_contract(expected)
+            .map_err(|err| IpcError::Handshake(err.to_string()))?;
+        {
+            let route_tables = self.route_tables.read();
+            if let Some(table) = route_tables.get(&expected.route_name) {
+                if Self::validate_method_table_contract(&expected.route_name, table, expected)
+                    .is_ok()
+                {
+                    return Ok(());
+                }
+            }
+        }
+
+        self.refresh_route_contract(&expected.route_name).await?;
+        self.validate_route_contract(expected)
+    }
+
+    /// CRM tag advertised by a route, if present.
+    pub fn route_contract(&self, route_name: &str) -> Option<c2_contract::ExpectedRouteContract> {
+        self.route_tables
+            .read()
+            .get(route_name)
+            .map(|table| c2_contract::ExpectedRouteContract {
+                route_name: route_name.to_string(),
+                crm_ns: table.crm_ns().to_string(),
+                crm_name: table.crm_name().to_string(),
+                crm_ver: table.crm_ver().to_string(),
+                abi_hash: table.abi_hash().to_string(),
+                signature_hash: table.signature_hash().to_string(),
+            })
+    }
+
+    /// Maximum logical payload size advertised by a route, if present.
+    pub fn route_max_payload_size(&self, route_name: &str) -> Option<u64> {
+        self.route_tables
+            .read()
+            .get(route_name)
+            .map(MethodTable::max_payload_size)
+    }
+
+    pub async fn pending_route_contract(
+        &mut self,
+        route_name: &str,
+        registration_token: &str,
+    ) -> Result<c2_contract::ExpectedRouteContract, IpcError> {
+        let payload = encode_pending_route_attestation_request(route_name, registration_token)
+            .map_err(IpcError::Handshake)?;
+        let payload = self
+            .send_control_inline(payload, "pending route attestation")
+            .await?;
         match decode_pending_route_attestation_response(&payload).map_err(IpcError::Handshake)? {
             PendingRouteAttestationResponse::Attested { contract } => {
-                let method_entries = contract
-                    .method_names
-                    .iter()
-                    .enumerate()
-                    .map(|(index, name)| MethodEntry {
-                        name: name.clone(),
-                        index: index as u16,
-                    })
-                    .collect::<Vec<_>>();
-                self.route_tables.insert(
-                    contract.route_name.clone(),
-                    MethodTable::from_entries(
-                        &method_entries,
-                        contract.crm_ns.clone(),
-                        contract.crm_name.clone(),
-                        contract.crm_ver.clone(),
-                        contract.abi_hash.clone(),
-                        contract.signature_hash.clone(),
-                        contract.max_payload_size,
-                    ),
-                );
-                Ok(c2_contract::ExpectedRouteContract {
-                    route_name: contract.route_name,
-                    crm_ns: contract.crm_ns,
-                    crm_name: contract.crm_name,
-                    crm_ver: contract.crm_ver,
-                    abi_hash: contract.abi_hash,
-                    signature_hash: contract.signature_hash,
-                })
+                self.cache_attested_contract(&contract);
+                Ok(Self::expected_contract_from_attestation(contract))
             }
             PendingRouteAttestationResponse::Rejected { code, message } => {
                 if code == PENDING_ROUTE_REJECT_NOT_FOUND {
@@ -1574,8 +1656,8 @@ impl IpcClient {
     }
 
     /// Get all route names.
-    pub fn route_names(&self) -> Vec<&str> {
-        self.route_tables.keys().map(|s| s.as_str()).collect()
+    pub fn route_names(&self) -> Vec<String> {
+        self.route_tables.read().keys().cloned().collect()
     }
 
     /// Whether the client has an active connection.
@@ -1880,10 +1962,10 @@ mod tests {
     fn client_validates_route_crm_contract_from_handshake_metadata() {
         const ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         const SIG_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
-        let mut client = IpcClient::new("ipc://contract_projection");
+        let client = IpcClient::new("ipc://contract_projection");
         let mut methods = HashMap::new();
         methods.insert("ping".to_string(), 0);
-        client.route_tables.insert(
+        client.route_tables.write().insert(
             "grid".to_string(),
             MethodTable {
                 crm_ns: "test.grid".to_string(),
@@ -1934,10 +2016,10 @@ mod tests {
     async fn client_rejects_request_over_route_payload_limit_before_transport() {
         const ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         const SIG_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
-        let mut client = IpcClient::new("ipc://payload_limit");
+        let client = IpcClient::new("ipc://payload_limit");
         let mut methods = HashMap::new();
         methods.insert("ping".to_string(), 0);
-        client.route_tables.insert(
+        client.route_tables.write().insert(
             "grid".to_string(),
             MethodTable {
                 crm_ns: "test.grid".to_string(),
@@ -1988,10 +2070,10 @@ mod tests {
                 ..c2_config::BaseIpcConfig::default()
             },
         };
-        let mut client = IpcClient::with_config("ipc://stream_length_mismatch", cfg);
+        let client = IpcClient::with_config("ipc://stream_length_mismatch", cfg);
         let mut methods = HashMap::new();
         methods.insert("ping".to_string(), 0);
-        client.route_tables.insert(
+        client.route_tables.write().insert(
             "grid".to_string(),
             MethodTable {
                 crm_ns: "test.grid".to_string(),

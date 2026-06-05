@@ -55,7 +55,9 @@ use c2_wire::msg_type::{DISCONNECT_ACK_BYTES, MsgType, PONG_BYTES};
 use c2_wire::registration_control::{
     PENDING_ROUTE_REJECT_INVALID, PENDING_ROUTE_REJECT_NOT_FOUND,
     PENDING_ROUTE_REJECT_TOKEN_MISMATCH, PendingRouteAttestation, PendingRouteAttestationResponse,
-    decode_pending_route_attestation_request, encode_pending_route_attestation_response,
+    ROUTE_CONTRACT_REJECT_INVALID, ROUTE_CONTRACT_REJECT_NOT_FOUND, RouteContractResponse,
+    decode_pending_route_attestation_request, decode_route_contract_request,
+    encode_pending_route_attestation_response, encode_route_contract_response,
 };
 use c2_wire::shutdown_control::{DirectShutdownAck, decode_shutdown_initiate, encode_shutdown_ack};
 
@@ -1684,25 +1686,54 @@ async fn handle_ctrl(
     let Some(msg_type) = payload.first().and_then(|&b| MsgType::from_byte(b)) else {
         return;
     };
-    if msg_type != MsgType::PendingRouteAttest {
-        debug!(request_id, "unknown ctrl frame ignored");
-        return;
-    }
+    let response = match msg_type {
+        MsgType::PendingRouteAttest => pending_route_attestation_payload(server, payload),
+        MsgType::RouteContract => route_contract_payload(server, payload).await,
+        _ => {
+            debug!(request_id, "unknown ctrl frame ignored");
+            return;
+        }
+    };
+    write_ctrl_response(writer, request_id, &response).await;
+}
 
+fn route_attestation_from_parts(
+    route_name: String,
+    crm_ns: String,
+    crm_name: String,
+    crm_ver: String,
+    abi_hash: String,
+    signature_hash: String,
+    method_names: Vec<String>,
+    max_payload_size: u64,
+) -> PendingRouteAttestation {
+    PendingRouteAttestation {
+        route_name,
+        crm_ns,
+        crm_name,
+        crm_ver,
+        abi_hash,
+        signature_hash,
+        method_names,
+        max_payload_size,
+    }
+}
+
+fn pending_route_attestation_payload(server: &Server, payload: &[u8]) -> Vec<u8> {
     let response = match decode_pending_route_attestation_request(payload) {
         Ok(request) => {
             match server.attest_pending_route(&request.route_name, &request.registration_token) {
                 Ok(info) => PendingRouteAttestationResponse::Attested {
-                    contract: PendingRouteAttestation {
-                        route_name: info.contract.route_name,
-                        crm_ns: info.contract.crm_ns,
-                        crm_name: info.contract.crm_name,
-                        crm_ver: info.contract.crm_ver,
-                        abi_hash: info.contract.abi_hash,
-                        signature_hash: info.contract.signature_hash,
-                        method_names: info.method_names,
-                        max_payload_size: info.max_payload_size,
-                    },
+                    contract: route_attestation_from_parts(
+                        info.contract.route_name,
+                        info.contract.crm_ns,
+                        info.contract.crm_name,
+                        info.contract.crm_ver,
+                        info.contract.abi_hash,
+                        info.contract.signature_hash,
+                        info.method_names,
+                        info.max_payload_size,
+                    ),
                 },
                 Err(response) => response,
             }
@@ -1714,15 +1745,54 @@ async fn handle_ctrl(
     };
 
     match encode_pending_route_attestation_response(&response) {
-        Ok(payload) => write_ctrl_response(writer, request_id, &payload).await,
+        Ok(payload) => payload,
         Err(err) => {
             let fallback = PendingRouteAttestationResponse::Rejected {
                 code: PENDING_ROUTE_REJECT_INVALID.to_string(),
                 message: err,
             };
-            if let Ok(payload) = encode_pending_route_attestation_response(&fallback) {
-                write_ctrl_response(writer, request_id, &payload).await;
+            encode_pending_route_attestation_response(&fallback).unwrap_or_default()
+        }
+    }
+}
+
+async fn route_contract_payload(server: &Server, payload: &[u8]) -> Vec<u8> {
+    let response = match decode_route_contract_request(payload) {
+        Ok(request) => {
+            let dispatcher = server.dispatcher.read().await;
+            match dispatcher.resolve(&request.route_name) {
+                Some(route) => RouteContractResponse::Attested {
+                    contract: route_attestation_from_parts(
+                        route.name.clone(),
+                        route.crm_ns.clone(),
+                        route.crm_name.clone(),
+                        route.crm_ver.clone(),
+                        route.abi_hash.clone(),
+                        route.signature_hash.clone(),
+                        route.method_names.clone(),
+                        server.config.max_payload_size,
+                    ),
+                },
+                None => RouteContractResponse::Rejected {
+                    code: ROUTE_CONTRACT_REJECT_NOT_FOUND.to_string(),
+                    message: format!("route not found: {}", request.route_name),
+                },
             }
+        }
+        Err(err) => RouteContractResponse::Rejected {
+            code: ROUTE_CONTRACT_REJECT_INVALID.to_string(),
+            message: err,
+        },
+    };
+
+    match encode_route_contract_response(&response) {
+        Ok(payload) => payload,
+        Err(err) => {
+            let fallback = RouteContractResponse::Rejected {
+                code: ROUTE_CONTRACT_REJECT_INVALID.to_string(),
+                message: err,
+            };
+            encode_route_contract_response(&fallback).unwrap_or_default()
         }
     }
 }

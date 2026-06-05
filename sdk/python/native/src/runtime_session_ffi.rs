@@ -654,7 +654,12 @@ impl PyRuntimeSession {
             expected_abi_hash,
             expected_signature_hash,
         )?;
-        if let Err(err) = client.validate_route_contract(&expected) {
+        let ensure_result = py.detach({
+            let client = Arc::clone(&client);
+            let expected = expected.clone();
+            move || client.ensure_route_contract(&expected)
+        });
+        if let Err(err) = ensure_result {
             self.pool.inner.release(address);
             return Err(pyo3::exceptions::PyRuntimeError::new_err(format!("{err}")));
         }
@@ -930,21 +935,24 @@ impl PyRuntimeSession {
             ));
         }
 
-        if !client
-            .route_names()
-            .into_iter()
-            .any(|registered| registered == expected.route_name)
-        {
+        let ensure_result = py.detach({
+            let client = Arc::clone(&client);
+            let expected = expected.clone();
+            move || client.ensure_route_contract(&expected)
+        });
+        if let Err(err) = ensure_result {
             pool.release(&addr);
-            return Err(RelayIpcConnectError::Unavailable(
-                RelayIpcUnavailable::route_missing(&addr, &expected.route_name),
-            ));
-        }
-        if let Err(err) = client.validate_route_contract(expected) {
-            pool.release(&addr);
-            return Err(RelayIpcConnectError::ContractMismatch(
-                PyRuntimeError::new_err(err.to_string()),
-            ));
+            return match err {
+                IpcError::RouteNotFound(_) => Err(RelayIpcConnectError::Unavailable(
+                    RelayIpcUnavailable::route_missing(&addr, &expected.route_name),
+                )),
+                IpcError::Handshake(_) => Err(RelayIpcConnectError::ContractMismatch(
+                    PyRuntimeError::new_err(err.to_string()),
+                )),
+                other => Err(RelayIpcConnectError::Unavailable(
+                    RelayIpcUnavailable::pool_acquire(&addr, &expected.route_name, other),
+                )),
+            };
         }
         self.inner.mark_client_config_frozen();
         Ok(client)

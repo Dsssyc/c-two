@@ -745,7 +745,10 @@ def test_relay_ipc_acceptance_does_not_trust_route_name_only() -> None:
         if (pos := acquire_body.find(needle)) >= 0
     ]
     assert identity_checks
-    assert min(identity_checks) < acquire_body.find('route_names()')
+    ensure_pos = acquire_body.find('ensure_route_contract(&expected)')
+    assert ensure_pos >= 0
+    assert min(identity_checks) < ensure_pos
+    assert 'route_names()' not in acquire_body
 
 
 def test_relay_ipc_identity_mismatch_falls_back_to_http_not_hard_error() -> None:
@@ -805,4 +808,4 @@ def test_relay_ipc_identity_boundary_is_native_owned() -> None:
 
     assert 'server_instance_id' not in registry_source
     assert 'expected_server_instance_id' in native_source
-    assert 'route_names()' in native_source
+    assert 'ensure_route_contract(&expected)' in native_source
