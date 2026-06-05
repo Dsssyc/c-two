@@ -668,6 +668,7 @@ impl<'a> RouteAuthority<'a> {
         }
 
         let mut route_table = self.state.route_table_write();
+        let mut required_replacement_address = None;
         if let Some(existing) = route_table.local_route(&name) {
             let existing_address = existing.ipc_address.clone().unwrap_or_default();
             let existing_server_id = existing.server_id.clone().unwrap_or_default();
@@ -715,6 +716,7 @@ impl<'a> RouteAuthority<'a> {
                     }
                     _ => return Err(ControlError::DuplicateRoute { existing_address }),
                 }
+                required_replacement_address = Some(existing_address);
             }
         }
 
@@ -738,7 +740,12 @@ impl<'a> RouteAuthority<'a> {
             return Err(ControlError::OwnerMismatch);
         }
 
-        let old_client = if let Some(token) = replacement {
+        let old_client = if let Some(required_replacement_address) = required_replacement_address {
+            let Some(token) = replacement else {
+                return Err(ControlError::DuplicateRoute {
+                    existing_address: required_replacement_address,
+                });
+            };
             let token_existing_address = token.existing_address.clone();
             let evidence: OwnerReplacementEvidence = token.evidence;
             match self

@@ -19,6 +19,7 @@ pub(crate) mod state;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub(crate) mod types;
+pub(crate) mod upstream_control;
 pub(crate) mod url;
 
 pub use c2_config::RelayConfig;

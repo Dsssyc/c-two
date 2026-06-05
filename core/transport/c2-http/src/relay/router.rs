@@ -926,6 +926,7 @@ async fn handle_register(
                 entry.crm_name,
                 entry.crm_ver
             );
+            state.start_upstream_control(&entry);
             entry
         }
         RegisterCommitResult::SameOwner { entry } => {
@@ -940,6 +941,7 @@ async fn handle_register(
                 entry.crm_name,
                 entry.crm_ver
             );
+            state.start_upstream_control(&entry);
             return (
                 StatusCode::OK,
                 Json(serde_json::json!({"registered": entry.name})),
@@ -1519,6 +1521,7 @@ fn remove_unreachable_route(state: &Arc<RelayState>, route: &RouteEntry) {
     if let Some((entry, removed_at, client)) =
         state.remove_unreachable_local_upstream_if_matches(route)
     {
+        state.stop_upstream_control_if_owner_idle_for_route(&entry);
         if let Some(client) = client {
             close_arc_client(client);
         }
@@ -1567,6 +1570,16 @@ mod tests {
     const TEST_ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const TEST_SIGNATURE_HASH: &str =
         "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+    async fn wait_for_local_route_removed(state: &Arc<RelayState>, name: &str) {
+        for _ in 0..40 {
+            if state.local_route(name).is_none() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("timed out waiting for local route {name:?} to be removed");
+    }
 
     struct RequestKindCallback;
 
@@ -3663,9 +3676,10 @@ mod tests {
         )
         .await;
 
+        wait_for_local_route_removed(&state, "grid").await;
         assert_eq!(
             get_probe(state.clone(), "grid").await,
-            StatusCode::BAD_GATEWAY
+            StatusCode::NOT_FOUND
         );
         assert!(state.local_route("grid").is_none());
 
@@ -3705,9 +3719,10 @@ mod tests {
         )
         .await;
 
+        wait_for_local_route_removed(&state, "grid").await;
         assert_eq!(
             get_probe(state.clone(), "grid").await,
-            StatusCode::BAD_GATEWAY
+            StatusCode::NOT_FOUND
         );
         assert!(state.local_route("grid").is_none());
 
@@ -3936,6 +3951,29 @@ mod tests {
             1,
             "snapshot refresh must not withdraw the relay route"
         );
+
+        shutdown_live_server(&server).await;
+    }
+
+    #[tokio::test]
+    async fn relay_upstream_watch_removes_local_route_without_data_plane_call() {
+        let state = test_state_for_client();
+        let address = format!(
+            "ipc://relay_upstream_watch_remove_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let server = start_live_server(&address, "server-grid").await;
+
+        assert_eq!(
+            post_register(state.clone(), "grid", "server-grid", &address).await,
+            StatusCode::CREATED
+        );
+        assert_eq!(state.resolve("grid").len(), 1);
+
+        assert!(server.unregister_route("grid").await);
+
+        wait_for_local_route_removed(&state, "grid").await;
 
         shutdown_live_server(&server).await;
     }

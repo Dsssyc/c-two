@@ -1,7 +1,7 @@
 # Route Catalog Watch Redesign Implementation Plan
 
 **Date:** 2026-06-05
-**Status:** Phase 1 implemented; Phase 2 call-token foundation implemented; Phase 3 RouteCatalog wire/server/client watch implemented; Phase 4 relay authority/data-pool split pending
+**Status:** Phase 1 implemented; Phase 2 call-token foundation implemented; Phase 3 RouteCatalog wire/server/client watch implemented; Phase 4 upstream control watch slice implemented; Phase 4/5 relay token and HTTP error cleanup pending
 **Scope:** IPC route lifecycle, relay route authority, relay upstream pools, relay-aware HTTP fallback, Rust error taxonomy, Python SDK error facade
 **Supersedes:** `docs/issues/ipc-route-contract-stale-snapshot.md` as the long-term design
 
@@ -933,6 +933,33 @@ Verification:
   revision, and compaction revision.
 - relay mesh route ordering tests prove old timestamp-only ordering no longer
   decides active vs tombstone state.
+
+Status:
+
+- upstream control watch slice implemented on 2026-06-05:
+  - registration attestation remains a temporary client and is closed after
+    commit;
+  - relay starts one control-only IPC watch task per local upstream owner
+    instance, keyed by server id, server instance id, and IPC address;
+  - control watch updates relay RouteAuthority when the owner route disappears,
+    closes, changes contract, or the owner instance identity changes, without
+    waiting for an HTTP probe/call;
+  - control clients are not stored in `UpstreamDataPool`, so idle eviction still
+    applies only to data-plane clients;
+  - replacement commit tolerates the old route being concurrently removed by
+    control watch after replacement evidence is collected.
+- verified for this slice:
+  - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay relay_upstream_watch_removes_local_route_without_data_plane_call -- --nocapture`;
+  - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay`.
+- remaining Phase 4/5 work:
+  - model relay-side `WatchDisconnected` / `RouteWatchUnavailable` authority
+    state instead of only logging control watch disconnects;
+  - add relay authority route UID/revision/state fields and align tombstone
+    compaction with catalog revision, not only timestamp tombstones;
+  - bind relay HTTP data-plane calls to immutable route tokens instead of
+    forwarding by route name after acquire;
+  - replace legacy relay HTTP JSON error names with canonical C2 error envelope
+    fields.
 
 ### Phase 5: Relay-Aware HTTP And Loopback Fallback Clean Cut
 

@@ -608,6 +608,7 @@ impl RelayServer {
                                             entry.crm_name,
                                             entry.crm_ver
                                         );
+                                        state.start_upstream_control(&entry);
                                         broadcast_route_announce(&state, &entry);
                                         Ok(())
                                     }
@@ -623,6 +624,7 @@ impl RelayServer {
                                             entry.crm_name,
                                             entry.crm_ver
                                         );
+                                        state.start_upstream_control(&entry);
                                         Ok(())
                                     }
                                     RegisterCommitResult::Duplicate { .. }

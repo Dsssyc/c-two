@@ -22,10 +22,12 @@ use crate::relay::conn_pool::{
 };
 use crate::relay::route_table::{RouteTable, TombstoneGcEntry};
 use crate::relay::types::*;
+use crate::relay::upstream_control::{self, UpstreamControlTask, UpstreamOwnerKey};
 
 pub struct RelayState {
     route_table: RwLock<RouteTable>,
     conn_pool: ConnectionPool,
+    upstream_controls: RwLock<HashMap<UpstreamOwnerKey, UpstreamControlTask>>,
     config: Arc<RelayConfig>,
     disseminator: Arc<dyn crate::relay::disseminator::Disseminator>,
 }
@@ -86,6 +88,7 @@ impl RelayState {
         Self {
             route_table: RwLock::new(RouteTable::new(config.relay_id.clone())),
             conn_pool: ConnectionPool::with_owner_lease_duration(owner_lease_duration),
+            upstream_controls: RwLock::new(HashMap::new()),
             disseminator,
             config,
         }
@@ -173,11 +176,14 @@ impl RelayState {
                 entry,
                 removed_at,
                 client,
-            }) => UnregisterResult::Removed {
-                entry,
-                removed_at,
-                client,
-            },
+            }) => {
+                self.stop_upstream_control_if_owner_idle_for_route(&entry);
+                UnregisterResult::Removed {
+                    entry,
+                    removed_at,
+                    client,
+                }
+            }
             Ok(
                 RouteCommandResult::Registered { .. }
                 | RouteCommandResult::SameOwner { .. }
@@ -390,6 +396,61 @@ impl RelayState {
 
     pub(crate) fn insert_owner_slot(&self, name: String, address: String) {
         self.conn_pool.insert_owner(name, address);
+    }
+
+    pub(crate) fn start_upstream_control(self: &Arc<Self>, entry: &RouteEntry) {
+        let Some(key) = upstream_control::owner_key_for_route(entry) else {
+            return;
+        };
+        {
+            let controls = self.upstream_controls.read();
+            if controls.contains_key(&key) {
+                return;
+            }
+        }
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let task = upstream_control::spawn(Arc::clone(self), key.clone());
+        let old_task = self.upstream_controls.write().insert(key, task);
+        if let Some(old_task) = old_task {
+            old_task.abort();
+        }
+    }
+
+    pub(crate) fn local_routes_for_owner(&self, key: &UpstreamOwnerKey) -> Vec<RouteEntry> {
+        self.route_table
+            .read()
+            .list_routes()
+            .into_iter()
+            .filter(|entry| upstream_control::owner_key_for_route(entry).as_ref() == Some(key))
+            .collect()
+    }
+
+    pub(crate) fn clear_upstream_control_if_matches(
+        &self,
+        key: &UpstreamOwnerKey,
+        token: &Arc<()>,
+    ) {
+        let mut controls = self.upstream_controls.write();
+        if controls
+            .get(key)
+            .is_some_and(|task| task.token_matches(token))
+        {
+            controls.remove(key);
+        }
+    }
+
+    pub(crate) fn stop_upstream_control_if_owner_idle_for_route(&self, entry: &RouteEntry) {
+        let Some(key) = upstream_control::owner_key_for_route(entry) else {
+            return;
+        };
+        if !self.local_routes_for_owner(&key).is_empty() {
+            return;
+        }
+        if let Some(task) = self.upstream_controls.write().remove(&key) {
+            task.abort();
+        }
     }
 
     pub(crate) fn remove_connection(&self, name: &str) -> Option<Arc<IpcClient>> {
