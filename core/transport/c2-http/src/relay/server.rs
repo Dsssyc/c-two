@@ -26,6 +26,9 @@ use crate::relay::url::peer_endpoint_url;
 use c2_config::RelayConfig;
 use c2_ipc::{ClientIpcConfig, IpcClient};
 
+const REGISTER_ATTESTATION_CONNECT_ATTEMPTS: usize = 3;
+const REGISTER_ATTESTATION_RETRY_DELAY: Duration = Duration::from_millis(20);
+
 /// Errors from the relay control API.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelayControlError {
@@ -126,6 +129,39 @@ fn close_client(client: IpcClient) {
         let mut client = client;
         client.close().await;
     });
+}
+
+fn should_retry_register_attestation_connect(error: &c2_ipc::IpcError) -> bool {
+    matches!(
+        error,
+        c2_ipc::IpcError::Io(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::WouldBlock
+            )
+    )
+}
+
+async fn connect_register_attestation_client(address: &str) -> Result<IpcClient, c2_ipc::IpcError> {
+    for attempt in 1..=REGISTER_ATTESTATION_CONNECT_ATTEMPTS {
+        let mut client = IpcClient::with_config(address, ClientIpcConfig::default());
+        match client.connect().await {
+            Ok(()) => return Ok(client),
+            Err(err)
+                if attempt < REGISTER_ATTESTATION_CONNECT_ATTEMPTS
+                    && should_retry_register_attestation_connect(&err) =>
+            {
+                tokio::time::sleep(REGISTER_ATTESTATION_RETRY_DELAY).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    unreachable!("register attestation connect loop always returns");
 }
 
 /// Relay server with a synchronous control API.
@@ -459,10 +495,8 @@ impl RelayServer {
                         }
                     };
                     let result = {
-                        let mut client =
-                            IpcClient::with_config(&address, ClientIpcConfig::default());
-                        match client.connect().await {
-                            Ok(()) => {
+                        match connect_register_attestation_client(&address).await {
+                            Ok(client) => {
                                 let server_identity_matches =
                                     client.server_id() == Some(server_id.as_str());
                                 if !server_identity_matches {
@@ -729,7 +763,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use super::{Command, RelayControlError, RelayServer};
+    use super::{
+        Command, RelayControlError, RelayServer, should_retry_register_attestation_connect,
+    };
     use c2_config::RelayConfig;
     use tokio::sync::{mpsc, oneshot};
 
@@ -769,7 +805,7 @@ mod tests {
             .find(".prepare_candidate_registration(")
             .expect("command registration must prepare replacement eligibility");
         let connect = body
-            .find("client.connect().await")
+            .find("connect_register_attestation_client(&address).await")
             .expect("command registration must connect candidate IPC");
         let read = body
             .find("read_ipc_route_contract")
@@ -916,6 +952,27 @@ mod tests {
 
         assert_eq!(c2.code, c2_error::ErrorCode::ResourceAlreadyRegistered);
         assert_eq!(c2.message, "Route name already registered: 'grid'");
+    }
+
+    #[test]
+    fn register_attestation_retry_policy_is_transport_only() {
+        assert!(should_retry_register_attestation_connect(
+            &c2_ipc::IpcError::Io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
+        ));
+        assert!(should_retry_register_attestation_connect(
+            &c2_ipc::IpcError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+        ));
+        assert!(!should_retry_register_attestation_connect(
+            &c2_ipc::IpcError::IdentityMismatch {
+                expected_server_id: "server-a".into(),
+                expected_server_instance_id: "instance-a".into(),
+                actual_server_id: "server-b".into(),
+                actual_server_instance_id: "instance-b".into(),
+            }
+        ));
+        assert!(!should_retry_register_attestation_connect(
+            &c2_ipc::IpcError::ContractMismatch("wrong contract".into())
+        ));
     }
 
     #[test]

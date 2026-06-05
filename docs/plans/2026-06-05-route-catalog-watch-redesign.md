@@ -1,7 +1,7 @@
 # Route Catalog Watch Redesign Implementation Plan
 
 **Date:** 2026-06-05
-**Status:** Phase 1 implemented; Phase 2 call-token foundation implemented; Phase 3 RouteCatalog wire/server/client watch implemented; Phase 4 upstream control watch and watch-unavailable authority slices implemented; Phase 5 relay token, canonical route errors, loopback fallback clean cut, and relay tombstone revision compaction slices implemented; Phase 6 cleanup/review pending
+**Status:** Phase 1 implemented; Phase 2 call-token foundation implemented; Phase 3 RouteCatalog wire/server/client watch implemented; Phase 4 upstream control watch and watch-unavailable authority slices implemented; Phase 5 relay token, canonical route errors, loopback fallback clean cut, relay tombstone revision compaction, and relay authority event-history slices implemented; Phase 6 cleanup/review pending
 **Scope:** IPC route lifecycle, relay route authority, relay upstream pools, relay-aware HTTP fallback, Rust error taxonomy, Python SDK error facade
 **Supersedes:** `docs/issues/ipc-route-contract-stale-snapshot.md` as the long-term design
 
@@ -976,11 +976,24 @@ Status:
   - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay relay_probe_does_not_trust_cached_data_plane_after_control_watch_unavailable`;
   - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay upstream_watch_unavailable_marks_owner_without_withdrawing_route`;
   - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay`.
+- relay register-attestation transient I/O retry slice implemented on
+  2026-06-06:
+  - synchronous relay register commands now retry only transient IPC transport
+    connect failures during the temporary attestation client setup;
+  - identity, contract, route missing, and other semantic attestation failures
+    are not retried or reclassified;
+  - this keeps register attestation from treating a one-off early EOF/reset as
+    a semantic registration failure while preserving strong owner/contract
+    checks.
+- verified for this slice:
+  - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay register_attestation_retry_policy_is_transport_only`;
+  - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay relay_control_unregister_rejects_wrong_server_id -- --nocapture`;
+  - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay`.
 - remaining Phase 4/5 work:
-  - model full relay route state and watch compaction boundaries over catalog
-    revision; the current Phase 4 slices cover local upstream control watch
-    availability and semantic withdrawal, while the Phase 5 tombstone slice
-    covers removed-route revision metadata and GC compaction logging.
+  - expose a relay authority watch/list surface only if a concrete mesh
+    consumer needs it. The internal route authority now has bounded
+    revision-ordered event history and compaction semantics; the public relay
+    data plane continues to use resolve/probe/call route tokens.
 
 ### Phase 5: Relay-Aware HTTP And Loopback Fallback Clean Cut
 
@@ -1084,10 +1097,24 @@ Implementation status on 2026-06-06:
   - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay peer_tombstone_gc_compacts_local_revision_not_owner_removed_revision`;
   - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay deleted_digest_diff_hash_binds_removed_revision`;
   - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay`.
+- implemented the relay authority event-history slice:
+  - `RouteTable` keeps bounded, revision-ordered local authority events for
+    active route upserts and removals;
+  - tombstone GC compacts route event history through the same local catalog
+    revision boundary as removed tombstones;
+  - event-history overflow advances the watch compaction boundary without
+    deleting current active routes;
+  - peer-leave route removals now advance `catalog_revision` and emit remove
+    events instead of silently deleting peer routes outside the revision stream;
+  - this is an internal primitive for a future relay watch/list surface, not a
+    compatibility path or a replacement for route-token resolve/probe/call.
+- verified for this slice:
+  - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay relay_watch`;
+  - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay peer_leave_removal_advances_catalog_and_emits_remove_events`;
+  - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay`.
 - remaining Phase 5/6 work:
-  - model full relay route state and watch compaction boundaries over catalog
-    revision; the current slice covers relay tombstone revision metadata and GC
-    compaction logging, not the full watch recovery surface.
+  - Phase 6 cleanup/review and final source scans for obsolete route fallback
+    and stale route-snapshot APIs.
 
 Verification:
 
@@ -1173,7 +1200,7 @@ Review every phase before implementation and after implementation:
 - [ ] Covers server process ABA via `server_instance_id`.
 - [ ] Covers relay idle eviction without route withdrawal.
 - [ ] Covers relay register/unregister logging and typed caller errors.
-- [ ] Covers tombstone GC and watch compaction semantics.
+- [x] Covers tombstone GC and watch compaction semantics.
 - [ ] Covers direct IPC independence from relay.
 - [ ] Covers loopback self-fallback deletion.
 - [x] Covers HTTP stale route token behavior.
