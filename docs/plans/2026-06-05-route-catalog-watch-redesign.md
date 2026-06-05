@@ -1,7 +1,7 @@
 # Route Catalog Watch Redesign Implementation Plan
 
 **Date:** 2026-06-05
-**Status:** Phase 1 implemented; Phase 2 call-token foundation implemented; Phase 3 RouteCatalog wire/server/client watch implemented; Phase 4 upstream control watch slice implemented; Phase 5 relay token, canonical route errors, loopback fallback clean cut, and relay tombstone revision compaction slices implemented; Phase 6 cleanup/review pending
+**Status:** Phase 1 implemented; Phase 2 call-token foundation implemented; Phase 3 RouteCatalog wire/server/client watch implemented; Phase 4 upstream control watch and watch-unavailable authority slices implemented; Phase 5 relay token, canonical route errors, loopback fallback clean cut, and relay tombstone revision compaction slices implemented; Phase 6 cleanup/review pending
 **Scope:** IPC route lifecycle, relay route authority, relay upstream pools, relay-aware HTTP fallback, Rust error taxonomy, Python SDK error facade
 **Supersedes:** `docs/issues/ipc-route-contract-stale-snapshot.md` as the long-term design
 
@@ -958,15 +958,29 @@ Status:
 - verified for this slice:
   - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay relay_upstream_watch_removes_local_route_without_data_plane_call -- --nocapture`;
   - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay`.
+- upstream control watch-unavailable authority slice implemented on 2026-06-06:
+  - relay records owner-key scoped watch-unavailable state when the upstream
+    control watch cannot connect or disconnects after attestation;
+  - a successful control watch reconnect with matching server identity clears
+    that state;
+  - watch-unavailable state is route authority metadata, not a route withdrawal:
+    it does not remove the route, create a tombstone, or broadcast a withdraw;
+  - the next relay HTTP probe/call for an affected local route must perform an
+    authoritative IPC route lookup before trusting any cached data-plane route
+    binding;
+  - if the lookup proves a semantic route failure, the existing withdraw policy
+    handles it; if the lookup cannot safely prove route state because of generic
+    I/O or watch/catalog unavailability, relay returns canonical
+    `RouteWatchUnavailable` and retains the route.
+- verified for this slice:
+  - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay relay_probe_does_not_trust_cached_data_plane_after_control_watch_unavailable`;
+  - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay upstream_watch_unavailable_marks_owner_without_withdrawing_route`;
+  - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay`.
 - remaining Phase 4/5 work:
-  - model relay-side `WatchDisconnected` / `RouteWatchUnavailable` authority
-    state instead of only logging control watch disconnects;
-  - add relay authority route UID/revision/state fields and align tombstone
-    compaction with catalog revision, not only timestamp tombstones;
-  - bind relay HTTP data-plane calls to immutable route tokens instead of
-    forwarding by route name after acquire;
-  - replace legacy relay HTTP JSON error names with canonical C2 error envelope
-    fields.
+  - model full relay route state and watch compaction boundaries over catalog
+    revision; the current Phase 4 slices cover local upstream control watch
+    availability and semantic withdrawal, while the Phase 5 tombstone slice
+    covers removed-route revision metadata and GC compaction logging.
 
 ### Phase 5: Relay-Aware HTTP And Loopback Fallback Clean Cut
 

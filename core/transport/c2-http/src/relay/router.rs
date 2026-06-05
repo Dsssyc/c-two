@@ -49,6 +49,10 @@ enum RequestClient {
     Stale {
         route: RouteEntry,
     },
+    WatchUnavailable {
+        route: RouteEntry,
+        reason: String,
+    },
     NotFound,
     Unreachable,
 }
@@ -105,6 +109,15 @@ fn resource_unavailable_response(route_name: &str, message: impl Into<String>) -
         c2_error::ErrorCode::ResourceUnavailable,
         message,
         [("route", route_name.to_string())],
+    )
+}
+
+fn route_watch_unavailable_response(route_name: &str, reason: impl Into<String>) -> Response {
+    c2_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        c2_error::ErrorCode::RouteWatchUnavailable,
+        format!("route watch unavailable for {route_name}"),
+        [("route", route_name.to_string()), ("reason", reason.into())],
     )
 }
 
@@ -1412,6 +1425,9 @@ async fn handle_probe(
             StatusCode::OK.into_response()
         }
         RequestClient::Stale { route } => route_stale_response(&route),
+        RequestClient::WatchUnavailable { route, reason } => {
+            route_watch_unavailable_response(&route.name, reason)
+        }
         RequestClient::NotFound => resource_not_found_response(&route_name),
         RequestClient::Unreachable => resource_unavailable_response(
             &route_name,
@@ -1469,6 +1485,9 @@ async fn call_handler(
                 binding,
             } => (lease, route, binding),
             RequestClient::Stale { route } => return route_stale_response(&route),
+            RequestClient::WatchUnavailable { route, reason } => {
+                return route_watch_unavailable_response(&route.name, reason);
+            }
             RequestClient::NotFound => return resource_not_found_response(&route_name),
             RequestClient::Unreachable => {
                 return resource_unavailable_response(
@@ -1601,6 +1620,9 @@ async fn acquire_request_client_for_route(
         },
         Err(UpstreamAcquireError::NotFound) => RequestClient::NotFound,
         Err(UpstreamAcquireError::Stale { route }) => RequestClient::Stale { route },
+        Err(UpstreamAcquireError::WatchUnavailable { route, reason }) => {
+            RequestClient::WatchUnavailable { route, reason }
+        }
         Err(UpstreamAcquireError::Unreachable {
             route,
             address,
@@ -2340,6 +2362,29 @@ mod tests {
         let status = response.status();
         let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         status
+    }
+
+    async fn get_probe_response(state: Arc<RelayState>, name: &str) -> (StatusCode, Vec<u8>) {
+        let route = state.local_route(name);
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                add_route_token_headers(
+                    add_expected_echo_headers(
+                        Request::builder()
+                            .method("GET")
+                            .uri(format!("/_probe/{name}")),
+                    ),
+                    route.as_ref(),
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, body.to_vec())
     }
 
     async fn get_probe_with_expected_crm_tag(
@@ -4539,6 +4584,82 @@ mod tests {
         assert!(server.unregister_route("grid").await);
 
         wait_for_local_route_removed(&state, "grid").await;
+
+        shutdown_live_server(&server).await;
+    }
+
+    #[tokio::test]
+    async fn relay_probe_does_not_trust_cached_data_plane_after_control_watch_unavailable() {
+        let state = test_state_for_client();
+        let address = format!(
+            "ipc://relay_watch_unavailable_cached_probe_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let server = start_live_server(&address, "server-grid").await;
+
+        let mut attested =
+            c2_ipc::IpcClient::with_config(&address, c2_config::ClientIpcConfig::default());
+        attested
+            .connect()
+            .await
+            .expect("attestation client connects");
+        let table = attested.route_table("grid").expect("server exports grid");
+        attested.close().await;
+
+        match state.commit_register_upstream(
+            "grid".into(),
+            "server-grid".into(),
+            "server-grid-instance".into(),
+            address.clone(),
+            "test.echo".into(),
+            "Echo".into(),
+            "0.1.0".into(),
+            TEST_ABI_HASH.into(),
+            TEST_SIGNATURE_HASH.into(),
+            table.max_payload_size(),
+            table.route_uid().to_string(),
+            table.route_revision(),
+            None,
+        ) {
+            RegisterCommitResult::Registered { .. } => {}
+            RegisterCommitResult::SameOwner { .. } => panic!("unexpected same-owner result"),
+            RegisterCommitResult::Duplicate { existing_address }
+            | RegisterCommitResult::ConflictingOwner { existing_address } => {
+                panic!("unexpected duplicate route at {existing_address}")
+            }
+            RegisterCommitResult::Invalid { reason } => {
+                panic!("unexpected invalid route in test: {reason}")
+            }
+        }
+
+        let mut stale_data_client =
+            c2_ipc::IpcClient::with_config(&address, c2_config::ClientIpcConfig::default());
+        stale_data_client
+            .connect()
+            .await
+            .expect("stale data-plane client connects");
+        stale_data_client.close().await;
+        stale_data_client.force_connected(true);
+        state.reconnect("grid", Arc::new(stale_data_client));
+
+        let route = state.local_route("grid").expect("relay route registered");
+        let key = crate::relay::upstream_control::owner_key_for_route(&route)
+            .expect("local route has owner key");
+        state.mark_upstream_control_watch_unavailable(&key, "watch stream closed");
+
+        let (status, body) = get_probe_response(state.clone(), "grid").await;
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let body = String::from_utf8(body).unwrap();
+        assert!(
+            body.contains("RouteWatchUnavailable"),
+            "watch-unavailable route must not be reported as generic success or route removal: {body}"
+        );
+        assert!(
+            state.local_route("grid").is_some(),
+            "watch unavailability alone must not withdraw the route"
+        );
 
         shutdown_live_server(&server).await;
     }

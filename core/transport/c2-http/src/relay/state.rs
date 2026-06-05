@@ -28,6 +28,7 @@ pub struct RelayState {
     route_table: RwLock<RouteTable>,
     conn_pool: ConnectionPool,
     upstream_controls: RwLock<HashMap<UpstreamOwnerKey, UpstreamControlTask>>,
+    upstream_watch_unavailable: RwLock<HashMap<UpstreamOwnerKey, String>>,
     config: Arc<RelayConfig>,
     disseminator: Arc<dyn crate::relay::disseminator::Disseminator>,
 }
@@ -65,6 +66,10 @@ pub enum UpstreamAcquireError {
     Stale {
         route: RouteEntry,
     },
+    WatchUnavailable {
+        route: RouteEntry,
+        reason: String,
+    },
     Unreachable {
         route: RouteEntry,
         address: String,
@@ -83,6 +88,31 @@ fn expected_contract_for_route(route: &RouteEntry) -> c2_contract::ExpectedRoute
     }
 }
 
+fn should_treat_as_semantic_route_failure(error: &c2_ipc::IpcError) -> bool {
+    matches!(
+        error,
+        c2_ipc::IpcError::IdentityMismatch { .. }
+            | c2_ipc::IpcError::ContractMismatch(_)
+            | c2_ipc::IpcError::RouteNotFound(_)
+            | c2_ipc::IpcError::RouteRemoved { .. }
+            | c2_ipc::IpcError::RouteClosed { .. }
+    )
+}
+
+async fn verify_route_after_watch_unavailable(
+    lease: &UpstreamLease,
+    expected: &c2_contract::ExpectedRouteContract,
+) -> Result<(), c2_ipc::IpcError> {
+    match lease.client().lookup_route(expected).await {
+        Err(c2_ipc::IpcError::CatalogCompacted { .. })
+        | Err(c2_ipc::IpcError::WatchUnavailable(_)) => {
+            lease.client().rebuild_route_catalog().await?;
+            lease.client().lookup_route(expected).await
+        }
+        other => other,
+    }
+}
+
 impl RelayState {
     pub fn new(
         config: Arc<RelayConfig>,
@@ -93,6 +123,7 @@ impl RelayState {
             route_table: RwLock::new(RouteTable::new(config.relay_id.clone())),
             conn_pool: ConnectionPool::with_owner_lease_duration(owner_lease_duration),
             upstream_controls: RwLock::new(HashMap::new()),
+            upstream_watch_unavailable: RwLock::new(HashMap::new()),
             disseminator,
             config,
         }
@@ -356,6 +387,32 @@ impl RelayState {
 
         let lease_address = lease.address();
         let expected_contract = expected_contract_for_route(&expected);
+        if let Some(reason) = self.upstream_control_watch_unavailable_for_route(expected) {
+            match verify_route_after_watch_unavailable(&lease, &expected_contract).await {
+                Ok(()) => {}
+                Err(error) if should_treat_as_semantic_route_failure(&error) => {
+                    if let Some(old_client) = lease.evict_current_client() {
+                        old_client.close_shared().await;
+                    }
+                    drop(lease);
+                    return Err(UpstreamAcquireError::Unreachable {
+                        route: expected.clone(),
+                        address: lease_address,
+                        error,
+                    });
+                }
+                Err(error) => {
+                    if let Some(old_client) = lease.evict_current_client() {
+                        old_client.close_shared().await;
+                    }
+                    drop(lease);
+                    return Err(UpstreamAcquireError::WatchUnavailable {
+                        route: expected.clone(),
+                        reason: format!("{reason}; route lookup unavailable: {error}"),
+                    });
+                }
+            }
+        }
         let binding = match lease
             .client()
             .ensure_route_token(
@@ -473,6 +530,28 @@ impl RelayState {
         }
     }
 
+    pub(crate) fn mark_upstream_control_watch_unavailable(
+        &self,
+        key: &UpstreamOwnerKey,
+        reason: impl Into<String>,
+    ) {
+        self.upstream_watch_unavailable
+            .write()
+            .insert(key.clone(), reason.into());
+    }
+
+    pub(crate) fn clear_upstream_control_watch_unavailable(&self, key: &UpstreamOwnerKey) {
+        self.upstream_watch_unavailable.write().remove(key);
+    }
+
+    pub(crate) fn upstream_control_watch_unavailable_for_route(
+        &self,
+        route: &RouteEntry,
+    ) -> Option<String> {
+        let key = upstream_control::owner_key_for_route(route)?;
+        self.upstream_watch_unavailable.read().get(&key).cloned()
+    }
+
     pub(crate) fn local_routes_for_owner(&self, key: &UpstreamOwnerKey) -> Vec<RouteEntry> {
         self.route_table
             .read()
@@ -493,6 +572,8 @@ impl RelayState {
             .is_some_and(|task| task.token_matches(token))
         {
             controls.remove(key);
+            drop(controls);
+            self.clear_upstream_control_watch_unavailable(key);
         }
     }
 
@@ -506,6 +587,7 @@ impl RelayState {
         if let Some(task) = self.upstream_controls.write().remove(&key) {
             task.abort();
         }
+        self.clear_upstream_control_watch_unavailable(&key);
     }
 
     pub(crate) fn remove_connection(&self, name: &str) -> Option<Arc<IpcClient>> {
@@ -930,6 +1012,32 @@ mod tests {
         assert!(
             state.evict_idle(0).is_empty(),
             "route registration must not attach a relay data-plane client"
+        );
+        assert_eq!(state.resolve("grid").len(), 1);
+    }
+
+    #[test]
+    fn upstream_watch_unavailable_marks_owner_without_withdrawing_route() {
+        let state = RelayState::new(test_config(), null_disseminator());
+        let client = Arc::new(IpcClient::new("ipc://grid"));
+        let entry = register_local(&state, "grid", "server-grid", "ipc://grid", client);
+        let key = upstream_control::owner_key_for_route(&entry).expect("local route owner key");
+
+        state.mark_upstream_control_watch_unavailable(&key, "watch stream closed");
+
+        let reason = state
+            .upstream_control_watch_unavailable_for_route(&entry)
+            .expect("watch-unavailable reason recorded");
+        assert!(reason.contains("watch stream closed"));
+        assert_eq!(state.resolve("grid").len(), 1);
+        assert_eq!(state.with_route_table(|rt| rt.list_tombstones().len()), 0);
+
+        state.clear_upstream_control_watch_unavailable(&key);
+
+        assert!(
+            state
+                .upstream_control_watch_unavailable_for_route(&entry)
+                .is_none()
         );
         assert_eq!(state.resolve("grid").len(), 1);
     }

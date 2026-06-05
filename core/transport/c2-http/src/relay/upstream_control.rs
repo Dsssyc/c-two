@@ -88,6 +88,10 @@ async fn run_control_watch(state: Arc<RelayState>, key: UpstreamOwnerKey, token:
                     key.server_instance_id(),
                     key.address()
                 );
+                state.mark_upstream_control_watch_unavailable(
+                    &key,
+                    format!("control watch connect failed: {err}"),
+                );
                 tokio::time::sleep(CONTROL_RETRY_DELAY).await;
                 continue;
             }
@@ -109,6 +113,7 @@ async fn run_control_watch(state: Arc<RelayState>, key: UpstreamOwnerKey, token:
             state.clear_upstream_control_if_matches(&key, &token);
             return;
         }
+        state.clear_upstream_control_watch_unavailable(&key);
 
         loop {
             if state.local_routes_for_owner(&key).is_empty() {
@@ -130,6 +135,7 @@ async fn run_control_watch(state: Arc<RelayState>, key: UpstreamOwnerKey, token:
                     key.server_instance_id(),
                     key.address()
                 );
+                state.mark_upstream_control_watch_unavailable(&key, "control watch disconnected");
                 break;
             }
             tokio::time::sleep(CONTROL_OBSERVE_INTERVAL).await;
