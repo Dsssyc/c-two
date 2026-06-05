@@ -1,5 +1,6 @@
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 
 use c2_server::{RouteConcurrencyHandle, SchedulerAcquireError, SchedulerGuard, SchedulerSnapshot};
 
@@ -52,9 +53,21 @@ impl From<SchedulerSnapshot> for PyRouteConcurrencySnapshot {
     }
 }
 
-fn acquire_error_to_py(err: SchedulerAcquireError) -> PyErr {
+fn acquire_error_to_py(py: Python<'_>, err: SchedulerAcquireError) -> PyErr {
     match err {
-        SchedulerAcquireError::Closed => PyRuntimeError::new_err("route closed"),
+        SchedulerAcquireError::Closed => {
+            let exc = PyRuntimeError::new_err("route closed");
+            let error_bytes =
+                c2_error::C2Error::new(c2_error::ErrorCode::ResourceClosed, "route closed")
+                    .to_wire_bytes();
+            if let Err(attr_err) = exc
+                .value(py)
+                .setattr("error_bytes", PyBytes::new(py, &error_bytes))
+            {
+                return attr_err;
+            }
+            exc
+        }
         SchedulerAcquireError::Capacity { field, limit } => PyRuntimeError::new_err(format!(
             "route concurrency capacity exceeded: {field}={limit}"
         )),
@@ -75,7 +88,7 @@ impl PyRouteConcurrency {
         let sched = self.inner.clone();
         let guard = py
             .detach(move || sched.blocking_acquire(method_idx))
-            .map_err(acquire_error_to_py)?;
+            .map_err(|err| acquire_error_to_py(py, err))?;
         Ok(PyRouteConcurrencyGuard { inner: Some(guard) })
     }
 

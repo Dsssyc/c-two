@@ -1,8 +1,9 @@
 # IPC Route Contract Stale Snapshot
 
 **Date**: 2026-06-05
-**Status**: Route catalog/watch redesign in progress; stale snapshot and relay
-data-plane route-token hazards are covered by current core changes
+**Status**: Addressed by the route catalog/watch redesign. This issue is kept
+as the historical root-cause record; the implemented design and verification
+record live in `docs/plans/2026-06-05-route-catalog-watch-redesign.md`.
 **Severity**: High for long-lived multi-route IPC servers
 **Scope**: `c2-ipc` client route catalog, direct IPC acquisition, relay upstream IPC acquisition, relay registration attestation
 
@@ -41,44 +42,39 @@ The failing sequence is:
 
 ## Decision
 
-`c2-ipc` and `c2-server` own the route-catalog refresh/watch mechanism.
+`c2-ipc` and `c2-server` own route catalog lookup, watch, and call-time route
+token validation.
 
-- `validate_route_contract(...)` remains a cache-only check.
-- `refresh_route_contract(route_name)` asks the connected server for the current
-  committed route contract and method table, then updates the client cache.
-- `ensure_route_contract(expected)` and route-token validation first try the
-  cache and perform a live query on cache miss, mismatch, or stale token.
-- When `refresh_route_contract(...)` is called, a live `RouteNotFound` response
-  is the semantic proof that the connected server does not currently export the
-  committed route.
-- Watch events proactively add, update, and remove client-side route records;
-  compaction explicitly tells the client its watch offset is too old and a full
-  refresh is required.
+- `RouteList`, `RouteLookup`, and `RouteWatch` replace handshake-snapshot
+  authority.
+- The old production `refresh_route_contract(...)` path has been removed.
+- Internal route ensure boundaries are route-catalog backed: they use clean
+  directory state only when the watch stream is current, otherwise they perform
+  authoritative lookup or relist.
+- Watch events proactively add, update, close, and remove client-side route
+  records. `Compacted` explicitly tells the client its watch offset is too old
+  and a full relist is required.
 - Relay HTTP probe/call prechecks keep the selected route snapshot and acquire a
   route-bound upstream binding. If the route is replaced between precheck and
   acquire, relay returns `RouteStale` instead of replaying the call against the
   replacement.
+- Relay authority, upstream control watch, and upstream data-plane pooling are
+  separate mechanisms. Idle eviction affects only relay-created data-plane IPC
+  clients and does not withdraw routes.
 
 This keeps the fast path cheap while removing the assumption that the handshake
 route list is a permanent catalog.
 
-## Known Remaining Gaps
+## Remaining Boundaries
 
-The current remaining gaps are narrower:
-
-- Some relay control-plane and malformed-request HTTP errors may still use
-  legacy ad hoc JSON bodies. Route semantic data-plane errors and relay-aware
-  loopback fallback denial now use canonical C2 error envelopes, and Python
-  maps native `error_bytes` back into `CCError` subclasses before generic relay
-  wrapping.
 - Additional SDKs must project the Rust `c2-error` registry the same way the
   Python SDK does.
 - Future remote transports must preserve the same route-token binding and
   canonical error-envelope behavior rather than reintroducing route-name-only
   dispatch.
-- Relay authority still needs the remaining cleanup that models route state and
-  tombstone compaction by catalog revision rather than only timestamped
-  tombstones.
+- The relay route-authority event log is currently an internal primitive. A
+  public relay watch/list surface should be added only when a concrete mesh
+  consumer needs it.
 
 ## HTTP Client Boundary
 
@@ -127,3 +123,6 @@ route attestation token path.
   acquire fails, the runtime must not retry the same failed route through the
   same relay HTTP data plane. With no distinct target, callers see
   `FallbackDenied` carrying `direct_ipc_failure` details.
+- Python SDK: a same-process thread-local proxy must still pass through native
+  route admission and raise public `ResourceClosed` after unregister, rather
+  than calling a removed Python resource binding directly.

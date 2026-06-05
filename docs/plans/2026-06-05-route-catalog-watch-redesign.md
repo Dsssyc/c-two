@@ -1,7 +1,7 @@
 # Route Catalog Watch Redesign Implementation Plan
 
 **Date:** 2026-06-05
-**Status:** Phase 1 implemented; Phase 2 call-token foundation implemented; Phase 3 RouteCatalog wire/server/client watch implemented; Phase 4 upstream control watch and watch-unavailable authority slices implemented; Phase 5 relay token, canonical route errors, loopback fallback clean cut, relay tombstone revision compaction, and relay authority event-history slices implemented; Phase 6 cleanup/review pending
+**Status:** Phase 1 implemented; Phase 2 call-token foundation implemented; Phase 3 RouteCatalog wire/server/client watch implemented; Phase 4 upstream control watch and watch-unavailable authority slices implemented; Phase 5 relay token, canonical route errors, loopback fallback clean cut, relay tombstone revision compaction, and relay authority event-history slices implemented; Phase 6 cleanup/review and final verification complete
 **Scope:** IPC route lifecycle, relay route authority, relay upstream pools, relay-aware HTTP fallback, Rust error taxonomy, Python SDK error facade
 **Supersedes:** `docs/issues/ipc-route-contract-stale-snapshot.md` as the long-term design
 
@@ -1142,8 +1142,11 @@ Verification:
 - source scans:
   - `rg -n "Handshake\\(" core/transport core/runtime sdk/python/native/src`
     returns only startup handshake/decode contexts, not route-policy matching;
-  - `rg -n "ensure_route_contract|refresh_route_contract" core sdk/python/native/src`
-    returns no production API references;
+  - `rg -n "refresh_route_contract" core sdk/python/native/src` returns no
+    production references;
+  - `rg -n "ensure_route_contract" core sdk/python/native/src` returns only the
+    canonical route-catalog backed IPC ensure API and relay registration /
+    upstream attestation call sites, not handshake-snapshot refresh logic;
   - `rg -n "resolve\\([^,)]*name|name_only|route_names\\(\\)" core/transport/c2-http sdk/python/native/src`
     returns no production relay resolve/call path;
   - `rg -n "falling back to HTTP relay" sdk/python/native/src core/transport/c2-http`
@@ -1152,6 +1155,47 @@ Verification:
   - `rg -n "direct_ipc_failure|resolve_relay_connection_after_local_ipc_failures" sdk/python/native/src core`
     proves denied fallback preserves the direct IPC acquire reason and reuses
     Rust-owned target reselection.
+
+Status:
+
+- implemented the thread-local lifecycle cleanup slice:
+  - thread-local proxies now retain their route name and always enter the
+    native route-concurrency guard when one is present, even for otherwise
+    unconstrained routes;
+  - a native admission close now crosses the Python thread-local boundary as
+    public `ResourceClosed` with route details, instead of a bare
+    `RuntimeError` or a direct call into a removed Python object;
+  - same-process thread-local proxies therefore observe the same route-close
+    authority as IPC dispatch for unregister and shutdown.
+- updated `docs/issues/ipc-route-contract-stale-snapshot.md` to make it a
+  historical root-cause record and point to this implemented plan instead of
+  the removed transitional `refresh_route_contract(...)` model.
+- completed Phase 6 source scans:
+  - `Handshake(` matches are limited to IPC error enum/display, native
+    handshake projection, and relay log classification; route withdrawal
+    policy no longer treats broad handshake/decode errors as semantic proof;
+  - `refresh_route_contract` has no production references;
+  - `ensure_route_contract` remains only as the canonical route-catalog backed
+    IPC ensure API and relay registration/upstream attestation boundary;
+  - name-only relay resolve/call paths are absent from production relay data
+    plane code; remaining matches are diagnostics, tests, or direct IPC route
+    listing surfaces;
+  - the old `falling back to HTTP relay` branch is absent;
+  - denied local IPC fallback still preserves `direct_ipc_failure` details and
+    uses Rust-owned candidate reselection.
+- focused verification for this slice:
+  - `C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_proxy_concurrency.py -q --timeout=30`;
+  - `C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/integration/test_registry.py -q -k 'thread_local_proxy_rejects_calls_after_unregister or ipc_proxy_keeps_acquired_route_token_after_reregister' --timeout=30`.
+- final verification completed on 2026-06-06:
+  - `cargo fmt --manifest-path core/Cargo.toml --all --check`;
+  - `cargo fmt --manifest-path sdk/python/native/Cargo.toml --check`;
+  - `git diff --check`;
+  - Phase 6 source scans listed above;
+  - `cargo test --manifest-path core/Cargo.toml --workspace`;
+  - `cargo check --manifest-path sdk/python/native/Cargo.toml`;
+  - `uv sync --reinstall-package c-two`;
+  - `C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30`
+    (`964 passed`).
 
 ## Test Matrix
 
@@ -1194,20 +1238,20 @@ Verification:
 
 Review every phase before implementation and after implementation:
 
-- [ ] Covers route registered after handshake.
-- [ ] Covers cached route removed or closed after handshake.
-- [ ] Covers route name ABA via `route_uid`.
-- [ ] Covers server process ABA via `server_instance_id`.
-- [ ] Covers relay idle eviction without route withdrawal.
-- [ ] Covers relay register/unregister logging and typed caller errors.
+- [x] Covers route registered after handshake.
+- [x] Covers cached route removed or closed after handshake.
+- [x] Covers route name ABA via `route_uid`.
+- [x] Covers server process ABA via `server_instance_id`.
+- [x] Covers relay idle eviction without route withdrawal.
+- [x] Covers relay register/unregister logging and typed caller errors.
 - [x] Covers tombstone GC and watch compaction semantics.
-- [ ] Covers direct IPC independence from relay.
-- [ ] Covers loopback self-fallback deletion.
+- [x] Covers direct IPC independence from relay.
+- [x] Covers loopback self-fallback deletion.
 - [x] Covers HTTP stale route token behavior.
-- [ ] Covers Rust internal typed errors and Python public `CCError` classes.
-- [ ] Defines source scans to remove obsolete APIs and avoid old-code
+- [x] Covers Rust internal typed errors and Python public `CCError` classes.
+- [x] Defines source scans to remove obsolete APIs and avoid old-code
   hangers-on.
-- [ ] Keeps hot-path performance bounded through clean directory fast path,
+- [x] Keeps hot-path performance bounded through clean directory fast path,
   route-specific watch subscriptions, and no per-call full catalog list.
 
 ## Review Pass 1

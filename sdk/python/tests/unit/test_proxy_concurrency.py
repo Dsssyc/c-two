@@ -7,6 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from c_two.error import ResourceClosed
 from c_two.transport.client.proxy import CRMProxy
 from c_two.transport.server.scheduler import ConcurrencyMode
 
@@ -43,7 +44,7 @@ class FakeScheduler:
         return nullcontext()
 
 
-def test_unconstrained_call_direct_skips_guard():
+def test_unconstrained_call_direct_still_enters_native_guard_for_lifecycle():
     scheduler = FakeScheduler(
         snapshot=SimpleNamespace(
             mode=ConcurrencyMode.PARALLEL,
@@ -56,7 +57,7 @@ def test_unconstrained_call_direct_skips_guard():
     )
     proxy = CRMProxy.thread_local(Resource(), scheduler=scheduler)
     assert proxy.call_direct('op', ()) == 'ok'
-    assert scheduler.guard_calls == []
+    assert scheduler.guard_calls == [0]
 
 
 def test_constrained_call_direct_enters_native_guard_by_method_index():
@@ -88,8 +89,9 @@ def test_closed_call_direct_fails_before_entering_resource():
         method_index={'op': 0},
     )
     scheduler.execution_guard = Mock(side_effect=RuntimeError('route closed'))
-    proxy = CRMProxy.thread_local(resource, scheduler=scheduler)
+    proxy = CRMProxy.thread_local(resource, name='grid', scheduler=scheduler)
 
-    with pytest.raises(RuntimeError, match='route closed'):
+    with pytest.raises(ResourceClosed, match="route 'grid' is closed") as exc_info:
         proxy.call_direct('op', ())
+    assert exc_info.value.details == {'route': 'grid'}
     assert resource.calls == []

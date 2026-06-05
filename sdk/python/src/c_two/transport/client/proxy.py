@@ -80,6 +80,7 @@ class CRMProxy:
         cls,
         crm_instance: object,
         *,
+        name: str | None = None,
         scheduler: Scheduler | None = None,
         on_terminate: Callable[[], None] | None = None,
         lease_tracker: Any = None,
@@ -100,7 +101,11 @@ class CRMProxy:
         proxy._mode = 'thread'
         proxy._crm = crm_instance
         proxy._client = None
-        proxy._name = ''
+        proxy._name = (
+            _require_explicit_route_name(name, 'thread-local')
+            if name is not None
+            else ''
+        )
         proxy._close_lock = threading.Lock()
         proxy._closed = False
         proxy._on_terminate = on_terminate
@@ -260,11 +265,34 @@ class CRMProxy:
             raise AttributeError(
                 f'{type(self._crm).__name__} has no method {method_name!r}',
             )
-        if self._scheduler is None or self._scheduler.is_unconstrained:
+        if self._scheduler is None:
             return method(*args)
         method_idx = self._scheduler.method_idx(method_name)
-        with self._scheduler.execution_guard(method_idx):
-            return method(*args)
+        try:
+            with self._scheduler.execution_guard(method_idx):
+                return method(*args)
+        except RuntimeError as exc:
+            error_bytes = getattr(exc, 'error_bytes', None)
+            if error_bytes is not None:
+                from ...error import CCError, ResourceClosed
+                cc_err = CCError.deserialize(memoryview(error_bytes))
+                if isinstance(cc_err, ResourceClosed) and self._name:
+                    raise ResourceClosed(
+                        f"route {self._name!r} is closed",
+                        details={'route': self._name},
+                    ) from exc
+                if cc_err is not None:
+                    raise cc_err from exc
+            if str(exc) == 'route closed':
+                from ...error import ResourceClosed
+                details = {'route': self._name} if self._name else {}
+                message = (
+                    f"route {self._name!r} is closed"
+                    if self._name
+                    else 'route is closed'
+                )
+                raise ResourceClosed(message, details=details) from exc
+            raise
 
     def terminate(self) -> None:
         """Release the proxy and invoke cleanup callback if set."""

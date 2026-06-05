@@ -209,6 +209,23 @@ class TestRegisterConnect:
         finally:
             cc.close(crm)
 
+    def test_thread_local_proxy_rejects_calls_after_unregister(self):
+        """Thread-local proxies must observe native route admission close."""
+        cc.register(Hello, HelloImpl(), name='hello')
+        crm = cc.connect(Hello, name='hello')
+        try:
+            assert crm.greeting('World') == 'Hello, World!'
+            cc.unregister('hello')
+
+            with pytest.raises(
+                cc.error.ResourceClosed,
+                match="route 'hello' is closed",
+            ) as exc_info:
+                crm.greeting('World')
+            assert exc_info.value.details == {'route': 'hello'}
+        finally:
+            cc.close(crm)
+
     def test_connect_thread_local_resource_error_is_classified(self):
         """Thread-local resource errors should not be masked by client wrapper state."""
         cc.register(DirectError, DirectErrorImpl(), name='direct-error')

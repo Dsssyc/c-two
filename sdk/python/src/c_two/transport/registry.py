@@ -405,6 +405,7 @@ class _ProcessRegistry:
             )
             proxy = CRMProxy.thread_local(
                 crm_instance,
+                name=name,
                 scheduler=scheduler,
                 lease_tracker=lease_tracker,
             )
