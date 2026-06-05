@@ -216,7 +216,7 @@ def test_relay_ipc_acceptance_does_not_trust_route_name_only() -> None:
         repo_root / 'sdk/python/native/src/runtime_session_ffi.rs'
     ).read_text(encoding='utf-8')
     acquire_body = source.split('fn acquire_relay_ipc_client(', 1)[1].split(
-        'fn acquire_relay_http_client(',
+        'fn expected_route_contract(',
         1,
     )[0]
 
@@ -228,12 +228,18 @@ def test_relay_ipc_acceptance_does_not_trust_route_name_only() -> None:
 
 Expected before implementation: FAIL because the native code checks route names without server identity.
 
-- [ ] **Step 3: Add a native source guard for fallback on identity mismatch**
+- [ ] **Step 3: Add a native source guard for local IPC mismatch recovery**
+
+Note: the original 2026-05-07 plan treated identity mismatch as a reason to
+fall back to HTTP. The 2026-06 route catalog redesign supersedes that behavior:
+loopback relay resolution must not directly retry the same failed local IPC
+candidate through the same relay HTTP data plane. The guard should assert
+failed local IPC candidates are excluded before any later target selection.
 
 Add this test to `sdk/python/tests/unit/test_runtime_session.py` next to `test_relay_ipc_acceptance_does_not_trust_route_name_only`:
 
 ```python
-def test_relay_ipc_identity_mismatch_falls_back_to_http_not_hard_error() -> None:
+def test_relay_ipc_unavailable_does_not_directly_fallback_to_same_http_relay() -> None:
     repo_root = Path(__file__).resolve().parents[4]
     source = (
         repo_root / 'sdk/python/native/src/runtime_session_ffi.rs'
@@ -244,11 +250,17 @@ def test_relay_ipc_identity_mismatch_falls_back_to_http_not_hard_error() -> None
     )[0]
 
     assert 'RelayIpcConnectError::Unavailable' in connect_body
-    assert 'acquire_relay_http_client' in connect_body
-    assert connect_body.find('RelayIpcConnectError::Unavailable') < connect_body.find('acquire_relay_http_client')
+    unavailable_branch = connect_body.split(
+        'Err(RelayIpcConnectError::Unavailable(reason)) => {',
+        1,
+    )[1].split('RelayResolvedConnection::Http', 1)[0]
+    assert 'acquire_relay_http_client' not in unavailable_branch
+    assert 'resolve_relay_connection_after_local_ipc_failures' in unavailable_branch
 ```
 
-Expected before implementation: PASS for the existing fallback branch, then Task 6 tightens the branch so identity mismatch maps to `Unavailable` instead of being accepted as IPC. This test prevents a future hard failure when a stale local IPC candidate is encountered and an HTTP route is still available.
+Expected before implementation: FAIL while the old branch directly calls an
+HTTP fallback helper. The test allows later target selection only after the
+failed local IPC candidate has been excluded by Rust runtime logic.
 
 - [ ] **Step 4: Verify red tests fail for the intended reason**
 
@@ -991,19 +1003,21 @@ A mismatch must not call `mark_client_config_frozen()` and must not perform a CR
 
 - [ ] **Step 4: Keep fallback behavior HTTP-safe**
 
-For `RelayIpcConnectError::Unavailable`, keep the existing fallback:
+Superseded by the 2026-06 route catalog redesign. The older plan allowed
+`RelayIpcConnectError::Unavailable` to fall back directly to HTTP:
 
 ```rust
-Err(RelayIpcConnectError::Unavailable) => self.acquire_relay_http_client(
-    py,
-    route_name,
-    use_proxy,
-    max_attempts,
-    call_timeout_secs,
-),
+Err(RelayIpcConnectError::Unavailable) => direct_http_fallback(...),
 ```
 
-Do not turn identity mismatch into a user-visible hard failure; stale local IPC candidates are expected to degrade to HTTP when an HTTP route exists.
+The current rule is stricter: exclude the failed local IPC candidate, re-resolve
+through the Rust relay-aware client, and return `FallbackDenied` with
+`direct_ipc_failure` details when no distinct target exists.
+
+Do not turn identity mismatch into route-name-only acceptance. Under the newer
+route catalog design, stale local IPC candidates may continue only after the
+failed candidate is excluded and a distinct local IPC or HTTP relay target is
+selected; otherwise callers receive `FallbackDenied`.
 
 - [ ] **Step 5: Run Python source guard**
 

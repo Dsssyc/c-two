@@ -66,14 +66,19 @@ route list is a permanent catalog.
 
 The current remaining gaps are narrower:
 
-- Some relay control-plane and malformed-request HTTP errors still use legacy
-  ad hoc JSON bodies. Route semantic data-plane errors now use canonical C2
-  error envelopes and Python maps them back into `CCError` subclasses.
+- Some relay control-plane and malformed-request HTTP errors may still use
+  legacy ad hoc JSON bodies. Route semantic data-plane errors and relay-aware
+  loopback fallback denial now use canonical C2 error envelopes, and Python
+  maps native `error_bytes` back into `CCError` subclasses before generic relay
+  wrapping.
 - Additional SDKs must project the Rust `c2-error` registry the same way the
   Python SDK does.
 - Future remote transports must preserve the same route-token binding and
   canonical error-envelope behavior rather than reintroducing route-name-only
   dispatch.
+- Relay authority still needs the remaining cleanup that models route state and
+  tombstone compaction by catalog revision rather than only timestamped
+  tombstones.
 
 ## HTTP Client Boundary
 
@@ -103,7 +108,6 @@ route attestation token path.
 
 - No Python-side route refresh logic.
 - No separate relay-specific IPC refresh implementation.
-- No route subscription, route generation, or pushed route-table invalidation.
 - No compatibility shim for accepting name-only CRM dispatch.
 - No change to ordinary external HTTP client pooling semantics.
 
@@ -119,3 +123,7 @@ route attestation token path.
 - Python SDK: a canonical relay route error returned during an HTTP CRM call
   must raise the matching `CCError` subclass instead of a generic
   `RuntimeError` / `ClientCallResource`.
+- Python SDK: when loopback relay resolution selects local IPC and that direct
+  acquire fails, the runtime must not retry the same failed route through the
+  same relay HTTP data plane. With no distinct target, callers see
+  `FallbackDenied` carrying `direct_ipc_failure` details.

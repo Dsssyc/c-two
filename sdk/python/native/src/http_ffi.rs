@@ -107,7 +107,7 @@ fn http_call_result_to_py<'py>(
     }
 }
 
-fn c2_error_wire_bytes_from_http_body(body: &str) -> Option<Vec<u8>> {
+pub(crate) fn c2_error_wire_bytes_from_http_body(body: &str) -> Option<Vec<u8>> {
     let envelope = serde_json::from_str::<c2_error::C2ErrorEnvelope>(body).ok()?;
     let error = c2_error::C2Error::from_envelope(envelope).ok()?;
     Some(error.to_wire_bytes())

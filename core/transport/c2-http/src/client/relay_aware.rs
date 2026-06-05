@@ -118,6 +118,15 @@ impl RelayAwareHttpClient {
             .block_on(self.resolve_http_target_async())
     }
 
+    pub fn resolve_target_after_local_ipc_failures(
+        &self,
+        failed_candidates: &[RelayLocalIpcCandidate],
+    ) -> Result<RelayResolvedTarget, HttpError> {
+        super::client::runtime()
+            .handle()
+            .block_on(self.resolve_target_after_local_ipc_failures_async(failed_candidates))
+    }
+
     async fn connect_async(&self) -> Result<(), HttpError> {
         match self.select_target_async(false).await? {
             RelayResolvedTarget::Http { .. } => Ok(()),
@@ -133,16 +142,37 @@ impl RelayAwareHttpClient {
         self.select_target_async(false).await
     }
 
+    pub async fn resolve_target_after_local_ipc_failures_async(
+        &self,
+        failed_candidates: &[RelayLocalIpcCandidate],
+    ) -> Result<RelayResolvedTarget, HttpError> {
+        self.select_target_with_local_exclusions_async(true, failed_candidates, true)
+            .await
+    }
+
     async fn select_target_async(
         &self,
         prefer_local_ipc: bool,
+    ) -> Result<RelayResolvedTarget, HttpError> {
+        self.select_target_with_local_exclusions_async(prefer_local_ipc, &[], false)
+            .await
+    }
+
+    async fn select_target_with_local_exclusions_async(
+        &self,
+        prefer_local_ipc: bool,
+        excluded_local_ipc_candidates: &[RelayLocalIpcCandidate],
+        fallback_denied_when_only_excluded: bool,
     ) -> Result<RelayResolvedTarget, HttpError> {
         let attempts = self.config.max_attempts.max(1);
         let mut last_error = None;
         let mut excluded_routes = HashSet::new();
 
         for attempt in 0..attempts {
-            let routes = match self.resolve_routes_async(attempt > 0).await {
+            let routes = match self
+                .resolve_routes_async(attempt > 0 || fallback_denied_when_only_excluded)
+                .await
+            {
                 Ok(routes) if !routes.is_empty() => routes,
                 Ok(_) => {
                     return Err(HttpError::ServerError(
@@ -158,6 +188,17 @@ impl RelayAwareHttpClient {
                     return Err(err);
                 }
             };
+            let had_routes_before_local_exclusion = !routes.is_empty();
+            let routes = filter_failed_local_ipc_candidates(routes, excluded_local_ipc_candidates);
+            if routes.is_empty()
+                && fallback_denied_when_only_excluded
+                && had_routes_before_local_exclusion
+            {
+                return Err(HttpError::ServerError(
+                    409,
+                    fallback_denied_body(self.route_name(), excluded_local_ipc_candidates),
+                ));
+            }
 
             if let Some(candidate) = select_local_ipc_candidate(
                 prefer_local_ipc,
@@ -413,6 +454,36 @@ fn crm_contract_mismatch_body(route_name: &str) -> String {
     )
 }
 
+fn fallback_denied_body(route_name: &str, failed_candidates: &[RelayLocalIpcCandidate]) -> String {
+    let last_failed = failed_candidates.last();
+    let mut details = serde_json::Map::new();
+    details.insert("route".to_string(), json!(route_name));
+    details.insert(
+        "reason".to_string(),
+        json!("only_failed_local_ipc_candidates"),
+    );
+    details.insert(
+        "failed_local_ipc_candidates".to_string(),
+        json!(failed_candidates.len().to_string()),
+    );
+    if let Some(candidate) = last_failed {
+        details.insert("ipc_address".to_string(), json!(candidate.address));
+        details.insert("server_id".to_string(), json!(candidate.server_id));
+        details.insert(
+            "server_instance_id".to_string(),
+            json!(candidate.server_instance_id),
+        );
+    }
+    json!({
+        "version": c2_error::ERROR_WIRE_VERSION,
+        "code": u16::from(c2_error::ErrorCode::FallbackDenied),
+        "name": c2_error::ErrorCode::FallbackDenied.name(),
+        "message": format!("same local relay HTTP fallback denied for route {route_name}"),
+        "details": details,
+    })
+    .to_string()
+}
+
 fn canonical_relay_error_body(
     code: c2_error::ErrorCode,
     message: &str,
@@ -456,6 +527,32 @@ fn select_local_ipc_candidate(
             server_instance_id: route.server_instance_id.clone()?,
         })
     })
+}
+
+fn filter_failed_local_ipc_candidates(
+    routes: Vec<RelayRouteInfo>,
+    failed_candidates: &[RelayLocalIpcCandidate],
+) -> Vec<RelayRouteInfo> {
+    if failed_candidates.is_empty() {
+        return routes;
+    }
+    routes
+        .into_iter()
+        .filter(|route| {
+            !failed_candidates
+                .iter()
+                .any(|failed| route_matches_local_ipc_candidate(route, failed))
+        })
+        .collect()
+}
+
+fn route_matches_local_ipc_candidate(
+    route: &RelayRouteInfo,
+    failed: &RelayLocalIpcCandidate,
+) -> bool {
+    route.ipc_address.as_deref() == Some(failed.address.as_str())
+        && route.server_id.as_deref() == Some(failed.server_id.as_str())
+        && route.server_instance_id.as_deref() == Some(failed.server_instance_id.as_str())
 }
 
 fn filter_routes_by_expected_contract(
@@ -662,6 +759,21 @@ mod tests {
                 ..route_info(name, state.stale_url.clone())
             },
         ])
+        .into_response()
+    }
+
+    async fn registry_resolve_only_failed_local_ipc(
+        State(state): State<RegistryState>,
+        Path(name): Path<String>,
+    ) -> Response {
+        state.resolve_count.fetch_add(1, Ordering::SeqCst);
+        Json(vec![RelayRouteInfo {
+            relay_url: state.stale_url.clone(),
+            ipc_address: Some("ipc://local-grid".to_string()),
+            server_id: Some("local-grid".to_string()),
+            server_instance_id: Some("inst-local-grid".to_string()),
+            ..route_info(name, state.stale_url.clone())
+        }])
         .into_response()
     }
 
@@ -874,6 +986,102 @@ mod tests {
             "local IPC target selection should not probe or iterate HTTP routes"
         );
 
+        registry_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn local_ipc_failure_selects_distinct_http_candidate_only() {
+        let (live_url, live_handle) =
+            spawn_app(Router::new().route("/_probe/{route}", get(|| async { StatusCode::OK })))
+                .await;
+        let resolve_count = Arc::new(AtomicUsize::new(0));
+        let registry_state = RegistryState {
+            stale_url: "http://127.0.0.1:9".to_string(),
+            live_url: live_url.clone(),
+            resolve_count: resolve_count.clone(),
+        };
+        let (registry_url, registry_handle) = spawn_app(
+            Router::new()
+                .route("/_resolve/{name}", get(registry_resolve_with_local_ipc))
+                .with_state(registry_state),
+        )
+        .await;
+
+        let client = RelayAwareHttpClient::new(
+            &registry_url,
+            expected_contract(),
+            false,
+            RelayAwareClientConfig {
+                max_attempts: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let failed = RelayLocalIpcCandidate {
+            address: "ipc://local-grid".to_string(),
+            server_id: "local-grid".to_string(),
+            server_instance_id: "inst-local-grid".to_string(),
+        };
+
+        let target = client
+            .resolve_target_after_local_ipc_failures_async(std::slice::from_ref(&failed))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            target,
+            RelayResolvedTarget::Http {
+                relay_url: live_url
+            }
+        );
+        assert_eq!(resolve_count.load(Ordering::SeqCst), 1);
+        registry_handle.abort();
+        live_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn local_ipc_failure_without_distinct_http_candidate_is_fallback_denied() {
+        let resolve_count = Arc::new(AtomicUsize::new(0));
+        let registry_state = RegistryState {
+            stale_url: "http://127.0.0.1:9".to_string(),
+            live_url: String::new(),
+            resolve_count: resolve_count.clone(),
+        };
+        let (registry_url, registry_handle) = spawn_app(
+            Router::new()
+                .route(
+                    "/_resolve/{name}",
+                    get(registry_resolve_only_failed_local_ipc),
+                )
+                .with_state(registry_state),
+        )
+        .await;
+
+        let client = RelayAwareHttpClient::new(
+            &registry_url,
+            expected_contract(),
+            false,
+            RelayAwareClientConfig {
+                max_attempts: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let failed = RelayLocalIpcCandidate {
+            address: "ipc://local-grid".to_string(),
+            server_id: "local-grid".to_string(),
+            server_instance_id: "inst-local-grid".to_string(),
+        };
+
+        let err = client
+            .resolve_target_after_local_ipc_failures_async(std::slice::from_ref(&failed))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, HttpError::ServerError(409, body) if relay_error_code_is(body.as_str(), c2_error::ErrorCode::FallbackDenied))
+        );
+        assert_eq!(resolve_count.load(Ordering::SeqCst), 1);
         registry_handle.abort();
     }
 

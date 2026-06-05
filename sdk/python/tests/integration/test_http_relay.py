@@ -266,7 +266,7 @@ class TestCcConnectHttp:
     def test_connect_http_rejects_crm_contract_mismatch_before_call(self, relay_stack):
         relay_url, _ = relay_stack
 
-        with pytest.raises(ResourceNotFound, match="Resource 'hello' not found"):
+        with pytest.raises(ResourceNotFound, match="route not found: hello"):
             cc.connect(Counter, name='hello', address=relay_url)
 
     def test_connect_http_call_route_not_found_raises_cc_error(self, relay_stack):
@@ -483,7 +483,7 @@ class TestCcConnectHttp:
         registry = _ProcessRegistry()
         try:
             registry.set_relay_anchor(relay.url)
-            with pytest.raises(ResourceNotFound, match="Resource 'missing-route' not found"):
+            with pytest.raises(ResourceNotFound, match="route not found: missing-route"):
                 registry.connect(Hello, name='missing-route')
         finally:
             registry.shutdown()

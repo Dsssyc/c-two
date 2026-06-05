@@ -47,6 +47,7 @@ from c_two.crm.methods import rpc_method_names
 from c_two.config.ipc import ClientIPCOverrides, ServerIPCOverrides
 from c_two.config.settings import settings
 from c_two.error import (
+    CCError,
     ResourceNotFound,
     ResourceUnavailable,
     RegistryUnavailable,
@@ -83,6 +84,16 @@ def _relay_control_error_status(exc: BaseException) -> int | None:
 
 def _is_crm_contract_mismatch(exc: BaseException) -> bool:
     return isinstance(exc, RuntimeError) and "CRM contract mismatch" in str(exc)
+
+
+def _cc_error_from_native_exception(exc: BaseException) -> CCError | None:
+    error_bytes = getattr(exc, "error_bytes", None)
+    if error_bytes is None:
+        return None
+    try:
+        return CCError.deserialize(memoryview(error_bytes))
+    except TypeError:
+        return CCError.deserialize(error_bytes)
 
 
 def _ensure_crm_contract_match(
@@ -408,6 +419,8 @@ class _ProcessRegistry:
             except Exception as exc:
                 if _is_crm_contract_mismatch(exc):
                     raise
+                if (cc_err := _cc_error_from_native_exception(exc)) is not None:
+                    raise cc_err from exc
                 status = _relay_control_error_status(exc)
                 if status == 404:
                     raise ResourceNotFound(f"Resource '{name}' not found") from exc
@@ -443,6 +456,8 @@ class _ProcessRegistry:
             except Exception as exc:
                 if _is_crm_contract_mismatch(exc):
                     raise
+                if (cc_err := _cc_error_from_native_exception(exc)) is not None:
+                    raise cc_err from exc
                 status = _relay_control_error_status(exc)
                 if status == 404:
                     raise ResourceNotFound(f"Resource '{name}' not found") from exc

@@ -1,7 +1,7 @@
 # Route Catalog Watch Redesign Implementation Plan
 
 **Date:** 2026-06-05
-**Status:** Phase 1 implemented; Phase 2 call-token foundation implemented; Phase 3 RouteCatalog wire/server/client watch implemented; Phase 4 upstream control watch slice implemented; Phase 4/5 relay token and HTTP error cleanup pending
+**Status:** Phase 1 implemented; Phase 2 call-token foundation implemented; Phase 3 RouteCatalog wire/server/client watch implemented; Phase 4 upstream control watch slice implemented; Phase 5 relay token, canonical route errors, and loopback fallback clean cut implemented; Phase 6 cleanup/review pending
 **Scope:** IPC route lifecycle, relay route authority, relay upstream pools, relay-aware HTTP fallback, Rust error taxonomy, Python SDK error facade
 **Supersedes:** `docs/issues/ipc-route-contract-stale-snapshot.md` as the long-term design
 
@@ -570,10 +570,16 @@ Loopback self-fallback rule:
 - If a loopback relay resolve result selects a local IPC endpoint and direct IPC
   acquire fails, the client must not fallback to the same local relay HTTP data
   plane.
-- The client may continue to a candidate with a different relay URL, server
-  instance, or nonlocal owner.
-- When no distinct candidate exists, expose the original typed IPC error to the
-  caller.
+- The relay-aware Rust client must exclude the failed local IPC candidate by
+  `ipc_address`, `server_id`, and `server_instance_id`, then re-resolve the
+  route target. If a newer local IPC candidate appears, direct IPC can be tried
+  again. If a distinct HTTP relay candidate exists, that candidate can be
+  selected.
+- When no distinct candidate exists, return public `FallbackDenied` with
+  `details.route`, `details.ipc_address`, `details.server_id`,
+  `details.server_instance_id`, `details.direct_ipc_failure_kind`, and
+  `details.direct_ipc_failure`. That preserves the original direct IPC acquire
+  reason without hiding it behind a same-relay HTTP retry.
 
 ## Error Taxonomy
 
@@ -593,7 +599,7 @@ pub enum RouteConnectErrorKind {
     CatalogCompacted,
     WatchDisconnected,
     LeaseExpired,
-    LoopbackFallbackDenied,
+    LocalIpcFallbackDenied,
 }
 ```
 
@@ -1004,14 +1010,37 @@ Implementation status on 2026-06-06:
   - `cargo test --manifest-path core/Cargo.toml -p c2-runtime`;
   - `cargo fmt --manifest-path core/Cargo.toml --all --check`;
   - `git diff --check`.
+- implemented the canonical relay route error and loopback fallback clean cut
+  slice:
+  - relay route semantic HTTP errors use canonical C2 error envelope fields;
+  - Python runtime/registry turns native `error_bytes` into public `CCError`
+    subclasses before generic relay wrapping;
+  - relay-aware target selection can exclude failed local IPC candidates and
+    choose only a distinct local IPC or HTTP relay target afterward;
+  - loopback local IPC acquire failure no longer directly calls a same-relay
+    HTTP fallback helper;
+  - when no distinct target exists, Python callers receive `FallbackDenied`
+    with direct IPC failure diagnostics in `details`.
+  - relay-resolved IPC contract mismatch now crosses the native/Python boundary
+    as canonical `ContractMismatch` error bytes instead of a bare
+    `RuntimeError`.
+- verified for this slice:
+  - `cargo fmt --manifest-path core/Cargo.toml --all --check`;
+  - `cargo fmt --manifest-path sdk/python/native/Cargo.toml --check`;
+  - `git diff --check`;
+  - `cargo test --manifest-path core/Cargo.toml -p c2-error`;
+  - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay`;
+  - `cargo test --manifest-path core/Cargo.toml -p c2-ipc`;
+  - `cargo test --manifest-path core/Cargo.toml -p c2-runtime`;
+  - `uv sync --reinstall-package c-two`;
+  - `C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_runtime_session.py -q --timeout=30`.
+  - `C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_runtime_session.py sdk/python/tests/integration/test_http_relay.py -q --timeout=30`;
+  - `C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30`
+    (`963 passed`).
 - remaining Phase 5/6 work:
   - expose route UID/revision as part of the external relay HTTP resolve/call
     token contract instead of only binding the relay's internal precheck
     snapshot;
-  - replace transitional relay HTTP `409 { "error": "RouteStale" }` JSON with
-    the canonical C2 error envelope and SDK-visible CC error class;
-  - complete the loopback self-fallback clean cut in runtime/Python-facing
-    relay resolution paths;
   - model route state and tombstone compaction by catalog revision rather than
     only timestamped route-table tombstones.
 
@@ -1045,8 +1074,12 @@ Verification:
     returns no production API references;
   - `rg -n "resolve\\([^,)]*name|name_only|route_names\\(\\)" core/transport/c2-http sdk/python/native/src`
     returns no production relay resolve/call path;
-  - `rg -n "falling back to HTTP relay|LoopbackFallbackDenied|same local relay" sdk/python/native/src core/transport/c2-http`
-    proves same-relay loopback HTTP fallback is denied.
+  - `rg -n "falling back to HTTP relay" sdk/python/native/src core/transport/c2-http`
+    returns no production match, proving the old direct HTTP fallback branch is
+    gone.
+  - `rg -n "direct_ipc_failure|resolve_relay_connection_after_local_ipc_failures" sdk/python/native/src core`
+    proves denied fallback preserves the direct IPC acquire reason and reuses
+    Rust-owned target reselection.
 
 ## Test Matrix
 
@@ -1066,7 +1099,7 @@ Verification:
 | explicit HTTP call through relay | creates data-plane upstream that may be idle-evicted safely | 4 |
 | data-plane reconnect reset | `ResourceUnavailable`, route retained | 4 |
 | upstream route watch removed | relay withdraws with semantic reason | 4 |
-| loopback local IPC failure | no same-relay HTTP fallback; original typed IPC error exposed | 5 |
+| loopback local IPC failure | no same-relay HTTP fallback; `FallbackDenied` preserves original IPC failure details | 5 |
 | local IPC failure with distinct remote candidate | remote candidate may be attempted | 5 |
 | relay tombstone GC | logs route names and revisions; watch compaction semantics preserved | 4 |
 | direct explicit IPC with relay env unavailable | unaffected by relay | 3 |

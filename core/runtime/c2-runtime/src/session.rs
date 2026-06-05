@@ -15,7 +15,7 @@ use parking_lot::Mutex;
 use c2_contract::ExpectedRouteContract;
 use c2_http::client::{
     HttpError, RelayAwareClientConfig, RelayAwareHttpClient, RelayControlClient,
-    RelayResolvedTarget,
+    RelayLocalIpcCandidate, RelayResolvedTarget,
 };
 use c2_server::{BuiltRoute, ServerLifecycleState, ServerRouteCloseOutcome};
 
@@ -193,9 +193,8 @@ struct RelayProjection {
 
 pub enum RelayResolvedConnection {
     Ipc {
-        address: String,
-        server_id: String,
-        server_instance_id: String,
+        client: RelayAwareHttpClient,
+        candidate: RelayLocalIpcCandidate,
     },
     Http {
         client: RelayAwareHttpClient,
@@ -811,11 +810,26 @@ impl RuntimeSession {
         )
         .map_err(runtime_http_error)?;
         match client.resolve_target().map_err(runtime_http_error)? {
-            RelayResolvedTarget::Ipc { candidate } => Ok(RelayResolvedConnection::Ipc {
-                address: candidate.address,
-                server_id: candidate.server_id,
-                server_instance_id: candidate.server_instance_id,
-            }),
+            RelayResolvedTarget::Ipc { candidate } => {
+                Ok(RelayResolvedConnection::Ipc { client, candidate })
+            }
+            RelayResolvedTarget::Http { relay_url } => {
+                Ok(RelayResolvedConnection::Http { client, relay_url })
+            }
+        }
+    }
+
+    pub fn resolve_relay_connection_after_local_ipc_failures(
+        client: RelayAwareHttpClient,
+        failed_candidates: &[RelayLocalIpcCandidate],
+    ) -> Result<RelayResolvedConnection, RuntimeSessionError> {
+        match client
+            .resolve_target_after_local_ipc_failures(failed_candidates)
+            .map_err(runtime_http_error)?
+        {
+            RelayResolvedTarget::Ipc { candidate } => {
+                Ok(RelayResolvedConnection::Ipc { client, candidate })
+            }
             RelayResolvedTarget::Http { relay_url } => {
                 Ok(RelayResolvedConnection::Http { client, relay_url })
             }

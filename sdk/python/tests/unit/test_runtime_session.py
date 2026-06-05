@@ -734,7 +734,7 @@ def test_relay_ipc_acceptance_does_not_trust_route_name_only() -> None:
         repo_root / 'sdk/python/native/src/runtime_session_ffi.rs'
     ).read_text(encoding='utf-8')
     acquire_body = source.split('fn acquire_relay_ipc_client(', 1)[1].split(
-        'fn acquire_relay_http_client(',
+        'fn expected_route_contract(',
         1,
     )[0]
 
@@ -751,7 +751,7 @@ def test_relay_ipc_acceptance_does_not_trust_route_name_only() -> None:
     assert 'route_names()' not in acquire_body
 
 
-def test_relay_ipc_identity_mismatch_falls_back_to_http_not_hard_error() -> None:
+def test_relay_ipc_unavailable_does_not_directly_fallback_to_same_http_relay() -> None:
     repo_root = Path(__file__).resolve().parents[4]
     source = (
         repo_root / 'sdk/python/native/src/runtime_session_ffi.rs'
@@ -762,14 +762,15 @@ def test_relay_ipc_identity_mismatch_falls_back_to_http_not_hard_error() -> None
     )[0]
 
     assert 'RelayIpcConnectError::Unavailable' in connect_body
-    assert 'acquire_relay_http_client' in connect_body
-    assert (
-        connect_body.find('RelayIpcConnectError::Unavailable')
-        < connect_body.find('acquire_relay_http_client')
-    )
+    unavailable_branch = connect_body.split(
+        'Err(RelayIpcConnectError::Unavailable(reason)) => {',
+        1,
+    )[1].split('RelayResolvedConnection::Http', 1)[0]
+    assert 'acquire_relay_http_client' not in unavailable_branch
+    assert 'resolve_relay_connection_after_local_ipc_failures' in unavailable_branch
 
 
-def test_relay_ipc_unavailable_reason_is_logged_before_http_fallback() -> None:
+def test_relay_ipc_unavailable_reason_is_reported_before_fallback_denial() -> None:
     repo_root = Path(__file__).resolve().parents[4]
     source = (
         repo_root / 'sdk/python/native/src/runtime_session_ffi.rs'
@@ -779,7 +780,7 @@ def test_relay_ipc_unavailable_reason_is_logged_before_http_fallback() -> None:
         1,
     )[0]
     acquire_body = source.split('fn acquire_relay_ipc_client(', 1)[1].split(
-        'fn acquire_relay_http_client(',
+        'fn expected_route_contract(',
         1,
     )[0]
 
@@ -788,13 +789,40 @@ def test_relay_ipc_unavailable_reason_is_logged_before_http_fallback() -> None:
     assert 'RelayIpcUnavailableReason::RouteMissing' in source
     assert 'Err(RelayIpcConnectError::Unavailable(reason))' in connect_body
     assert 'eprintln!' in connect_body
-    assert (
-        connect_body.find('eprintln!')
-        < connect_body.find('acquire_relay_http_client')
-    )
+    assert 'falling back to HTTP relay' not in connect_body
+    assert 'fallback denied' in connect_body.lower()
+    assert 'direct_ipc_failure' in source
+    assert 'direct_ipc_failure_kind' in source
     assert 'RelayIpcUnavailable::pool_acquire' in acquire_body
     assert 'RelayIpcUnavailable::identity_mismatch' in acquire_body
     assert 'RelayIpcUnavailable::route_missing' in acquire_body
+
+
+def test_registry_restores_native_error_bytes_before_wrapping() -> None:
+    from c_two.error import CCError, FallbackDenied
+    from c_two.transport.registry import _cc_error_from_native_exception
+
+    native_exc = RuntimeError('native failure')
+    native_exc.error_bytes = CCError.serialize(FallbackDenied(
+        'same local relay HTTP fallback denied',
+        details={'route': 'grid'},
+    ))
+
+    restored = _cc_error_from_native_exception(native_exc)
+
+    assert isinstance(restored, FallbackDenied)
+    assert restored.details == {'route': 'grid'}
+
+
+def test_relay_ipc_contract_mismatch_uses_cc_error_envelope() -> None:
+    repo_root = Path(__file__).resolve().parents[4]
+    source = (
+        repo_root / 'sdk/python/native/src/runtime_session_ffi.rs'
+    ).read_text(encoding='utf-8')
+
+    assert 'RelayIpcConnectError::ContractMismatch' in source
+    assert 'relay_ipc_contract_mismatch_to_py' in source
+    assert 'ErrorCode::ContractMismatch' in source
 
 
 def test_relay_ipc_identity_boundary_is_native_owned() -> None:
