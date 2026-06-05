@@ -1,7 +1,7 @@
 # Route Catalog Watch Redesign Implementation Plan
 
 **Date:** 2026-06-05
-**Status:** Phase 1 implemented; Phase 2 pending
+**Status:** Phase 1 implemented; Phase 2 call-token foundation implemented; full RouteCatalog/watch pending
 **Scope:** IPC route lifecycle, relay route authority, relay upstream pools, relay-aware HTTP fallback, Rust error taxonomy, Python SDK error facade
 **Supersedes:** `docs/issues/ipc-route-contract-stale-snapshot.md` as the long-term design
 
@@ -803,6 +803,28 @@ Verification:
 - wire fixture tests for route call identity;
 - `cargo test --manifest-path core/Cargo.toml -p c2-server`
 - `cargo test --manifest-path core/Cargo.toml -p c2-ipc`
+
+Status:
+
+- call-token foundation implemented on 2026-06-05:
+  - `c2-wire` call control now carries route name, route UID, observed route
+    revision, CRM tag, contract hashes, and method index;
+  - IPC handshakes and route attestation responses now expose route UID and
+    route revision;
+  - IPC clients build every route-bound call from the attested route token
+    instead of route name alone;
+  - `c2-server` validates route UID, revision, contract identity, route state,
+    and method index before invoking resource callbacks;
+  - stale route tokens return registered `RouteStale`; route scheduler close
+    returns registered `ResourceClosed`; contract mismatches return registered
+    `ContractMismatch`;
+  - Python wire FFI and generated TypeScript IPC clients were updated to the
+    new token-bearing protocol.
+- not yet implemented:
+  - the standalone `RouteCatalog` storage type and event log;
+  - IPC `RouteList`, `RouteLookup`, `RouteWatch`, `RouteAck`, and `RouteNack`;
+  - thread-local route lifecycle parity;
+  - removal of transitional lazy route-contract refresh APIs.
 
 ### Phase 3: IPC RouteList, RouteLookup, RouteWatch, RouteDirectory
 

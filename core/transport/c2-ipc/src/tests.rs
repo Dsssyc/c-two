@@ -14,11 +14,27 @@ mod client_tests {
         request_chunk_count,
     };
 
+    const ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const SIG_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+    fn call_identity(route_name: &str) -> RouteCallIdentity {
+        RouteCallIdentity {
+            route_name: route_name.into(),
+            route_uid: format!("{route_name}-route-uid-0001"),
+            observed_route_revision: 1,
+            crm_ns: "test.grid".into(),
+            crm_name: "Grid".into(),
+            crm_ver: "0.1.0".into(),
+            abi_hash: ABI_HASH.into(),
+            signature_hash: SIG_HASH.into(),
+        }
+    }
+
     #[test]
     fn encode_v2_inline_call() {
         // Verify that an inline v2 call frame has the expected layout:
         // [16B header (flags=FLAG_CALL_V2)] [call_control] [data]
-        let ctrl = encode_call_control("grid", 0).unwrap();
+        let ctrl = encode_call_control(&call_identity("grid"), 0).unwrap();
         let data = b"hello";
         let mut payload = Vec::new();
         payload.extend_from_slice(&ctrl);
@@ -31,7 +47,7 @@ mod client_tests {
         assert!(!hdr.is_buddy());
 
         let (decoded_ctrl, consumed) = decode_call_control(frame_payload, 0).unwrap();
-        assert_eq!(decoded_ctrl.route_name, "grid");
+        assert_eq!(decoded_ctrl.identity.route_name, "grid");
         assert_eq!(decoded_ctrl.method_idx, 0);
 
         let inline_data = &frame_payload[consumed..];
@@ -115,7 +131,7 @@ mod client_tests {
         let buddy_bytes = encode_buddy_payload(&bp);
         assert_eq!(buddy_bytes.len(), BUDDY_PAYLOAD_SIZE);
 
-        let ctrl = encode_call_control("grid", 3).unwrap();
+        let ctrl = encode_call_control(&call_identity("grid"), 3).unwrap();
         let mut payload = Vec::new();
         payload.extend_from_slice(&buddy_bytes);
         payload.extend_from_slice(&ctrl);
@@ -140,7 +156,7 @@ mod client_tests {
 
         // Decode call control after buddy payload.
         let (decoded_ctrl, _) = decode_call_control(frame_payload, BUDDY_PAYLOAD_SIZE).unwrap();
-        assert_eq!(decoded_ctrl.route_name, "grid");
+        assert_eq!(decoded_ctrl.identity.route_name, "grid");
         assert_eq!(decoded_ctrl.method_idx, 3);
     }
 
@@ -155,7 +171,7 @@ mod client_tests {
             is_dedicated: true,
         };
         let buddy_bytes = encode_buddy_payload(&bp);
-        let ctrl = encode_call_control("net", 1).unwrap();
+        let ctrl = encode_call_control(&call_identity("net"), 1).unwrap();
 
         let mut payload = Vec::new();
         payload.extend_from_slice(&buddy_bytes);
@@ -181,7 +197,7 @@ mod client_tests {
         let total_chunks: u16 = 3;
         let request_id: u64 = 42;
 
-        let ctrl = encode_call_control(route, method_idx).unwrap();
+        let ctrl = encode_call_control(&call_identity(route), method_idx).unwrap();
         let chunk_data = b"chunk_payload_data";
 
         // ── Chunk 0: [chunk_header][call_control][data] ──
@@ -208,7 +224,7 @@ mod client_tests {
 
         // Decode call control (present on chunk 0).
         let (decoded_ctrl, ctrl_consumed) = decode_call_control(fp_0, CHUNK_HEADER_SIZE).unwrap();
-        assert_eq!(decoded_ctrl.route_name, route);
+        assert_eq!(decoded_ctrl.identity.route_name, route);
         assert_eq!(decoded_ctrl.method_idx, method_idx);
 
         // Remaining is chunk data.
@@ -351,7 +367,7 @@ mod client_tests {
         use c2_wire::chunk::encode_chunk_header;
 
         let chunk_hdr = encode_chunk_header(0, 1);
-        let ctrl = encode_call_control("route", 0).unwrap();
+        let ctrl = encode_call_control(&call_identity("route"), 0).unwrap();
         let data = vec![0xABu8; 128];
 
         let mut payload = Vec::new();

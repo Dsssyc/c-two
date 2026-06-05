@@ -21,7 +21,10 @@ use c2_wire::buddy::{
 };
 use c2_wire::chunk::encode_chunk_header;
 use c2_wire::chunk::{ChunkConfig, ChunkRegistry};
-use c2_wire::control::{ReplyControl, decode_reply_control, encode_call_control};
+use c2_wire::control::{
+    ReplyControl, RouteCallIdentity, decode_reply_control, encode_call_control,
+    encoded_call_control_len,
+};
 use c2_wire::flags;
 use c2_wire::frame::{self, DecodeError, FrameHeader, HEADER_SIZE};
 use c2_wire::handshake::{
@@ -235,6 +238,9 @@ impl From<c2_wire::control::EncodeError> for IpcError {
 /// Per-route method table (name ↔ index).
 #[derive(Debug, Clone)]
 pub struct MethodTable {
+    route_name: String,
+    route_uid: String,
+    route_revision: u64,
     crm_ns: String,
     crm_name: String,
     crm_ver: String,
@@ -248,6 +254,9 @@ impl MethodTable {
     fn from_route(route: &RouteInfo) -> Self {
         Self::from_entries(
             &route.methods,
+            route.name.clone(),
+            route.route_uid.clone(),
+            route.route_revision,
             route.crm_ns.clone(),
             route.crm_name.clone(),
             route.crm_ver.clone(),
@@ -259,6 +268,9 @@ impl MethodTable {
 
     pub(crate) fn from_entries(
         entries: &[MethodEntry],
+        route_name: String,
+        route_uid: String,
+        route_revision: u64,
         crm_ns: String,
         crm_name: String,
         crm_ver: String,
@@ -271,6 +283,9 @@ impl MethodTable {
             name_to_idx.insert(e.name.clone(), e.index);
         }
         Self {
+            route_name,
+            route_uid,
+            route_revision,
             crm_ns,
             crm_name,
             crm_ver,
@@ -316,6 +331,27 @@ impl MethodTable {
 
     pub fn max_payload_size(&self) -> u64 {
         self.max_payload_size
+    }
+
+    pub fn route_uid(&self) -> &str {
+        &self.route_uid
+    }
+
+    pub fn route_revision(&self) -> u64 {
+        self.route_revision
+    }
+
+    pub(crate) fn call_identity(&self) -> RouteCallIdentity {
+        RouteCallIdentity {
+            route_name: self.route_name.clone(),
+            route_uid: self.route_uid.clone(),
+            observed_route_revision: self.route_revision,
+            crm_ns: self.crm_ns.clone(),
+            crm_name: self.crm_name.clone(),
+            crm_ver: self.crm_ver.clone(),
+            abi_hash: self.abi_hash.clone(),
+            signature_hash: self.signature_hash.clone(),
+        }
     }
 }
 
@@ -733,31 +769,22 @@ impl IpcClient {
             .map(|identity| identity.server_instance_id.as_str())
     }
 
-    fn method_idx_for(&self, route_name: &str, method_name: &str) -> Result<u16, IpcError> {
+    fn call_target_for(
+        &self,
+        route_name: &str,
+        method_name: &str,
+    ) -> Result<(u16, RouteCallIdentity, u64), IpcError> {
         let route_tables = self.route_tables.read();
         let table = route_tables
             .get(route_name)
             .ok_or_else(|| IpcError::RouteNotFound(route_name.to_string()))?;
-        table
+        let method_idx = table
             .index_of(method_name)
             .ok_or_else(|| IpcError::MethodNotFound {
                 route_name: route_name.to_string(),
                 method_name: method_name.to_string(),
-            })
-    }
-
-    fn ensure_route_payload_size(&self, route_name: &str, data_len: u64) -> Result<(), IpcError> {
-        let route_tables = self.route_tables.read();
-        let table = route_tables
-            .get(route_name)
-            .ok_or_else(|| IpcError::RouteNotFound(route_name.to_string()))?;
-        let max_payload_size = table.max_payload_size();
-        if data_len > max_payload_size {
-            return Err(IpcError::Config(format!(
-                "request payload size {data_len} exceeds route '{route_name}' max_payload_size {max_payload_size}"
-            )));
-        }
-        Ok(())
+            })?;
+        Ok((method_idx, table.call_identity(), table.max_payload_size()))
     }
 
     /// Send a CRM call and wait for the response.
@@ -771,12 +798,18 @@ impl IpcClient {
         method_name: &str,
         data: &[u8],
     ) -> Result<ResponseData, IpcError> {
-        let method_idx = self.method_idx_for(route_name, method_name)?;
-        self.ensure_route_payload_size(route_name, u64::try_from(data.len()).unwrap_or(u64::MAX))?;
+        let (method_idx, identity, max_payload_size) =
+            self.call_target_for(route_name, method_name)?;
+        let data_len = u64::try_from(data.len()).unwrap_or(u64::MAX);
+        if data_len > max_payload_size {
+            return Err(IpcError::Config(format!(
+                "request payload size {data_len} exceeds route '{route_name}' max_payload_size {max_payload_size}"
+            )));
+        }
 
         match choose_request_transport(&self.config, self.pool.is_some(), data.len()) {
             RequestTransportKind::Buddy => {
-                match self.call_buddy(route_name, method_idx, data).await {
+                match self.call_buddy(&identity, method_idx, data).await {
                     Ok(result) => return Ok(result),
                     Err(IpcError::Shm(_)) => {
                         // Pool allocation or SHM setup failed. Fall back through the
@@ -787,17 +820,17 @@ impl IpcClient {
                 }
             }
             RequestTransportKind::Chunked => {
-                return self.call_chunked(route_name, method_idx, data).await;
+                return self.call_chunked(&identity, method_idx, data).await;
             }
             RequestTransportKind::Inline => {
-                return self.call_inline(route_name, method_idx, data).await;
+                return self.call_inline(&identity, method_idx, data).await;
             }
         }
 
         match choose_request_transport(&self.config, false, data.len()) {
-            RequestTransportKind::Chunked => self.call_chunked(route_name, method_idx, data).await,
+            RequestTransportKind::Chunked => self.call_chunked(&identity, method_idx, data).await,
             RequestTransportKind::Inline | RequestTransportKind::Buddy => {
-                self.call_inline(route_name, method_idx, data).await
+                self.call_inline(&identity, method_idx, data).await
             }
         }
     }
@@ -821,38 +854,43 @@ impl IpcClient {
         B: AsRef<[u8]>,
         E: Display,
     {
-        let method_idx = self.method_idx_for(route_name, method_name)?;
-        self.ensure_route_payload_size(route_name, data_len)?;
+        let (method_idx, identity, max_payload_size) =
+            self.call_target_for(route_name, method_name)?;
+        if data_len > max_payload_size {
+            return Err(IpcError::Config(format!(
+                "request payload size {data_len} exceeds route '{route_name}' max_payload_size {max_payload_size}"
+            )));
+        }
         let data_len = checked_payload_len_usize(data_len)?;
         if data_len == 0 {
-            return self.call_inline(route_name, method_idx, &[]).await;
+            return self.call_inline(&identity, method_idx, &[]).await;
         }
 
         match choose_request_transport(&self.config, self.pool.is_some(), data_len) {
             RequestTransportKind::Buddy => {
                 if let Some(alloc) = self.try_alloc_request_block(data_len)? {
                     return self
-                        .call_buddy_stream(route_name, method_idx, alloc, data_len, chunks)
+                        .call_buddy_stream(&identity, method_idx, alloc, data_len, chunks)
                         .await;
                 }
                 match choose_request_transport(&self.config, false, data_len) {
                     RequestTransportKind::Chunked => {
-                        self.call_chunked_stream(route_name, method_idx, data_len, chunks)
+                        self.call_chunked_stream(&identity, method_idx, data_len, chunks)
                             .await
                     }
                     RequestTransportKind::Inline | RequestTransportKind::Buddy => {
                         let data = collect_exact_stream(data_len, chunks).await?;
-                        self.call_inline(route_name, method_idx, &data).await
+                        self.call_inline(&identity, method_idx, &data).await
                     }
                 }
             }
             RequestTransportKind::Chunked => {
-                self.call_chunked_stream(route_name, method_idx, data_len, chunks)
+                self.call_chunked_stream(&identity, method_idx, data_len, chunks)
                     .await
             }
             RequestTransportKind::Inline => {
                 let data = collect_exact_stream(data_len, chunks).await?;
-                self.call_inline(route_name, method_idx, &data).await
+                self.call_inline(&identity, method_idx, &data).await
             }
         }
     }
@@ -860,7 +898,7 @@ impl IpcClient {
     /// Inline call path — sends call control + data in a single frame.
     async fn call_inline(
         &self,
-        route_name: &str,
+        identity: &RouteCallIdentity,
         method_idx: u16,
         data: &[u8],
     ) -> Result<ResponseData, IpcError> {
@@ -873,8 +911,7 @@ impl IpcClient {
         }
 
         // Build and send the frame.
-        // Compute ctrl size: 1 byte name_len + name + 2 bytes method_idx
-        let ctrl_len = 1 + route_name.len() + 2;
+        let ctrl_len = encoded_call_control_len(identity)?;
         let payload_len = ctrl_len + data.len();
         let total_len = (12 + payload_len) as u32;
         let frame_size = frame::HEADER_SIZE + payload_len;
@@ -892,7 +929,7 @@ impl IpcClient {
                 let ctrl_written = c2_wire::control::encode_call_control_into(
                     &mut buf,
                     frame::HEADER_SIZE,
-                    route_name,
+                    identity,
                     method_idx,
                 )?;
                 let data_off = frame::HEADER_SIZE + ctrl_written;
@@ -904,7 +941,7 @@ impl IpcClient {
                 hdr_buf[0..4].copy_from_slice(&total_len.to_le_bytes());
                 hdr_buf[4..12].copy_from_slice(&(rid as u64).to_le_bytes());
                 hdr_buf[12..16].copy_from_slice(&flags::FLAG_CALL_V2.to_le_bytes());
-                let ctrl = encode_call_control(route_name, method_idx)?;
+                let ctrl = encode_call_control(identity, method_idx)?;
                 writer.write_all(&hdr_buf).await?;
                 writer.write_all(&ctrl).await?;
                 writer.write_all(data).await?;
@@ -930,7 +967,7 @@ impl IpcClient {
     /// The server reads data from SHM and frees the allocation.
     async fn call_buddy(
         &self,
-        route_name: &str,
+        identity: &RouteCallIdentity,
         method_idx: u16,
         data: &[u8],
     ) -> Result<ResponseData, IpcError> {
@@ -976,7 +1013,7 @@ impl IpcClient {
         let buddy_bytes = encode_buddy_payload(&bp);
 
         // Build call control.
-        let ctrl = encode_call_control(route_name, method_idx)?;
+        let ctrl = encode_call_control(identity, method_idx)?;
 
         // Assemble frame payload: [11B buddy][call_control]
         let payload_len = buddy_bytes.len() + ctrl.len();
@@ -1052,7 +1089,7 @@ impl IpcClient {
 
     async fn call_buddy_stream<S, B, E>(
         &self,
-        route_name: &str,
+        identity: &RouteCallIdentity,
         method_idx: u16,
         alloc: PoolAllocation,
         data_size: usize,
@@ -1118,7 +1155,7 @@ impl IpcClient {
             )));
         }
 
-        self.call_with_prealloc(route_name, method_idx, &alloc, data_size)
+        self.call_with_prealloc(identity, method_idx, &alloc, data_size)
             .await
     }
 
@@ -1129,7 +1166,7 @@ impl IpcClient {
     /// already did that. On send failure, frees the allocation from the pool.
     pub(crate) async fn call_with_prealloc(
         &self,
-        route_name: &str,
+        identity: &RouteCallIdentity,
         method_idx: u16,
         alloc: &PoolAllocation,
         data_size: usize,
@@ -1151,7 +1188,7 @@ impl IpcClient {
         let buddy_bytes = encode_buddy_payload(&bp);
 
         // Build call control.
-        let ctrl = match encode_call_control(route_name, method_idx) {
+        let ctrl = match encode_call_control(identity, method_idx) {
             Ok(ctrl) => ctrl,
             Err(err) => {
                 self.free_prealloc(alloc);
@@ -1218,7 +1255,7 @@ impl IpcClient {
     /// Chunked call path — splits data into chunks and sends with FLAG_CHUNKED.
     async fn call_chunked(
         &self,
-        route_name: &str,
+        identity: &RouteCallIdentity,
         method_idx: u16,
         data: &[u8],
     ) -> Result<ResponseData, IpcError> {
@@ -1234,7 +1271,7 @@ impl IpcClient {
         }
 
         // Build call control (included only in chunk 0).
-        let ctrl = encode_call_control(route_name, method_idx)?;
+        let ctrl = encode_call_control(identity, method_idx)?;
 
         let send_result: Result<(), IpcError> = async {
             let mut writer_guard = self.writer.lock().await;
@@ -1284,7 +1321,7 @@ impl IpcClient {
 
     async fn call_chunked_stream<S, B, E>(
         &self,
-        route_name: &str,
+        identity: &RouteCallIdentity,
         method_idx: u16,
         data_size: usize,
         chunks: S,
@@ -1297,7 +1334,7 @@ impl IpcClient {
         let chunk_size = self.config.chunk_size as usize;
         let total_chunks = request_chunk_count(data_size, chunk_size)?;
         if total_chunks == 0 {
-            return self.call_inline(route_name, method_idx, &[]).await;
+            return self.call_inline(identity, method_idx, &[]).await;
         }
 
         let rid = self.rid_counter.fetch_add(1, Ordering::Relaxed);
@@ -1306,7 +1343,7 @@ impl IpcClient {
             self.pending.lock().insert(rid, tx);
         }
 
-        let ctrl = encode_call_control(route_name, method_idx)?;
+        let ctrl = encode_call_control(identity, method_idx)?;
         let send_result = self
             .send_chunked_stream_frames(rid, total_chunks, chunk_size, data_size, &ctrl, chunks)
             .await;
@@ -1513,6 +1550,9 @@ impl IpcClient {
             .collect::<Vec<_>>();
         MethodTable::from_entries(
             &method_entries,
+            contract.route_name.clone(),
+            contract.route_uid.clone(),
+            contract.route_revision,
             contract.crm_ns.clone(),
             contract.crm_name.clone(),
             contract.crm_ver.clone(),
@@ -2011,6 +2051,9 @@ mod tests {
         client.route_tables.write().insert(
             "grid".to_string(),
             MethodTable {
+                route_name: "grid".to_string(),
+                route_uid: "grid-route-uid-0001".to_string(),
+                route_revision: 1,
                 crm_ns: "test.grid".to_string(),
                 crm_name: "Grid".to_string(),
                 crm_ver: "0.1.0".to_string(),
@@ -2065,6 +2108,9 @@ mod tests {
         client.route_tables.write().insert(
             "grid".to_string(),
             MethodTable {
+                route_name: "grid".to_string(),
+                route_uid: "grid-route-uid-0001".to_string(),
+                route_revision: 1,
                 crm_ns: "test.grid".to_string(),
                 crm_name: "Grid".to_string(),
                 crm_ver: "0.1.0".to_string(),
@@ -2119,6 +2165,9 @@ mod tests {
         client.route_tables.write().insert(
             "grid".to_string(),
             MethodTable {
+                route_name: "grid".to_string(),
+                route_uid: "grid-route-uid-0001".to_string(),
+                route_revision: 1,
                 crm_ns: "test.grid".to_string(),
                 crm_name: "Grid".to_string(),
                 crm_ver: "0.1.0".to_string(),

@@ -22,6 +22,8 @@ pub struct RouteContractRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingRouteAttestation {
     pub route_name: String,
+    pub route_uid: String,
+    pub route_revision: u64,
     pub crm_ns: String,
     pub crm_name: String,
     pub crm_ver: String,
@@ -172,6 +174,7 @@ fn validate_attested_contract(contract: &PendingRouteAttestation) -> Result<(), 
         signature_hash: contract.signature_hash.clone(),
     };
     c2_contract::validate_expected_route_contract(&expected).map_err(|err| err.to_string())?;
+    validate_route_uid(&contract.route_uid)?;
     if contract.max_payload_size == 0 {
         return Err("max_payload_size must be > 0".to_string());
     }
@@ -191,6 +194,23 @@ fn validate_attested_contract(contract: &PendingRouteAttestation) -> Result<(), 
     Ok(())
 }
 
+fn validate_route_uid(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("route_uid must not be empty".to_string());
+    }
+    if value.len() > c2_contract::MAX_WIRE_TEXT_BYTES {
+        return Err(format!(
+            "route_uid is too long: {} bytes > {}",
+            value.len(),
+            c2_contract::MAX_WIRE_TEXT_BYTES
+        ));
+    }
+    if value.bytes().any(|b| b <= 0x20 || b == b'/' || b == b'\\') {
+        return Err("route_uid contains an invalid character".to_string());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,6 +218,8 @@ mod tests {
     fn contract() -> PendingRouteAttestation {
         PendingRouteAttestation {
             route_name: "grid".to_string(),
+            route_uid: "grid-route-uid-0001".to_string(),
+            route_revision: 1,
             crm_ns: "test.echo".to_string(),
             crm_name: "Echo".to_string(),
             crm_ver: "0.1.0".to_string(),
@@ -257,6 +279,8 @@ mod tests {
             "\x0b",
             "{\"status\":\"attested\",\"contract\":{",
             "\"route_name\":\"grid\",",
+            "\"route_uid\":\"grid-route-uid-0001\",",
+            "\"route_revision\":1,",
             "\"crm_ns\":\"test.echo\",",
             "\"crm_name\":\"Echo\",",
             "\"crm_ver\":\"0.1.0\",",
@@ -305,6 +329,8 @@ mod tests {
             "\x0d",
             "{\"status\":\"attested\",\"contract\":{",
             "\"route_name\":\"grid\",",
+            "\"route_uid\":\"grid-route-uid-0001\",",
+            "\"route_revision\":1,",
             "\"crm_ns\":\"test.echo\",",
             "\"crm_name\":\"Echo\",",
             "\"crm_ver\":\"0.1.0\",",

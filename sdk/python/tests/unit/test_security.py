@@ -46,6 +46,21 @@ def route_info(name: str, methods: list[MethodEntry]) -> RouteInfo:
         abi_hash=ABI_HASH,
         signature_hash=SIG_HASH,
         max_payload_size=1024,
+        route_uid=f'{name}-route-uid-0001',
+        route_revision=1,
+    )
+
+
+def call_control_args(route_name: str) -> tuple[str, str, int, str, str, str, str, str]:
+    return (
+        route_name,
+        f'{route_name}-route-uid-0001',
+        1,
+        'test.security',
+        'SecurityRoute',
+        '0.1.0',
+        ABI_HASH,
+        SIG_HASH,
     )
 
 
@@ -161,6 +176,10 @@ class TestHandshakeBoundsChecking:
         buf += struct.pack('<H', 1)     # route_count=1
         buf.append(2)                   # route_name_len=2
         buf += b'r1'                    # route_name
+        route_uid = b'r1-route-uid-0001'
+        buf.append(len(route_uid))
+        buf += route_uid
+        buf += struct.pack('<Q', 1)
         buf.append(len(b'test.security'))
         buf += b'test.security'
         buf.append(len(b'SecurityRoute'))
@@ -231,16 +250,34 @@ class TestCallControlBoundsChecking:
 
     def test_valid_after_hardening(self):
         """Normal round-trip still works."""
-        encoded = encode_call_control('hello', 42)
-        name, idx, consumed = decode_call_control(encoded)
+        encoded = encode_call_control(*call_control_args('hello'), 42)
+        name, route_uid, revision, crm_ns, crm_name, crm_ver, abi_hash, sig_hash, idx, consumed = decode_call_control(encoded)
         assert name == 'hello'
+        assert route_uid == 'hello-route-uid-0001'
+        assert revision == 1
+        assert crm_ns == 'test.security'
+        assert crm_name == 'SecurityRoute'
+        assert crm_ver == '0.1.0'
+        assert abi_hash == ABI_HASH
+        assert sig_hash == SIG_HASH
         assert idx == 42
 
     def test_max_name_length(self):
         """255-byte name (max for 1-byte length)."""
         long_name = 'x' * 255
-        encoded = encode_call_control(long_name, 100)
-        name, idx, consumed = decode_call_control(encoded)
+        route_name, _route_uid, revision, crm_ns, crm_name, crm_ver, abi_hash, sig_hash = call_control_args(long_name)
+        encoded = encode_call_control(
+            route_name,
+            'long-route-uid-0001',
+            revision,
+            crm_ns,
+            crm_name,
+            crm_ver,
+            abi_hash,
+            sig_hash,
+            100,
+        )
+        name, _route_uid, _revision, _crm_ns, _crm_name, _crm_ver, _abi_hash, _sig_hash, idx, consumed = decode_call_control(encoded)
         assert name == long_name
         assert idx == 100
 

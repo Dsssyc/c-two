@@ -531,6 +531,8 @@ mod tests {
 
                 let route = c2_wire::handshake::RouteInfo {
                     name: "grid".to_string(),
+                    route_uid: "grid-route-uid-0001".to_string(),
+                    route_revision: 1,
                     crm_ns: "test.pool".to_string(),
                     crm_name: "Grid".to_string(),
                     crm_ver: "0.1.0".to_string(),

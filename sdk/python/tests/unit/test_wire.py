@@ -29,6 +29,8 @@ def route_info(name: str, methods: list[MethodEntry]) -> RouteInfo:
         abi_hash=ABI_HASH,
         signature_hash=SIG_HASH,
         max_payload_size=1024,
+        route_uid=f'{name}-route-uid-0001',
+        route_revision=1,
     )
 
 
@@ -51,6 +53,8 @@ def test_route_info_rejects_invalid_crm_tag():
             abi_hash=ABI_HASH,
             signature_hash=SIG_HASH,
             max_payload_size=1024,
+            route_uid='grid-route-uid-0001',
+            route_revision=1,
         )
 
 
@@ -65,6 +69,8 @@ def test_route_info_rejects_zero_max_payload_size():
             abi_hash=ABI_HASH,
             signature_hash=SIG_HASH,
             max_payload_size=0,
+            route_uid='grid-route-uid-0001',
+            route_revision=1,
         )
 
 
@@ -130,6 +136,8 @@ class TestHandshake:
             abi_hash=ABI_HASH,
             signature_hash=SIG_HASH,
             max_payload_size=2048,
+            route_uid='hello-route-uid-0001',
+            route_revision=1,
             methods=[
                 MethodEntry(name="add", index=0),
                 MethodEntry(name="greeting", index=1),
@@ -151,6 +159,8 @@ class TestHandshake:
         assert len(hs.routes) == 1
         r = hs.routes[0]
         assert r.name == "hello"
+        assert r.route_uid == 'hello-route-uid-0001'
+        assert r.route_revision == 1
         assert r.crm_ns == "test.hello"
         assert r.crm_name == "Hello"
         assert r.crm_ver == "1.2.3"

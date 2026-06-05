@@ -111,6 +111,8 @@ def encode_server_handshake(
         [2B route_count LE]
         [per-route:
             [1B name_len][route_name UTF-8]
+            [1B route_uid_len][route_uid UTF-8]
+            [8B route_revision LE]
             [1B crm_ns_len][crm_ns UTF-8]
             [1B crm_name_len][crm_name UTF-8]
             [1B crm_ver_len][crm_ver UTF-8]

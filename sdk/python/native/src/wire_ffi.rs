@@ -47,6 +47,10 @@ pub struct PyRouteInfo {
     #[pyo3(get)]
     name: String,
     #[pyo3(get)]
+    route_uid: String,
+    #[pyo3(get)]
+    route_revision: u64,
+    #[pyo3(get)]
     crm_ns: String,
     #[pyo3(get)]
     crm_name: String,
@@ -65,7 +69,7 @@ pub struct PyRouteInfo {
 #[pymethods]
 impl PyRouteInfo {
     #[new]
-    #[pyo3(signature = (name, methods, crm_ns, crm_name, crm_ver, abi_hash, signature_hash, max_payload_size))]
+    #[pyo3(signature = (name, methods, crm_ns, crm_name, crm_ver, abi_hash, signature_hash, max_payload_size, route_uid, route_revision))]
     fn new(
         name: String,
         methods: Vec<Py<PyMethodEntry>>,
@@ -75,6 +79,8 @@ impl PyRouteInfo {
         abi_hash: &str,
         signature_hash: &str,
         max_payload_size: u64,
+        route_uid: &str,
+        route_revision: u64,
     ) -> PyResult<Self> {
         c2_contract::validate_crm_tag(crm_ns, crm_name, crm_ver)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
@@ -85,9 +91,14 @@ impl PyRouteInfo {
         if max_payload_size == 0 {
             return Err(PyValueError::new_err("max_payload_size must be > 0"));
         }
+        if route_uid.is_empty() {
+            return Err(PyValueError::new_err("route_uid must not be empty"));
+        }
 
         Ok(Self {
             name,
+            route_uid: route_uid.to_string(),
+            route_revision,
             crm_ns: crm_ns.to_string(),
             crm_name: crm_name.to_string(),
             crm_ver: crm_ver.to_string(),
@@ -124,8 +135,10 @@ impl PyRouteInfo {
 
     fn __repr__(&self) -> String {
         format!(
-            "RouteInfo(name='{}', crm_ns='{}', crm_name='{}', crm_ver='{}', abi_hash='{}', signature_hash='{}', max_payload_size={}, methods=[{}])",
+            "RouteInfo(name='{}', route_uid='{}', route_revision={}, crm_ns='{}', crm_name='{}', crm_ver='{}', abi_hash='{}', signature_hash='{}', max_payload_size={}, methods=[{}])",
             self.name,
+            self.route_uid,
+            self.route_revision,
             self.crm_ns,
             self.crm_name,
             self.crm_ver,
@@ -220,20 +233,55 @@ fn decode_frame(body: &[u8]) -> PyResult<(u64, u32, Vec<u8>)> {
 
 // ── Call / Reply control ────────────────────────────────────────────────
 
-/// Encode V2 call control: `[1B name_len][route UTF-8][2B method_idx LE]`.
 #[pyfunction]
-fn encode_call_control(name: &str, method_idx: u16) -> PyResult<Vec<u8>> {
-    c2_wire::control::encode_call_control(name, method_idx).map_err(encode_err)
+#[pyo3(signature = (route_name, route_uid, observed_route_revision, crm_ns, crm_name, crm_ver, abi_hash, signature_hash, method_idx))]
+fn encode_call_control(
+    route_name: &str,
+    route_uid: &str,
+    observed_route_revision: u64,
+    crm_ns: &str,
+    crm_name: &str,
+    crm_ver: &str,
+    abi_hash: &str,
+    signature_hash: &str,
+    method_idx: u16,
+) -> PyResult<Vec<u8>> {
+    let identity = c2_wire::control::RouteCallIdentity {
+        route_name: route_name.to_string(),
+        route_uid: route_uid.to_string(),
+        observed_route_revision,
+        crm_ns: crm_ns.to_string(),
+        crm_name: crm_name.to_string(),
+        crm_ver: crm_ver.to_string(),
+        abi_hash: abi_hash.to_string(),
+        signature_hash: signature_hash.to_string(),
+    };
+    c2_wire::control::encode_call_control(&identity, method_idx).map_err(encode_err)
 }
 
 /// Decode V2 call control from `data[offset..]`.
 ///
-/// Returns `(route_name, method_idx, bytes_consumed)`.
+/// Returns `(route_name, route_uid, observed_route_revision, crm_ns, crm_name,
+/// crm_ver, abi_hash, signature_hash, method_idx, bytes_consumed)`.
 #[pyfunction]
-fn decode_call_control(data: &[u8], offset: usize) -> PyResult<(String, u16, usize)> {
+fn decode_call_control(
+    data: &[u8],
+    offset: usize,
+) -> PyResult<(String, String, u64, String, String, String, String, String, u16, usize)> {
     let (ctrl, consumed) =
         c2_wire::control::decode_call_control(data, offset).map_err(decode_err)?;
-    Ok((ctrl.route_name, ctrl.method_idx, consumed))
+    Ok((
+        ctrl.identity.route_name,
+        ctrl.identity.route_uid,
+        ctrl.identity.observed_route_revision,
+        ctrl.identity.crm_ns,
+        ctrl.identity.crm_name,
+        ctrl.identity.crm_ver,
+        ctrl.identity.abi_hash,
+        ctrl.identity.signature_hash,
+        ctrl.method_idx,
+        consumed,
+    ))
 }
 
 /// Encode V2 reply control.
@@ -401,6 +449,8 @@ fn encode_server_handshake(
                 .collect();
             c2_wire::handshake::RouteInfo {
                 name: r_ref.name.clone(),
+                route_uid: r_ref.route_uid.clone(),
+                route_revision: r_ref.route_revision,
                 crm_ns: r_ref.crm_ns.clone(),
                 crm_name: r_ref.crm_name.clone(),
                 crm_ver: r_ref.crm_ver.clone(),
@@ -449,6 +499,8 @@ fn decode_handshake(py: Python<'_>, payload: &[u8]) -> PyResult<PyHandshake> {
             py,
             PyRouteInfo {
                 name: route.name,
+                route_uid: route.route_uid,
+                route_revision: route.route_revision,
                 crm_ns: route.crm_ns,
                 crm_name: route.crm_name,
                 crm_ver: route.crm_ver,

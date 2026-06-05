@@ -171,7 +171,7 @@ impl SyncClient {
         alloc: &PoolAllocation,
         data_size: usize,
     ) -> Result<ResponseData, IpcError> {
-        let method_idx = match (|| {
+        let (method_idx, identity) = match (|| {
             let route_tables = self.inner.route_tables.read();
             let table = route_tables
                 .get(route_name)
@@ -190,9 +190,9 @@ impl SyncClient {
                     "request payload size {data_size_u64} exceeds route '{route_name}' max_payload_size {max_payload_size}"
                 )));
             }
-            Ok(method_idx)
+            Ok((method_idx, table.call_identity()))
         })() {
-            Ok(method_idx) => method_idx,
+            Ok(target) => target,
             Err(err) => {
                 self.inner.free_prealloc(alloc);
                 return Err(err);
@@ -200,7 +200,7 @@ impl SyncClient {
         };
         self.rt.block_on(
             self.inner
-                .call_with_prealloc(route_name, method_idx, alloc, data_size),
+                .call_with_prealloc(&identity, method_idx, alloc, data_size),
         )
     }
 
@@ -385,6 +385,9 @@ pub(crate) mod tests {
                     name: "ping".to_string(),
                     index: 0,
                 }],
+                "grid".to_string(),
+                "grid-route-uid-0001".to_string(),
+                1,
                 "cc.test".to_string(),
                 "Grid".to_string(),
                 "0.1.0".to_string(),

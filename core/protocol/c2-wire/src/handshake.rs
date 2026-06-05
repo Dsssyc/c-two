@@ -20,6 +20,8 @@
 //! [2B route_count LE]
 //! [per-route:
 //!     [1B name_len][route_name UTF-8]
+//!     [1B route_uid_len][route_uid UTF-8]
+//!     [8B route_revision LE]
 //!     [1B crm_ns_len][crm_ns UTF-8]
 //!     [1B crm_name_len][crm_name UTF-8]
 //!     [1B crm_ver_len][crm_ver UTF-8]
@@ -68,6 +70,8 @@ pub struct MethodEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteInfo {
     pub name: String,
+    pub route_uid: String,
+    pub route_revision: u64,
     pub crm_ns: String,
     pub crm_name: String,
     pub crm_ver: String,
@@ -163,6 +167,10 @@ pub fn encode_server_handshake(
     buf.extend_from_slice(&(routes.len() as u16).to_le_bytes());
     for route in routes {
         validate_name_len("route name", &route.name)?;
+        validate_route_uid(&route.route_uid).map_err(|reason| EncodeError::InvalidText {
+            field: "route_uid",
+            reason,
+        })?;
         validate_crm_tag(&route.crm_ns, &route.crm_name, &route.crm_ver).map_err(|reason| {
             EncodeError::InvalidText {
                 field: "crm tag",
@@ -187,6 +195,10 @@ pub fn encode_server_handshake(
         let name_b = route.name.as_bytes();
         buf.push(name_b.len() as u8);
         buf.extend_from_slice(name_b);
+        let route_uid_b = route.route_uid.as_bytes();
+        buf.push(route_uid_b.len() as u8);
+        buf.extend_from_slice(route_uid_b);
+        buf.extend_from_slice(&route.route_revision.to_le_bytes());
         let crm_ns_b = route.crm_ns.as_bytes();
         buf.push(crm_ns_b.len() as u8);
         buf.extend_from_slice(crm_ns_b);
@@ -238,6 +250,23 @@ fn validate_contract_hash_text(_field: &'static str, value: &str) -> Result<(), 
 
 fn validate_crm_tag(crm_ns: &str, crm_name: &str, crm_ver: &str) -> Result<(), String> {
     c2_contract::validate_crm_tag(crm_ns, crm_name, crm_ver).map_err(|err| err.to_string())
+}
+
+fn validate_route_uid(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("must not be empty".to_string());
+    }
+    if value.as_bytes().len() > MAX_HANDSHAKE_NAME_BYTES {
+        return Err(format!(
+            "is too long: {} bytes > {}",
+            value.as_bytes().len(),
+            MAX_HANDSHAKE_NAME_BYTES
+        ));
+    }
+    if value.bytes().any(|b| b <= 0x20 || b == b'/' || b == b'\\') {
+        return Err("contains an invalid character".to_string());
+    }
+    Ok(())
 }
 
 // ── Decoding (both directions) ───────────────────────────────────────────
@@ -343,6 +372,21 @@ pub fn decode_handshake(buf: &[u8]) -> Result<Handshake, DecodeError> {
         let r_name = read_str(buf, off, r_len)?;
         off += r_len;
 
+        check_remaining(buf, off, 1, "route_uid length")?;
+        let route_uid_len = buf[off] as usize;
+        off += 1;
+        check_remaining(buf, off, route_uid_len, "route_uid")?;
+        let route_uid = read_str(buf, off, route_uid_len)?;
+        off += route_uid_len;
+        validate_route_uid(&route_uid).map_err(|reason| DecodeError::InvalidText {
+            field: "route_uid",
+            reason,
+        })?;
+
+        check_remaining(buf, off, 8, "route_revision")?;
+        let route_revision = read_u64(buf, off);
+        off += 8;
+
         check_remaining(buf, off, 1, "crm namespace length")?;
         let crm_ns_len = buf[off] as usize;
         off += 1;
@@ -433,6 +477,8 @@ pub fn decode_handshake(buf: &[u8]) -> Result<Handshake, DecodeError> {
         }
         routes.push(RouteInfo {
             name: r_name,
+            route_uid,
+            route_revision,
             crm_ns,
             crm_name,
             crm_ver,

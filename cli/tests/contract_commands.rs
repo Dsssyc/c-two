@@ -1539,8 +1539,9 @@ function ipcFrameHeader(requestId: number, flags: number, totalLen: number): Uin
   return out;
 }
 
-function ipcServerHandshakeFrame(options: { readonly routeName?: string; readonly abiHash?: string; readonly maxPayloadSize?: number; readonly shmPrefix?: string; readonly shmSegments?: readonly { readonly name: string; readonly size: number }[]; readonly capabilities?: number } = {}): Uint8Array {
+function ipcServerHandshakeFrame(options: { readonly routeName?: string; readonly routeUid?: string; readonly routeRevision?: number; readonly abiHash?: string; readonly maxPayloadSize?: number; readonly shmPrefix?: string; readonly shmSegments?: readonly { readonly name: string; readonly size: number }[]; readonly capabilities?: number } = {}): Uint8Array {
   const routeName = options.routeName ?? "route";
+  const routeUid = options.routeUid ?? `${routeName}-uid-0001`;
   const abiHash = options.abiHash ?? FASTDB_PORTABLE_CONTRACT.abiHash;
   const shmPrefix = options.shmPrefix ?? "";
   const shmSegments = options.shmSegments ?? [];
@@ -1555,6 +1556,8 @@ function ipcServerHandshakeFrame(options: { readonly routeName?: string; readonl
     ipcTextField("instance-smoke"),
     ipcU16LE(1),
     ipcTextField(routeName),
+    ipcTextField(routeUid),
+    ipcU64LE(options.routeRevision ?? 1),
     ipcTextField(FASTDB_PORTABLE_CONTRACT.namespace),
     ipcTextField(FASTDB_PORTABLE_CONTRACT.name),
     ipcTextField(FASTDB_PORTABLE_CONTRACT.version),
@@ -1633,6 +1636,59 @@ function ipcBuddyHeader(payload: Uint8Array): { readonly segmentIndex: number; r
     byteLength: view.getUint32(6, true),
     dedicated: payload[10] === C2_IPC_SMOKE_BUDDY_FLAG_DEDICATED,
     dataOffset: 11,
+  };
+}
+
+function ipcReadText(payload: Uint8Array, offset: number): { readonly value: string; readonly offset: number } {
+  const length = payload[offset];
+  const start = offset + 1;
+  const end = start + length;
+  return { value: ipcTextDecoder.decode(payload.slice(start, end)), offset: end };
+}
+
+function ipcCallControlSummary(payload: Uint8Array): {
+  readonly routeName: string;
+  readonly routeUid: string;
+  readonly routeRevision: number;
+  readonly crmNs: string;
+  readonly crmName: string;
+  readonly crmVer: string;
+  readonly abiHash: string;
+  readonly signatureHash: string;
+  readonly methodIndex: number;
+  readonly body: Uint8Array;
+} {
+  let offset = 0;
+  const routeName = ipcReadText(payload, offset);
+  offset = routeName.offset;
+  const routeUid = ipcReadText(payload, offset);
+  offset = routeUid.offset;
+  const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+  const routeRevision = Number(view.getBigUint64(offset, true));
+  offset += 8;
+  const crmNs = ipcReadText(payload, offset);
+  offset = crmNs.offset;
+  const crmName = ipcReadText(payload, offset);
+  offset = crmName.offset;
+  const crmVer = ipcReadText(payload, offset);
+  offset = crmVer.offset;
+  const abiHash = ipcReadText(payload, offset);
+  offset = abiHash.offset;
+  const signatureHash = ipcReadText(payload, offset);
+  offset = signatureHash.offset;
+  const methodIndex = view.getUint16(offset, true);
+  offset += 2;
+  return {
+    routeName: routeName.value,
+    routeUid: routeUid.value,
+    routeRevision,
+    crmNs: crmNs.value,
+    crmName: crmName.value,
+    crmVer: crmVer.value,
+    abiHash: abiHash.value,
+    signatureHash: signatureHash.value,
+    methodIndex,
+    body: payload.slice(offset),
   };
 }
 
@@ -1903,14 +1959,22 @@ const ipcCallFrame = ipcConnection.writes[1];
 if (ipcFrameRequestId(ipcCallFrame) !== 1 || ipcFrameFlags(ipcCallFrame) !== C2_IPC_SMOKE_FLAG_CALL_V2) {
   throw new Error("IPC transport sent an invalid v2 call frame");
 }
-const ipcCallPayload = ipcFramePayload(ipcCallFrame);
-const ipcCallRouteLength = ipcCallPayload[0];
-const ipcCallRoute = ipcTextDecoder.decode(ipcCallPayload.slice(1, 1 + ipcCallRouteLength));
-const ipcCallMethodIndexOffset = 1 + ipcCallRouteLength;
-const ipcCallMethodIndex = new DataView(ipcCallPayload.buffer, ipcCallPayload.byteOffset, ipcCallPayload.byteLength).getUint16(ipcCallMethodIndexOffset, true);
-const ipcCallBody = ipcCallPayload.slice(ipcCallMethodIndexOffset + 2);
-if (ipcCallRoute !== "route" || ipcCallMethodIndex !== 7 || ipcCallBody[0] !== 1 || ipcCallBody[1] !== 2 || ipcCallBody[2] !== 3) {
-  throw new Error("IPC transport did not encode route, method index, and payload correctly");
+const ipcCall = ipcCallControlSummary(ipcFramePayload(ipcCallFrame));
+if (
+  ipcCall.routeName !== "route"
+  || ipcCall.routeUid !== "route-uid-0001"
+  || ipcCall.routeRevision !== 1
+  || ipcCall.crmNs !== FASTDB_PORTABLE_CONTRACT.namespace
+  || ipcCall.crmName !== FASTDB_PORTABLE_CONTRACT.name
+  || ipcCall.crmVer !== FASTDB_PORTABLE_CONTRACT.version
+  || ipcCall.abiHash !== FASTDB_PORTABLE_CONTRACT.abiHash
+  || ipcCall.signatureHash !== FASTDB_PORTABLE_CONTRACT.signatureHash
+  || ipcCall.methodIndex !== 7
+  || ipcCall.body[0] !== 1
+  || ipcCall.body[1] !== 2
+  || ipcCall.body[2] !== 3
+) {
+  throw new Error("IPC transport did not encode route identity, contract, method index, and payload correctly");
 }
 const ipcHandshakePayload = ipcFramePayload(ipcConnection.writes[0]);
 const ipcClientCapabilities = new DataView(ipcHandshakePayload.buffer, ipcHandshakePayload.byteOffset, ipcHandshakePayload.byteLength).getUint16(4, true);
@@ -1976,13 +2040,20 @@ nodeSocketServer.on("connection", (socket: C2NodeSmokeServerSocket) => {
           continue;
         }
         if (requestId === 1 && flags === C2_IPC_SMOKE_FLAG_CALL_V2) {
-          const routeLength = payload[0];
-          const route = ipcTextDecoder.decode(payload.slice(1, 1 + routeLength));
-          const methodIndexOffset = 1 + routeLength;
-          const methodIndex = new DataView(payload.buffer, payload.byteOffset, payload.byteLength).getUint16(methodIndexOffset, true);
-          const body = payload.slice(methodIndexOffset + 2);
-          if (route !== "route" || methodIndex !== 7 || Array.from(body).join(",") !== "201,202,203") {
-            throw new Error(`unexpected real Node IPC call frame route=${route} method=${methodIndex} body=${Array.from(body).join(",")}`);
+          const call = ipcCallControlSummary(payload);
+          if (
+            call.routeName !== "route"
+            || call.routeUid !== "route-uid-0001"
+            || call.routeRevision !== 1
+            || call.crmNs !== FASTDB_PORTABLE_CONTRACT.namespace
+            || call.crmName !== FASTDB_PORTABLE_CONTRACT.name
+            || call.crmVer !== FASTDB_PORTABLE_CONTRACT.version
+            || call.abiHash !== FASTDB_PORTABLE_CONTRACT.abiHash
+            || call.signatureHash !== FASTDB_PORTABLE_CONTRACT.signatureHash
+            || call.methodIndex !== 7
+            || Array.from(call.body).join(",") !== "201,202,203"
+          ) {
+            throw new Error(`unexpected real Node IPC call frame route=${call.routeName} uid=${call.routeUid} revision=${call.routeRevision} method=${call.methodIndex} body=${Array.from(call.body).join(",")}`);
           }
           nodeSocketCallSeen = true;
           socket.write(ipcSuccessReplyFrame(requestId, new Uint8Array([44, 45, 46])));
@@ -2057,14 +2128,24 @@ const ipcChunkedRequestHeader2 = ipcRequestChunkHeader(ipcChunkedRequestPayload2
 if (ipcChunkedRequestHeader0.chunkIndex !== 0 || ipcChunkedRequestHeader0.totalChunks !== 3 || ipcChunkedRequestHeader1.chunkIndex !== 1 || ipcChunkedRequestHeader1.totalChunks !== 3 || ipcChunkedRequestHeader2.chunkIndex !== 2 || ipcChunkedRequestHeader2.totalChunks !== 3) {
   throw new Error("IPC chunked request headers did not encode chunk indexes and total count");
 }
-const ipcChunkedRequestRouteLength = ipcChunkedRequestPayload0[ipcChunkedRequestHeader0.dataOffset];
-const ipcChunkedRequestRoute = ipcTextDecoder.decode(ipcChunkedRequestPayload0.slice(ipcChunkedRequestHeader0.dataOffset + 1, ipcChunkedRequestHeader0.dataOffset + 1 + ipcChunkedRequestRouteLength));
-const ipcChunkedRequestMethodIndexOffset = ipcChunkedRequestHeader0.dataOffset + 1 + ipcChunkedRequestRouteLength;
-const ipcChunkedRequestMethodIndex = new DataView(ipcChunkedRequestPayload0.buffer, ipcChunkedRequestPayload0.byteOffset, ipcChunkedRequestPayload0.byteLength).getUint16(ipcChunkedRequestMethodIndexOffset, true);
-const ipcChunkedRequestData0 = ipcChunkedRequestPayload0.slice(ipcChunkedRequestMethodIndexOffset + 2);
+const ipcChunkedRequestCall0 = ipcCallControlSummary(ipcChunkedRequestPayload0.slice(ipcChunkedRequestHeader0.dataOffset));
+const ipcChunkedRequestData0 = ipcChunkedRequestCall0.body;
 const ipcChunkedRequestData1 = ipcChunkedRequestPayload1.slice(ipcChunkedRequestHeader1.dataOffset);
 const ipcChunkedRequestData2 = ipcChunkedRequestPayload2.slice(ipcChunkedRequestHeader2.dataOffset);
-if (ipcChunkedRequestRoute !== "route" || ipcChunkedRequestMethodIndex !== 7 || Array.from(ipcChunkedRequestData0).join(",") !== "1,2" || Array.from(ipcChunkedRequestData1).join(",") !== "3,4" || Array.from(ipcChunkedRequestData2).join(",") !== "5") {
+if (
+  ipcChunkedRequestCall0.routeName !== "route"
+  || ipcChunkedRequestCall0.routeUid !== "route-uid-0001"
+  || ipcChunkedRequestCall0.routeRevision !== 1
+  || ipcChunkedRequestCall0.crmNs !== FASTDB_PORTABLE_CONTRACT.namespace
+  || ipcChunkedRequestCall0.crmName !== FASTDB_PORTABLE_CONTRACT.name
+  || ipcChunkedRequestCall0.crmVer !== FASTDB_PORTABLE_CONTRACT.version
+  || ipcChunkedRequestCall0.abiHash !== FASTDB_PORTABLE_CONTRACT.abiHash
+  || ipcChunkedRequestCall0.signatureHash !== FASTDB_PORTABLE_CONTRACT.signatureHash
+  || ipcChunkedRequestCall0.methodIndex !== 7
+  || Array.from(ipcChunkedRequestData0).join(",") !== "1,2"
+  || Array.from(ipcChunkedRequestData1).join(",") !== "3,4"
+  || Array.from(ipcChunkedRequestData2).join(",") !== "5"
+) {
   throw new Error("IPC chunked request did not encode call control and split payload data correctly");
 }
 
@@ -2192,11 +2273,19 @@ const ipcRequestShmBuddy = ipcBuddyHeader(ipcRequestShmPayload);
 if (ipcRequestShmBuddy.segmentIndex !== 0 || ipcRequestShmBuddy.offset !== 128 || ipcRequestShmBuddy.byteLength !== 4 || ipcRequestShmBuddy.dedicated) {
   throw new Error(`IPC request SHM frame encoded the wrong buddy coordinates: ${JSON.stringify(ipcRequestShmBuddy)}`);
 }
-const ipcRequestShmRouteLength = ipcRequestShmPayload[ipcRequestShmBuddy.dataOffset];
-const ipcRequestShmRoute = ipcTextDecoder.decode(ipcRequestShmPayload.slice(ipcRequestShmBuddy.dataOffset + 1, ipcRequestShmBuddy.dataOffset + 1 + ipcRequestShmRouteLength));
-const ipcRequestShmMethodIndexOffset = ipcRequestShmBuddy.dataOffset + 1 + ipcRequestShmRouteLength;
-const ipcRequestShmMethodIndex = new DataView(ipcRequestShmPayload.buffer, ipcRequestShmPayload.byteOffset, ipcRequestShmPayload.byteLength).getUint16(ipcRequestShmMethodIndexOffset, true);
-if (ipcRequestShmRoute !== "route" || ipcRequestShmMethodIndex !== 7 || ipcRequestShmPayload.byteLength !== ipcRequestShmMethodIndexOffset + 2) {
+const ipcRequestShmCall = ipcCallControlSummary(ipcRequestShmPayload.slice(ipcRequestShmBuddy.dataOffset));
+if (
+  ipcRequestShmCall.routeName !== "route"
+  || ipcRequestShmCall.routeUid !== "route-uid-0001"
+  || ipcRequestShmCall.routeRevision !== 1
+  || ipcRequestShmCall.crmNs !== FASTDB_PORTABLE_CONTRACT.namespace
+  || ipcRequestShmCall.crmName !== FASTDB_PORTABLE_CONTRACT.name
+  || ipcRequestShmCall.crmVer !== FASTDB_PORTABLE_CONTRACT.version
+  || ipcRequestShmCall.abiHash !== FASTDB_PORTABLE_CONTRACT.abiHash
+  || ipcRequestShmCall.signatureHash !== FASTDB_PORTABLE_CONTRACT.signatureHash
+  || ipcRequestShmCall.methodIndex !== 7
+  || ipcRequestShmCall.body.byteLength !== 0
+) {
   throw new Error("IPC request SHM frame did not encode exactly buddy metadata plus call control");
 }
 if (ipcRequestShmReleaseCount !== 0) {
