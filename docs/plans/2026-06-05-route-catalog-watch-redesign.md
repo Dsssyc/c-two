@@ -559,7 +559,8 @@ HTTP and direct IPC must share route token semantics:
 
 - relay resolve returns `route_uid`, `route_revision`, `server_id`,
   `server_instance_id`, relay owner identity, CRM contract, and route state;
-- HTTP probe/call carries expected CRM contract and observed route token;
+- HTTP probe/call carries expected CRM contract and observed route token
+  through `x-c2-route-uid` and `x-c2-route-revision`;
 - relay validates RouteAuthority before acquiring upstream;
 - upstream IPC server validates again at call dispatch;
 - stale HTTP route errors are structured so the client can re-resolve and try
@@ -1037,10 +1038,22 @@ Implementation status on 2026-06-06:
   - `C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_runtime_session.py sdk/python/tests/integration/test_http_relay.py -q --timeout=30`;
   - `C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30`
     (`963 passed`).
+- implemented the external relay HTTP route-token contract slice:
+  - `RelayRouteInfo` now exposes `route_uid` and `route_revision` from relay
+    resolve responses;
+  - relay-aware HTTP probe/call sends the selected route token as
+    `x-c2-route-uid` and `x-c2-route-revision` together with the expected CRM
+    contract headers;
+  - relay data-plane probe/call rejects missing or malformed route token
+    headers as canonical `ProtocolViolation`;
+  - relay data-plane probe/call rejects stale external route tokens as
+    canonical `RouteStale` before upstream acquire, and revalidates the token
+    after acquire before forwarding;
+  - client-side resolve rejects malformed route tokens before caching route
+    candidates.
+- verified for this slice:
+  - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay`.
 - remaining Phase 5/6 work:
-  - expose route UID/revision as part of the external relay HTTP resolve/call
-    token contract instead of only binding the relay's internal precheck
-    snapshot;
   - model route state and tombstone compaction by catalog revision rather than
     only timestamped route-table tombstones.
 
@@ -1131,7 +1144,7 @@ Review every phase before implementation and after implementation:
 - [ ] Covers tombstone GC and watch compaction semantics.
 - [ ] Covers direct IPC independence from relay.
 - [ ] Covers loopback self-fallback deletion.
-- [ ] Covers HTTP stale route token behavior.
+- [x] Covers HTTP stale route token behavior.
 - [ ] Covers Rust internal typed errors and Python public `CCError` classes.
 - [ ] Defines source scans to remove obsolete APIs and avoid old-code
   hangers-on.

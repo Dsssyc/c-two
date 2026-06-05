@@ -22,6 +22,8 @@ const EXPECTED_CRM_NAME_HEADER: &str = "x-c2-expected-crm-name";
 const EXPECTED_CRM_VER_HEADER: &str = "x-c2-expected-crm-ver";
 const EXPECTED_ABI_HASH_HEADER: &str = "x-c2-expected-abi-hash";
 const EXPECTED_SIGNATURE_HASH_HEADER: &str = "x-c2-expected-signature-hash";
+const ROUTE_UID_HEADER: &str = "x-c2-route-uid";
+const ROUTE_REVISION_HEADER: &str = "x-c2-route-revision";
 
 fn encode_segment(s: &str) -> String {
     utf8_percent_encode(s, PATH_SEGMENT).to_string()
@@ -75,6 +77,12 @@ pub struct HttpClient {
     remote_payload_chunk_size: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HttpRouteToken {
+    pub route_uid: String,
+    pub route_revision: u64,
+}
+
 impl HttpClient {
     #[cfg(test)]
     fn new_with_proxy_policy(
@@ -121,9 +129,10 @@ impl HttpClient {
         })
     }
 
-    pub(crate) async fn call_with_expected_crm_async(
+    pub(crate) async fn call_with_route_token_async(
         &self,
         expected: &ExpectedRouteContract,
+        route_token: &HttpRouteToken,
         method_name: &str,
         data: &[u8],
     ) -> Result<Vec<u8>, HttpError> {
@@ -143,6 +152,7 @@ impl HttpClient {
                 self.remote_payload_chunk_size,
             )?);
         let request = add_expected_contract_headers(request, expected);
+        let request = add_route_token_headers(request, route_token);
         let resp = request
             .send()
             .await
@@ -188,9 +198,10 @@ impl HttpClient {
         Ok(resp.status().as_u16() == 200)
     }
 
-    pub(crate) async fn probe_route_with_expected_crm_async(
+    pub(crate) async fn probe_route_with_token_async(
         &self,
         expected: &ExpectedRouteContract,
+        route_token: &HttpRouteToken,
     ) -> Result<(), HttpError> {
         let url = format!(
             "{}/_probe/{}",
@@ -198,6 +209,7 @@ impl HttpClient {
             encode_segment(&expected.route_name)
         );
         let request = add_expected_contract_headers(self.client.get(&url), expected);
+        let request = add_route_token_headers(request, route_token);
         let resp = request
             .send()
             .await
@@ -231,6 +243,18 @@ fn add_expected_contract_headers(
         .header(EXPECTED_CRM_VER_HEADER, &expected.crm_ver)
         .header(EXPECTED_ABI_HASH_HEADER, &expected.abi_hash)
         .header(EXPECTED_SIGNATURE_HASH_HEADER, &expected.signature_hash)
+}
+
+fn add_route_token_headers(
+    request: reqwest::RequestBuilder,
+    route_token: &HttpRouteToken,
+) -> reqwest::RequestBuilder {
+    request
+        .header(ROUTE_UID_HEADER, &route_token.route_uid)
+        .header(
+            ROUTE_REVISION_HEADER,
+            route_token.route_revision.to_string(),
+        )
 }
 
 #[cfg(test)]

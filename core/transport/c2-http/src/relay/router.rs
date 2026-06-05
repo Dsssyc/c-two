@@ -36,6 +36,8 @@ const EXPECTED_CRM_NAME_HEADER: &str = "x-c2-expected-crm-name";
 const EXPECTED_CRM_VER_HEADER: &str = "x-c2-expected-crm-ver";
 const EXPECTED_ABI_HASH_HEADER: &str = "x-c2-expected-abi-hash";
 const EXPECTED_SIGNATURE_HASH_HEADER: &str = "x-c2-expected-signature-hash";
+const ROUTE_UID_HEADER: &str = "x-c2-route-uid";
+const ROUTE_REVISION_HEADER: &str = "x-c2-route-revision";
 const UNKNOWN_LENGTH_BODY_LIMIT_BYTES: u64 = 64 * 1024;
 
 enum RequestClient {
@@ -49,6 +51,11 @@ enum RequestClient {
     },
     NotFound,
     Unreachable,
+}
+
+struct ExpectedRouteToken {
+    route_uid: String,
+    route_revision: u64,
 }
 
 struct OptionalConnectInfo(Option<SocketAddr>);
@@ -327,6 +334,15 @@ fn crm_contract_mismatch_response(route_name: &str) -> Response {
     )
 }
 
+fn protocol_violation_response(route_name: &str, message: impl Into<String>) -> Response {
+    c2_error_response(
+        StatusCode::BAD_REQUEST,
+        c2_error::ErrorCode::ProtocolViolation,
+        message,
+        [("route", route_name.to_string())],
+    )
+}
+
 fn route_matches_expected_crm(
     route: &RouteEntry,
     expected: &c2_contract::ExpectedRouteContract,
@@ -337,6 +353,80 @@ fn route_matches_expected_crm(
         && route.crm_ver == expected.crm_ver
         && route.abi_hash == expected.abi_hash
         && route.signature_hash == expected.signature_hash
+}
+
+fn route_token_from_headers(
+    route_name: &str,
+    headers: &HeaderMap,
+) -> Result<ExpectedRouteToken, Response> {
+    let route_uid = single_route_token_header(route_name, headers, ROUTE_UID_HEADER)?;
+    let route_revision = single_route_token_header(route_name, headers, ROUTE_REVISION_HEADER)?;
+
+    match (route_uid, route_revision) {
+        (Some(route_uid), Some(route_revision)) => {
+            c2_contract::validate_call_route_key("route_uid", &route_uid).map_err(|err| {
+                protocol_violation_response(
+                    route_name,
+                    format!("invalid route token header {ROUTE_UID_HEADER}: {err}"),
+                )
+            })?;
+            let route_revision = route_revision.parse::<u64>().map_err(|_| {
+                protocol_violation_response(
+                    route_name,
+                    format!("invalid route token header {ROUTE_REVISION_HEADER}: must be u64"),
+                )
+            })?;
+            if route_revision == 0 {
+                return Err(protocol_violation_response(
+                    route_name,
+                    format!("invalid route token header {ROUTE_REVISION_HEADER}: must be > 0"),
+                ));
+            }
+            Ok(ExpectedRouteToken {
+                route_uid,
+                route_revision,
+            })
+        }
+        (None, None) => Err(protocol_violation_response(
+            route_name,
+            "route token headers are required",
+        )),
+        _ => Err(protocol_violation_response(
+            route_name,
+            "route token headers must be supplied together",
+        )),
+    }
+}
+
+fn single_route_token_header(
+    route_name: &str,
+    headers: &HeaderMap,
+    header_name: &'static str,
+) -> Result<Option<String>, Response> {
+    let mut values = headers.get_all(header_name).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(protocol_violation_response(
+            route_name,
+            format!("route token header {header_name} must not be repeated"),
+        ));
+    }
+    value.to_str().map(str::to_string).map(Some).map_err(|_| {
+        protocol_violation_response(route_name, "route token headers must be valid UTF-8")
+    })
+}
+
+fn validate_route_token_for_route(
+    route: &RouteEntry,
+    expected: &ExpectedRouteToken,
+) -> Result<(), Response> {
+    if route.route_uid == expected.route_uid && route.route_revision == expected.route_revision {
+        Ok(())
+    } else {
+        Err(route_stale_response(route))
+    }
 }
 
 fn register_contract_claim_from_body(
@@ -1296,6 +1386,13 @@ async fn handle_probe(
         Ok(route) => route,
         Err(response) => return response,
     };
+    let route_token = match route_token_from_headers(&route_name, &headers) {
+        Ok(token) => token,
+        Err(response) => return response,
+    };
+    if let Err(response) = validate_route_token_for_route(&advertised_route, &route_token) {
+        return response;
+    }
     #[cfg(test)]
     run_data_plane_after_precheck_hook(&route_name);
     match acquire_request_client_for_route(state, &advertised_route).await {
@@ -1303,6 +1400,10 @@ async fn handle_probe(
             if let Err(response) =
                 validate_expected_crm_for_acquired_route(&route_name, &route, &expected_crm)
             {
+                drop(lease);
+                return response;
+            }
+            if let Err(response) = validate_route_token_for_route(&route, &route_token) {
                 drop(lease);
                 return response;
             }
@@ -1337,6 +1438,13 @@ async fn call_handler(
         Ok(route) => route,
         Err(response) => return response,
     };
+    let route_token = match route_token_from_headers(&route_name, &headers) {
+        Ok(token) => token,
+        Err(response) => return response,
+    };
+    if let Err(response) = validate_route_token_for_route(&advertised_route, &route_token) {
+        return response;
+    }
     let content_length = match content_length_from_headers(&headers) {
         Ok(value) => value,
         Err(response) => return response,
@@ -1371,6 +1479,10 @@ async fn call_handler(
     if let Err(response) =
         validate_expected_crm_for_acquired_route(&route_name, &acquired_route, &expected_crm)
     {
+        drop(lease);
+        return response;
+    }
+    if let Err(response) = validate_route_token_for_route(&acquired_route, &route_token) {
         drop(lease);
         return response;
     }
@@ -2083,21 +2195,59 @@ mod tests {
         status
     }
 
+    fn add_expected_echo_headers(
+        builder: axum::http::request::Builder,
+    ) -> axum::http::request::Builder {
+        builder
+            .header("x-c2-expected-crm-ns", "test.echo")
+            .header("x-c2-expected-crm-name", "Echo")
+            .header("x-c2-expected-crm-ver", "0.1.0")
+            .header("x-c2-expected-abi-hash", TEST_ABI_HASH)
+            .header("x-c2-expected-signature-hash", TEST_SIGNATURE_HASH)
+    }
+
+    fn add_expected_crm_tag_headers(
+        builder: axum::http::request::Builder,
+        crm_ns: &str,
+        crm_name: &str,
+        crm_ver: &str,
+    ) -> axum::http::request::Builder {
+        builder
+            .header("x-c2-expected-crm-ns", crm_ns)
+            .header("x-c2-expected-crm-name", crm_name)
+            .header("x-c2-expected-crm-ver", crm_ver)
+            .header("x-c2-expected-abi-hash", TEST_ABI_HASH)
+            .header("x-c2-expected-signature-hash", TEST_SIGNATURE_HASH)
+    }
+
+    fn add_route_token_headers(
+        builder: axum::http::request::Builder,
+        route: Option<&RouteEntry>,
+    ) -> axum::http::request::Builder {
+        match route {
+            Some(route) => builder
+                .header("x-c2-route-uid", route.route_uid.as_str())
+                .header("x-c2-route-revision", route.route_revision.to_string()),
+            None => builder,
+        }
+    }
+
     async fn post_call(state: Arc<RelayState>, name: &str, method: &str) -> StatusCode {
+        let route = state.local_route(name);
         let app = build_router(state);
         let response = app
             .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/{name}/{method}"))
-                    .header("content-type", "application/octet-stream")
-                    .header("x-c2-expected-crm-ns", "test.echo")
-                    .header("x-c2-expected-crm-name", "Echo")
-                    .header("x-c2-expected-crm-ver", "0.1.0")
-                    .header("x-c2-expected-abi-hash", TEST_ABI_HASH)
-                    .header("x-c2-expected-signature-hash", TEST_SIGNATURE_HASH)
-                    .body(Body::from(Vec::new()))
-                    .unwrap(),
+                add_route_token_headers(
+                    add_expected_echo_headers(
+                        Request::builder()
+                            .method("POST")
+                            .uri(format!("/{name}/{method}"))
+                            .header("content-type", "application/octet-stream"),
+                    ),
+                    route.as_ref(),
+                )
+                .body(Body::from(Vec::new()))
+                .unwrap(),
             )
             .await
             .unwrap();
@@ -2111,20 +2261,21 @@ mod tests {
         name: &str,
         method: &str,
     ) -> (StatusCode, Vec<u8>) {
+        let route = state.local_route(name);
         let app = build_router(state);
         let response = app
             .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/{name}/{method}"))
-                    .header("content-type", "application/octet-stream")
-                    .header("x-c2-expected-crm-ns", "test.echo")
-                    .header("x-c2-expected-crm-name", "Echo")
-                    .header("x-c2-expected-crm-ver", "0.1.0")
-                    .header("x-c2-expected-abi-hash", TEST_ABI_HASH)
-                    .header("x-c2-expected-signature-hash", TEST_SIGNATURE_HASH)
-                    .body(Body::from(Vec::new()))
-                    .unwrap(),
+                add_route_token_headers(
+                    add_expected_echo_headers(
+                        Request::builder()
+                            .method("POST")
+                            .uri(format!("/{name}/{method}"))
+                            .header("content-type", "application/octet-stream"),
+                    ),
+                    route.as_ref(),
+                )
+                .body(Body::from(Vec::new()))
+                .unwrap(),
             )
             .await
             .unwrap();
@@ -2141,20 +2292,24 @@ mod tests {
         crm_name: &str,
         crm_ver: &str,
     ) -> StatusCode {
+        let route = state.local_route(name);
         let app = build_router(state);
         let response = app
             .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/{name}/{method}"))
-                    .header("content-type", "application/octet-stream")
-                    .header("x-c2-expected-crm-ns", crm_ns)
-                    .header("x-c2-expected-crm-name", crm_name)
-                    .header("x-c2-expected-crm-ver", crm_ver)
-                    .header("x-c2-expected-abi-hash", TEST_ABI_HASH)
-                    .header("x-c2-expected-signature-hash", TEST_SIGNATURE_HASH)
-                    .body(Body::from(Vec::new()))
-                    .unwrap(),
+                add_route_token_headers(
+                    add_expected_crm_tag_headers(
+                        Request::builder()
+                            .method("POST")
+                            .uri(format!("/{name}/{method}"))
+                            .header("content-type", "application/octet-stream"),
+                        crm_ns,
+                        crm_name,
+                        crm_ver,
+                    ),
+                    route.as_ref(),
+                )
+                .body(Body::from(Vec::new()))
+                .unwrap(),
             )
             .await
             .unwrap();
@@ -2164,19 +2319,20 @@ mod tests {
     }
 
     async fn get_probe(state: Arc<RelayState>, name: &str) -> StatusCode {
+        let route = state.local_route(name);
         let app = build_router(state);
         let response = app
             .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri(format!("/_probe/{name}"))
-                    .header("x-c2-expected-crm-ns", "test.echo")
-                    .header("x-c2-expected-crm-name", "Echo")
-                    .header("x-c2-expected-crm-ver", "0.1.0")
-                    .header("x-c2-expected-abi-hash", TEST_ABI_HASH)
-                    .header("x-c2-expected-signature-hash", TEST_SIGNATURE_HASH)
-                    .body(Body::empty())
-                    .unwrap(),
+                add_route_token_headers(
+                    add_expected_echo_headers(
+                        Request::builder()
+                            .method("GET")
+                            .uri(format!("/_probe/{name}")),
+                    ),
+                    route.as_ref(),
+                )
+                .body(Body::empty())
+                .unwrap(),
             )
             .await
             .unwrap();
@@ -2192,19 +2348,23 @@ mod tests {
         crm_name: &str,
         crm_ver: &str,
     ) -> StatusCode {
+        let route = state.local_route(name);
         let app = build_router(state);
         let response = app
             .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri(format!("/_probe/{name}"))
-                    .header("x-c2-expected-crm-ns", crm_ns)
-                    .header("x-c2-expected-crm-name", crm_name)
-                    .header("x-c2-expected-crm-ver", crm_ver)
-                    .header("x-c2-expected-abi-hash", TEST_ABI_HASH)
-                    .header("x-c2-expected-signature-hash", TEST_SIGNATURE_HASH)
-                    .body(Body::empty())
-                    .unwrap(),
+                add_route_token_headers(
+                    add_expected_crm_tag_headers(
+                        Request::builder()
+                            .method("GET")
+                            .uri(format!("/_probe/{name}")),
+                        crm_ns,
+                        crm_name,
+                        crm_ver,
+                    ),
+                    route.as_ref(),
+                )
+                .body(Body::empty())
+                .unwrap(),
             )
             .await
             .unwrap();
@@ -2442,6 +2602,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relay_probe_requires_route_token_headers_for_matching_route() {
+        let state = test_state();
+        let address = format!(
+            "ipc://relay_probe_missing_route_token_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let server = start_live_server(&address, "server-grid").await;
+        assert_eq!(
+            post_register(state.clone(), "grid", "server-grid", &address).await,
+            StatusCode::CREATED,
+        );
+
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                add_expected_echo_headers(Request::builder().method("GET").uri("/_probe/grid"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["version"], 1);
+        assert_eq!(body["code"], 713);
+        assert_eq!(body["name"], "ProtocolViolation");
+        assert_eq!(body["details"]["route"], "grid");
+
+        shutdown_live_server(&server).await;
+    }
+
+    #[tokio::test]
+    async fn relay_probe_rejects_stale_external_route_token_before_acquire() {
+        let state = test_state();
+        let address = format!(
+            "ipc://relay_probe_stale_external_token_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let server = start_live_server(&address, "server-grid").await;
+        assert_eq!(
+            post_register(state.clone(), "grid", "server-grid", &address).await,
+            StatusCode::CREATED,
+        );
+        let current_route = state.local_route("grid").expect("route registered");
+
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                add_expected_echo_headers(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/_probe/grid")
+                        .header("x-c2-route-uid", "stale-grid-route-uid")
+                        .header("x-c2-route-revision", "1"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["version"], 1);
+        assert_eq!(body["code"], 704);
+        assert_eq!(body["name"], "RouteStale");
+        assert_eq!(body["details"]["route"], "grid");
+        assert_eq!(body["details"]["route_uid"], current_route.route_uid);
+        assert_eq!(
+            body["details"]["route_revision"],
+            current_route.route_revision.to_string()
+        );
+
+        shutdown_live_server(&server).await;
+    }
+
+    #[tokio::test]
+    async fn relay_probe_rejects_repeated_route_token_header() {
+        let state = test_state();
+        let address = format!(
+            "ipc://relay_probe_repeated_route_token_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let server = start_live_server(&address, "server-grid").await;
+        assert_eq!(
+            post_register(state.clone(), "grid", "server-grid", &address).await,
+            StatusCode::CREATED,
+        );
+        let current_route = state.local_route("grid").expect("route registered");
+
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                add_expected_echo_headers(
+                    Request::builder()
+                        .method("GET")
+                        .uri("/_probe/grid")
+                        .header("x-c2-route-uid", current_route.route_uid.as_str())
+                        .header("x-c2-route-uid", current_route.route_uid.as_str())
+                        .header(
+                            "x-c2-route-revision",
+                            current_route.route_revision.to_string(),
+                        ),
+                )
+                .body(Body::empty())
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["version"], 1);
+        assert_eq!(body["code"], 713);
+        assert_eq!(body["name"], "ProtocolViolation");
+        assert_eq!(body["details"]["route"], "grid");
+
+        shutdown_live_server(&server).await;
+    }
+
+    #[tokio::test]
     async fn data_plane_rejects_partial_expected_hash_headers_before_acquire() {
         let state = test_state();
         let app = build_router(state);
@@ -2524,6 +2812,8 @@ mod tests {
         assert_eq!(routes[0].ipc_address.as_deref(), Some("ipc://grid"));
         assert_eq!(routes[0].server_id.as_deref(), Some("server-grid"));
         assert_eq!(routes[0].server_instance_id.as_deref(), Some("inst-grid"));
+        assert_eq!(routes[0].route_uid, "grid-server-grid-uid");
+        assert_eq!(routes[0].route_revision, 1);
 
         let (status, routes) = get_resolve_routes_from(
             state,
@@ -2535,6 +2825,8 @@ mod tests {
         assert_eq!(routes[0].ipc_address, None);
         assert_eq!(routes[0].server_id, None);
         assert_eq!(routes[0].server_instance_id, None);
+        assert_eq!(routes[0].route_uid, "grid-server-grid-uid");
+        assert_eq!(routes[0].route_revision, 1);
     }
 
     #[tokio::test]
@@ -3131,6 +3423,7 @@ mod tests {
                 registered_at: 1000.0,
             }));
         });
+        let route = state.local_route("grid");
         let app = build_router(state);
         let stream = futures::stream::once(async {
             panic!("oversized relay request body should not be polled");
@@ -3140,18 +3433,18 @@ mod tests {
 
         let response = app
             .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/grid/ping")
-                    .header("content-type", "application/octet-stream")
-                    .header("content-length", "5")
-                    .header("x-c2-expected-crm-ns", "test.echo")
-                    .header("x-c2-expected-crm-name", "Echo")
-                    .header("x-c2-expected-crm-ver", "0.1.0")
-                    .header("x-c2-expected-abi-hash", TEST_ABI_HASH)
-                    .header("x-c2-expected-signature-hash", TEST_SIGNATURE_HASH)
-                    .body(Body::from_stream(stream))
-                    .unwrap(),
+                add_route_token_headers(
+                    add_expected_echo_headers(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/grid/ping")
+                            .header("content-type", "application/octet-stream")
+                            .header("content-length", "5"),
+                    ),
+                    route.as_ref(),
+                )
+                .body(Body::from_stream(stream))
+                .unwrap(),
             )
             .await
             .unwrap();
@@ -3187,6 +3480,7 @@ mod tests {
                 registered_at: 1000.0,
             }));
         });
+        let route = state.local_route("grid");
         let app = build_router(state);
         let stream = futures::stream::once(async {
             panic!("invalid content-length request body should not be polled");
@@ -3196,19 +3490,19 @@ mod tests {
 
         let response = app
             .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/grid/ping")
-                    .header("content-type", "application/octet-stream")
-                    .header("content-length", "5")
-                    .header("content-length", "5")
-                    .header("x-c2-expected-crm-ns", "test.echo")
-                    .header("x-c2-expected-crm-name", "Echo")
-                    .header("x-c2-expected-crm-ver", "0.1.0")
-                    .header("x-c2-expected-abi-hash", TEST_ABI_HASH)
-                    .header("x-c2-expected-signature-hash", TEST_SIGNATURE_HASH)
-                    .body(Body::from_stream(stream))
-                    .unwrap(),
+                add_route_token_headers(
+                    add_expected_echo_headers(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/grid/ping")
+                            .header("content-type", "application/octet-stream")
+                            .header("content-length", "5")
+                            .header("content-length", "5"),
+                    ),
+                    route.as_ref(),
+                )
+                .body(Body::from_stream(stream))
+                .unwrap(),
             )
             .await
             .unwrap();
@@ -3238,20 +3532,21 @@ mod tests {
             Ok::<Bytes, std::io::Error>(Bytes::from(vec![b'b'; 32 * 1024])),
             Ok::<Bytes, std::io::Error>(Bytes::from_static(b"c")),
         ]);
+        let route = state.local_route("grid");
         let app = build_router(state);
         let response = app
             .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/grid/ping")
-                    .header("content-type", "application/octet-stream")
-                    .header("x-c2-expected-crm-ns", "test.echo")
-                    .header("x-c2-expected-crm-name", "Echo")
-                    .header("x-c2-expected-crm-ver", "0.1.0")
-                    .header("x-c2-expected-abi-hash", TEST_ABI_HASH)
-                    .header("x-c2-expected-signature-hash", TEST_SIGNATURE_HASH)
-                    .body(Body::from_stream(stream))
-                    .unwrap(),
+                add_route_token_headers(
+                    add_expected_echo_headers(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/grid/ping")
+                            .header("content-type", "application/octet-stream"),
+                    ),
+                    route.as_ref(),
+                )
+                .body(Body::from_stream(stream))
+                .unwrap(),
             )
             .await
             .unwrap();
@@ -3280,21 +3575,22 @@ mod tests {
 
         let payload = vec![b'x'; ClientIpcConfig::default().chunk_size as usize + 1];
         let content_length = payload.len().to_string();
+        let route = state.local_route("grid");
         let app = build_router(state);
         let response = app
             .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/grid/ping")
-                    .header("content-type", "application/octet-stream")
-                    .header("content-length", content_length)
-                    .header("x-c2-expected-crm-ns", "test.echo")
-                    .header("x-c2-expected-crm-name", "Echo")
-                    .header("x-c2-expected-crm-ver", "0.1.0")
-                    .header("x-c2-expected-abi-hash", TEST_ABI_HASH)
-                    .header("x-c2-expected-signature-hash", TEST_SIGNATURE_HASH)
-                    .body(Body::from(payload))
-                    .unwrap(),
+                add_route_token_headers(
+                    add_expected_echo_headers(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/grid/ping")
+                            .header("content-type", "application/octet-stream")
+                            .header("content-length", content_length),
+                    ),
+                    route.as_ref(),
+                )
+                .body(Body::from(payload))
+                .unwrap(),
             )
             .await
             .unwrap();
@@ -4104,24 +4400,26 @@ mod tests {
         );
         state.evict_connection("grid");
 
+        let route = state.local_route("grid");
         let app = build_router(state.clone());
         let mut tasks = Vec::new();
         for _ in 0..16 {
             let app = app.clone();
+            let route = route.clone();
             tasks.push(tokio::spawn(async move {
                 let response = app
                     .oneshot(
-                        Request::builder()
-                            .method("POST")
-                            .uri("/grid/ping")
-                            .header("content-type", "application/octet-stream")
-                            .header("x-c2-expected-crm-ns", "test.echo")
-                            .header("x-c2-expected-crm-name", "Echo")
-                            .header("x-c2-expected-crm-ver", "0.1.0")
-                            .header("x-c2-expected-abi-hash", TEST_ABI_HASH)
-                            .header("x-c2-expected-signature-hash", TEST_SIGNATURE_HASH)
-                            .body(Body::from(Vec::new()))
-                            .unwrap(),
+                        add_route_token_headers(
+                            add_expected_echo_headers(
+                                Request::builder()
+                                    .method("POST")
+                                    .uri("/grid/ping")
+                                    .header("content-type", "application/octet-stream"),
+                            ),
+                            route.as_ref(),
+                        )
+                        .body(Body::from(Vec::new()))
+                        .unwrap(),
                     )
                     .await
                     .unwrap();
@@ -4186,20 +4484,21 @@ mod tests {
         state.reconnect("builder", Arc::new(stale_client));
         register_echo_route(&server, "builder").await;
 
+        let route = state.local_route("builder");
         let app = build_router(state.clone());
         let response = app
             .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/builder/ping")
-                    .header("content-type", "application/octet-stream")
-                    .header("x-c2-expected-crm-ns", "test.echo")
-                    .header("x-c2-expected-crm-name", "Echo")
-                    .header("x-c2-expected-crm-ver", "0.1.0")
-                    .header("x-c2-expected-abi-hash", TEST_ABI_HASH)
-                    .header("x-c2-expected-signature-hash", TEST_SIGNATURE_HASH)
-                    .body(Body::empty())
-                    .unwrap(),
+                add_route_token_headers(
+                    add_expected_echo_headers(
+                        Request::builder()
+                            .method("POST")
+                            .uri("/builder/ping")
+                            .header("content-type", "application/octet-stream"),
+                    ),
+                    route.as_ref(),
+                )
+                .body(Body::empty())
+                .unwrap(),
             )
             .await
             .unwrap();

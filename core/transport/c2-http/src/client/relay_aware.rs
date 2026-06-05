@@ -237,7 +237,7 @@ impl RelayAwareHttpClient {
 
                 match client
                     .client
-                    .probe_route_with_expected_crm_async(&self.expected)
+                    .probe_route_with_token_async(&self.expected, &route.route_token())
                     .await
                 {
                     Ok(()) => {
@@ -318,7 +318,12 @@ impl RelayAwareHttpClient {
 
                 match client
                     .client
-                    .call_with_expected_crm_async(&self.expected, method_name, data)
+                    .call_with_route_token_async(
+                        &self.expected,
+                        &route.route_token(),
+                        method_name,
+                        data,
+                    )
                     .await
                 {
                     Ok(bytes) => {
@@ -632,6 +637,8 @@ mod tests {
         RelayRouteInfo {
             name,
             relay_url,
+            route_uid: "grid-route-uid-0001".to_string(),
+            route_revision: 1,
             ipc_address: None,
             server_id: None,
             server_instance_id: None,
@@ -819,8 +826,15 @@ mod tests {
                 .is_some_and(|v| v == TEST_SIGNATURE_HASH)
     }
 
+    fn route_token_headers_match(headers: &HeaderMap) -> bool {
+        headers
+            .get("x-c2-route-uid")
+            .is_some_and(|v| v == "grid-route-uid-0001")
+            && headers.get("x-c2-route-revision").is_some_and(|v| v == "1")
+    }
+
     async fn probe_requires_expected_crm_headers(headers: HeaderMap) -> Response {
-        if expected_crm_headers_match(&headers) {
+        if expected_crm_headers_match(&headers) && route_token_headers_match(&headers) {
             StatusCode::OK.into_response()
         } else {
             (
@@ -841,7 +855,7 @@ mod tests {
         Path((route, _method)): Path<(String, String)>,
         body: Bytes,
     ) -> Response {
-        if expected_crm_headers_match(&headers) {
+        if expected_crm_headers_match(&headers) && route_token_headers_match(&headers) {
             let mut out = b"ok:".to_vec();
             out.extend_from_slice(&body);
             (StatusCode::OK, out).into_response()
