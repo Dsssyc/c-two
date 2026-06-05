@@ -145,8 +145,28 @@ pub enum IpcError {
     Decode(DecodeError),
     /// Handshake failed or incompatible server.
     Handshake(String),
+    /// Peer violated IPC route/control protocol after the transport connected.
+    Protocol(String),
+    /// Connected server identity does not match the expected owner.
+    IdentityMismatch {
+        expected_server_id: String,
+        expected_server_instance_id: String,
+        actual_server_id: String,
+        actual_server_instance_id: String,
+    },
+    /// Connected route contract does not match the expected CRM contract.
+    ContractMismatch(String),
     /// Requested route no longer exists on the connected IPC server.
     RouteNotFound(String),
+    /// Requested method does not exist on the connected route.
+    MethodNotFound {
+        route_name: String,
+        method_name: String,
+    },
+    /// Shared-memory request/response setup failed.
+    Shm(String),
+    /// Chunked response assembly failed.
+    Chunk(String),
     /// CRM method returned an error (serialized error bytes).
     CrmError(Vec<u8>),
     /// Client is closed or connection lost.
@@ -162,7 +182,27 @@ impl std::fmt::Display for IpcError {
             Self::Config(msg) => write!(f, "IPC config error: {msg}"),
             Self::Decode(e) => write!(f, "IPC decode error: {e}"),
             Self::Handshake(msg) => write!(f, "IPC handshake failed: {msg}"),
+            Self::Protocol(msg) => write!(f, "IPC protocol violation: {msg}"),
+            Self::IdentityMismatch {
+                expected_server_id,
+                expected_server_instance_id,
+                actual_server_id,
+                actual_server_instance_id,
+            } => write!(
+                f,
+                "IPC server identity mismatch: expected {expected_server_id}/{expected_server_instance_id}, got {actual_server_id}/{actual_server_instance_id}"
+            ),
+            Self::ContractMismatch(msg) => write!(f, "IPC contract mismatch: {msg}"),
             Self::RouteNotFound(route) => write!(f, "IPC route not found: {route}"),
+            Self::MethodNotFound {
+                route_name,
+                method_name,
+            } => write!(
+                f,
+                "IPC method not found: route={route_name} method={method_name}"
+            ),
+            Self::Shm(msg) => write!(f, "IPC SHM error: {msg}"),
+            Self::Chunk(msg) => write!(f, "IPC chunk error: {msg}"),
             Self::CrmError(_) => write!(f, "CRM method error"),
             Self::Closed => write!(f, "IPC client closed"),
             Self::Pool(msg) => write!(f, "Pool error: {msg}"),
@@ -186,7 +226,7 @@ impl From<DecodeError> for IpcError {
 
 impl From<c2_wire::control::EncodeError> for IpcError {
     fn from(e: c2_wire::control::EncodeError) -> Self {
-        Self::Handshake(e.to_string())
+        Self::Protocol(e.to_string())
     }
 }
 
@@ -532,9 +572,10 @@ impl IpcClient {
 
         // Perform handshake.
         let hs = self.do_handshake(&mut writer, reader).await?;
-        let server_identity = hs.server_identity.clone().ok_or_else(|| {
-            IpcError::Handshake("server handshake missing server identity".into())
-        })?;
+        let server_identity = hs
+            .server_identity
+            .clone()
+            .ok_or_else(|| IpcError::Protocol("server handshake missing server identity".into()))?;
 
         // Store method tables from the handshake response.
         for route in &hs.routes {
@@ -604,7 +645,7 @@ impl IpcClient {
         };
 
         let payload = encode_client_handshake(&segments, cap_flags, &prefix)
-            .map_err(|e| IpcError::Handshake(e.to_string()))?;
+            .map_err(|e| IpcError::Protocol(e.to_string()))?;
         let frame_bytes = frame::encode_frame(0, flags::FLAG_HANDSHAKE, &payload);
         writer.write_all(&frame_bytes).await?;
 
@@ -615,7 +656,7 @@ impl IpcClient {
         let (hdr, _hdr_payload) = frame::decode_frame_body(body_rest, total_len)?;
 
         if !hdr.is_handshake() {
-            return Err(IpcError::Handshake(
+            return Err(IpcError::Protocol(
                 "Server response is not a handshake frame".into(),
             ));
         }
@@ -626,16 +667,15 @@ impl IpcClient {
             reader.read_exact(&mut payload_buf).await?;
         }
 
-        let hs = decode_handshake(&payload_buf)
-            .map_err(|e| IpcError::Handshake(format!("decode: {e}")))?;
+        let hs = decode_handshake(&payload_buf)?;
 
         if hs.capability_flags & CAP_CALL_V2 == 0 {
-            return Err(IpcError::Handshake(
+            return Err(IpcError::Protocol(
                 "Server does not support v2 call frames".into(),
             ));
         }
         if hs.server_identity.is_none() {
-            return Err(IpcError::Handshake(
+            return Err(IpcError::Protocol(
                 "server handshake missing server identity".into(),
             ));
         }
@@ -697,17 +737,20 @@ impl IpcClient {
         let route_tables = self.route_tables.read();
         let table = route_tables
             .get(route_name)
-            .ok_or_else(|| IpcError::Handshake(format!("unknown route: {route_name}")))?;
+            .ok_or_else(|| IpcError::RouteNotFound(route_name.to_string()))?;
         table
             .index_of(method_name)
-            .ok_or_else(|| IpcError::Handshake(format!("unknown method: {method_name}")))
+            .ok_or_else(|| IpcError::MethodNotFound {
+                route_name: route_name.to_string(),
+                method_name: method_name.to_string(),
+            })
     }
 
     fn ensure_route_payload_size(&self, route_name: &str, data_len: u64) -> Result<(), IpcError> {
         let route_tables = self.route_tables.read();
         let table = route_tables
             .get(route_name)
-            .ok_or_else(|| IpcError::Handshake(format!("unknown route: {route_name}")))?;
+            .ok_or_else(|| IpcError::RouteNotFound(route_name.to_string()))?;
         let max_payload_size = table.max_payload_size();
         if data_len > max_payload_size {
             return Err(IpcError::Config(format!(
@@ -735,7 +778,7 @@ impl IpcClient {
             RequestTransportKind::Buddy => {
                 match self.call_buddy(route_name, method_idx, data).await {
                     Ok(result) => return Ok(result),
-                    Err(IpcError::Handshake(_)) => {
+                    Err(IpcError::Shm(_)) => {
                         // Pool allocation or SHM setup failed. Fall back through the
                         // non-SHM policy below rather than failing large relay calls
                         // that can still use chunked transfer.
@@ -904,7 +947,7 @@ impl IpcClient {
         let alloc = {
             let mut pool = pool_arc.lock();
             pool.alloc(data.len())
-                .map_err(|e| IpcError::Handshake(format!("buddy alloc failed: {e}")))?
+                .map_err(|e| IpcError::Shm(format!("buddy alloc failed: {e}")))?
         };
 
         // Write data into the SHM region.
@@ -915,7 +958,7 @@ impl IpcClient {
                 Err(e) => {
                     drop(pool);
                     let _ = pool_arc.lock().free(&alloc);
-                    return Err(IpcError::Handshake(format!("buddy data_ptr failed: {e}")));
+                    return Err(IpcError::Shm(format!("buddy data_ptr failed: {e}")));
                 }
             };
             unsafe {
@@ -1058,7 +1101,7 @@ impl IpcClient {
                     Err(err) => {
                         drop(pool);
                         self.free_request_block(&alloc);
-                        return Err(IpcError::Handshake(format!("buddy data_ptr failed: {err}")));
+                        return Err(IpcError::Shm(format!("buddy data_ptr failed: {err}")));
                     }
                 };
                 unsafe {
@@ -1442,7 +1485,7 @@ impl IpcClient {
         {
             return Ok(());
         }
-        Err(IpcError::Handshake(format!(
+        Err(IpcError::ContractMismatch(format!(
             "CRM contract mismatch for route {}: expected {}/{}/{} abi_hash={} signature_hash={}, got {}/{}/{} abi_hash={} signature_hash={}",
             route_name,
             expected.crm_ns,
@@ -1529,7 +1572,7 @@ impl IpcClient {
         };
         match response {
             ResponseData::Inline(payload) => Ok(payload),
-            _ => Err(IpcError::Handshake(format!(
+            _ => Err(IpcError::Protocol(format!(
                 "{description} returned non-inline response"
             ))),
         }
@@ -1551,7 +1594,7 @@ impl IpcClient {
         expected: &c2_contract::ExpectedRouteContract,
     ) -> Result<(), IpcError> {
         c2_contract::validate_expected_route_contract(expected)
-            .map_err(|err| IpcError::Handshake(err.to_string()))?;
+            .map_err(|err| IpcError::ContractMismatch(err.to_string()))?;
         let route_tables = self.route_tables.read();
         let table = route_tables
             .get(&expected.route_name)
@@ -1564,11 +1607,11 @@ impl IpcClient {
         &self,
         route_name: &str,
     ) -> Result<c2_contract::ExpectedRouteContract, IpcError> {
-        let request = encode_route_contract_request(route_name).map_err(IpcError::Handshake)?;
+        let request = encode_route_contract_request(route_name).map_err(IpcError::Protocol)?;
         let payload = self
             .send_control_inline(request, "route contract attestation")
             .await?;
-        match decode_route_contract_response(&payload).map_err(IpcError::Handshake)? {
+        match decode_route_contract_response(&payload).map_err(IpcError::Protocol)? {
             RouteContractResponse::Attested { contract } => {
                 self.cache_attested_contract(&contract);
                 Ok(Self::expected_contract_from_attestation(contract))
@@ -1577,7 +1620,7 @@ impl IpcClient {
                 if code == ROUTE_CONTRACT_REJECT_NOT_FOUND {
                     Err(IpcError::RouteNotFound(route_name.to_string()))
                 } else {
-                    Err(IpcError::Handshake(message))
+                    Err(IpcError::ContractMismatch(message))
                 }
             }
         }
@@ -1591,7 +1634,7 @@ impl IpcClient {
         expected: &c2_contract::ExpectedRouteContract,
     ) -> Result<(), IpcError> {
         c2_contract::validate_expected_route_contract(expected)
-            .map_err(|err| IpcError::Handshake(err.to_string()))?;
+            .map_err(|err| IpcError::ContractMismatch(err.to_string()))?;
         {
             let route_tables = self.route_tables.read();
             if let Some(table) = route_tables.get(&expected.route_name) {
@@ -1636,11 +1679,11 @@ impl IpcClient {
         registration_token: &str,
     ) -> Result<c2_contract::ExpectedRouteContract, IpcError> {
         let payload = encode_pending_route_attestation_request(route_name, registration_token)
-            .map_err(IpcError::Handshake)?;
+            .map_err(IpcError::Protocol)?;
         let payload = self
             .send_control_inline(payload, "pending route attestation")
             .await?;
-        match decode_pending_route_attestation_response(&payload).map_err(IpcError::Handshake)? {
+        match decode_pending_route_attestation_response(&payload).map_err(IpcError::Protocol)? {
             PendingRouteAttestationResponse::Attested { contract } => {
                 self.cache_attested_contract(&contract);
                 Ok(Self::expected_contract_from_attestation(contract))
@@ -1649,7 +1692,7 @@ impl IpcClient {
                 if code == PENDING_ROUTE_REJECT_NOT_FOUND {
                     Err(IpcError::RouteNotFound(route_name.to_string()))
                 } else {
-                    Err(IpcError::Handshake(message))
+                    Err(IpcError::ContractMismatch(message))
                 }
             }
         }
@@ -1818,7 +1861,7 @@ async fn recv_loop(
                     eprintln!("Warning: reply chunk assembler creation failed: {e}");
                     let tx = pending.lock().remove(&rid);
                     if let Some(tx) = tx {
-                        let _ = tx.send(Err(IpcError::Handshake(format!(
+                        let _ = tx.send(Err(IpcError::Chunk(format!(
                             "chunked reply assembler failed: {e}"
                         ))));
                     }
@@ -1840,7 +1883,7 @@ async fn recv_loop(
                             Err(e) => {
                                 let tx = pending.lock().remove(&rid);
                                 if let Some(tx) = tx {
-                                    let _ = tx.send(Err(IpcError::Handshake(format!(
+                                    let _ = tx.send(Err(IpcError::Chunk(format!(
                                         "chunked reply finish error: {e}"
                                     ))));
                                 }
@@ -1852,7 +1895,7 @@ async fn recv_loop(
                     eprintln!("Warning: reply chunk feed error: {e}");
                     let tx = pending.lock().remove(&rid);
                     if let Some(tx) = tx {
-                        let _ = tx.send(Err(IpcError::Handshake(format!(
+                        let _ = tx.send(Err(IpcError::Chunk(format!(
                             "chunked reply feed error: {e}"
                         ))));
                     }

@@ -61,7 +61,7 @@ mod client_tests {
 
     #[test]
     fn encode_v2_error_reply() {
-        let err = b"3:test error".to_vec();
+        let err = br#"C2E1{"version":1,"code":3,"name":"ResourceFunctionExecuting","message":"test error","details":{}}"#.to_vec();
         let ctrl = try_encode_reply_control(&ReplyControl::Error(err.clone())).unwrap();
         let frame_bytes =
             frame::encode_frame(42, flags::FLAG_RESPONSE | flags::FLAG_REPLY_V2, &ctrl);

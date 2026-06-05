@@ -6,7 +6,9 @@ from c_two.error import (
     ResourceSerializeOutput, ResourceExecuteFunction,
     ClientSerializeInput, ClientDeserializeOutput, ClientOutputFromBuffer,
     ClientCallResource,
-    ResourceAlreadyRegistered, StaleResource, WriteConflict,
+    ResourceAlreadyRegistered, RouteStale, WriteConflict,
+    ResourceClosed, ResourceRemoved, ContractMismatch, IdentityMismatch,
+    RouteCatalogCompacted, RouteWatchUnavailable, ProtocolViolation, FallbackDenied,
 )
 
 
@@ -22,11 +24,19 @@ class TestERRORCode:
         assert ERROR_Code.ERROR_AT_CLIENT_CALLING_RESOURCE == 7
         assert ERROR_Code.ERROR_AT_CLIENT_OUTPUT_FROM_BUFFER == 8
         assert ERROR_Code.ERROR_RESOURCE_ALREADY_REGISTERED == 703
-        assert ERROR_Code.ERROR_STALE_RESOURCE == 704
+        assert ERROR_Code.ERROR_ROUTE_STALE == 704
         assert ERROR_Code.ERROR_WRITE_CONFLICT == 706
+        assert ERROR_Code.ERROR_RESOURCE_CLOSED == 707
+        assert ERROR_Code.ERROR_RESOURCE_REMOVED == 708
+        assert ERROR_Code.ERROR_CONTRACT_MISMATCH == 709
+        assert ERROR_Code.ERROR_IDENTITY_MISMATCH == 710
+        assert ERROR_Code.ERROR_ROUTE_CATALOG_COMPACTED == 711
+        assert ERROR_Code.ERROR_ROUTE_WATCH_UNAVAILABLE == 712
+        assert ERROR_Code.ERROR_PROTOCOL_VIOLATION == 713
+        assert ERROR_Code.ERROR_FALLBACK_DENIED == 714
 
-    def test_has_exactly_15_members(self):
-        assert len(ERROR_Code) == 15
+    def test_has_exactly_23_members(self):
+        assert len(ERROR_Code) == 23
 
     def test_values_are_unique(self):
         values = [e.value for e in ERROR_Code]
@@ -47,6 +57,14 @@ class TestCCError:
         assert err.code == ERROR_Code.ERROR_AT_RESOURCE_FUNCTION_EXECUTING
         assert err.message == 'something broke'
 
+    def test_details_creation(self):
+        err = CCError(
+            code=ERROR_Code.ERROR_RESOURCE_UNAVAILABLE,
+            message='upstream failed',
+            details={'route': 'grid', 'cause_kind': 'TransportIo'},
+        )
+        assert err.details == {'route': 'grid', 'cause_kind': 'TransportIo'}
+
     def test_str_format(self):
         err = CCError(code=ERROR_Code.ERROR_AT_RESOURCE_FUNCTION_EXECUTING, message='oops')
         assert str(err) == 'ERROR_AT_RESOURCE_FUNCTION_EXECUTING: oops'
@@ -57,11 +75,11 @@ class TestCCError:
 
     def test_repr_format(self):
         err = CCError(code=ERROR_Code.ERROR_AT_RESOURCE_FUNCTION_EXECUTING, message='oops')
-        assert repr(err) == 'CCError(code=3, message=oops)'
+        assert repr(err) == 'CCError(code=3, message=oops, details={})'
 
     def test_repr_format_default(self):
         err = CCError()
-        assert repr(err) == 'CCError(code=0, message=Error occurred when using C-Two.)'
+        assert repr(err) == 'CCError(code=0, message=Error occurred when using C-Two., details={})'
 
     def test_is_exception(self):
         err = CCError()
@@ -75,12 +93,17 @@ class TestCCError:
 
 class TestCCErrorSerialization:
     def test_round_trip(self):
-        original = CCError(code=ERROR_Code.ERROR_AT_RESOURCE_FUNCTION_EXECUTING, message='test msg')
+        original = CCError(
+            code=ERROR_Code.ERROR_AT_RESOURCE_FUNCTION_EXECUTING,
+            message='test msg',
+            details={'route': 'grid'},
+        )
         data = CCError.serialize(original)
         restored = CCError.deserialize(memoryview(data))
         assert restored is not None
         assert restored.code == original.code
         assert restored.message == original.message
+        assert restored.details == {'route': 'grid'}
 
     def test_serialize_none_returns_empty_bytes(self):
         assert CCError.serialize(None) == b''
@@ -97,7 +120,10 @@ class TestCCErrorSerialization:
 
     def test_serialize_produces_expected_bytes(self):
         err = CCError(code=ERROR_Code.ERROR_AT_RESOURCE_FUNCTION_EXECUTING, message='hello')
-        assert CCError.serialize(err) == b'3:hello'
+        assert CCError.serialize(err) == (
+            b'C2E1{"version":1,"code":3,"name":"ResourceFunctionExecuting",'
+            b'"message":"hello","details":{}}'
+        )
 
     def test_round_trip_default_error(self):
         original = CCError()
@@ -108,11 +134,17 @@ class TestCCErrorSerialization:
         assert restored.message == original.message
 
     def test_unknown_numeric_code_deserializes_to_unknown_with_context(self):
-        restored = CCError.deserialize(memoryview(b"9999:low-level relay failure"))
+        restored = CCError.deserialize(memoryview(
+            b'C2E1{"version":1,"code":9999,"name":"FutureRouteError",'
+            b'"message":"low-level relay failure","details":{"route":"grid"}}'
+        ))
         assert restored is not None
         assert type(restored) is CCError
         assert restored.code == ERROR_Code.ERROR_UNKNOWN
-        assert restored.message == "Unknown error code 9999: low-level relay failure"
+        assert restored.message == "Unknown error code 9999 (FutureRouteError): low-level relay failure"
+        assert restored.details["route"] == "grid"
+        assert restored.details["unknown_code"] == "9999"
+        assert restored.details["unknown_name"] == "FutureRouteError"
 
     @pytest.mark.parametrize(
         ("payload", "expected_fragment"),
@@ -120,6 +152,7 @@ class TestCCErrorSerialization:
             (b"abc:not a number", "Malformed error payload"),
             (b"3", "Malformed error payload"),
             (b"\xff", "Malformed error payload"),
+            (b"703:grid exists", "Malformed error payload"),
         ],
     )
     def test_malformed_payload_deserializes_to_unknown(self, payload, expected_fragment):
@@ -139,6 +172,18 @@ SUBCLASS_PARAMS = [
     (ClientDeserializeOutput,ERROR_Code.ERROR_AT_CLIENT_OUTPUT_DESERIALIZING, 'deserializing output at client'),
     (ClientOutputFromBuffer,  ERROR_Code.ERROR_AT_CLIENT_OUTPUT_FROM_BUFFER,  'constructing client output from buffer'),
     (ClientCallResource,       ERROR_Code.ERROR_AT_CLIENT_CALLING_RESOURCE,          'calling resource from client'),
+]
+
+ROUTE_CATALOG_SUBCLASS_PARAMS = [
+    (RouteStale, ERROR_Code.ERROR_ROUTE_STALE),
+    (ResourceClosed, ERROR_Code.ERROR_RESOURCE_CLOSED),
+    (ResourceRemoved, ERROR_Code.ERROR_RESOURCE_REMOVED),
+    (ContractMismatch, ERROR_Code.ERROR_CONTRACT_MISMATCH),
+    (IdentityMismatch, ERROR_Code.ERROR_IDENTITY_MISMATCH),
+    (RouteCatalogCompacted, ERROR_Code.ERROR_ROUTE_CATALOG_COMPACTED),
+    (RouteWatchUnavailable, ERROR_Code.ERROR_ROUTE_WATCH_UNAVAILABLE),
+    (ProtocolViolation, ERROR_Code.ERROR_PROTOCOL_VIOLATION),
+    (FallbackDenied, ERROR_Code.ERROR_FALLBACK_DENIED),
 ]
 
 
@@ -170,6 +215,15 @@ class TestErrorSubclasses:
         assert isinstance(err, Exception)
 
 
+class TestRouteCatalogErrorSubclasses:
+    @pytest.mark.parametrize("cls,expected_code", ROUTE_CATALOG_SUBCLASS_PARAMS)
+    def test_correct_error_code(self, cls, expected_code):
+        err = cls('detail', details={'route': 'grid'})
+        assert err.code == expected_code
+        assert err.message == 'detail'
+        assert err.details == {'route': 'grid'}
+
+
 ALL_SUBCLASSES = [
     error.ResourceDeserializeInput,
     error.ResourceInputFromBuffer,
@@ -179,6 +233,15 @@ ALL_SUBCLASSES = [
     error.ClientDeserializeOutput,
     error.ClientOutputFromBuffer,
     error.ClientCallResource,
+    error.RouteStale,
+    error.ResourceClosed,
+    error.ResourceRemoved,
+    error.ContractMismatch,
+    error.IdentityMismatch,
+    error.RouteCatalogCompacted,
+    error.RouteWatchUnavailable,
+    error.ProtocolViolation,
+    error.FallbackDenied,
 ]
 
 
@@ -224,14 +287,14 @@ class TestSubclassDeserialization:
         assert "bad output view" in restored_client.message
 
     def test_future_mesh_errors_round_trip(self):
-        stale = StaleResource("grid stale")
+        stale = RouteStale("grid stale")
         conflict = WriteConflict("grid write conflict")
 
         stale_result = CCError.deserialize(memoryview(CCError.serialize(stale)))
         conflict_result = CCError.deserialize(memoryview(CCError.serialize(conflict)))
 
-        assert isinstance(stale_result, StaleResource)
-        assert stale_result.code == ERROR_Code.ERROR_STALE_RESOURCE
+        assert isinstance(stale_result, RouteStale)
+        assert stale_result.code == ERROR_Code.ERROR_ROUTE_STALE
         assert stale_result.message == "grid stale"
         assert isinstance(conflict_result, WriteConflict)
         assert conflict_result.code == ERROR_Code.ERROR_WRITE_CONFLICT
@@ -249,7 +312,9 @@ class TestErrorCodeToClass:
         assert set(error._CODE_TO_CLASS.keys()) == expected_codes
 
     def test_unknown_code_deserializes_to_base(self):
-        result = CCError.deserialize(memoryview(b'0:some message'))
+        result = CCError.deserialize(memoryview(
+            b'C2E1{"version":1,"code":0,"name":"Unknown","message":"some message","details":{}}'
+        ))
         assert type(result) is CCError
         assert result.code == ERROR_Code.ERROR_UNKNOWN
         assert result.message == 'some message'
@@ -273,9 +338,17 @@ class TestNativeErrorRegistryParity:
             "ERROR_RESOURCE_NOT_FOUND": ("ResourceNotFound", 701),
             "ERROR_RESOURCE_UNAVAILABLE": ("ResourceUnavailable", 702),
             "ERROR_RESOURCE_ALREADY_REGISTERED": ("ResourceAlreadyRegistered", 703),
-            "ERROR_STALE_RESOURCE": ("StaleResource", 704),
+            "ERROR_ROUTE_STALE": ("RouteStale", 704),
             "ERROR_REGISTRY_UNAVAILABLE": ("RegistryUnavailable", 705),
             "ERROR_WRITE_CONFLICT": ("WriteConflict", 706),
+            "ERROR_RESOURCE_CLOSED": ("ResourceClosed", 707),
+            "ERROR_RESOURCE_REMOVED": ("ResourceRemoved", 708),
+            "ERROR_CONTRACT_MISMATCH": ("ContractMismatch", 709),
+            "ERROR_IDENTITY_MISMATCH": ("IdentityMismatch", 710),
+            "ERROR_ROUTE_CATALOG_COMPACTED": ("RouteCatalogCompacted", 711),
+            "ERROR_ROUTE_WATCH_UNAVAILABLE": ("RouteWatchUnavailable", 712),
+            "ERROR_PROTOCOL_VIOLATION": ("ProtocolViolation", 713),
+            "ERROR_FALLBACK_DENIED": ("FallbackDenied", 714),
         }
 
         assert set(ERROR_Code.__members__) == set(expected)
@@ -286,15 +359,15 @@ class TestNativeErrorRegistryParity:
     def test_serialize_uses_native_wire_encoder(self, monkeypatch):
         calls = []
 
-        def fake_encode(code, message):
-            calls.append((code, message))
-            return b"3:from-native"
+        def fake_encode(code, message, details):
+            calls.append((code, message, details))
+            return b"C2E1from-native"
 
         monkeypatch.setattr(error._native, "encode_error_wire", fake_encode)
 
         err = CCError(ERROR_Code.ERROR_AT_RESOURCE_FUNCTION_EXECUTING, "boom")
-        assert CCError.serialize(err) == b"3:from-native"
-        assert calls == [(3, "boom")]
+        assert CCError.serialize(err) == b"C2E1from-native"
+        assert calls == [(3, "boom", {})]
 
     def test_deserialize_uses_native_wire_decoder_without_python_tobytes(self, monkeypatch):
         class NoToBytes:
@@ -305,12 +378,13 @@ class TestNativeErrorRegistryParity:
 
         def fake_decode(data):
             calls.append(data)
-            return (703, "grid exists")
+            return (703, "grid exists", {"route": "grid"})
 
         monkeypatch.setattr(error._native, "decode_error_wire_parts", fake_decode)
 
         result = CCError.deserialize(NoToBytes())
         assert isinstance(result, ResourceAlreadyRegistered)
         assert result.message == "grid exists"
+        assert result.details == {"route": "grid"}
         assert len(calls) == 1
         assert isinstance(calls[0], NoToBytes)

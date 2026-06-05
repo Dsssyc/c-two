@@ -1,7 +1,7 @@
 # Route Catalog Watch Redesign Implementation Plan
 
 **Date:** 2026-06-05
-**Status:** Reviewed design draft; implementation pending
+**Status:** Phase 1 implemented; Phase 2 pending
 **Scope:** IPC route lifecycle, relay route authority, relay upstream pools, relay-aware HTTP fallback, Rust error taxonomy, Python SDK error facade
 **Supersedes:** `docs/issues/ipc-route-contract-stale-snapshot.md` as the long-term design
 
@@ -748,6 +748,25 @@ Verification:
 - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay`
 - `uv sync --reinstall-package c-two`
 - `C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_error.py sdk/python/tests/unit/test_runtime_session.py -q --timeout=30`
+
+Status:
+
+- implemented Rust `C2E1` error envelope in `c2-error`;
+- registered route/catalog public error codes and exported Python `CCError`
+  subclasses with `details`;
+- replaced non-handshake IPC route/contract/protocol/SHM/chunk failures with
+  typed `IpcError` variants;
+- updated relay acquisition/withdraw classification to use typed semantic
+  variants instead of broad `Handshake(String)`;
+- verification passed on 2026-06-05:
+  - `cargo test --manifest-path core/Cargo.toml -p c2-error`;
+  - `cargo test --manifest-path core/Cargo.toml -p c2-wire`;
+  - `cargo test --manifest-path core/Cargo.toml -p c2-ipc`;
+  - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay`;
+  - `cargo test --manifest-path core/Cargo.toml -p c2-runtime`;
+  - `uv sync --reinstall-package c-two`;
+  - `C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_error.py sdk/python/tests/unit/test_native_error_registry.py sdk/python/tests/unit/test_mesh_errors.py sdk/python/tests/unit/test_runtime_session.py -q --timeout=30`;
+  - `C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/integration/test_error_propagation.py -q --timeout=30`.
 
 ### Phase 2: Server RouteCatalog And Call-Time Validation
 

@@ -261,7 +261,7 @@ impl RelayState {
                 let route_name = route_name.clone();
                 async move {
                     if expected.ipc_address.as_deref() != Some(address.as_str()) {
-                        return Err(c2_ipc::IpcError::Handshake(format!(
+                        return Err(c2_ipc::IpcError::Protocol(format!(
                             "relay upstream address mismatch for route {route_name}: expected {:?}, got {address}",
                             expected.ipc_address
                         )));
@@ -276,11 +276,15 @@ impl RelayState {
                         let got_server_instance_id =
                             client.server_instance_id().unwrap_or("").to_string();
                         client.close().await;
-                        return Err(c2_ipc::IpcError::Handshake(format!(
-                            "relay upstream identity mismatch for route {route_name}: expected {}/{}, got {got_server_id}/{got_server_instance_id}",
-                            expected.server_id.as_deref().unwrap_or(""),
-                            expected.server_instance_id.as_deref().unwrap_or(""),
-                        )));
+                        return Err(c2_ipc::IpcError::IdentityMismatch {
+                            expected_server_id: expected.server_id.clone().unwrap_or_default(),
+                            expected_server_instance_id: expected
+                                .server_instance_id
+                                .clone()
+                                .unwrap_or_default(),
+                            actual_server_id: got_server_id,
+                            actual_server_instance_id: got_server_instance_id,
+                        });
                     }
                     let expected_contract = expected_contract_for_route(&expected);
                     if let Err(err) = client.ensure_route_contract(&expected_contract).await {

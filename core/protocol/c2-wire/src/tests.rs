@@ -190,7 +190,7 @@ mod control_tests {
 
     #[test]
     fn reply_control_error_roundtrip() {
-        let err = b"3:test error".to_vec();
+        let err = br#"C2E1{"version":1,"code":3,"name":"ResourceFunctionExecuting","message":"test error","details":{}}"#.to_vec();
         let encoded = try_encode_reply_control(&ReplyControl::Error(err.clone())).unwrap();
         let (decoded, consumed) = decode_reply_control(&encoded, 0).unwrap();
         assert_eq!(consumed, encoded.len());
@@ -747,11 +747,16 @@ mod cross_lang_tests {
 
     #[test]
     fn canonical_reply_error_fixture_decodes() {
-        let bytes = hex_to_bytes("010c000000333a74657374206572726f72");
+        let bytes = hex_to_bytes(
+            "0161000000433245317b2276657273696f6e223a312c22636f6465223a332c226e616d65223a225265736f7572636546756e6374696f6e457865637574696e67222c226d657373616765223a2274657374206572726f72222c2264657461696c73223a7b7d7d",
+        );
         let (ctrl, consumed) = decode_reply_control(&bytes, 0).unwrap();
         match ctrl {
             ReplyControl::Error(data) => {
-                assert_eq!(data, b"3:test error");
+                assert_eq!(
+                    data,
+                    br#"C2E1{"version":1,"code":3,"name":"ResourceFunctionExecuting","message":"test error","details":{}}"#
+                );
             }
             _ => panic!("expected error"),
         }
@@ -832,9 +837,11 @@ mod cross_lang_tests {
 
     #[test]
     fn rust_encode_matches_canonical_reply_error_fixture() {
-        let err = b"3:test error".to_vec();
+        let err = br#"C2E1{"version":1,"code":3,"name":"ResourceFunctionExecuting","message":"test error","details":{}}"#.to_vec();
         let encoded = try_encode_reply_control(&ReplyControl::Error(err)).unwrap();
-        let expected = hex_to_bytes("010c000000333a74657374206572726f72");
+        let expected = hex_to_bytes(
+            "0161000000433245317b2276657273696f6e223a312c22636f6465223a332c226e616d65223a225265736f7572636546756e6374696f6e457865637574696e67222c226d657373616765223a2274657374206572726f72222c2264657461696c73223a7b7d7d",
+        );
         assert_eq!(encoded, expected);
     }
 

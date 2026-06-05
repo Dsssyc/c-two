@@ -503,7 +503,8 @@ impl RelayServer {
                                         c2_ipc::IpcError::RouteNotFound(_) => {
                                             "route_not_exported".to_string()
                                         }
-                                        c2_ipc::IpcError::Handshake(reason) => reason,
+                                        c2_ipc::IpcError::ContractMismatch(reason)
+                                        | c2_ipc::IpcError::Protocol(reason) => reason,
                                         other => format!("route_attestation_failed: {other}"),
                                     };
                                     close_client(client);

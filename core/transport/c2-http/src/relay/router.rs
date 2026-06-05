@@ -730,7 +730,8 @@ async fn handle_register(
                         ),
                     }
                 }
-                Err(c2_ipc::IpcError::Handshake(reason)) => {
+                Err(c2_ipc::IpcError::ContractMismatch(reason))
+                | Err(c2_ipc::IpcError::Protocol(reason)) => {
                     close_client(c);
                     eprintln!(
                         "[relay] Register rejected: name={name} server_id={server_id} address={address} reason={reason}"
@@ -797,7 +798,8 @@ async fn handle_register(
                     )
                         .into_response();
                 }
-                Err(c2_ipc::IpcError::Handshake(reason)) => {
+                Err(c2_ipc::IpcError::ContractMismatch(reason))
+                | Err(c2_ipc::IpcError::Protocol(reason)) => {
                     close_client(c);
                     eprintln!(
                         "[relay] Register rejected: name={name} server_id={server_id} address={address} reason={reason}"
@@ -1482,7 +1484,13 @@ fn upstream_acquire_error_kind(error: &c2_ipc::IpcError) -> &'static str {
         c2_ipc::IpcError::Config(_) => "config",
         c2_ipc::IpcError::Decode(_) => "decode",
         c2_ipc::IpcError::Handshake(_) => "handshake",
+        c2_ipc::IpcError::Protocol(_) => "protocol",
+        c2_ipc::IpcError::IdentityMismatch { .. } => "identity-mismatch",
+        c2_ipc::IpcError::ContractMismatch(_) => "contract-mismatch",
         c2_ipc::IpcError::RouteNotFound(_) => "route-missing",
+        c2_ipc::IpcError::MethodNotFound { .. } => "method-missing",
+        c2_ipc::IpcError::Shm(_) => "shm",
+        c2_ipc::IpcError::Chunk(_) => "chunk",
         c2_ipc::IpcError::CrmError(_) => "crm-error",
         c2_ipc::IpcError::Closed => "closed",
         c2_ipc::IpcError::Pool(_) => "pool",
@@ -1492,7 +1500,9 @@ fn upstream_acquire_error_kind(error: &c2_ipc::IpcError) -> &'static str {
 fn should_withdraw_unreachable_route(error: &c2_ipc::IpcError) -> bool {
     matches!(
         error,
-        c2_ipc::IpcError::Handshake(_) | c2_ipc::IpcError::RouteNotFound(_)
+        c2_ipc::IpcError::IdentityMismatch { .. }
+            | c2_ipc::IpcError::ContractMismatch(_)
+            | c2_ipc::IpcError::RouteNotFound(_)
     )
 }
 

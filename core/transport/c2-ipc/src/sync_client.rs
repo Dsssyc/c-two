@@ -175,10 +175,14 @@ impl SyncClient {
             let route_tables = self.inner.route_tables.read();
             let table = route_tables
                 .get(route_name)
-                .ok_or_else(|| IpcError::Handshake(format!("unknown route: {route_name}")))?;
-            let method_idx = table
-                .index_of(method_name)
-                .ok_or_else(|| IpcError::Handshake(format!("unknown method: {method_name}")))?;
+                .ok_or_else(|| IpcError::RouteNotFound(route_name.to_string()))?;
+            let method_idx =
+                table
+                    .index_of(method_name)
+                    .ok_or_else(|| IpcError::MethodNotFound {
+                        route_name: route_name.to_string(),
+                        method_name: method_name.to_string(),
+                    })?;
             let max_payload_size = table.max_payload_size();
             let data_size_u64 = u64::try_from(data_size).unwrap_or(u64::MAX);
             if data_size_u64 > max_payload_size {

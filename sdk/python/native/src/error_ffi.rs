@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -24,28 +26,31 @@ fn decode_error_wire_parts(py: Python<'_>, data: PyBuffer<u8>) -> PyResult<Optio
         return Ok(None);
     };
 
-    let tuple = (u16::from(err.code), err.message).into_pyobject(py)?;
+    let details = PyDict::new(py);
+    for (key, value) in err.details {
+        details.set_item(key, value)?;
+    }
+    let tuple = (u16::from(err.code), err.message, details).into_pyobject(py)?;
     Ok(Some(tuple.into_any().unbind()))
 }
 
 #[pyfunction]
+#[pyo3(signature = (code, message, details=None))]
 fn encode_error_wire<'py>(
     py: Python<'py>,
     code: u16,
     message: &str,
+    details: Option<Bound<'py, PyDict>>,
 ) -> PyResult<Bound<'py, PyBytes>> {
     let code = ErrorCode::try_from(code).unwrap_or(ErrorCode::Unknown);
-    let code_text = u16::from(code).to_string();
-    let message_bytes = message.as_bytes();
-    let total_len = code_text.len() + 1 + message_bytes.len();
-
-    PyBytes::new_with(py, total_len, |buf| {
-        let code_bytes = code_text.as_bytes();
-        buf[..code_bytes.len()].copy_from_slice(code_bytes);
-        buf[code_bytes.len()] = b':';
-        buf[code_bytes.len() + 1..].copy_from_slice(message_bytes);
-        Ok(())
-    })
+    let mut details_map = BTreeMap::new();
+    if let Some(details) = details {
+        for (key, value) in details.iter() {
+            details_map.insert(key.extract::<String>()?, value.extract::<String>()?);
+        }
+    }
+    let wire = C2Error::new(code, message).with_details(details_map).to_wire_bytes();
+    Ok(PyBytes::new(py, &wire))
 }
 
 pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {

@@ -946,7 +946,7 @@ impl PyRuntimeSession {
                 IpcError::RouteNotFound(_) => Err(RelayIpcConnectError::Unavailable(
                     RelayIpcUnavailable::route_missing(&addr, &expected.route_name),
                 )),
-                IpcError::Handshake(_) => Err(RelayIpcConnectError::ContractMismatch(
+                IpcError::ContractMismatch(_) => Err(RelayIpcConnectError::ContractMismatch(
                     PyRuntimeError::new_err(err.to_string()),
                 )),
                 other => Err(RelayIpcConnectError::Unavailable(
