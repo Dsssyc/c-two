@@ -6,16 +6,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use serde::Deserialize;
 use serde_json::json;
 
 use super::{HttpClient, HttpClientPool, HttpError, RelayControlClient, RelayRouteInfo};
 use c2_contract::ExpectedRouteContract;
-
-#[derive(Debug, Deserialize)]
-struct RelayErrorBody {
-    error: String,
-}
 
 #[derive(Debug, Clone, Copy)]
 pub struct RelayAwareClientConfig {
@@ -153,7 +147,7 @@ impl RelayAwareHttpClient {
                 Ok(_) => {
                     return Err(HttpError::ServerError(
                         404,
-                        relay_error_body("ResourceNotFound", self.route_name()),
+                        resource_not_found_body(self.route_name()),
                     ));
                 }
                 Err(err) => {
@@ -177,10 +171,7 @@ impl RelayAwareHttpClient {
             let ordered = self.order_routes(routes, &excluded_routes);
             if ordered.is_empty() {
                 return Err(last_error.unwrap_or_else(|| {
-                    HttpError::ServerError(
-                        404,
-                        relay_error_body("ResourceNotFound", self.route_name()),
-                    )
+                    HttpError::ServerError(404, resource_not_found_body(self.route_name()))
                 }));
             }
 
@@ -228,7 +219,7 @@ impl RelayAwareHttpClient {
         }
 
         Err(last_error.unwrap_or_else(|| {
-            HttpError::ServerError(404, relay_error_body("ResourceNotFound", self.route_name()))
+            HttpError::ServerError(404, resource_not_found_body(self.route_name()))
         }))
     }
 
@@ -247,7 +238,7 @@ impl RelayAwareHttpClient {
                 Ok(_) => {
                     return Err(HttpError::ServerError(
                         404,
-                        relay_error_body("ResourceNotFound", self.route_name()),
+                        resource_not_found_body(self.route_name()),
                     ));
                 }
                 Err(err) => {
@@ -262,10 +253,7 @@ impl RelayAwareHttpClient {
             let ordered = self.order_routes(routes, &excluded_routes);
             if ordered.is_empty() {
                 return Err(last_error.unwrap_or_else(|| {
-                    HttpError::ServerError(
-                        404,
-                        relay_error_body("ResourceNotFound", self.route_name()),
-                    )
+                    HttpError::ServerError(404, resource_not_found_body(self.route_name()))
                 }));
             }
             for route in ordered {
@@ -312,7 +300,7 @@ impl RelayAwareHttpClient {
         }
 
         Err(last_error.unwrap_or_else(|| {
-            HttpError::ServerError(404, relay_error_body("ResourceNotFound", self.route_name()))
+            HttpError::ServerError(404, resource_not_found_body(self.route_name()))
         }))
     }
 
@@ -389,30 +377,55 @@ impl Drop for RelayPoolGuard {
 
 fn route_is_stale(err: &HttpError) -> bool {
     match err {
-        HttpError::ServerError(404, body) => relay_error_is(body, "ResourceNotFound"),
-        HttpError::ServerError(409, body) => relay_error_is(body, "RouteStale"),
-        HttpError::ServerError(502, body) => relay_error_is(body, "UpstreamUnavailable"),
+        HttpError::ServerError(404, body) => {
+            relay_error_code_is(body, c2_error::ErrorCode::ResourceNotFound)
+        }
+        HttpError::ServerError(409, body) => {
+            relay_error_code_is(body, c2_error::ErrorCode::RouteStale)
+        }
+        HttpError::ServerError(502, body) => {
+            relay_error_code_is(body, c2_error::ErrorCode::ResourceUnavailable)
+        }
         _ => false,
     }
 }
 
-fn relay_error_is(body: &str, expected: &str) -> bool {
-    serde_json::from_str::<RelayErrorBody>(body).is_ok_and(|parsed| parsed.error == expected)
+fn relay_error_code_is(body: &str, expected: c2_error::ErrorCode) -> bool {
+    let Ok(envelope) = serde_json::from_str::<c2_error::C2ErrorEnvelope>(body) else {
+        return false;
+    };
+    c2_error::C2Error::from_envelope(envelope).is_ok_and(|err| err.code == expected)
 }
 
-fn relay_error_body(error: &str, route_name: &str) -> String {
-    json!({
-        "error": error,
-        "route": route_name,
-    })
-    .to_string()
+fn resource_not_found_body(route_name: &str) -> String {
+    canonical_relay_error_body(
+        c2_error::ErrorCode::ResourceNotFound,
+        &format!("route not found: {route_name}"),
+        route_name,
+    )
 }
 
 fn crm_contract_mismatch_body(route_name: &str) -> String {
+    canonical_relay_error_body(
+        c2_error::ErrorCode::ContractMismatch,
+        &format!("CRM contract mismatch for route {route_name}"),
+        route_name,
+    )
+}
+
+fn canonical_relay_error_body(
+    code: c2_error::ErrorCode,
+    message: &str,
+    route_name: &str,
+) -> String {
     json!({
-        "error": "CRMContractMismatch",
-        "route": route_name,
-        "message": format!("CRM contract mismatch for route {route_name}"),
+        "version": c2_error::ERROR_WIRE_VERSION,
+        "code": u16::from(code),
+        "name": code.name(),
+        "message": message,
+        "details": {
+            "route": route_name,
+        },
     })
     .to_string()
 }
@@ -546,10 +559,32 @@ mod tests {
         .into_response()
     }
 
-    async fn stale_call() -> Response {
+    fn canonical_error_json(
+        code: u16,
+        name: &str,
+        message: &str,
+        route: &str,
+    ) -> serde_json::Value {
+        json!({
+            "version": 1,
+            "code": code,
+            "name": name,
+            "message": message,
+            "details": {
+                "route": route,
+            },
+        })
+    }
+
+    async fn stale_call(Path((route, _method)): Path<(String, String)>) -> Response {
         (
             StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({"error": "UpstreamUnavailable"})),
+            Json(canonical_error_json(
+                702,
+                "ResourceUnavailable",
+                "relay upstream unavailable",
+                &route,
+            )),
         )
             .into_response()
     }
@@ -589,10 +624,15 @@ mod tests {
             .into_response()
     }
 
-    async fn stale_not_found() -> Response {
+    async fn stale_not_found(Path((route, _method)): Path<(String, String)>) -> Response {
         (
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "ResourceNotFound"})),
+            Json(canonical_error_json(
+                701,
+                "ResourceNotFound",
+                "relay route not found",
+                &route,
+            )),
         )
             .into_response()
     }
@@ -673,10 +713,12 @@ mod tests {
         } else {
             (
                 StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "CRMContractMismatch",
-                    "message": "CRM contract mismatch for route grid",
-                })),
+                Json(canonical_error_json(
+                    709,
+                    "ContractMismatch",
+                    "CRM contract mismatch for route grid",
+                    "grid",
+                )),
             )
                 .into_response()
         }
@@ -684,7 +726,7 @@ mod tests {
 
     async fn call_requires_expected_crm_headers(
         headers: HeaderMap,
-        Path((_route, _method)): Path<(String, String)>,
+        Path((route, _method)): Path<(String, String)>,
         body: Bytes,
     ) -> Response {
         if expected_crm_headers_match(&headers) {
@@ -694,10 +736,12 @@ mod tests {
         } else {
             (
                 StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "CRMContractMismatch",
-                    "message": "CRM contract mismatch for route grid",
-                })),
+                Json(canonical_error_json(
+                    709,
+                    "ContractMismatch",
+                    "CRM contract mismatch for route grid",
+                    &route,
+                )),
             )
                 .into_response()
         }

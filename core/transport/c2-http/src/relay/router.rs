@@ -1,5 +1,6 @@
 //! Axum router for the multi-upstream relay server.
 
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -71,13 +72,57 @@ where
 }
 
 fn duplicate_route_response(name: &str, existing_address: &str) -> Response {
-    (
+    c2_error_response(
         StatusCode::CONFLICT,
-        Json(serde_json::json!({
-            "error": "DuplicateRoute",
-            "name": name,
-            "existing_address": existing_address,
-        })),
+        c2_error::ErrorCode::ResourceAlreadyRegistered,
+        format!("route already registered: {name}"),
+        [
+            ("name", name.to_string()),
+            ("existing_address", existing_address.to_string()),
+        ],
+    )
+}
+
+fn resource_not_found_response(route_name: &str) -> Response {
+    c2_error_response(
+        StatusCode::NOT_FOUND,
+        c2_error::ErrorCode::ResourceNotFound,
+        format!("route not found: {route_name}"),
+        [("route", route_name.to_string())],
+    )
+}
+
+fn resource_unavailable_response(route_name: &str, message: impl Into<String>) -> Response {
+    c2_error_response(
+        StatusCode::BAD_GATEWAY,
+        c2_error::ErrorCode::ResourceUnavailable,
+        message,
+        [("route", route_name.to_string())],
+    )
+}
+
+fn c2_error_response<I, K, V>(
+    status: StatusCode,
+    code: c2_error::ErrorCode,
+    message: impl Into<String>,
+    details: I,
+) -> Response
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: Into<String>,
+    V: Into<String>,
+{
+    let details = details
+        .into_iter()
+        .map(|(key, value)| (key.into(), value.into()))
+        .collect::<BTreeMap<_, _>>();
+    (
+        status,
+        Json(
+            c2_error::C2Error::new(code, message)
+                .with_details(details)
+                .envelope(),
+        ),
     )
         .into_response()
 }
@@ -274,15 +319,12 @@ fn expected_crm_from_headers(
 }
 
 fn crm_contract_mismatch_response(route_name: &str) -> Response {
-    (
+    c2_error_response(
         StatusCode::CONFLICT,
-        Json(serde_json::json!({
-            "error": "CRMContractMismatch",
-            "route": route_name,
-            "message": format!("CRM contract mismatch for route {route_name}"),
-        })),
+        c2_error::ErrorCode::ContractMismatch,
+        format!("CRM contract mismatch for route {route_name}"),
+        [("route", route_name.to_string())],
     )
-        .into_response()
 }
 
 fn route_matches_expected_crm(
@@ -427,14 +469,7 @@ fn validate_expected_crm_for_route(
     expected: &c2_contract::ExpectedRouteContract,
 ) -> Result<RouteEntry, Response> {
     let Some(route) = state.local_route(route_name) else {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": "ResourceNotFound",
-                "route": route_name,
-            })),
-        )
-            .into_response());
+        return Err(resource_not_found_response(route_name));
     };
     if route_matches_expected_crm(&route, expected) {
         Ok(route)
@@ -1183,13 +1218,7 @@ async fn handle_resolve(
     };
     let mut routes = state.resolve_matching(&expected_crm);
     if routes.is_empty() {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": "ResourceNotFound", "name": name,
-            })),
-        )
-            .into_response();
+        return resource_not_found_response(&name);
     }
     if !expose_ipc_address {
         for route in &mut routes {
@@ -1281,22 +1310,11 @@ async fn handle_probe(
             StatusCode::OK.into_response()
         }
         RequestClient::Stale { route } => route_stale_response(&route),
-        RequestClient::NotFound => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": "ResourceNotFound",
-                "route": route_name,
-            })),
-        )
-            .into_response(),
-        RequestClient::Unreachable => (
-            StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({
-                "error": "UpstreamUnavailable",
-                "route": route_name,
-            })),
-        )
-            .into_response(),
+        RequestClient::NotFound => resource_not_found_response(&route_name),
+        RequestClient::Unreachable => resource_unavailable_response(
+            &route_name,
+            format!("relay upstream unavailable: {route_name}"),
+        ),
     }
 }
 
@@ -1342,25 +1360,12 @@ async fn call_handler(
                 binding,
             } => (lease, route, binding),
             RequestClient::Stale { route } => return route_stale_response(&route),
-            RequestClient::NotFound => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({
-                        "error": "ResourceNotFound",
-                        "route": route_name,
-                    })),
-                )
-                    .into_response();
-            }
+            RequestClient::NotFound => return resource_not_found_response(&route_name),
             RequestClient::Unreachable => {
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    Json(serde_json::json!({
-                        "error": "UpstreamUnavailable",
-                        "route": route_name,
-                    })),
-                )
-                    .into_response();
+                return resource_unavailable_response(
+                    &route_name,
+                    format!("relay upstream unavailable: {route_name}"),
+                );
             }
         };
     if let Err(response) =
@@ -1422,26 +1427,14 @@ async fn call_handler(
         Err(c2_ipc::IpcError::RouteNotFound(route)) => {
             drop(lease);
             remove_unreachable_route(&state, &acquired_route);
-            (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": "ResourceNotFound",
-                    "route": route,
-                })),
-            )
-                .into_response()
+            resource_not_found_response(&route)
         }
         Err(e) => {
             // Evict dead client so next request triggers reconnect.
             if let Some(old_client) = lease.evict_current_client() {
                 close_arc_client(old_client);
             }
-            (
-                StatusCode::BAD_GATEWAY,
-                [("content-type", "text/plain")],
-                format!("relay error: {e}"),
-            )
-                .into_response()
+            resource_unavailable_response(&route_name, format!("relay error: {e}"))
         }
     }
 }
@@ -1518,16 +1511,19 @@ async fn acquire_request_client_for_route(
 }
 
 fn route_stale_response(route: &RouteEntry) -> Response {
-    (
+    c2_error_response(
         StatusCode::CONFLICT,
-        Json(serde_json::json!({
-            "error": "RouteStale",
-            "route": route.name.clone(),
-            "route_uid": route.route_uid.clone(),
-            "route_revision": route.route_revision,
-        })),
+        c2_error::ErrorCode::RouteStale,
+        format!(
+            "stale relay route token for {} uid={} revision={}",
+            route.name, route.route_uid, route.route_revision
+        ),
+        [
+            ("route", route.name.clone()),
+            ("route_uid", route.route_uid.clone()),
+            ("route_revision", route.route_revision.to_string()),
+        ],
     )
-        .into_response()
 }
 
 fn upstream_acquire_error_kind(error: &c2_ipc::IpcError) -> &'static str {
@@ -3375,11 +3371,11 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let body = String::from_utf8(body.to_vec()).unwrap();
-        assert!(
-            body.contains("CRMContractMismatch"),
-            "unexpected body: {body}"
-        );
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["version"], 1);
+        assert_eq!(body["code"], 709);
+        assert_eq!(body["name"], "ContractMismatch");
+        assert_eq!(body["details"]["route"], "grid");
 
         shutdown_live_server(&server).await;
     }
@@ -3517,13 +3513,13 @@ mod tests {
 
         let (status, body) = post_call_response(state.clone(), &route_name, "ping").await;
         assert_eq!(status, StatusCode::CONFLICT);
-        let body = String::from_utf8(body).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["version"], 1);
+        assert_eq!(body["code"], 704);
+        assert_eq!(body["name"], "RouteStale");
+        assert_eq!(body["details"]["route"], route_name);
         assert!(
-            body.contains("RouteStale"),
-            "stale route token must be explicit, got: {body}"
-        );
-        assert!(
-            !body.contains("new-route"),
+            !body.to_string().contains("new-route"),
             "relay call must not replay against replacement route: {body}"
         );
 

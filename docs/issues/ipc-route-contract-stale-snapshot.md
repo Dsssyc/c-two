@@ -1,7 +1,8 @@
 # IPC Route Contract Stale Snapshot
 
 **Date**: 2026-06-05
-**Status**: Transitional baseline; superseded by the planned route catalog/watch redesign for full route lifecycle consistency
+**Status**: Route catalog/watch redesign in progress; stale snapshot and relay
+data-plane route-token hazards are covered by current core changes
 **Severity**: High for long-lived multi-route IPC servers
 **Scope**: `c2-ipc` client route catalog, direct IPC acquisition, relay upstream IPC acquisition, relay registration attestation
 
@@ -17,9 +18,12 @@ This affected two production-relevant paths:
 - direct IPC clients reused from the address-keyed `ClientPool`;
 - HTTP relay data-plane calls when the relay reused an upstream `IpcClient`.
 
-The repair is a single IPC-owned live route contract query. Direct IPC and relay
-upstream IPC now share `c2_ipc::IpcClient::ensure_route_contract(...)` before a
-route-bound client is accepted for dispatch.
+The repair moved beyond a single live lookup. IPC servers now expose a route
+catalog with per-route identity and revisions, IPC clients can watch catalog
+events, and relay data-plane calls bind acquisition to the selected route token
+before dispatch. Direct IPC and relay upstream IPC still share the same
+IPC-owned validation path; relay no longer treats route-name lookup alone as
+enough to call an upstream.
 
 ## Reproduced Failure
 
@@ -37,38 +41,39 @@ The failing sequence is:
 
 ## Decision
 
-`c2-ipc` owns the route-catalog refresh mechanism.
+`c2-ipc` and `c2-server` own the route-catalog refresh/watch mechanism.
 
 - `validate_route_contract(...)` remains a cache-only check.
 - `refresh_route_contract(route_name)` asks the connected server for the current
   committed route contract and method table, then updates the client cache.
-- `ensure_route_contract(expected)` first tries the cache and only performs a
-  live query on cache miss or contract mismatch.
+- `ensure_route_contract(expected)` and route-token validation first try the
+  cache and perform a live query on cache miss, mismatch, or stale token.
 - When `refresh_route_contract(...)` is called, a live `RouteNotFound` response
   is the semantic proof that the connected server does not currently export the
   committed route.
+- Watch events proactively add, update, and remove client-side route records;
+  compaction explicitly tells the client its watch offset is too old and a full
+  refresh is required.
+- Relay HTTP probe/call prechecks keep the selected route snapshot and acquire a
+  route-bound upstream binding. If the route is replaced between precheck and
+  acquire, relay returns `RouteStale` instead of replaying the call against the
+  replacement.
 
 This keeps the fast path cheap while removing the assumption that the handshake
 route list is a permanent catalog.
 
 ## Known Remaining Gaps
 
-This repair intentionally does not provide complete route lifecycle
-consistency. It is a tested baseline that fixes stale snapshots missing a route
-that was registered after connection handshake. It does not fully solve these
-cases:
+The current remaining gaps are narrower:
 
-- a cached route that later becomes closed, removed, or replaced can still pass
-  cache-only validation until a call reaches server-side dispatch;
-- `IpcError::Handshake` still represents protocol/decode failures as well as
-  semantic identity and contract failures, so relay withdraw decisions cannot
-  safely use it as a single route-invalid signal;
-- clients and relay upstream pools do not subscribe to route catalog updates,
-  so they cannot proactively invalidate stale route entries.
-
-The long-term fix is a clean-cut route catalog protocol with revisions, watch
-events, route instance identity, typed transport/semantic errors, and
-server-side call-time route validation.
+- Some relay control-plane and malformed-request HTTP errors still use legacy
+  ad hoc JSON bodies. Route semantic data-plane errors now use canonical C2
+  error envelopes and Python maps them back into `CCError` subclasses.
+- Additional SDKs must project the Rust `c2-error` registry the same way the
+  Python SDK does.
+- Future remote transports must preserve the same route-token binding and
+  canonical error-envelope behavior rather than reintroducing route-name-only
+  dispatch.
 
 ## HTTP Client Boundary
 
@@ -81,11 +86,10 @@ an HTTP connection pool entry for the same relay URL does not reuse an IPC
 server route table.
 
 The HTTP relay data plane still depends on IPC behind the relay. A request such
-as `POST /builder/ping` can acquire a relay-owned upstream `IpcClient`. That
-upstream client is subject to the same IPC handshake snapshot issue, so
-`RelayState::acquire_upstream(...)` now calls the shared IPC
-`ensure_route_contract(...)` both when creating a new upstream client and when
-the connection pool returns an existing client.
+as `POST /builder/ping` acquires a relay-owned upstream `IpcClient`. That
+upstream client is subject to IPC catalog drift, so relay acquisition validates
+the selected route token before dispatch. A replacement route under the same
+name is not an acceptable substitute for the prechecked route.
 
 ## Registration Boundary
 
@@ -110,3 +114,8 @@ route attestation token path.
 - `c2-http` relay: an HTTP relay data-plane request must succeed when the relay
   upstream slot contains an `IpcClient` whose original handshake snapshot lacks
   the later committed route.
+- `c2-http` relay: a call prechecked against one route token must reject a
+  same-contract replacement route with canonical `RouteStale`.
+- Python SDK: a canonical relay route error returned during an HTTP CRM call
+  must raise the matching `CCError` subclass instead of a generic
+  `RuntimeError` / `ClientCallResource`.

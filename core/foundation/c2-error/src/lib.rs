@@ -279,16 +279,7 @@ impl C2Error {
         out
     }
 
-    pub fn from_wire_bytes(data: &[u8]) -> Result<Option<Self>, C2ErrorDecodeError> {
-        if data.is_empty() {
-            return Ok(None);
-        }
-
-        let Some(payload) = data.strip_prefix(ERROR_WIRE_MAGIC) else {
-            return Err(C2ErrorDecodeError::MissingMagic);
-        };
-        let envelope: C2ErrorEnvelope = serde_json::from_slice(payload)
-            .map_err(|err| C2ErrorDecodeError::InvalidJson(err.to_string()))?;
+    pub fn from_envelope(envelope: C2ErrorEnvelope) -> Result<Self, C2ErrorDecodeError> {
         if envelope.version != ERROR_WIRE_VERSION {
             return Err(C2ErrorDecodeError::UnsupportedVersion(envelope.version));
         }
@@ -302,11 +293,11 @@ impl C2Error {
                         actual: envelope.name,
                     });
                 }
-                Ok(Some(C2Error {
+                Ok(C2Error {
                     code,
                     message: envelope.message,
                     details: envelope.details,
-                }))
+                })
             }
             Err(()) => {
                 let mut details = envelope.details;
@@ -316,16 +307,29 @@ impl C2Error {
                 details
                     .entry("unknown_name".to_string())
                     .or_insert_with(|| envelope.name.clone());
-                Ok(Some(C2Error {
+                Ok(C2Error {
                     code: ErrorCode::Unknown,
                     message: format!(
                         "Unknown error code {} ({}): {}",
                         envelope.code, envelope.name, envelope.message
                     ),
                     details,
-                }))
+                })
             }
         }
+    }
+
+    pub fn from_wire_bytes(data: &[u8]) -> Result<Option<Self>, C2ErrorDecodeError> {
+        if data.is_empty() {
+            return Ok(None);
+        }
+
+        let Some(payload) = data.strip_prefix(ERROR_WIRE_MAGIC) else {
+            return Err(C2ErrorDecodeError::MissingMagic);
+        };
+        let envelope: C2ErrorEnvelope = serde_json::from_slice(payload)
+            .map_err(|err| C2ErrorDecodeError::InvalidJson(err.to_string()))?;
+        Ok(Some(Self::from_envelope(envelope)?))
     }
 }
 
@@ -339,7 +343,7 @@ impl std::error::Error for C2Error {}
 
 #[cfg(test)]
 mod tests {
-    use super::{C2Error, ErrorCode};
+    use super::{C2Error, C2ErrorEnvelope, ErrorCode};
     use std::collections::BTreeMap;
 
     #[test]
@@ -459,6 +463,24 @@ mod tests {
         )
             .unwrap()
             .unwrap();
+        assert_eq!(err.code, ErrorCode::ResourceNotFound);
+        assert_eq!(err.message, "missing grid");
+        assert_eq!(err.details.get("route").map(String::as_str), Some("grid"));
+    }
+
+    #[test]
+    fn envelope_decode_known_code_returns_canonical_error() {
+        let mut details = BTreeMap::new();
+        details.insert("route".to_string(), "grid".to_string());
+        let err = C2Error::from_envelope(C2ErrorEnvelope {
+            version: 1,
+            code: 701,
+            name: "ResourceNotFound".to_string(),
+            message: "missing grid".to_string(),
+            details,
+        })
+        .unwrap();
+
         assert_eq!(err.code, ErrorCode::ResourceNotFound);
         assert_eq!(err.message, "missing grid");
         assert_eq!(err.details.get("route").map(String::as_str), Some("grid"));
