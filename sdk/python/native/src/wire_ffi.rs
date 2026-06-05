@@ -267,7 +267,18 @@ fn encode_call_control(
 fn decode_call_control(
     data: &[u8],
     offset: usize,
-) -> PyResult<(String, String, u64, String, String, String, String, String, u16, usize)> {
+) -> PyResult<(
+    String,
+    String,
+    u64,
+    String,
+    String,
+    String,
+    String,
+    String,
+    u16,
+    usize,
+)> {
     let (ctrl, consumed) =
         c2_wire::control::decode_call_control(data, offset).map_err(decode_err)?;
     Ok((

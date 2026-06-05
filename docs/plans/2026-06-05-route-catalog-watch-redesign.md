@@ -1,7 +1,7 @@
 # Route Catalog Watch Redesign Implementation Plan
 
 **Date:** 2026-06-05
-**Status:** Phase 1 implemented; Phase 2 call-token foundation implemented; Phase 3 wire-control and server catalog/control slices implemented; client RouteDirectory/watch pending
+**Status:** Phase 1 implemented; Phase 2 call-token foundation implemented; Phase 3 RouteCatalog wire/server/client watch implemented; Phase 4 relay authority/data-pool split pending
 **Scope:** IPC route lifecycle, relay route authority, relay upstream pools, relay-aware HTTP fallback, Rust error taxonomy, Python SDK error facade
 **Supersedes:** `docs/issues/ipc-route-contract-stale-snapshot.md` as the long-term design
 
@@ -381,14 +381,12 @@ critical decisions.
 
 ### RouteAck And RouteNack
 
-`RouteAck` and `RouteNack` are implemented with the watch protocol in Phase 3,
-not merely reserved. Direct IPC clients send an ACK after applying a contiguous
-event sequence. A NACK is sent when the client rejects an event due to invalid
-wire data, contract validation failure, revision gap, or local apply error.
-
-The server does not wait for ACK before making a route change authoritative.
-ACK/NACK is diagnostic and flow-control input, not a distributed consensus
-commit. After a NACK, the client marks its directory dirty and relists.
+`RouteAck` and `RouteNack` are part of the route catalog control envelope.
+`RouteNack` carries a registered `C2ErrorEnvelope` and is consumed by direct IPC
+clients as a signal to mark the route directory dirty and relist. `RouteAck` is
+reserved in the wire/control model for diagnostics and future flow-control
+input; servers do not wait for ACK before making a route change authoritative.
+After any NACK, the client must mark its directory dirty and relist.
 
 ```rust
 pub struct RouteAck {
@@ -833,10 +831,12 @@ Deliverables:
 - add wire messages for list, lookup, watch, heartbeat, compacted;
 - implement client `RouteDirectory`;
 - add watch task lifecycle to `IpcClient`;
-- implement `RouteAck` and `RouteNack`;
+- implement `RouteNack` handling and keep `RouteAck` in the typed control
+  envelope for diagnostics/future flow-control;
 - make acquire use clean directory fast path or authoritative lookup/relist;
-- remove `refresh_route_contract(...)` and `ensure_route_contract(...)` as
-  production APIs.
+- remove the old lazy `refresh_route_contract(...)` production path. The
+  remaining internal `ensure_route_contract(...)` boundary now performs
+  catalog lookup/relist instead of accepting handshake snapshots as authority.
 
 Implementation status:
 
@@ -849,8 +849,26 @@ Implementation status:
   bounded watch compaction, handshake projection from catalog state, call-time
   catalog lookup, and `RouteList` / `RouteLookup` / one-shot `RouteWatch`
   control payload handling;
-- client `RouteDirectory`, long-lived client watch lifecycle, and removal of
-  lazy snapshot refresh APIs remain pending in this phase.
+- implemented client `RouteDirectory` in `c2-ipc` and replaced the old
+  handshake `route_tables` authority with catalog projection state;
+- implemented an IPC client watch lifecycle that repeatedly issues
+  `RouteWatch` from the observed catalog revision, applies ordered route events,
+  treats heartbeat as batch completion, and rebuilds through `RouteList` after
+  NACK or compaction;
+- route-bound direct IPC acquire now forces authoritative `RouteLookup` before
+  creating a `RouteBinding`. Python `CRMProxy` and relay-resolved local IPC
+  clients carry that immutable binding, so an existing proxy cannot silently
+  retarget to a new same-name resource instance after route replacement;
+- non-binding internal ensure paths can still use clean directory fast path,
+  `RouteLookup`, or `RouteList` rebuild. Watch-unavailable state is surfaced as
+  `RouteWatchUnavailable` instead of being collapsed into route-missing;
+- removed the `refresh_route_contract(...)` production path and added a source
+  guard for it. The internal `ensure_route_contract(...)` method remains as the
+  runtime/relay call boundary but now uses authoritative catalog lookup/relist;
+- updated relay registration and HTTP acquire paths to use catalog rebuild and
+  typed route-state errors rather than lazy route-contract refresh. Relay
+  withdrawal remains forbidden for catalog compaction, watch unavailable,
+  route stale, and generic I/O.
 
 Acceptance:
 
@@ -867,6 +885,19 @@ Verification:
 - `cargo test --manifest-path core/Cargo.toml -p c2-wire`
 - `cargo test --manifest-path core/Cargo.toml -p c2-ipc`
 - direct IPC integration test with relay env unset and unavailable relay env.
+
+Status:
+
+- implemented and verified on 2026-06-05:
+  - `cargo test --manifest-path core/Cargo.toml -p c2-ipc`;
+  - `cargo test --manifest-path core/Cargo.toml -p c2-server`;
+  - `cargo test --manifest-path core/Cargo.toml -p c2-runtime`;
+  - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay`;
+  - `cargo test --manifest-path core/Cargo.toml --workspace`;
+  - `uv sync --reinstall-package c-two`;
+  - `C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/unit/test_error.py sdk/python/tests/unit/test_native_error_registry.py sdk/python/tests/unit/test_runtime_session.py -q --timeout=30`;
+  - `C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/integration/test_error_propagation.py -q --timeout=30`;
+  - `C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30`.
 
 ### Phase 4: Relay RouteAuthority And Upstream Boundaries
 

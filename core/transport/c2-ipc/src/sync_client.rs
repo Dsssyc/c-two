@@ -9,8 +9,8 @@ use std::sync::{Arc, OnceLock};
 use c2_mem::{MemPool, PoolAllocation};
 
 use crate::client::{
-    ClientIpcConfig, IpcClient, IpcError, MethodTable, RequestTransportKind, ServerPoolState,
-    choose_request_transport,
+    ClientIpcConfig, IpcClient, IpcError, MethodTable, RequestTransportKind, RouteBinding,
+    ServerPoolState, choose_request_transport,
 };
 use crate::response::ResponseData;
 
@@ -82,6 +82,17 @@ impl SyncClient {
     ) -> Result<ResponseData, IpcError> {
         self.rt
             .block_on(self.inner.call(route_name, method_name, data))
+    }
+
+    /// Synchronous CRM call through an immutable route binding.
+    pub fn call_bound(
+        &self,
+        binding: &RouteBinding,
+        method_name: &str,
+        data: &[u8],
+    ) -> Result<ResponseData, IpcError> {
+        self.rt
+            .block_on(self.inner.call_bound(binding, method_name, data))
     }
 
     /// Whether the client has a SHM pool and data exceeds the threshold.
@@ -172,25 +183,46 @@ impl SyncClient {
         data_size: usize,
     ) -> Result<ResponseData, IpcError> {
         let (method_idx, identity) = match (|| {
-            let route_tables = self.inner.route_tables.read();
-            let table = route_tables
-                .get(route_name)
-                .ok_or_else(|| IpcError::RouteNotFound(route_name.to_string()))?;
-            let method_idx =
-                table
-                    .index_of(method_name)
-                    .ok_or_else(|| IpcError::MethodNotFound {
-                        route_name: route_name.to_string(),
-                        method_name: method_name.to_string(),
-                    })?;
-            let max_payload_size = table.max_payload_size();
+            let (method_idx, identity, max_payload_size) =
+                self.inner.call_target_for(route_name, method_name)?;
             let data_size_u64 = u64::try_from(data_size).unwrap_or(u64::MAX);
             if data_size_u64 > max_payload_size {
                 return Err(IpcError::Config(format!(
                     "request payload size {data_size_u64} exceeds route '{route_name}' max_payload_size {max_payload_size}"
                 )));
             }
-            Ok((method_idx, table.call_identity()))
+            Ok((method_idx, identity))
+        })() {
+            Ok(target) => target,
+            Err(err) => {
+                self.inner.free_prealloc(alloc);
+                return Err(err);
+            }
+        };
+        self.rt.block_on(
+            self.inner
+                .call_with_prealloc(&identity, method_idx, alloc, data_size),
+        )
+    }
+
+    /// Synchronous CRM call with pre-allocated SHM data through an immutable route binding.
+    pub fn call_bound_prealloc(
+        &self,
+        binding: &RouteBinding,
+        method_name: &str,
+        alloc: &PoolAllocation,
+        data_size: usize,
+    ) -> Result<ResponseData, IpcError> {
+        let (method_idx, identity) = match (|| {
+            let (method_idx, identity, max_payload_size) = binding.call_target_for(method_name)?;
+            let data_size_u64 = u64::try_from(data_size).unwrap_or(u64::MAX);
+            if data_size_u64 > max_payload_size {
+                return Err(IpcError::Config(format!(
+                    "request payload size {data_size_u64} exceeds route '{}' max_payload_size {max_payload_size}",
+                    binding.route_name()
+                )));
+            }
+            Ok((method_idx, identity))
         })() {
             Ok(target) => target,
             Err(err) => {
@@ -248,6 +280,15 @@ impl SyncClient {
         expected: &c2_contract::ExpectedRouteContract,
     ) -> Result<(), IpcError> {
         self.rt.block_on(self.inner.ensure_route_contract(expected))
+    }
+
+    /// Ensure and bind the connected route against an expected CRM contract.
+    pub fn bind_route(
+        &self,
+        expected: &c2_contract::ExpectedRouteContract,
+    ) -> Result<RouteBinding, IpcError> {
+        self.rt.block_on(self.inner.lookup_route(expected))?;
+        self.inner.bind_route(expected)
     }
 
     /// CRM tag advertised by a route, if present.
@@ -378,7 +419,7 @@ pub(crate) mod tests {
         };
         let pool = Arc::new(Mutex::new(MemPool::new(c2_mem::PoolConfig::default())));
         let inner = IpcClient::with_pool("ipc://sync_payload_limit", pool.clone(), config);
-        inner.route_tables.write().insert(
+        inner.route_directory.write().insert_table(
             "grid".to_string(),
             MethodTable::from_entries(
                 &[c2_wire::handshake::MethodEntry {

@@ -567,6 +567,25 @@ mod tests {
                     &payload,
                 );
                 stream.write_all(&frame).unwrap();
+                let mut len_buf = [0_u8; 4];
+                stream.read_exact(&mut len_buf).unwrap();
+                let body_len = u32::from_le_bytes(len_buf) as usize;
+                let mut body = vec![0_u8; body_len];
+                stream.read_exact(&mut body).unwrap();
+                let request_id = u64::from_le_bytes(body[0..8].try_into().unwrap());
+                let heartbeat = c2_wire::route_catalog_control::encode_route_watch_event(
+                    &c2_wire::route_catalog_control::RouteWatchEvent::Heartbeat {
+                        catalog_revision: 1,
+                    },
+                )
+                .unwrap();
+                let response = c2_wire::frame::encode_frame(
+                    request_id,
+                    c2_wire::flags::FLAG_RESPONSE | c2_wire::flags::FLAG_CTRL,
+                    &heartbeat,
+                );
+                stream.write_all(&response).unwrap();
+                std::thread::sleep(Duration::from_millis(100));
             }
         });
 
@@ -580,7 +599,7 @@ mod tests {
     }
 
     #[test]
-    fn pooled_direct_client_refreshes_route_registered_after_handshake() {
+    fn pooled_direct_client_observes_route_registered_after_handshake() {
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         rt.block_on(async {
             let address = unique_ipc_address("pool_live_route_refresh");
@@ -608,9 +627,6 @@ mod tests {
 
             register_test_route(&server, "builder").await;
             let builder_contract = expected_contract("builder");
-            client
-                .validate_route_contract(&builder_contract)
-                .expect_err("old handshake snapshot must not already know builder");
 
             let ensure_client = Arc::clone(&client);
             let ensure_contract = builder_contract.clone();
@@ -619,8 +635,18 @@ mod tests {
             })
             .await
             .expect("ensure task should complete")
-            .expect("direct pooled IPC client should refresh builder route from server");
-            assert!(client.route_names().contains(&"builder".to_string()));
+            .expect("direct pooled IPC client should acquire builder through route catalog");
+
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !client.route_names().contains(&"builder".to_string())
+                && Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(
+                client.route_names().contains(&"builder".to_string()),
+                "route directory should contain builder after lookup/watch"
+            );
             pool.release(&address);
 
             server

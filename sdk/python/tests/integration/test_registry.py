@@ -16,7 +16,7 @@ import pytest
 
 import c_two as cc
 from c_two.config.settings import settings
-from c_two.error import ResourceAlreadyRegistered
+from c_two.error import ResourceAlreadyRegistered, RouteStale
 from c_two.transport.registry import _ProcessRegistry
 from c_two.transport.client.proxy import CRMProxy
 
@@ -46,6 +46,14 @@ class UndecoratedHello:
 class MissingGreetingImpl:
     def other(self, name: str) -> str:
         return name
+
+
+class PrefixHelloImpl(HelloImpl):
+    def __init__(self, prefix: str) -> None:
+        self.prefix = prefix
+
+    def greeting(self, name: str) -> str:
+        return f'{self.prefix}:{name}'
 
 
 class BadGreetingAnnotationImpl:
@@ -271,6 +279,27 @@ class TestRegisterConnect:
             assert crm.client._client.route_name == 'hello'  # noqa: SLF001
         finally:
             cc.close(crm)
+
+    def test_ipc_proxy_keeps_acquired_route_token_after_reregister(self):
+        cc.register(Hello, PrefixHelloImpl('old'), name='hello')
+        addr = cc.server_address()
+        assert addr is not None
+
+        old_crm = cc.connect(Hello, name='hello', address=addr)
+        try:
+            assert old_crm.greeting('grid') == 'old:grid'
+            cc.unregister('hello')
+            cc.register(Hello, PrefixHelloImpl('new'), name='hello')
+
+            new_crm = cc.connect(Hello, name='hello', address=addr)
+            try:
+                assert new_crm.greeting('grid') == 'new:grid'
+                with pytest.raises(RouteStale, match='stale route token'):
+                    old_crm.greeting('grid')
+            finally:
+                cc.close(new_crm)
+        finally:
+            cc.close(old_crm)
 
     def test_raw_ipc_client_rejects_unbound_crm_call(self):
         from c_two._native import RustClientPool

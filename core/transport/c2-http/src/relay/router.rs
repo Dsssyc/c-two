@@ -756,8 +756,8 @@ async fn handle_register(
                             .into_response();
                 }
             },
-            None => match c.refresh_route_contract(&name).await {
-                Ok(_) => match read_ipc_route_contract(&c, &name) {
+            None => match c.rebuild_route_catalog().await {
+                Ok(()) => match read_ipc_route_contract(&c, &name) {
                     Ok(contract) => contract,
                     Err(ControlError::NotFound) => {
                         close_client(c);
@@ -1471,7 +1471,9 @@ async fn acquire_request_client(state: Arc<RelayState>, route_name: &str) -> Req
                 remove_unreachable_route(&state, &route);
             }
             match error {
-                c2_ipc::IpcError::RouteNotFound(_) => RequestClient::NotFound,
+                c2_ipc::IpcError::RouteNotFound(_)
+                | c2_ipc::IpcError::RouteRemoved { .. }
+                | c2_ipc::IpcError::RouteClosed { .. } => RequestClient::NotFound,
                 _ => RequestClient::Unreachable,
             }
         }
@@ -1488,6 +1490,11 @@ fn upstream_acquire_error_kind(error: &c2_ipc::IpcError) -> &'static str {
         c2_ipc::IpcError::IdentityMismatch { .. } => "identity-mismatch",
         c2_ipc::IpcError::ContractMismatch(_) => "contract-mismatch",
         c2_ipc::IpcError::RouteNotFound(_) => "route-missing",
+        c2_ipc::IpcError::RouteRemoved { .. } => "route-removed",
+        c2_ipc::IpcError::RouteClosed { .. } => "route-closed",
+        c2_ipc::IpcError::RouteStale { .. } => "route-stale",
+        c2_ipc::IpcError::CatalogCompacted { .. } => "catalog-compacted",
+        c2_ipc::IpcError::WatchUnavailable(_) => "watch-unavailable",
         c2_ipc::IpcError::MethodNotFound { .. } => "method-missing",
         c2_ipc::IpcError::Shm(_) => "shm",
         c2_ipc::IpcError::Chunk(_) => "chunk",
@@ -1503,6 +1510,8 @@ fn should_withdraw_unreachable_route(error: &c2_ipc::IpcError) -> bool {
         c2_ipc::IpcError::IdentityMismatch { .. }
             | c2_ipc::IpcError::ContractMismatch(_)
             | c2_ipc::IpcError::RouteNotFound(_)
+            | c2_ipc::IpcError::RouteRemoved { .. }
+            | c2_ipc::IpcError::RouteClosed { .. }
     )
 }
 

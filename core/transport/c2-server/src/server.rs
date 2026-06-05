@@ -1939,24 +1939,38 @@ fn route_watch_payloads(server: &Server, payload: &[u8]) -> Vec<Vec<u8>> {
             current_revision,
             events,
         } => {
-            if events.is_empty() && request.allow_heartbeat {
-                return vec![
-                    encode_route_watch_event(&RouteWatchEvent::Heartbeat {
-                        catalog_revision: current_revision,
-                    })
-                    .unwrap_or_else(|err| {
-                        route_catalog_nack_payload(server, current_revision, err)
-                    }),
-                ];
+            if events.is_empty() {
+                if request.allow_heartbeat {
+                    return vec![
+                        encode_route_watch_event(&RouteWatchEvent::Heartbeat {
+                            catalog_revision: current_revision,
+                        })
+                        .unwrap_or_else(|err| {
+                            route_catalog_nack_payload(server, current_revision, err)
+                        }),
+                    ];
+                }
+                return Vec::new();
             }
-            events
+            let mut payloads = events
                 .into_iter()
                 .map(|event| {
                     let revision = event_revision_for_nack(&event);
                     encode_route_watch_event(&event)
                         .unwrap_or_else(|err| route_catalog_nack_payload(server, revision, err))
                 })
-                .collect()
+                .collect::<Vec<_>>();
+            if request.allow_heartbeat {
+                payloads.push(
+                    encode_route_watch_event(&RouteWatchEvent::Heartbeat {
+                        catalog_revision: current_revision,
+                    })
+                    .unwrap_or_else(|err| {
+                        route_catalog_nack_payload(server, current_revision, err)
+                    }),
+                );
+            }
+            payloads
         }
     }
 }
@@ -3968,6 +3982,39 @@ mod tests {
             }
             other => panic!("expected removed lookup, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn route_watch_ctrl_terminates_event_batch_with_heartbeat() {
+        use c2_wire::route_catalog_control::{
+            RouteSelector, RouteWatchEvent, RouteWatchRequest, decode_route_watch_event,
+            encode_route_watch_request,
+        };
+
+        let server = Arc::new(
+            Server::new("ipc://route_watch_heartbeat", ServerIpcConfig::default()).unwrap(),
+        );
+        server.register_route(make_route("grid")).await.unwrap();
+        let request = RouteWatchRequest {
+            from_revision: 0,
+            selector: RouteSelector::All,
+            allow_heartbeat: true,
+        };
+
+        let payloads =
+            route_watch_payloads(&server, &encode_route_watch_request(&request).unwrap());
+
+        assert_eq!(payloads.len(), 2);
+        assert!(matches!(
+            decode_route_watch_event(&payloads[0]).unwrap(),
+            RouteWatchEvent::Added { .. }
+        ));
+        assert!(matches!(
+            decode_route_watch_event(&payloads[1]).unwrap(),
+            RouteWatchEvent::Heartbeat {
+                catalog_revision: 1
+            }
+        ));
     }
 
     #[tokio::test]

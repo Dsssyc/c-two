@@ -328,6 +328,10 @@ mod client_tests {
             !client_production.contains("pub async fn call_full("),
             "IpcClient must expose one canonical semantic call API"
         );
+        assert!(
+            !client_production.contains("refresh_route_contract"),
+            "IpcClient must not reintroduce name-only route contract refresh"
+        );
 
         let sync_source = include_str!("sync_client.rs");
         let sync_production = sync_source

@@ -19,7 +19,7 @@ use pyo3::types::PyBytes;
 use crate::lease_ffi::PyBufferLeaseTracker;
 use crate::writable_sink::{prepared_plan_nbytes, write_python_payload_plan};
 use c2_config::{BaseIpcConfig, ClientIpcConfig};
-use c2_ipc::{ClientPool, IpcError, ResponseData, ServerPoolState, SyncClient};
+use c2_ipc::{ClientPool, IpcError, ResponseData, RouteBinding, ServerPoolState, SyncClient};
 use c2_mem::{BufferLeaseGuard, MemPool};
 
 // ---------------------------------------------------------------------------
@@ -359,14 +359,14 @@ impl Drop for PyResponseBuffer {
 #[pyclass(name = "RustClient", frozen)]
 pub struct PyRustClient {
     inner: Arc<SyncClient>,
-    bound_route_name: Option<String>,
+    bound_route: Option<RouteBinding>,
 }
 
 impl PyRustClient {
-    pub(crate) fn from_arc_bound(inner: Arc<SyncClient>, route_name: String) -> Self {
+    pub(crate) fn from_arc_bound(inner: Arc<SyncClient>, binding: RouteBinding) -> Self {
         Self {
             inner,
-            bound_route_name: Some(route_name),
+            bound_route: Some(binding),
         }
     }
 }
@@ -374,12 +374,12 @@ impl PyRustClient {
 pub(crate) fn call_sync_client<'py>(
     py: Python<'py>,
     inner: &Arc<SyncClient>,
-    route_name: &str,
+    route_binding: &RouteBinding,
     method_name: &str,
     data: &[u8],
 ) -> PyResult<PyResponseBuffer> {
     let client = Arc::clone(inner);
-    let route = route_name.to_string();
+    let binding = route_binding.clone();
     let method = method_name.to_string();
 
     // Fast path: direct SHM write for large payloads.
@@ -390,8 +390,9 @@ pub(crate) fn call_sync_client<'py>(
         match client.pool_alloc_and_write(data) {
             Ok(alloc) => {
                 let data_size = data.len();
-                let result =
-                    py.detach(move || client.call_prealloc(&route, &method, &alloc, data_size));
+                let result = py.detach(move || {
+                    client.call_bound_prealloc(&binding, &method, &alloc, data_size)
+                });
                 return match result {
                     Ok(response_data) => {
                         let pool = inner.server_pool_arc();
@@ -424,7 +425,7 @@ pub(crate) fn call_sync_client<'py>(
     // Fallback: inline/chunked path (small payloads or pool unavailable).
     // to_vec() is needed because detach requires owned data.
     let payload = data.to_vec();
-    let result = py.detach(move || client.call(&route, &method, &payload));
+    let result = py.detach(move || client.call_bound(&binding, &method, &payload));
 
     match result {
         Ok(response_data) => {
@@ -510,7 +511,7 @@ impl PyRustClient {
         })?;
         Ok(Self {
             inner: Arc::new(client),
-            bound_route_name: None,
+            bound_route: None,
         })
     }
 
@@ -526,12 +527,12 @@ impl PyRustClient {
         method_name: &str,
         data: &[u8],
     ) -> PyResult<PyResponseBuffer> {
-        let Some(bound_route_name) = self.bound_route_name.as_ref() else {
+        let Some(bound_route) = self.bound_route.as_ref() else {
             return Err(PyRuntimeError::new_err(
                 "RustClient CRM calls require a route-bound client from RuntimeSession.acquire_ipc_client()",
             ));
         };
-        call_sync_client(py, &self.inner, bound_route_name, method_name, data)
+        call_sync_client(py, &self.inner, bound_route, method_name, data)
     }
 
     /// Call a CRM method with a prepared payload write plan.
@@ -541,7 +542,7 @@ impl PyRustClient {
         method_name: &str,
         plan: &Bound<'py, PyAny>,
     ) -> PyResult<PyResponseBuffer> {
-        let Some(bound_route_name) = self.bound_route_name.as_ref() else {
+        let Some(bound_route) = self.bound_route.as_ref() else {
             return Err(PyRuntimeError::new_err(
                 "RustClient CRM calls require a route-bound client from RuntimeSession.acquire_ipc_client()",
             ));
@@ -558,13 +559,7 @@ impl PyRustClient {
         if !self.inner.should_use_shm(data_size) {
             let payload = plan.call_method0("to_bytes")?;
             let bytes = payload.cast::<PyBytes>()?;
-            return call_sync_client(
-                py,
-                &self.inner,
-                bound_route_name,
-                method_name,
-                bytes.as_bytes(),
-            );
+            return call_sync_client(py, &self.inner, bound_route, method_name, bytes.as_bytes());
         }
 
         let alloc = self
@@ -576,9 +571,10 @@ impl PyRustClient {
             .map_err(|err| PyRuntimeError::new_err(format!("{err}")))?;
 
         let client = Arc::clone(&self.inner);
-        let route = bound_route_name.to_string();
+        let binding = bound_route.clone();
         let method = method_name.to_string();
-        let result = py.detach(move || client.call_prealloc(&route, &method, &alloc, data_size));
+        let result =
+            py.detach(move || client.call_bound_prealloc(&binding, &method, &alloc, data_size));
         match result {
             Ok(response_data) => {
                 let pool = self.inner.server_pool_arc();
@@ -608,7 +604,9 @@ impl PyRustClient {
     /// Route name validated by the runtime session for CRM calls.
     #[getter]
     fn route_name(&self) -> Option<&str> {
-        self.bound_route_name.as_deref()
+        self.bound_route
+            .as_ref()
+            .map(|binding| binding.route_name())
     }
 
     /// Get all route names advertised by the server.
@@ -706,7 +704,7 @@ impl PyRustClientPool {
             .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
         Ok(PyRustClient {
             inner: client,
-            bound_route_name: None,
+            bound_route: None,
         })
     }
 

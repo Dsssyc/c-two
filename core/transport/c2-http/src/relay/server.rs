@@ -498,7 +498,7 @@ impl RelayServer {
                                     let _ = reply.send(Err(RelayControlError::Other(reason)));
                                     continue;
                                 }
-                                if let Err(err) = client.refresh_route_contract(&name).await {
+                                if let Err(err) = client.rebuild_route_catalog().await {
                                     let reason = match err {
                                         c2_ipc::IpcError::RouteNotFound(_) => {
                                             "route_not_exported".to_string()

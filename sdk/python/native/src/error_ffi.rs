@@ -49,7 +49,9 @@ fn encode_error_wire<'py>(
             details_map.insert(key.extract::<String>()?, value.extract::<String>()?);
         }
     }
-    let wire = C2Error::new(code, message).with_details(details_map).to_wire_bytes();
+    let wire = C2Error::new(code, message)
+        .with_details(details_map)
+        .to_wire_bytes();
     Ok(PyBytes::new(py, &wire))
 }
 
