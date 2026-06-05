@@ -324,6 +324,175 @@ mod control_tests {
     }
 }
 
+mod route_catalog_control_tests {
+    use crate::route_catalog_control::*;
+    use c2_error::{C2Error, ErrorCode};
+
+    const ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const SIG_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+    fn contract(route_name: &str) -> RouteContractWire {
+        RouteContractWire {
+            route_name: route_name.into(),
+            crm_ns: "test.grid".into(),
+            crm_name: "Grid".into(),
+            crm_ver: "0.1.0".into(),
+            abi_hash: ABI_HASH.into(),
+            signature_hash: SIG_HASH.into(),
+        }
+    }
+
+    fn record(route_name: &str, revision: u64) -> RouteRecordWire {
+        RouteRecordWire {
+            route_name: route_name.into(),
+            route_uid: format!("{route_name}-uid-0001"),
+            route_revision: revision,
+            catalog_revision: revision,
+            owner_server_id: "server-grid".into(),
+            owner_server_instance_id: "instance-grid-0001".into(),
+            owner_epoch: 1,
+            contract: contract(route_name),
+            methods: vec![
+                RouteMethodWire {
+                    name: "step".into(),
+                    index: 0,
+                },
+                RouteMethodWire {
+                    name: "query".into(),
+                    index: 1,
+                },
+            ],
+            max_payload_size: 1024,
+            state: RouteStateWire::Ready,
+            state_reason: Some(RouteStateReasonWire::RegisterCommitted),
+            lease_deadline_ms: None,
+        }
+    }
+
+    #[test]
+    fn route_list_request_matches_canonical_fixture() {
+        let request = RouteListRequest {
+            selector: RouteSelector::All,
+            min_revision: None,
+        };
+        let encoded = encode_route_list_request(&request).unwrap();
+        let expected = b"\x0e{\"selector\":{\"type\":\"all\"},\"min_revision\":null}".to_vec();
+
+        assert_eq!(encoded, expected);
+        assert_eq!(decode_route_list_request(&expected).unwrap(), request);
+    }
+
+    #[test]
+    fn route_lookup_stale_response_round_trips_current_record() {
+        let current = record("grid", 3);
+        let response = RouteLookupResponse::Stale {
+            current: current.clone(),
+        };
+        let encoded = encode_route_lookup_response(&response).unwrap();
+        let decoded = decode_route_lookup_response(&encoded).unwrap();
+
+        assert_eq!(decoded, response);
+        match decoded {
+            RouteLookupResponse::Stale {
+                current: decoded_current,
+            } => {
+                assert_eq!(decoded_current.route_uid, "grid-uid-0001");
+                assert_eq!(decoded_current.route_revision, 3);
+                assert_eq!(decoded_current.contract.abi_hash, ABI_HASH);
+            }
+            other => panic!("expected stale response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_watch_compacted_event_is_history_boundary_not_removal() {
+        let event = RouteWatchEvent::Compacted {
+            compacted_revision: 7,
+            current_revision: 11,
+        };
+        let encoded = encode_route_watch_event(&event).unwrap();
+        let expected =
+            b"\x13{\"event\":\"compacted\",\"compacted_revision\":7,\"current_revision\":11}"
+                .to_vec();
+
+        assert_eq!(encoded, expected);
+        assert_eq!(decode_route_watch_event(&expected).unwrap(), event);
+    }
+
+    #[test]
+    fn route_nack_carries_registered_c2_error_envelope() {
+        let error =
+            C2Error::new(ErrorCode::RouteCatalogCompacted, "watch history compacted").envelope();
+        let nack = RouteNack {
+            nonce: 55,
+            rejected_revision: 9,
+            error,
+        };
+        let encoded = encode_route_nack(&nack).unwrap();
+        let decoded = decode_route_nack(&encoded).unwrap();
+
+        assert_eq!(decoded, nack);
+        assert_eq!(decoded.error.name, "RouteCatalogCompacted");
+        assert_eq!(decoded.error.code, 711);
+    }
+
+    #[test]
+    fn route_lookup_request_requires_complete_observed_token() {
+        let request = RouteLookupRequest {
+            expected: contract("grid"),
+            observed_route_uid: Some("grid-uid-0001".into()),
+            observed_route_revision: None,
+        };
+
+        let err = encode_route_lookup_request(&request)
+            .expect_err("observed route token must include uid and revision together");
+
+        assert!(err.contains("observed route token"), "{err}");
+    }
+
+    #[test]
+    fn route_list_response_rejects_duplicate_routes() {
+        let response = RouteListResponse {
+            catalog_revision: 2,
+            min_watch_revision: 1,
+            routes: vec![record("grid", 1), record("grid", 2)],
+        };
+
+        let err = encode_route_list_response(&response)
+            .expect_err("duplicate route names must be rejected");
+
+        assert!(err.contains("duplicate route_name"), "{err}");
+    }
+
+    #[test]
+    fn route_record_rejects_contract_route_name_mismatch() {
+        let mut current = record("grid", 1);
+        current.contract.route_name = "other-grid".into();
+        let response = RouteLookupResponse::Ready { current };
+
+        let err = encode_route_lookup_response(&response)
+            .expect_err("record contract route_name must match route_name");
+
+        assert!(err.contains("contract route_name"), "{err}");
+    }
+
+    #[test]
+    fn route_nack_rejects_error_code_name_mismatch() {
+        let mut error =
+            C2Error::new(ErrorCode::RouteCatalogCompacted, "watch history compacted").envelope();
+        error.name = "ResourceUnavailable".into();
+        let nack = RouteNack {
+            nonce: 55,
+            rejected_revision: 9,
+            error,
+        };
+
+        let err = encode_route_nack(&nack).expect_err("error envelope code/name mismatch fails");
+
+        assert!(err.contains("name mismatch"), "{err}");
+    }
+}
+
 mod handshake_tests {
     use crate::handshake::*;
 

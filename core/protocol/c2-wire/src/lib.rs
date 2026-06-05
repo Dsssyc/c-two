@@ -9,6 +9,7 @@
 //! - **Chunk header** (4 bytes): `[2B chunk_idx LE][2B total_chunks LE]`
 //! - **Control messages**: Segment announce, consumed, buddy announce
 //! - **Handshake**: Segments + capabilities + routes + method tables
+//! - **Route catalog control**: list, lookup, watch, ACK, and NACK payloads
 //! - **MsgType**: Signal/message type enum
 //!
 //! All integers are little-endian.
@@ -23,6 +24,7 @@ pub mod frame;
 pub mod handshake;
 pub mod msg_type;
 pub mod registration_control;
+pub mod route_catalog_control;
 pub mod shutdown_control;
 
 #[cfg(test)]

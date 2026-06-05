@@ -231,6 +231,7 @@ version = "0.1.0"
 dependencies = [
  "c2-config",
  "c2-contract",
+ "c2-error",
  "c2-mem",
  "parking_lot",
  "serde",

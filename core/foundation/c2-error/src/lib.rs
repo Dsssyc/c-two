@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, fmt};
 use serde::{Deserialize, Serialize};
 
 const ERROR_WIRE_MAGIC: &[u8; 4] = b"C2E1";
-const ERROR_WIRE_VERSION: u16 = 1;
+pub const ERROR_WIRE_VERSION: u16 = 1;
 
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
