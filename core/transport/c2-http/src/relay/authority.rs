@@ -30,6 +30,8 @@ pub(crate) enum ControlError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AttestedRouteContract {
+    pub route_uid: String,
+    pub route_revision: u64,
     pub crm_ns: String,
     pub crm_name: String,
     pub crm_ver: String,
@@ -91,7 +93,14 @@ pub(crate) fn read_ipc_route_contract(
             reason: format!("IPC upstream route '{route_name}' advertised an invalid CRM contract"),
         });
     }
+    let binding = client
+        .bind_route(&contract)
+        .map_err(|err| ControlError::ContractMismatch {
+            reason: format!("IPC upstream route '{route_name}' token bind failed: {err}"),
+        })?;
     Ok(AttestedRouteContract {
+        route_uid: binding.route_uid().to_string(),
+        route_revision: binding.route_revision(),
         crm_ns: contract.crm_ns,
         crm_name: contract.crm_name,
         crm_ver: contract.crm_ver,
@@ -149,6 +158,11 @@ pub(crate) fn attest_ipc_route_contract(
             ),
         });
     }
+    let binding = client
+        .bind_route(&claimed)
+        .map_err(|err| ControlError::ContractMismatch {
+            reason: format!("IPC upstream route '{route_name}' token bind failed: {err}"),
+        })?;
     let max_payload_size = client
         .route_max_payload_size(route_name)
         .ok_or(ControlError::NotFound)?;
@@ -160,6 +174,8 @@ pub(crate) fn attest_ipc_route_contract(
         });
     }
     Ok(AttestedRouteContract {
+        route_uid: binding.route_uid().to_string(),
+        route_revision: binding.route_revision(),
         crm_ns: contract.crm_ns,
         crm_name: contract.crm_name,
         crm_ver: contract.crm_ver,
@@ -229,6 +245,11 @@ pub(crate) async fn attest_ipc_pending_route_contract(
             ),
         });
     }
+    let binding = client
+        .bind_route(&claimed)
+        .map_err(|err| ControlError::ContractMismatch {
+            reason: format!("IPC upstream pending route '{route_name}' token bind failed: {err}"),
+        })?;
     if claimed_max_payload_size != max_payload_size {
         return Err(ControlError::ContractMismatch {
             reason: format!(
@@ -237,6 +258,8 @@ pub(crate) async fn attest_ipc_pending_route_contract(
         });
     }
     Ok(AttestedRouteContract {
+        route_uid: binding.route_uid().to_string(),
+        route_revision: binding.route_revision(),
         crm_ns: contract.crm_ns,
         crm_name: contract.crm_name,
         crm_ver: contract.crm_ver,
@@ -277,6 +300,8 @@ pub(crate) struct OwnerReplacement {
     abi_hash: String,
     signature_hash: String,
     max_payload_size: u64,
+    route_uid: String,
+    route_revision: u64,
     token: OwnerToken,
     evidence: OwnerReplacementEvidence,
 }
@@ -294,6 +319,8 @@ pub(crate) struct OwnerReplacementCandidate {
     abi_hash: String,
     signature_hash: String,
     max_payload_size: u64,
+    route_uid: String,
+    route_revision: u64,
     token: OwnerToken,
 }
 
@@ -311,6 +338,8 @@ impl OwnerReplacementCandidate {
             abi_hash: self.abi_hash,
             signature_hash: self.signature_hash,
             max_payload_size: self.max_payload_size,
+            route_uid: self.route_uid,
+            route_revision: self.route_revision,
             token: self.token,
             evidence,
         }
@@ -329,6 +358,8 @@ pub(crate) enum RouteCommand {
         abi_hash: String,
         signature_hash: String,
         max_payload_size: u64,
+        route_uid: String,
+        route_revision: u64,
         replacement: Option<OwnerReplacement>,
     },
     UnregisterLocal {
@@ -598,6 +629,8 @@ impl<'a> RouteAuthority<'a> {
                 abi_hash,
                 signature_hash,
                 max_payload_size,
+                route_uid,
+                route_revision,
                 replacement,
             } => self.register_local(
                 name,
@@ -610,6 +643,8 @@ impl<'a> RouteAuthority<'a> {
                 abi_hash,
                 signature_hash,
                 max_payload_size,
+                route_uid,
+                route_revision,
                 replacement,
             ),
             RouteCommand::UnregisterLocal { name, server_id } => {
@@ -644,6 +679,8 @@ impl<'a> RouteAuthority<'a> {
         abi_hash: String,
         signature_hash: String,
         max_payload_size: u64,
+        route_uid: String,
+        route_revision: u64,
         replacement: Option<OwnerReplacement>,
     ) -> Result<RouteCommandResult, ControlError> {
         self.validate_route_name(&name)?;
@@ -664,6 +701,16 @@ impl<'a> RouteAuthority<'a> {
         if max_payload_size == 0 {
             return Err(ControlError::ContractMismatch {
                 reason: "max_payload_size must be > 0".to_string(),
+            });
+        }
+        c2_contract::validate_call_route_key("route_uid", &route_uid).map_err(|err| {
+            ControlError::ContractMismatch {
+                reason: err.to_string(),
+            }
+        })?;
+        if route_revision == 0 {
+            return Err(ControlError::ContractMismatch {
+                reason: "route_revision must be > 0".to_string(),
             });
         }
 
@@ -689,10 +736,14 @@ impl<'a> RouteAuthority<'a> {
                         ) {
                             return Err(ControlError::ContractMismatch { reason });
                         }
-                        if let Some(token) = self.state.owner_token(&name) {
-                            self.state.renew_owner_lease(&name, &token);
+                        if existing.route_uid == route_uid
+                            && existing.route_revision == route_revision
+                        {
+                            if let Some(token) = self.state.owner_token(&name) {
+                                self.state.renew_owner_lease(&name, &token);
+                            }
+                            return Ok(RouteCommandResult::SameOwner { entry: existing });
                         }
-                        return Ok(RouteCommandResult::SameOwner { entry: existing });
                     }
                 } else {
                     return Err(ControlError::AddressMismatch { existing_address });
@@ -710,6 +761,8 @@ impl<'a> RouteAuthority<'a> {
                             || token.abi_hash != existing.abi_hash
                             || token.signature_hash != existing.signature_hash
                             || token.max_payload_size != existing.max_payload_size
+                            || token.route_uid != existing.route_uid
+                            || token.route_revision != existing.route_revision
                         {
                             return Err(ControlError::DuplicateRoute { existing_address });
                         }
@@ -733,6 +786,8 @@ impl<'a> RouteAuthority<'a> {
             abi_hash,
             signature_hash,
             max_payload_size,
+            route_uid,
+            route_revision,
             locality: Locality::Local,
             registered_at: route_table.next_local_timestamp(),
         };
@@ -801,6 +856,8 @@ impl<'a> RouteAuthority<'a> {
                     abi_hash: existing.abi_hash.clone(),
                     signature_hash: existing.signature_hash.clone(),
                     max_payload_size: existing.max_payload_size,
+                    route_uid: existing.route_uid.clone(),
+                    route_revision: existing.route_revision,
                     token,
                 })
             }
@@ -1091,6 +1148,8 @@ mod tests {
             signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
                 .into(),
             max_payload_size: 1024,
+            route_uid: format!("{name}-{relay_id}-uid"),
+            route_revision: 1,
             locality: Locality::Peer,
             registered_at: 1000.0,
         }

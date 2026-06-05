@@ -70,6 +70,8 @@ impl RouteTable {
             || c2_contract::validate_contract_hash("abi_hash", &entry.abi_hash).is_err()
             || c2_contract::validate_contract_hash("signature_hash", &entry.signature_hash).is_err()
             || entry.max_payload_size == 0
+            || c2_contract::validate_call_route_key("route_uid", &entry.route_uid).is_err()
+            || entry.route_revision == 0
             || !entry.registered_at.is_finite()
         {
             return false;
@@ -713,6 +715,8 @@ impl RouteTable {
                 abi_hash: entry.abi_hash.clone(),
                 signature_hash: entry.signature_hash.clone(),
                 max_payload_size: entry.max_payload_size,
+                route_uid: entry.route_uid.clone(),
+                route_revision: entry.route_revision,
                 registered_at: entry.registered_at,
                 hash: route_entry_digest_hash(entry),
             })
@@ -902,6 +906,8 @@ mod tests {
             signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
                 .into(),
             max_payload_size: 1024,
+            route_uid: format!("{name}-{relay_id}-uid"),
+            route_revision: 1,
             locality: Locality::Local,
             registered_at: 1000.0,
         }
@@ -922,6 +928,8 @@ mod tests {
             signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
                 .into(),
             max_payload_size: 1024,
+            route_uid: format!("{name}-{relay_id}-uid"),
+            route_revision: 1,
             locality: Locality::Peer,
             registered_at,
         }
@@ -1017,7 +1025,7 @@ mod tests {
         let active_digest = active_table.route_digest();
         assert_eq!(
             active_digest.get(&("grid".to_string(), "relay-a".to_string(), false)),
-            Some(&"041751786968419cef9940d98f60c292ae4a22c92166a51bc55c87f6e0601a18".to_string())
+            Some(&"246282f2b0f56805a15cb27615ad2326cb73417fb5946f6305c8a9da59a21cdb".to_string())
         );
 
         let mut deleted_table = RouteTable::new("relay-a".into());

@@ -980,6 +980,41 @@ Acceptance:
 - stale route token causes re-resolve, not ambiguous call replay;
 - HTTP and IPC stale route behavior share the same error taxonomy.
 
+Implementation status on 2026-06-06:
+
+- implemented the internal relay data-plane route-token binding slice:
+  - relay `RouteEntry`, `RouteInfo`, full-sync routes, peer announce, and digest
+    diff entries now carry `route_uid` and `route_revision`;
+  - local relay registration commits only attested IPC route tokens, and
+    same-owner idempotence requires the same owner instance, contract, route UID,
+    and route revision;
+  - relay HTTP probe/call prechecks keep the selected `RouteEntry` snapshot and
+    acquire the IPC upstream against that exact route token;
+  - `IpcClient::ensure_route_token()` refreshes/looks up the server route
+    catalog before treating a cached missing or mismatched token as
+    authoritative, so watch lag does not look like semantic route removal;
+  - relay HTTP data-plane forwarding now uses `call_bound_sized_stream()` /
+    `call_bound()` with the acquired `RouteBinding`, not mutable route-name
+    dispatch after acquire;
+  - same-contract route replacement after relay precheck returns `RouteStale`
+    instead of replaying the call against the replacement route.
+- verified for this slice:
+  - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay`;
+  - `cargo test --manifest-path core/Cargo.toml -p c2-ipc`;
+  - `cargo test --manifest-path core/Cargo.toml -p c2-runtime`;
+  - `cargo fmt --manifest-path core/Cargo.toml --all --check`;
+  - `git diff --check`.
+- remaining Phase 5/6 work:
+  - expose route UID/revision as part of the external relay HTTP resolve/call
+    token contract instead of only binding the relay's internal precheck
+    snapshot;
+  - replace transitional relay HTTP `409 { "error": "RouteStale" }` JSON with
+    the canonical C2 error envelope and SDK-visible CC error class;
+  - complete the loopback self-fallback clean cut in runtime/Python-facing
+    relay resolution paths;
+  - model route state and tombstone compaction by catalog revision rather than
+    only timestamped route-table tombstones.
+
 Verification:
 
 - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay`

@@ -41,6 +41,10 @@ enum RequestClient {
     Ready {
         lease: UpstreamLease,
         route: RouteEntry,
+        binding: c2_ipc::RouteBinding,
+    },
+    Stale {
+        route: RouteEntry,
     },
     NotFound,
     Unreachable,
@@ -588,7 +592,17 @@ async fn handle_register(
     };
 
     // Connect IPC client and attest the registered route contract.
-    let (client, crm_ns, crm_name, crm_ver, abi_hash, signature_hash, max_payload_size) = {
+    let (
+        client,
+        crm_ns,
+        crm_name,
+        crm_ver,
+        abi_hash,
+        signature_hash,
+        max_payload_size,
+        route_uid,
+        route_revision,
+    ) = {
         let mut c = match connect_ipc_for_register(&address).await {
             Ok(client) => client,
             Err(e) => {
@@ -850,6 +864,8 @@ async fn handle_register(
             contract.abi_hash,
             contract.signature_hash,
             contract.max_payload_size,
+            contract.route_uid,
+            contract.route_revision,
         )
     };
 
@@ -912,6 +928,8 @@ async fn handle_register(
         abi_hash,
         signature_hash,
         max_payload_size,
+        route_uid,
+        route_revision,
         replacement,
     ) {
         RegisterCommitResult::Registered { entry } => {
@@ -1244,14 +1262,15 @@ async fn handle_probe(
         Ok(expected) => expected,
         Err(response) => return response,
     };
-    match validate_expected_crm_for_route(&state, &route_name, &expected_crm) {
-        Ok(_) => {}
+    let advertised_route = match validate_expected_crm_for_route(&state, &route_name, &expected_crm)
+    {
+        Ok(route) => route,
         Err(response) => return response,
-    }
+    };
     #[cfg(test)]
     run_data_plane_after_precheck_hook(&route_name);
-    match acquire_request_client(state, &route_name).await {
-        RequestClient::Ready { lease, route } => {
+    match acquire_request_client_for_route(state, &advertised_route).await {
+        RequestClient::Ready { lease, route, .. } => {
             if let Err(response) =
                 validate_expected_crm_for_acquired_route(&route_name, &route, &expected_crm)
             {
@@ -1261,6 +1280,7 @@ async fn handle_probe(
             drop(lease);
             StatusCode::OK.into_response()
         }
+        RequestClient::Stale { route } => route_stale_response(&route),
         RequestClient::NotFound => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
@@ -1314,29 +1334,35 @@ async fn call_handler(
     }
     #[cfg(test)]
     run_data_plane_after_precheck_hook(&route_name);
-    let (lease, acquired_route) = match acquire_request_client(state.clone(), &route_name).await {
-        RequestClient::Ready { lease, route } => (lease, route),
-        RequestClient::NotFound => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": "ResourceNotFound",
-                    "route": route_name,
-                })),
-            )
-                .into_response();
-        }
-        RequestClient::Unreachable => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({
-                    "error": "UpstreamUnavailable",
-                    "route": route_name,
-                })),
-            )
-                .into_response();
-        }
-    };
+    let (lease, acquired_route, binding) =
+        match acquire_request_client_for_route(state.clone(), &advertised_route).await {
+            RequestClient::Ready {
+                lease,
+                route,
+                binding,
+            } => (lease, route, binding),
+            RequestClient::Stale { route } => return route_stale_response(&route),
+            RequestClient::NotFound => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": "ResourceNotFound",
+                        "route": route_name,
+                    })),
+                )
+                    .into_response();
+            }
+            RequestClient::Unreachable => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(serde_json::json!({
+                        "error": "UpstreamUnavailable",
+                        "route": route_name,
+                    })),
+                )
+                    .into_response();
+            }
+        };
     if let Err(response) =
         validate_expected_crm_for_acquired_route(&route_name, &acquired_route, &expected_crm)
     {
@@ -1358,8 +1384,8 @@ async fn call_handler(
     let call_result = match content_length {
         Some(content_length) => {
             client
-                .call_sized_stream(
-                    &route_name,
+                .call_bound_sized_stream(
+                    &binding,
                     &method_name,
                     content_length,
                     body.into_data_stream(),
@@ -1377,7 +1403,7 @@ async fn call_handler(
                         return response;
                     }
                 };
-            client.call(&route_name, &method_name, &body).await
+            client.call_bound(&binding, &method_name, &body).await
         }
     };
 
@@ -1456,10 +1482,19 @@ fn materialized_response_or_error(
     }
 }
 
-async fn acquire_request_client(state: Arc<RelayState>, route_name: &str) -> RequestClient {
-    match state.acquire_upstream(route_name).await {
-        Ok((lease, route)) => RequestClient::Ready { lease, route },
+async fn acquire_request_client_for_route(
+    state: Arc<RelayState>,
+    route: &RouteEntry,
+) -> RequestClient {
+    let route_name = route.name.clone();
+    match state.acquire_upstream_for_route(route).await {
+        Ok((lease, route, binding)) => RequestClient::Ready {
+            lease,
+            route,
+            binding,
+        },
         Err(UpstreamAcquireError::NotFound) => RequestClient::NotFound,
+        Err(UpstreamAcquireError::Stale { route }) => RequestClient::Stale { route },
         Err(UpstreamAcquireError::Unreachable {
             route,
             address,
@@ -1480,6 +1515,19 @@ async fn acquire_request_client(state: Arc<RelayState>, route_name: &str) -> Req
             }
         }
     }
+}
+
+fn route_stale_response(route: &RouteEntry) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": "RouteStale",
+            "route": route.name.clone(),
+            "route_uid": route.route_uid.clone(),
+            "route_revision": route.route_revision,
+        })),
+    )
+        .into_response()
 }
 
 fn upstream_acquire_error_kind(error: &c2_ipc::IpcError) -> &'static str {
@@ -1655,6 +1703,70 @@ mod tests {
         server
     }
 
+    struct MarkerCallback {
+        marker: &'static [u8],
+    }
+
+    impl CrmCallback for MarkerCallback {
+        fn invoke(
+            &self,
+            _route_name: &str,
+            _method_idx: u16,
+            _request: RequestData,
+            _response_pool: Arc<parking_lot::RwLock<c2_mem::MemPool>>,
+        ) -> Result<ResponseMeta, CrmError> {
+            Ok(ResponseMeta::Inline(self.marker.to_vec()))
+        }
+    }
+
+    async fn start_marker_server(
+        address: &str,
+        server_id: &str,
+        server_instance_id: &str,
+        route_name: &str,
+        marker: &'static [u8],
+    ) -> Arc<Server> {
+        let server = Arc::new(
+            Server::new_with_identity(
+                address,
+                ServerIpcConfig::default(),
+                ServerIdentity {
+                    server_id: server_id.to_string(),
+                    server_instance_id: server_instance_id.to_string(),
+                },
+            )
+            .unwrap(),
+        );
+        let route = server
+            .build_route(
+                RouteBuildSpec {
+                    name: route_name.into(),
+                    crm_ns: "test.echo".into(),
+                    crm_name: "Echo".into(),
+                    crm_ver: "0.1.0".into(),
+                    abi_hash: TEST_ABI_HASH.into(),
+                    signature_hash: TEST_SIGNATURE_HASH.into(),
+                    method_names: vec!["ping".into()],
+                    access_map: std::collections::HashMap::new(),
+                    concurrency_mode: ConcurrencyMode::ReadParallel,
+                    limits: SchedulerLimits::default(),
+                },
+                Arc::new(MarkerCallback { marker }),
+            )
+            .unwrap();
+        let reservation = server.reserve_route(route).await.unwrap();
+        server.commit_reserved_route(reservation).await.unwrap();
+        let run_server = server.clone();
+        tokio::spawn(async move {
+            let _ = run_server.run().await;
+        });
+        server
+            .wait_until_responsive(std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        server
+    }
+
     fn source_between<'a>(source: &'a str, start: &str, end: &str) -> Option<&'a str> {
         let start_idx = source.find(start)?;
         let after_start = &source[start_idx..];
@@ -1754,13 +1866,22 @@ mod tests {
             !body.contains("to_bytes("),
             "relay data-plane must not materialize request bodies before IPC forwarding"
         );
+        for forbidden in [
+            ".call(&route_name,",
+            ".call_sized_stream(\n                    &route_name,",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "relay data-plane must not forward by mutable route name after acquire: {forbidden}"
+            );
+        }
         assert!(
-            body.contains(".call_sized_stream("),
-            "relay data-plane must use sized streaming for Content-Length requests"
+            body.contains(".call_bound_sized_stream("),
+            "relay data-plane must use route-bound sized streaming for Content-Length requests"
         );
         assert!(
-            body.contains(".call(&route_name, &method_name,"),
-            "relay data-plane must keep canonical IpcClient::call for bounded unknown-length fallback"
+            body.contains(".call_bound("),
+            "relay data-plane must use route-bound call for bounded unknown-length fallback"
         );
     }
 
@@ -1987,6 +2108,33 @@ mod tests {
         let status = response.status();
         let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         status
+    }
+
+    async fn post_call_response(
+        state: Arc<RelayState>,
+        name: &str,
+        method: &str,
+    ) -> (StatusCode, Vec<u8>) {
+        let app = build_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/{name}/{method}"))
+                    .header("content-type", "application/octet-stream")
+                    .header("x-c2-expected-crm-ns", "test.echo")
+                    .header("x-c2-expected-crm-name", "Echo")
+                    .header("x-c2-expected-crm-ver", "0.1.0")
+                    .header("x-c2-expected-abi-hash", TEST_ABI_HASH)
+                    .header("x-c2-expected-signature-hash", TEST_SIGNATURE_HASH)
+                    .body(Body::from(Vec::new()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, body.to_vec())
     }
 
     async fn post_call_with_expected_crm_tag(
@@ -2365,6 +2513,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-server-grid-uid".into(),
+            1,
             None,
         );
 
@@ -2751,6 +2901,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-server-grid-uid".into(),
+            1,
             None,
         ) {
             RegisterCommitResult::Registered { .. } => {}
@@ -2814,6 +2966,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-missing-server-grid-uid".into(),
+            1,
             None,
         );
 
@@ -2870,6 +3024,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-route-missing-server-grid-uid".into(),
+            1,
             None,
         );
 
@@ -2973,6 +3129,8 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 4,
+                route_uid: "grid-oversized-uid".into(),
+                route_revision: 1,
                 locality: crate::relay::types::Locality::Local,
                 registered_at: 1000.0,
             }));
@@ -3027,6 +3185,8 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
+                route_uid: "grid-duplicate-content-length-uid".into(),
+                route_revision: 1,
                 locality: crate::relay::types::Locality::Local,
                 registered_at: 1000.0,
             }));
@@ -3251,6 +3411,8 @@ mod tests {
                 TEST_ABI_HASH.to_string(),
                 TEST_SIGNATURE_HASH.to_string(),
                 1024,
+                format!("{route_for_hook}-server-new-uid"),
+                1,
                 None,
             ) {
                 RegisterCommitResult::Registered { .. }
@@ -3266,6 +3428,107 @@ mod tests {
                 }
             }
         });
+    }
+
+    async fn install_same_contract_route_swap_after_precheck(
+        state: Arc<RelayState>,
+        route_name: &str,
+        new_address: &str,
+    ) {
+        let state_for_hook = state;
+        let route_for_hook = route_name.to_string();
+        let new_address_for_hook = new_address.to_string();
+        set_data_plane_after_precheck_hook(route_name.to_string(), move || {
+            if let crate::relay::state::UnregisterResult::Removed { client, .. } =
+                state_for_hook.unregister_upstream(&route_for_hook, "server-old")
+            {
+                if let Some(client) = client {
+                    tokio::spawn(async move { client.close_shared().await });
+                }
+            }
+            match state_for_hook.commit_register_upstream(
+                route_for_hook.clone(),
+                "server-new".into(),
+                "server-new-instance".into(),
+                new_address_for_hook,
+                "test.echo".into(),
+                "Echo".into(),
+                "0.1.0".into(),
+                TEST_ABI_HASH.to_string(),
+                TEST_SIGNATURE_HASH.to_string(),
+                1024,
+                format!("{route_for_hook}-server-new-uid"),
+                1,
+                None,
+            ) {
+                RegisterCommitResult::Registered { .. }
+                | RegisterCommitResult::SameOwner { .. } => {}
+                RegisterCommitResult::Duplicate { existing_address }
+                | RegisterCommitResult::ConflictingOwner { existing_address } => {
+                    panic!(
+                        "failed to install replacement route in precheck hook: {existing_address}"
+                    )
+                }
+                RegisterCommitResult::Invalid { reason } => {
+                    panic!("failed to install replacement route in precheck hook: {reason}")
+                }
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn call_rejects_same_contract_route_replacement_after_precheck() {
+        let state = test_state();
+        let suffix = unique_suffix();
+        let route_name = format!("grid-token-toctou-call-{suffix}");
+        let old_address = format!(
+            "ipc://relay_call_token_old_{}_{}",
+            std::process::id(),
+            suffix
+        );
+        let new_address = format!(
+            "ipc://relay_call_token_new_{}_{}",
+            std::process::id(),
+            suffix
+        );
+        let old_server = start_marker_server(
+            &old_address,
+            "server-old",
+            "server-old-instance",
+            &route_name,
+            b"old-route",
+        )
+        .await;
+        let new_server = start_marker_server(
+            &new_address,
+            "server-new",
+            "server-new-instance",
+            &route_name,
+            b"new-route",
+        )
+        .await;
+
+        assert_eq!(
+            post_register(state.clone(), &route_name, "server-old", &old_address).await,
+            StatusCode::CREATED
+        );
+        install_same_contract_route_swap_after_precheck(state.clone(), &route_name, &new_address)
+            .await;
+
+        let (status, body) = post_call_response(state.clone(), &route_name, "ping").await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let body = String::from_utf8(body).unwrap();
+        assert!(
+            body.contains("RouteStale"),
+            "stale route token must be explicit, got: {body}"
+        );
+        assert!(
+            !body.contains("new-route"),
+            "relay call must not replay against replacement route: {body}"
+        );
+
+        shutdown_live_server(&old_server).await;
+        shutdown_live_server(&new_server).await;
     }
 
     #[tokio::test]
@@ -3884,7 +4147,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn relay_upstream_ipc_client_refreshes_route_registered_after_snapshot() {
+    async fn relay_upstream_stale_snapshot_does_not_bind_later_route_by_name() {
         let state = test_state_for_client();
         let address = format!(
             "ipc://relay_upstream_live_route_refresh_{}_{}",
@@ -3910,6 +4173,8 @@ mod tests {
             TEST_ABI_HASH.into(),
             TEST_SIGNATURE_HASH.into(),
             ServerIpcConfig::default().max_payload_size,
+            "builder-server-grid-uid".into(),
+            1,
             None,
         ) {
             RegisterCommitResult::Registered { .. } => {}
@@ -3943,13 +4208,17 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        assert_eq!(&body[..], b"echo");
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body.contains("RouteStale"),
+            "stale snapshot must not be refreshed by route name: {body}"
+        );
         assert_eq!(
             state.resolve("builder").len(),
             1,
-            "snapshot refresh must not withdraw the relay route"
+            "stale route token must not be treated as generic unreachable"
         );
 
         shutdown_live_server(&server).await;

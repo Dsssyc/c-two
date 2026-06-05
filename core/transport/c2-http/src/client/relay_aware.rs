@@ -390,6 +390,7 @@ impl Drop for RelayPoolGuard {
 fn route_is_stale(err: &HttpError) -> bool {
     match err {
         HttpError::ServerError(404, body) => relay_error_is(body, "ResourceNotFound"),
+        HttpError::ServerError(409, body) => relay_error_is(body, "RouteStale"),
         HttpError::ServerError(502, body) => relay_error_is(body, "UpstreamUnavailable"),
         _ => false,
     }

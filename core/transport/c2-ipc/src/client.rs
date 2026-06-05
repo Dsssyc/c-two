@@ -440,6 +440,18 @@ impl RouteBinding {
         &self.table.route_name
     }
 
+    pub fn route_uid(&self) -> &str {
+        self.table.route_uid()
+    }
+
+    pub fn route_revision(&self) -> u64 {
+        self.table.route_revision()
+    }
+
+    pub fn max_payload_size(&self) -> u64 {
+        self.table.max_payload_size()
+    }
+
     pub(crate) fn call_target_for(
         &self,
         method_name: &str,
@@ -1431,6 +1443,31 @@ impl IpcClient {
         .await
     }
 
+    /// Send a CRM call from a known-size body stream through a previously
+    /// acquired immutable route binding.
+    pub async fn call_bound_sized_stream<S, B, E>(
+        &self,
+        binding: &RouteBinding,
+        method_name: &str,
+        data_len: u64,
+        chunks: S,
+    ) -> Result<ResponseData, IpcError>
+    where
+        S: Stream<Item = Result<B, E>>,
+        B: AsRef<[u8]>,
+        E: Display,
+    {
+        let (method_idx, identity, max_payload_size) = binding.call_target_for(method_name)?;
+        if data_len > max_payload_size {
+            return Err(IpcError::Config(format!(
+                "request payload size {data_len} exceeds route '{}' max_payload_size {max_payload_size}",
+                binding.route_name()
+            )));
+        }
+        self.call_sized_stream_resolved_target(method_idx, identity, data_len, chunks)
+            .await
+    }
+
     /// Send a CRM call from a body stream with a known total payload size.
     ///
     /// This shares the same transport selector as [`IpcClient::call`] but does
@@ -1457,6 +1494,22 @@ impl IpcClient {
                 "request payload size {data_len} exceeds route '{route_name}' max_payload_size {max_payload_size}"
             )));
         }
+        self.call_sized_stream_resolved_target(method_idx, identity, data_len, chunks)
+            .await
+    }
+
+    async fn call_sized_stream_resolved_target<S, B, E>(
+        &self,
+        method_idx: u16,
+        identity: RouteCallIdentity,
+        data_len: u64,
+        chunks: S,
+    ) -> Result<ResponseData, IpcError>
+    where
+        S: Stream<Item = Result<B, E>>,
+        B: AsRef<[u8]>,
+        E: Display,
+    {
         let data_len = checked_payload_len_usize(data_len)?;
         if data_len == 0 {
             return self.call_inline(&identity, method_idx, &[]).await;
@@ -2369,6 +2422,60 @@ impl IpcClient {
         let table = self.bound_route_table(&expected.route_name)?;
         Self::validate_method_table_contract(&expected.route_name, &table, expected)?;
         Ok(RouteBinding::from_table(table))
+    }
+
+    /// Bind the route only if the cached server catalog still carries the exact
+    /// route UID and revision observed by the caller.
+    pub fn bind_route_token(
+        &self,
+        expected: &c2_contract::ExpectedRouteContract,
+        route_uid: &str,
+        route_revision: u64,
+    ) -> Result<RouteBinding, IpcError> {
+        c2_contract::validate_expected_route_contract(expected)
+            .map_err(|err| IpcError::ContractMismatch(err.to_string()))?;
+        let table = self.bound_route_table(&expected.route_name)?;
+        Self::validate_method_table_contract(&expected.route_name, &table, expected)?;
+        if table.route_uid() != route_uid || table.route_revision() != route_revision {
+            return Err(IpcError::RouteStale {
+                route_name: expected.route_name.clone(),
+                current_route_uid: table.route_uid().to_string(),
+                current_route_revision: table.route_revision(),
+            });
+        }
+        Ok(RouteBinding::from_table(table))
+    }
+
+    /// Bind a route token, refreshing the server route catalog before deciding
+    /// that a cached missing or mismatched token is authoritative.
+    pub async fn ensure_route_token(
+        &self,
+        expected: &c2_contract::ExpectedRouteContract,
+        route_uid: &str,
+        route_revision: u64,
+    ) -> Result<RouteBinding, IpcError> {
+        c2_contract::validate_expected_route_contract(expected)
+            .map_err(|err| IpcError::ContractMismatch(err.to_string()))?;
+        if let Ok(binding) = self.bind_route_token(expected, route_uid, route_revision) {
+            return Ok(binding);
+        }
+
+        if self.route_directory.read().is_dirty() {
+            self.rebuild_route_directory().await?;
+            if let Ok(binding) = self.bind_route_token(expected, route_uid, route_revision) {
+                return Ok(binding);
+            }
+        }
+
+        match self.lookup_route_contract(expected).await {
+            Ok(()) => self.bind_route_token(expected, route_uid, route_revision),
+            Err(IpcError::CatalogCompacted { .. } | IpcError::WatchUnavailable(_)) => {
+                self.rebuild_route_directory().await?;
+                self.lookup_route_contract(expected).await?;
+                self.bind_route_token(expected, route_uid, route_revision)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// CRM tag advertised by a route, if present.

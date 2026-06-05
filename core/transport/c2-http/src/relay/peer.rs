@@ -5,8 +5,8 @@ use crate::relay::types::{
     valid_route_digest_hash, valid_wire_relay_id,
 };
 
-pub const PROTOCOL_VERSION: u32 = 4;
-pub const ROUTE_HASH_PEER_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
+pub const ROUTE_HASH_PEER_VERSION: u32 = 5;
 
 /// Envelope wrapping every peer-to-peer message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +31,8 @@ pub enum PeerMessage {
         abi_hash: String,
         signature_hash: String,
         max_payload_size: u64,
+        route_uid: String,
+        route_revision: u64,
         registered_at: f64,
     },
     /// A CRM route was unregistered.
@@ -78,6 +80,8 @@ pub enum DigestDiffEntry {
         abi_hash: String,
         signature_hash: String,
         max_payload_size: u64,
+        route_uid: String,
+        route_revision: u64,
         registered_at: f64,
         hash: RouteDigestHash,
     },
@@ -122,6 +126,8 @@ pub(crate) struct ValidatedDigestDiffActive {
     pub abi_hash: String,
     pub signature_hash: String,
     pub max_payload_size: u64,
+    pub route_uid: String,
+    pub route_revision: u64,
     pub registered_at: f64,
 }
 
@@ -169,6 +175,8 @@ impl From<ValidatedDigestDiffActive> for RouteEntry {
             abi_hash: active.abi_hash,
             signature_hash: active.signature_hash,
             max_payload_size: active.max_payload_size,
+            route_uid: active.route_uid,
+            route_revision: active.route_revision,
             locality: Locality::Peer,
             registered_at: active.registered_at,
         }
@@ -215,6 +223,8 @@ pub fn validate_route_state_envelope(
             abi_hash,
             signature_hash,
             max_payload_size,
+            route_uid,
+            route_revision,
             registered_at,
         } => {
             if relay_id != &envelope.sender_relay_id
@@ -228,6 +238,8 @@ pub fn validate_route_state_envelope(
                     abi_hash,
                     signature_hash,
                     *max_payload_size,
+                    route_uid,
+                    *route_revision,
                     *registered_at,
                 )
             {
@@ -313,6 +325,8 @@ fn validate_digest_diff_entries(
                 abi_hash,
                 signature_hash,
                 max_payload_size,
+                route_uid,
+                route_revision,
                 registered_at,
                 hash,
             } => {
@@ -327,6 +341,8 @@ fn validate_digest_diff_entries(
                         abi_hash,
                         signature_hash,
                         *max_payload_size,
+                        route_uid,
+                        *route_revision,
                         *registered_at,
                     )
                     || hash != &expected_hash
@@ -346,6 +362,8 @@ fn validate_digest_diff_entries(
                         abi_hash: abi_hash.clone(),
                         signature_hash: signature_hash.clone(),
                         max_payload_size: *max_payload_size,
+                        route_uid: route_uid.clone(),
+                        route_revision: *route_revision,
                         registered_at: *registered_at,
                     },
                 ));
@@ -391,6 +409,8 @@ pub fn route_digest_hash_for_diff_entry(
             abi_hash,
             signature_hash,
             max_payload_size,
+            route_uid,
+            route_revision,
             registered_at,
             ..
         } => {
@@ -404,6 +424,8 @@ pub fn route_digest_hash_for_diff_entry(
                 abi_hash,
                 signature_hash,
                 *max_payload_size,
+                route_uid,
+                *route_revision,
                 *registered_at,
             ) {
                 return Err(PeerRouteStateError::InvalidDigestDiff {
@@ -420,6 +442,8 @@ pub fn route_digest_hash_for_diff_entry(
                 abi_hash,
                 signature_hash,
                 *max_payload_size,
+                route_uid,
+                *route_revision,
                 *registered_at,
             ))
         }
@@ -450,6 +474,8 @@ fn valid_active_route_fields(
     abi_hash: &str,
     signature_hash: &str,
     max_payload_size: u64,
+    route_uid: &str,
+    route_revision: u64,
     registered_at: f64,
 ) -> bool {
     crate::relay::route_table::valid_route_name(name)
@@ -459,6 +485,8 @@ fn valid_active_route_fields(
         && c2_contract::validate_contract_hash("abi_hash", abi_hash).is_ok()
         && c2_contract::validate_contract_hash("signature_hash", signature_hash).is_ok()
         && max_payload_size > 0
+        && c2_contract::validate_call_route_key("route_uid", route_uid).is_ok()
+        && route_revision > 0
         && registered_at.is_finite()
 }
 
@@ -512,6 +540,8 @@ mod tests {
                 signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
                     .into(),
                 max_payload_size: 1024,
+                route_uid: "grid-route-uid-0001".into(),
+                route_revision: 1,
                 registered_at: 1000.0,
             },
         );
@@ -541,6 +571,8 @@ mod tests {
                 signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
                     .into(),
                 max_payload_size: 1024,
+                route_uid: "grid-route-uid-0001".into(),
+                route_revision: 1,
                 registered_at: 1000.0,
             },
         );
@@ -565,6 +597,8 @@ mod tests {
             signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
                 .into(),
             max_payload_size: 1024,
+            route_uid: "grid-route-uid-0001".into(),
+            route_revision: 1,
             registered_at: 1000.0,
             hash: String::new(),
         };

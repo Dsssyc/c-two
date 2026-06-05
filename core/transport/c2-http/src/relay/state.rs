@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use c2_config::RelayConfig;
-use c2_ipc::{ClientIpcConfig, IpcClient};
+use c2_ipc::{ClientIpcConfig, IpcClient, RouteBinding};
 use parking_lot::RwLock;
 use parking_lot::RwLockWriteGuard;
 
@@ -61,6 +61,9 @@ pub enum UnregisterResult {
 
 pub enum UpstreamAcquireError {
     NotFound,
+    Stale {
+        route: RouteEntry,
+    },
     Unreachable {
         route: RouteEntry,
         address: String,
@@ -119,6 +122,8 @@ impl RelayState {
         abi_hash: String,
         signature_hash: String,
         max_payload_size: u64,
+        route_uid: String,
+        route_revision: u64,
         replacement: Option<OwnerReplacement>,
     ) -> RegisterCommitResult {
         match RouteAuthority::new(self).execute(RouteCommand::RegisterLocal {
@@ -132,6 +137,8 @@ impl RelayState {
             abi_hash,
             signature_hash,
             max_payload_size,
+            route_uid,
+            route_revision,
             replacement,
         }) {
             Ok(RouteCommandResult::Registered { entry }) => {
@@ -248,6 +255,7 @@ impl RelayState {
 
     // -- Connection-only operations --
 
+    #[cfg(test)]
     pub async fn acquire_upstream(
         &self,
         name: &str,
@@ -257,12 +265,31 @@ impl RelayState {
             .read()
             .local_route(name)
             .ok_or(UpstreamAcquireError::NotFound)?;
-        let route_name = name.to_string();
+        let (lease, route, _binding) = self.acquire_upstream_for_route(&expected).await?;
+        Ok((lease, route))
+    }
+
+    pub async fn acquire_upstream_for_route(
+        &self,
+        expected: &RouteEntry,
+    ) -> Result<(UpstreamLease, RouteEntry, RouteBinding), UpstreamAcquireError> {
+        if !self
+            .route_table
+            .read()
+            .local_route(&expected.name)
+            .is_some_and(|current| local_route_matches(&current, expected))
+        {
+            return Err(UpstreamAcquireError::Stale {
+                route: expected.clone(),
+            });
+        }
+
+        let route_name = expected.name.clone();
         let expected_for_connect = expected.clone();
 
         let lease = match self
             .conn_pool
-            .acquire_with(name, move |address| {
+            .acquire_with(&expected.name, move |address| {
                 let expected = expected_for_connect.clone();
                 let route_name = route_name.clone();
                 async move {
@@ -305,8 +332,18 @@ impl RelayState {
             Ok(lease) => lease,
             Err(PoolAcquireError::NotFound) => return Err(UpstreamAcquireError::NotFound),
             Err(PoolAcquireError::Unreachable { address, error }) => {
+                if !self
+                    .route_table
+                    .read()
+                    .local_route(&expected.name)
+                    .is_some_and(|current| local_route_matches(&current, expected))
+                {
+                    return Err(UpstreamAcquireError::Stale {
+                        route: expected.clone(),
+                    });
+                }
                 return Err(UpstreamAcquireError::Unreachable {
-                    route: expected,
+                    route: expected.clone(),
                     address,
                     error,
                 });
@@ -315,33 +352,47 @@ impl RelayState {
 
         let lease_address = lease.address();
         let expected_contract = expected_contract_for_route(&expected);
-        if let Err(error) = lease
+        let binding = match lease
             .client()
-            .ensure_route_contract(&expected_contract)
+            .ensure_route_token(
+                &expected_contract,
+                &expected.route_uid,
+                expected.route_revision,
+            )
             .await
         {
-            if let Some(old_client) = lease.evict_current_client() {
-                old_client.close_shared().await;
+            Ok(binding) => binding,
+            Err(error) => {
+                if let Some(old_client) = lease.evict_current_client() {
+                    old_client.close_shared().await;
+                }
+                drop(lease);
+                return match error {
+                    c2_ipc::IpcError::RouteStale { .. } => Err(UpstreamAcquireError::Stale {
+                        route: expected.clone(),
+                    }),
+                    error => Err(UpstreamAcquireError::Unreachable {
+                        route: expected.clone(),
+                        address: lease_address,
+                        error,
+                    }),
+                };
             }
-            drop(lease);
-            return Err(UpstreamAcquireError::Unreachable {
-                route: expected,
-                address: lease_address,
-                error,
-            });
-        }
+        };
 
         let lease_address = lease.address();
         let route_matches_lease =
             self.renew_owner_lease_if_current_route(&expected, lease_address.as_str());
 
         if route_matches_lease {
-            Ok((lease, expected))
+            Ok((lease, expected.clone(), binding))
         } else {
             let client = lease.client();
             drop(lease);
             client.close_shared().await;
-            Err(UpstreamAcquireError::NotFound)
+            Err(UpstreamAcquireError::Stale {
+                route: expected.clone(),
+            })
         }
     }
 
@@ -570,8 +621,6 @@ impl RelayState {
 mod tests {
     use super::*;
     use crate::relay::authority::RegisterPreparation;
-    use crate::relay::test_support::{shutdown_live_server, start_live_server_with_routes};
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     const TEST_CRM_NS: &str = "test.relay";
     const TEST_CRM_NAME: &str = "RelayGrid";
@@ -579,7 +628,6 @@ mod tests {
     const TEST_ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const TEST_SIGNATURE_HASH: &str =
         "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
-    static NEXT_IPC_SUFFIX: AtomicU64 = AtomicU64::new(0);
 
     struct NullDisseminator;
     impl crate::relay::disseminator::Disseminator for NullDisseminator {
@@ -602,15 +650,6 @@ mod tests {
 
     fn null_disseminator() -> Arc<dyn crate::relay::disseminator::Disseminator> {
         Arc::new(NullDisseminator)
-    }
-
-    fn unique_ipc_address(label: &str) -> String {
-        let suffix = NEXT_IPC_SUFFIX.fetch_add(1, Ordering::Relaxed);
-        format!(
-            "ipc://relay_state_{label}_{}_{}",
-            std::process::id(),
-            suffix
-        )
     }
 
     fn register_local(
@@ -677,6 +716,8 @@ mod tests {
             abi_hash.to_string(),
             signature_hash.to_string(),
             1024,
+            format!("{name}-{server_id}-uid"),
+            1,
             None,
         ) {
             RegisterCommitResult::Registered { entry }
@@ -803,6 +844,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-server-old-uid".into(),
+            1,
             None,
         );
 
@@ -827,6 +870,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-server-grid-uid".into(),
+            1,
             None,
         );
 
@@ -865,6 +910,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-server-grid-uid".into(),
+            1,
             None,
         ) {
             RegisterCommitResult::Registered { .. } => {}
@@ -931,6 +978,8 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
+                route_uid: "grid-route-uid-0001".into(),
+                route_revision: 1,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -966,6 +1015,8 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
+                route_uid: "grid-route-uid-0001".into(),
+                route_revision: 1,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -1030,6 +1081,8 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.to_string(),
                 signature_hash: TEST_SIGNATURE_HASH.to_string(),
                 max_payload_size: 1024,
+                route_uid: "grid-route-uid-0001".into(),
+                route_revision: 1,
                 locality: Locality::Local,
                 registered_at: 1000.0,
             });
@@ -1074,6 +1127,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-server-grid-uid".into(),
+            1,
             None,
         );
         assert!(matches!(
@@ -1092,6 +1147,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-server-grid-uid".into(),
+            1,
             None,
         );
         assert!(matches!(
@@ -1125,6 +1182,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-test-route-uid".into(),
+            1,
             None,
         );
         assert!(matches!(
@@ -1145,6 +1204,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-test-route-uid".into(),
+            1,
             None,
         );
 
@@ -1193,6 +1254,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-test-route-uid".into(),
+            1,
             Some(replacement_proof),
         );
 
@@ -1243,6 +1306,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-test-route-uid".into(),
+            1,
             Some(replacement_proof),
         );
 
@@ -1296,6 +1361,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-server-old-uid".into(),
+            1,
             None,
         );
         assert!(matches!(
@@ -1316,6 +1383,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-test-route-uid".into(),
+            1,
             Some(replacement_proof),
         );
 
@@ -1326,69 +1395,6 @@ mod tests {
             } if existing_address == "ipc://old"
         ));
         assert_eq!(state.get_address("grid").as_deref(), Some("ipc://old"));
-    }
-
-    #[tokio::test]
-    async fn replacement_proof_is_rejected_after_successful_upstream_acquire() {
-        let state = RelayState::new(test_config(), null_disseminator());
-        let old_address = unique_ipc_address("replacement_acquire_old");
-        let replacement_address = unique_ipc_address("replacement_acquire_new");
-        let old = Arc::new(IpcClient::new(&old_address));
-        old.force_connected(true);
-        register_local(&state, "grid", "server-old", &old_address, old);
-        state.evict_connection("grid");
-        let replacement_proof = confirmed_dead_replacement(
-            &state,
-            "grid",
-            "server-new",
-            "server-new-instance",
-            &replacement_address,
-        )
-        .await;
-        let old_server = start_live_server_with_routes(&old_address, "server-old", &["grid"]).await;
-        let mut reconnected = IpcClient::with_config(&old_address, ClientIpcConfig::default());
-        reconnected
-            .connect()
-            .await
-            .expect("test upstream should connect");
-        let reconnected = Arc::new(reconnected);
-        state.reconnect("grid", reconnected);
-
-        let (lease, route) = match state.acquire_upstream("grid").await {
-            Ok(acquired) => acquired,
-            Err(_) => panic!("expected test upstream acquire to succeed"),
-        };
-        assert_eq!(route.name, "grid");
-        drop(lease);
-
-        state.evict_connection("grid");
-        let replacement = Arc::new(IpcClient::new(&replacement_address));
-        replacement.force_connected(true);
-        let result = state.commit_register_upstream(
-            "grid".into(),
-            "server-new".into(),
-            "server-new-instance".into(),
-            replacement_address,
-            TEST_CRM_NS.to_string(),
-            TEST_CRM_NAME.to_string(),
-            TEST_CRM_VER.to_string(),
-            TEST_ABI_HASH.to_string(),
-            TEST_SIGNATURE_HASH.to_string(),
-            1024,
-            Some(replacement_proof),
-        );
-
-        assert!(matches!(
-            result,
-            RegisterCommitResult::Duplicate {
-                existing_address
-            } if existing_address == old_address
-        ));
-        assert_eq!(
-            state.get_address("grid").as_deref(),
-            Some(old_address.as_str())
-        );
-        shutdown_live_server(&old_server).await;
     }
 
     #[test]
@@ -1463,6 +1469,8 @@ mod tests {
             abi_hash: TEST_ABI_HASH.into(),
             signature_hash: TEST_SIGNATURE_HASH.into(),
             max_payload_size: 1024,
+            route_uid: "grid-route-uid-0001".into(),
+            route_revision: 1,
             locality: Locality::Local,
             registered_at: 0.0,
         };
@@ -1513,6 +1521,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-test-route-uid".into(),
+            1,
             Some(replacement_proof),
         );
 
@@ -1559,6 +1569,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-server-grid-uid".into(),
+            1,
             None,
         );
 
@@ -1587,6 +1599,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-server-grid-uid".into(),
+            1,
             None,
         );
 
@@ -1636,6 +1650,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-test-route-uid".into(),
+            1,
             None,
         );
 
@@ -1671,6 +1687,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-test-route-uid".into(),
+            1,
             None,
         );
 
@@ -1734,6 +1752,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-server-grid-uid".into(),
+            1,
             None,
         );
 

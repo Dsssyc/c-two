@@ -594,6 +594,8 @@ impl RelayServer {
                                     contract.abi_hash,
                                     contract.signature_hash,
                                     contract.max_payload_size,
+                                    contract.route_uid,
+                                    contract.route_revision,
                                     replacement,
                                 ) {
                                     RegisterCommitResult::Registered { entry } => {
@@ -1158,6 +1160,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-server-grid-uid".into(),
+            1,
             None,
         ) {
             RegisterCommitResult::Registered { .. } => {}
