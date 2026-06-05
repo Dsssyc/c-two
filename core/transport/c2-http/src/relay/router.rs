@@ -1155,6 +1155,7 @@ async fn handle_unregister(
         crate::relay::state::UnregisterResult::Removed {
             entry,
             removed_at,
+            removed_revision,
             client,
         } => {
             // Close old client asynchronously
@@ -1162,9 +1163,9 @@ async fn handle_unregister(
                 close_arc_client(arc_client);
             }
 
-            broadcast_route_withdraw(&state, &entry, removed_at);
+            broadcast_route_withdraw(&state, &entry, removed_at, removed_revision);
             eprintln!(
-                "[relay] Unregister removed: name={} server_id={} removed_at={removed_at}",
+                "[relay] Unregister removed: name={} server_id={} removed_at={removed_at} removed_revision={removed_revision}",
                 entry.name,
                 entry.server_id.as_deref().unwrap_or("")
             );
@@ -1674,14 +1675,14 @@ fn should_withdraw_unreachable_route(error: &c2_ipc::IpcError) -> bool {
 }
 
 fn remove_unreachable_route(state: &Arc<RelayState>, route: &RouteEntry) {
-    if let Some((entry, removed_at, client)) =
+    if let Some((entry, removed_at, removed_revision, client)) =
         state.remove_unreachable_local_upstream_if_matches(route)
     {
         state.stop_upstream_control_if_owner_idle_for_route(&entry);
         if let Some(client) = client {
             close_arc_client(client);
         }
-        broadcast_route_withdraw(state, &entry, removed_at);
+        broadcast_route_withdraw(state, &entry, removed_at, removed_revision);
     }
 }
 

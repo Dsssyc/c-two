@@ -666,17 +666,18 @@ impl RelayServer {
                         UnregisterResult::Removed {
                             entry,
                             removed_at,
+                            removed_revision,
                             client,
                         } => {
                             if let Some(arc_client) = client {
                                 tokio::spawn(async move { arc_client.close_shared().await });
                             }
                             eprintln!(
-                                "[relay] Unregister command removed: name={} server_id={} removed_at={removed_at}",
+                                "[relay] Unregister command removed: name={} server_id={} removed_at={removed_at} removed_revision={removed_revision}",
                                 entry.name,
                                 entry.server_id.as_deref().unwrap_or("")
                             );
-                            broadcast_route_withdraw(&state, &entry, removed_at);
+                            broadcast_route_withdraw(&state, &entry, removed_at, removed_revision);
                             let _ = reply.send(Ok(()));
                         }
                         UnregisterResult::AlreadyRemoved => {

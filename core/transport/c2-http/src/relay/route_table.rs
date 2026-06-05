@@ -24,12 +24,17 @@ pub struct RouteTable {
     /// process-local monotonicity while still outranking stale pre-restart
     /// logical counters seen through anti-entropy.
     next_timestamp: f64,
+    /// Local monotonic revision for this relay's applied route catalog changes.
+    catalog_revision: u64,
+    /// Highest local tombstone catalog revision that has been compacted.
+    compaction_revision: u64,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct TombstoneGcEntry {
     pub tombstone: RouteTombstone,
     pub reason: TombstoneGcReason,
+    pub compaction_revision: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,11 +60,30 @@ impl RouteTable {
             peers: HashMap::new(),
             relay_id,
             next_timestamp: current_epoch_millis().saturating_sub(1) as f64,
+            catalog_revision: 0,
+            compaction_revision: 0,
         }
     }
 
     pub fn relay_id(&self) -> &str {
         &self.relay_id
+    }
+
+    pub fn catalog_revision(&self) -> u64 {
+        self.catalog_revision
+    }
+
+    pub fn compaction_revision(&self) -> u64 {
+        self.compaction_revision
+    }
+
+    fn next_catalog_revision(&self) -> u64 {
+        self.catalog_revision.saturating_add(1).max(1)
+    }
+
+    fn advance_catalog_revision(&mut self) -> u64 {
+        self.catalog_revision = self.next_catalog_revision();
+        self.catalog_revision
     }
 
     fn valid_route_entry(&self, entry: &RouteEntry) -> bool {
@@ -98,6 +122,7 @@ impl RouteTable {
 
     fn valid_tombstone(&self, tombstone: &RouteTombstone) -> bool {
         tombstone.removed_at.is_finite()
+            && tombstone.removed_revision > 0
             && valid_route_name(&tombstone.name)
             && valid_relay_id(&tombstone.relay_id)
             && tombstone.server_id.as_deref().map_or(true, valid_server_id)
@@ -126,6 +151,7 @@ impl RouteTable {
         let key = (entry.name.clone(), entry.relay_id.clone());
         self.tombstones.remove(&key);
         self.routes.insert(key, entry);
+        self.advance_catalog_revision();
     }
 
     /// Register or update a route (upsert semantics).
@@ -142,11 +168,14 @@ impl RouteTable {
         name: &str,
         relay_id: &str,
         removed_at: f64,
+        removed_revision: u64,
     ) -> Option<RouteEntry> {
         let tombstone = RouteTombstone {
             name: name.to_string(),
             relay_id: relay_id.to_string(),
             removed_at,
+            removed_revision,
+            local_catalog_revision: 0,
             server_id: None,
             observed_at: Instant::now(),
         };
@@ -172,18 +201,21 @@ impl RouteTable {
         &mut self,
         name: &str,
         server_id: &str,
-    ) -> (Option<RouteEntry>, f64) {
+    ) -> (Option<RouteEntry>, f64, u64) {
         let relay_id = self.relay_id.clone();
         let removed_at = self.next_local_timestamp();
+        let removed_revision = self.next_catalog_revision();
         let tombstone = RouteTombstone {
             name: name.to_string(),
             relay_id: relay_id.clone(),
             removed_at,
+            removed_revision,
+            local_catalog_revision: 0,
             server_id: Some(server_id.to_string()),
             observed_at: Instant::now(),
         };
         if !self.valid_tombstone(&tombstone) {
-            return (None, removed_at);
+            return (None, removed_at, removed_revision);
         }
         let key = (name.to_string(), relay_id);
         if self
@@ -191,19 +223,19 @@ impl RouteTable {
             .get(&key)
             .is_some_and(|entry| entry.registered_at > removed_at)
         {
-            return (None, removed_at);
+            return (None, removed_at, removed_revision);
         }
         let removed = self.routes.get(&key).cloned();
         if !self.apply_tombstone(tombstone) {
-            return (None, removed_at);
+            return (None, removed_at, removed_revision);
         }
-        (removed, removed_at)
+        (removed, removed_at, removed_revision)
     }
 
     pub fn unregister_local_route_if_matches(
         &mut self,
         expected: &RouteEntry,
-    ) -> (Option<RouteEntry>, f64) {
+    ) -> (Option<RouteEntry>, f64, u64) {
         let relay_id = self.relay_id.clone();
         let key = (expected.name.clone(), relay_id.clone());
         let matches_expected = self
@@ -211,9 +243,14 @@ impl RouteTable {
             .get(&key)
             .is_some_and(|entry| local_route_matches(entry, expected));
         if !matches_expected {
-            return (None, self.next_local_timestamp());
+            return (
+                None,
+                self.next_local_timestamp(),
+                self.next_catalog_revision(),
+            );
         }
         let removed_at = self.next_local_timestamp();
+        let removed_revision = self.next_catalog_revision();
         let server_id = self
             .routes
             .get(&key)
@@ -222,24 +259,26 @@ impl RouteTable {
             name: expected.name.clone(),
             relay_id,
             removed_at,
+            removed_revision,
+            local_catalog_revision: 0,
             server_id,
             observed_at: Instant::now(),
         };
         if !self.valid_tombstone(&tombstone) {
-            return (None, removed_at);
+            return (None, removed_at, removed_revision);
         }
         if self
             .routes
             .get(&key)
             .is_some_and(|entry| entry.registered_at > removed_at)
         {
-            return (None, removed_at);
+            return (None, removed_at, removed_revision);
         }
         let removed = self.routes.get(&key).cloned();
         if !self.apply_tombstone(tombstone) {
-            return (None, removed_at);
+            return (None, removed_at, removed_revision);
         }
-        (removed, removed_at)
+        (removed, removed_at, removed_revision)
     }
 
     pub fn next_local_timestamp(&mut self) -> f64 {
@@ -277,7 +316,9 @@ impl RouteTable {
                 tombstone.server_id = existing.server_id.clone();
             }
         }
+        let local_catalog_revision = self.advance_catalog_revision();
         tombstone.observed_at = Instant::now();
+        tombstone.local_catalog_revision = local_catalog_revision;
         self.routes.remove(&key);
         self.tombstones.insert(key, tombstone);
         true
@@ -413,10 +454,24 @@ impl RouteTable {
             })
             .collect();
 
+        let compaction_revision = expired
+            .iter()
+            .filter_map(|(key, _)| self.tombstones.get(key))
+            .map(|tombstone| tombstone.local_catalog_revision)
+            .max()
+            .unwrap_or(self.compaction_revision);
+        if compaction_revision > self.compaction_revision {
+            self.compaction_revision = compaction_revision;
+        }
+
         let mut removed = Vec::with_capacity(expired.len());
         for (key, reason) in expired {
             if let Some(tombstone) = self.tombstones.remove(&key) {
-                removed.push(TombstoneGcEntry { tombstone, reason });
+                removed.push(TombstoneGcEntry {
+                    tombstone,
+                    reason,
+                    compaction_revision,
+                });
             }
         }
         removed
@@ -700,6 +755,7 @@ impl RouteTable {
                     name: t.name.clone(),
                     relay_id: t.relay_id.clone(),
                     removed_at: t.removed_at,
+                    removed_revision: t.removed_revision,
                     hash: tombstone_digest_hash(t),
                 });
         }
@@ -742,6 +798,8 @@ impl RouteTable {
             name: name.to_string(),
             relay_id: relay_id.to_string(),
             removed_at,
+            removed_revision: self.next_catalog_revision(),
+            local_catalog_revision: 0,
             server_id: None,
             observed_at: Instant::now(),
         };
@@ -1033,13 +1091,15 @@ mod tests {
             name: "grid".into(),
             relay_id: "relay-a".into(),
             removed_at: 1001.0,
+            removed_revision: 1,
+            local_catalog_revision: 0,
             server_id: None,
             observed_at: Instant::now(),
         }));
         let deleted_digest = deleted_table.route_digest();
         assert_eq!(
             deleted_digest.get(&("grid".to_string(), "relay-a".to_string(), true)),
-            Some(&"cfafdde5bcded22e10fb117488185a44efcd34ba03f8997ec974a8c09539f563".to_string())
+            Some(&"f3aa6db4fe8d7d90b9e8edd3497d6392cace19c2dc49a2ab465e8b063f8acf34".to_string())
         );
     }
 
@@ -1171,7 +1231,7 @@ mod tests {
         let mut rt = RouteTable::new("relay-a".into());
         rt.register_route(local_entry("grid", "relay-a"));
         assert!(rt.local_route("grid").is_some());
-        let removed = rt.unregister_route_with_tombstone("grid", "relay-a", 2000.0);
+        let removed = rt.unregister_route_with_tombstone("grid", "relay-a", 2000.0, 1);
         assert!(removed.is_some());
         assert!(rt.local_route("grid").is_none());
         assert_eq!(rt.list_tombstones().len(), 1);
@@ -1228,6 +1288,8 @@ mod tests {
             name: "grid".into(),
             relay_id: "relay-a".into(),
             removed_at: newer_removed_at,
+            removed_revision: 1,
+            local_catalog_revision: 0,
             server_id: None,
             observed_at: Instant::now(),
         }));
@@ -1244,7 +1306,7 @@ mod tests {
             ..local_entry("grid", "relay-a")
         });
 
-        let (_removed, removed_at) =
+        let (_removed, removed_at, _removed_revision) =
             rt.unregister_local_route_with_tombstone("grid", "server-grid");
         assert!(removed_at > first);
     }
@@ -1419,6 +1481,8 @@ mod tests {
             name: "grid".into(),
             relay_id: "relay-a".into(),
             removed_at: 2000.0,
+            removed_revision: 1,
+            local_catalog_revision: 0,
             server_id: None,
             observed_at: Instant::now(),
         });
@@ -1504,6 +1568,8 @@ mod tests {
             name: "grid".into(),
             relay_id: "relay-a".into(),
             removed_at: f64::NAN,
+            removed_revision: 1,
+            local_catalog_revision: 0,
             server_id: None,
             observed_at: Instant::now(),
         }));
@@ -1522,6 +1588,8 @@ mod tests {
             name: "bad\nroute".into(),
             relay_id: "relay-a".into(),
             removed_at: 2000.0,
+            removed_revision: 1,
+            local_catalog_revision: 0,
             server_id: None,
             observed_at: Instant::now(),
         }));
@@ -1530,6 +1598,8 @@ mod tests {
             name: "grid".into(),
             relay_id: " ".into(),
             removed_at: 2000.0,
+            removed_revision: 1,
+            local_catalog_revision: 0,
             server_id: None,
             observed_at: Instant::now(),
         }));
@@ -1538,6 +1608,8 @@ mod tests {
             name: "grid".into(),
             relay_id: "relay-a".into(),
             removed_at: 2000.0,
+            removed_revision: 1,
+            local_catalog_revision: 0,
             server_id: Some("bad/server".into()),
             observed_at: Instant::now(),
         }));
@@ -1556,6 +1628,8 @@ mod tests {
             name: "grid".into(),
             relay_id: "bad/relay".into(),
             removed_at: 2000.0,
+            removed_revision: 1,
+            local_catalog_revision: 0,
             server_id: None,
             observed_at: Instant::now(),
         }));
@@ -1570,7 +1644,7 @@ mod tests {
         register_alive_peer(&mut rt, "relay-a");
         assert!(rt.register_route(peer_entry("grid", "relay-a", 1000.0)));
 
-        let removed = rt.unregister_route_with_tombstone("grid", "relay-a", f64::NAN);
+        let removed = rt.unregister_route_with_tombstone("grid", "relay-a", f64::NAN, 1);
 
         assert!(removed.is_none());
         assert_eq!(rt.resolve("grid").len(), 1);
@@ -1582,7 +1656,7 @@ mod tests {
         let mut rt = RouteTable::new("relay-a".into());
         assert!(rt.register_route(local_entry("grid", "relay-a")));
 
-        let (removed, _) = rt.unregister_local_route_with_tombstone("grid", "bad/server");
+        let (removed, _, _) = rt.unregister_local_route_with_tombstone("grid", "bad/server");
 
         assert!(removed.is_none());
         assert!(rt.local_route("grid").is_some());
@@ -1622,6 +1696,8 @@ mod tests {
             name: "grid".into(),
             relay_id: "relay-a".into(),
             removed_at: 2000.0,
+            removed_revision: 1,
+            local_catalog_revision: 0,
             server_id: None,
             observed_at: Instant::now(),
         });
@@ -1641,6 +1717,8 @@ mod tests {
             name: "grid".into(),
             relay_id: "relay-a".into(),
             removed_at: 2000.0,
+            removed_revision: 1,
+            local_catalog_revision: 0,
             server_id: None,
             observed_at: Instant::now(),
         }));
@@ -1707,7 +1785,7 @@ mod tests {
             ..local_entry("grid", "relay-a")
         });
 
-        let (_removed, removed_at) =
+        let (_removed, removed_at, _removed_revision) =
             rt.unregister_local_route_with_tombstone("grid", "server-grid");
         let updated = rt.register_route(RouteEntry {
             registered_at: removed_at + 1.0,
@@ -1726,6 +1804,8 @@ mod tests {
             name: "grid".into(),
             relay_id: "relay-a".into(),
             removed_at: 10.0,
+            removed_revision: 1,
+            local_catalog_revision: 0,
             server_id: None,
             observed_at: Instant::now(),
         }));
@@ -1754,6 +1834,8 @@ mod tests {
                 name: "grid".into(),
                 relay_id: "relay-a".into(),
                 removed_at: 2000.0,
+                removed_revision: 1,
+                local_catalog_revision: 0,
                 server_id: None,
                 observed_at: Instant::now(),
             }],
@@ -1779,6 +1861,8 @@ mod tests {
                 name: "grid".into(),
                 relay_id: "relay-a".into(),
                 removed_at: 2000.0,
+                removed_revision: 1,
+                local_catalog_revision: 0,
                 server_id: None,
                 observed_at: Instant::now(),
             }],
@@ -1906,6 +1990,8 @@ mod tests {
                 name: "existing".into(),
                 relay_id: "relay-a".into(),
                 removed_at: 3000.0,
+                removed_revision: 1,
+                local_catalog_revision: 0,
                 server_id: None,
                 observed_at: Instant::now(),
             }],
@@ -1935,6 +2021,8 @@ mod tests {
                 name: "x".repeat(MAX_WIRE_TEXT_BYTES + 1),
                 relay_id: "relay-a".into(),
                 removed_at: 2000.0,
+                removed_revision: 1,
+                local_catalog_revision: 0,
                 server_id: None,
                 observed_at: Instant::now(),
             }],
@@ -1983,6 +2071,8 @@ mod tests {
                 name: "existing".into(),
                 relay_id: "relay-a".into(),
                 removed_at: 2000.0,
+                removed_revision: 1,
+                local_catalog_revision: 0,
                 server_id: None,
                 observed_at: Instant::now(),
             }],
@@ -2020,6 +2110,8 @@ mod tests {
                 name: "existing".into(),
                 relay_id: "relay-a".into(),
                 removed_at: 2000.0,
+                removed_revision: 1,
+                local_catalog_revision: 0,
                 server_id: None,
                 observed_at: Instant::now(),
             }],
@@ -2044,6 +2136,8 @@ mod tests {
             name: "grid".into(),
             relay_id: "relay-a".into(),
             removed_at: 2000.0,
+            removed_revision: 1,
+            local_catalog_revision: 0,
             server_id: None,
             observed_at: Instant::now(),
         });
@@ -2055,5 +2149,59 @@ mod tests {
         assert_eq!(removed[0].tombstone.server_id, None);
         assert_eq!(removed[0].reason, TombstoneGcReason::RetentionExpired);
         assert!(rt.list_tombstones().is_empty());
+    }
+
+    #[test]
+    fn catalog_revision_advances_for_route_events_and_gc_compacts_removed_revision() {
+        let mut rt = RouteTable::new("relay-a".into());
+        assert_eq!(rt.catalog_revision(), 0);
+        assert_eq!(rt.compaction_revision(), 0);
+
+        assert!(rt.register_route(local_entry("grid", "relay-a")));
+        assert_eq!(rt.catalog_revision(), 1);
+
+        let (removed, _, _) = rt.unregister_local_route_with_tombstone("grid", "server-grid");
+        assert!(removed.is_some());
+        assert_eq!(rt.catalog_revision(), 2);
+
+        let tombstone = rt.list_tombstones().pop().expect("tombstone recorded");
+        assert_eq!(tombstone.removed_revision, 2);
+        assert_eq!(tombstone.local_catalog_revision, 2);
+        assert_eq!(rt.compaction_revision(), 0);
+
+        let removed = rt.gc_tombstones(Duration::from_secs(0));
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].tombstone.removed_revision, 2);
+        assert_eq!(removed[0].tombstone.local_catalog_revision, 2);
+        assert_eq!(removed[0].compaction_revision, 2);
+        assert_eq!(rt.compaction_revision(), 2);
+    }
+
+    #[test]
+    fn peer_tombstone_gc_compacts_local_revision_not_owner_removed_revision() {
+        let mut rt = RouteTable::new("relay-b".into());
+        register_alive_peer(&mut rt, "relay-a");
+
+        assert!(rt.apply_tombstone(RouteTombstone {
+            name: "grid".into(),
+            relay_id: "relay-a".into(),
+            removed_at: 2000.0,
+            removed_revision: 77,
+            local_catalog_revision: 0,
+            server_id: None,
+            observed_at: Instant::now(),
+        }));
+        assert_eq!(rt.catalog_revision(), 1);
+
+        let tombstone = rt.list_tombstones().pop().expect("tombstone recorded");
+        assert_eq!(tombstone.removed_revision, 77);
+        assert_eq!(tombstone.local_catalog_revision, 1);
+
+        let removed = rt.gc_tombstones(Duration::from_secs(0));
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].tombstone.removed_revision, 77);
+        assert_eq!(removed[0].tombstone.local_catalog_revision, 1);
+        assert_eq!(removed[0].compaction_revision, 1);
+        assert_eq!(rt.compaction_revision(), 1);
     }
 }

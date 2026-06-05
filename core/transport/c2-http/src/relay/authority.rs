@@ -375,6 +375,7 @@ pub(crate) enum RouteCommand {
         name: String,
         relay_id: String,
         removed_at: f64,
+        removed_revision: u64,
     },
     RemovePeerRoutes {
         relay_id: String,
@@ -391,6 +392,7 @@ pub(crate) enum RouteCommandResult {
     Unregistered {
         entry: RouteEntry,
         removed_at: f64,
+        removed_revision: u64,
         client: Option<Arc<IpcClient>>,
     },
     AlreadyUnregistered,
@@ -659,7 +661,14 @@ impl<'a> RouteAuthority<'a> {
                 name,
                 relay_id,
                 removed_at,
-            } => self.withdraw_peer(sender_relay_id, name, relay_id, removed_at),
+                removed_revision,
+            } => self.withdraw_peer(
+                sender_relay_id,
+                name,
+                relay_id,
+                removed_at,
+                removed_revision,
+            ),
             RouteCommand::RemovePeerRoutes { relay_id } => {
                 self.remove_peer_routes(&relay_id);
                 Ok(RouteCommandResult::PeerRoutesRemoved)
@@ -873,7 +882,7 @@ impl<'a> RouteAuthority<'a> {
         self.validate_route_name(&name)?;
         self.validate_server_id(&server_id)?;
 
-        let (entry, removed_at, client) = {
+        let (entry, removed_at, removed_revision, client) = {
             let mut route_table = self.state.route_table_write();
             let Some(existing) = route_table.local_route(&name) else {
                 if route_table.local_tombstone_matches_server(&name, &server_id) {
@@ -884,10 +893,10 @@ impl<'a> RouteAuthority<'a> {
             if existing.server_id.as_deref() != Some(server_id.as_str()) {
                 return Err(ControlError::OwnerMismatch);
             }
-            let (entry, removed_at) =
+            let (entry, removed_at, removed_revision) =
                 route_table.unregister_local_route_with_tombstone(&name, &server_id);
             let client = self.state.remove_connection(&name);
-            (entry, removed_at, client)
+            (entry, removed_at, removed_revision, client)
         };
         let Some(entry) = entry else {
             return Err(ControlError::NotFound);
@@ -895,6 +904,7 @@ impl<'a> RouteAuthority<'a> {
         Ok(RouteCommandResult::Unregistered {
             entry,
             removed_at,
+            removed_revision,
             client,
         })
     }
@@ -949,6 +959,7 @@ impl<'a> RouteAuthority<'a> {
         name: String,
         relay_id: String,
         removed_at: f64,
+        removed_revision: u64,
     ) -> Result<RouteCommandResult, ControlError> {
         self.validate_route_name(&name)?;
         self.validate_relay_id(&sender_relay_id)?;
@@ -961,7 +972,7 @@ impl<'a> RouteAuthority<'a> {
         }
         self.state
             .route_table_write()
-            .unregister_route_with_tombstone(&name, &relay_id, removed_at);
+            .unregister_route_with_tombstone(&name, &relay_id, removed_at, removed_revision);
         Ok(RouteCommandResult::PeerRouteChanged)
     }
 

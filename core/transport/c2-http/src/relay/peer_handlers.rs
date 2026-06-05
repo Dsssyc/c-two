@@ -118,12 +118,14 @@ pub async fn handle_peer_announce(
             name,
             relay_id,
             removed_at,
+            removed_revision,
         } => {
             let _ = RouteAuthority::new(&state).execute(RouteCommand::WithdrawPeer {
                 sender_relay_id,
                 name,
                 relay_id,
                 removed_at,
+                removed_revision,
             });
         }
         _ => {
@@ -320,6 +322,7 @@ pub async fn handle_peer_digest(
                                 name: tombstone.name,
                                 relay_id: tombstone.relay_id,
                                 removed_at: tombstone.removed_at,
+                                removed_revision: tombstone.removed_revision,
                                 hash,
                             });
                         }
@@ -353,12 +356,14 @@ pub async fn handle_peer_digest(
                             name,
                             relay_id,
                             removed_at,
+                            removed_revision,
                         } = deleted;
                         let _ = RouteAuthority::new(&state).execute(RouteCommand::WithdrawPeer {
                             sender_relay_id: sender_relay_id.clone(),
                             name,
                             relay_id,
                             removed_at,
+                            removed_revision,
                         });
                     }
                 }
@@ -462,6 +467,7 @@ mod tests {
             name: name.into(),
             relay_id: relay_id.into(),
             removed_at,
+            removed_revision: 1,
             hash: String::new(),
         };
         let hash = crate::relay::peer::route_digest_hash_for_diff_entry(&entry).unwrap();
@@ -880,6 +886,7 @@ mod tests {
                 name: "grid".into(),
                 relay_id: "relay-b".into(),
                 removed_at: 1001.0,
+                removed_revision: 1,
             },
         );
         envelope.protocol_version = crate::relay::peer::ROUTE_HASH_PEER_VERSION - 1;
@@ -990,6 +997,7 @@ mod tests {
                 name: "grid".into(),
                 relay_id: "relay-a".into(),
                 removed_at: 1001.0,
+                removed_revision: 1,
             },
         );
 

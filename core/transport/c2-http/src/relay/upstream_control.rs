@@ -158,7 +158,7 @@ async fn remove_owner_routes(state: &Arc<RelayState>, key: &UpstreamOwnerKey, re
 }
 
 async fn remove_route(state: &Arc<RelayState>, route: &RouteEntry, reason: &str) {
-    let Some((entry, removed_at, client)) =
+    let Some((entry, removed_at, removed_revision, client)) =
         state.remove_unreachable_local_upstream_if_matches(route)
     else {
         return;
@@ -167,13 +167,15 @@ async fn remove_route(state: &Arc<RelayState>, route: &RouteEntry, reason: &str)
         client.close_shared().await;
     }
     eprintln!(
-        "[relay] Upstream control watch removed route: name={} server_id={} server_instance_id={} address={} reason={reason}",
+        "[relay] Upstream control watch removed route: name={} server_id={} server_instance_id={} address={} removed_at={} removed_revision={} reason={reason}",
         entry.name,
         entry.server_id.as_deref().unwrap_or(""),
         entry.server_instance_id.as_deref().unwrap_or(""),
-        entry.ipc_address.as_deref().unwrap_or("")
+        entry.ipc_address.as_deref().unwrap_or(""),
+        removed_at,
+        removed_revision
     );
-    broadcast_route_withdraw(state, &entry, removed_at);
+    broadcast_route_withdraw(state, &entry, removed_at, removed_revision);
 }
 
 fn expected_contract_for_route(route: &RouteEntry) -> c2_contract::ExpectedRouteContract {

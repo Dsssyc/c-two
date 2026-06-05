@@ -30,6 +30,7 @@ pub(crate) fn broadcast_route_withdraw(
     state: &Arc<RelayState>,
     entry: &RouteEntry,
     removed_at: f64,
+    removed_revision: u64,
 ) {
     let envelope = PeerEnvelope::new(
         state.relay_id(),
@@ -37,6 +38,7 @@ pub(crate) fn broadcast_route_withdraw(
             name: entry.name.clone(),
             relay_id: entry.relay_id.clone(),
             removed_at,
+            removed_revision,
         },
     );
     let peers = state.list_peers();

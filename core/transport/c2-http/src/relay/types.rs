@@ -42,6 +42,10 @@ pub struct RouteTombstone {
     pub name: String,
     pub relay_id: String,
     pub removed_at: f64,
+    /// Delete-event revision assigned by the owner relay.
+    pub removed_revision: u64,
+    /// Local route-table revision assigned when this relay applies the tombstone.
+    pub local_catalog_revision: u64,
     pub server_id: Option<String>,
     pub observed_at: Instant,
 }
@@ -151,7 +155,7 @@ pub struct PeerSnapshot {
     pub status: PeerStatus,
 }
 
-pub const ROUTE_HASH_FULL_SYNC_VERSION: u32 = 3;
+pub const ROUTE_HASH_FULL_SYNC_VERSION: u32 = 6;
 pub type RouteDigestHash = String;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,6 +194,7 @@ pub struct FullSyncTombstone {
     pub name: String,
     pub relay_id: String,
     pub removed_at: f64,
+    pub removed_revision: u64,
     pub hash: RouteDigestHash,
 }
 
@@ -272,6 +277,7 @@ impl FullSyncTombstone {
             name: tombstone.name.clone(),
             relay_id: tombstone.relay_id.clone(),
             removed_at: tombstone.removed_at,
+            removed_revision: tombstone.removed_revision,
             hash: tombstone_digest_hash(tombstone),
         }
     }
@@ -281,6 +287,8 @@ impl FullSyncTombstone {
             name: self.name.clone(),
             relay_id: self.relay_id.clone(),
             removed_at: self.removed_at,
+            removed_revision: self.removed_revision,
+            local_catalog_revision: 0,
             server_id: None,
             observed_at: observed_now(),
         }
@@ -382,6 +390,7 @@ fn valid_full_sync_tombstone(tombstone: &FullSyncTombstone) -> bool {
     crate::relay::route_table::valid_route_name(&tombstone.name)
         && valid_wire_relay_id(&tombstone.relay_id)
         && tombstone.removed_at.is_finite()
+        && tombstone.removed_revision > 0
         && valid_route_digest_hash(&tombstone.hash)
 }
 
@@ -414,7 +423,12 @@ pub(crate) fn route_entry_digest_hash(entry: &RouteEntry) -> RouteDigestHash {
 }
 
 pub(crate) fn tombstone_digest_hash(tombstone: &RouteTombstone) -> RouteDigestHash {
-    deleted_route_digest_hash(&tombstone.name, &tombstone.relay_id, tombstone.removed_at)
+    deleted_route_digest_hash(
+        &tombstone.name,
+        &tombstone.relay_id,
+        tombstone.removed_at,
+        tombstone.removed_revision,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -453,8 +467,15 @@ pub(crate) fn deleted_route_digest_hash(
     name: &str,
     relay_id: &str,
     removed_at: f64,
+    removed_revision: u64,
 ) -> RouteDigestHash {
-    stable_route_digest_hash(&["deleted", name, relay_id, &removed_at.to_bits().to_string()])
+    stable_route_digest_hash(&[
+        "deleted",
+        name,
+        relay_id,
+        &removed_at.to_bits().to_string(),
+        &removed_revision.to_string(),
+    ])
 }
 
 fn stable_route_digest_hash(fields: &[&str]) -> RouteDigestHash {

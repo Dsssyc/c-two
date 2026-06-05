@@ -52,6 +52,7 @@ pub enum UnregisterResult {
     Removed {
         entry: RouteEntry,
         removed_at: f64,
+        removed_revision: u64,
         client: Option<Arc<IpcClient>>,
     },
     AlreadyRemoved,
@@ -182,12 +183,14 @@ impl RelayState {
             Ok(RouteCommandResult::Unregistered {
                 entry,
                 removed_at,
+                removed_revision,
                 client,
             }) => {
                 self.stop_upstream_control_if_owner_idle_for_route(&entry);
                 UnregisterResult::Removed {
                     entry,
                     removed_at,
+                    removed_revision,
                     client,
                 }
             }
@@ -213,18 +216,19 @@ impl RelayState {
     pub fn remove_unreachable_local_upstream_if_matches(
         &self,
         expected: &RouteEntry,
-    ) -> Option<(RouteEntry, f64, Option<Arc<IpcClient>>)> {
-        let (entry, removed_at, client) = {
+    ) -> Option<(RouteEntry, f64, u64, Option<Arc<IpcClient>>)> {
+        let (entry, removed_at, removed_revision, client) = {
             let mut route_table = self.route_table.write();
-            let (entry, removed_at) = route_table.unregister_local_route_if_matches(expected);
+            let (entry, removed_at, removed_revision) =
+                route_table.unregister_local_route_if_matches(expected);
             let client = if entry.is_some() {
                 self.conn_pool.remove(&expected.name)
             } else {
                 None
             };
-            (entry, removed_at, client)
+            (entry, removed_at, removed_revision, client)
         };
-        entry.map(|entry| (entry, removed_at, client))
+        entry.map(|entry| (entry, removed_at, removed_revision, client))
     }
 
     // -- Route-only operations --
@@ -602,6 +606,10 @@ impl RelayState {
         self.route_table.write().gc_tombstones(retention)
     }
 
+    pub(crate) fn route_catalog_revisions(&self) -> (u64, u64) {
+        self.with_route_table(|rt| (rt.catalog_revision(), rt.compaction_revision()))
+    }
+
     pub(crate) fn with_route_table<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&RouteTable) -> R,
@@ -814,6 +822,7 @@ mod tests {
                 name: name.to_string(),
                 relay_id: relay_id.to_string(),
                 removed_at: 1001.0,
+                removed_revision: 1,
             })
             .unwrap();
     }
@@ -1043,6 +1052,7 @@ mod tests {
             name: "grid".into(),
             relay_id: "test-relay".into(),
             removed_at: 1001.0,
+            removed_revision: 1,
         });
         assert!(matches!(result, Err(ControlError::OwnerMismatch)));
 

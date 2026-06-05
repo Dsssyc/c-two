@@ -1,7 +1,7 @@
 # Route Catalog Watch Redesign Implementation Plan
 
 **Date:** 2026-06-05
-**Status:** Phase 1 implemented; Phase 2 call-token foundation implemented; Phase 3 RouteCatalog wire/server/client watch implemented; Phase 4 upstream control watch slice implemented; Phase 5 relay token, canonical route errors, and loopback fallback clean cut implemented; Phase 6 cleanup/review pending
+**Status:** Phase 1 implemented; Phase 2 call-token foundation implemented; Phase 3 RouteCatalog wire/server/client watch implemented; Phase 4 upstream control watch slice implemented; Phase 5 relay token, canonical route errors, loopback fallback clean cut, and relay tombstone revision compaction slices implemented; Phase 6 cleanup/review pending
 **Scope:** IPC route lifecycle, relay route authority, relay upstream pools, relay-aware HTTP fallback, Rust error taxonomy, Python SDK error facade
 **Supersedes:** `docs/issues/ipc-route-contract-stale-snapshot.md` as the long-term design
 
@@ -1053,9 +1053,27 @@ Implementation status on 2026-06-06:
     candidates.
 - verified for this slice:
   - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay`.
+- implemented the relay tombstone revision compaction slice:
+  - relay tombstones now carry `removed_revision` in internal state, full-sync
+    snapshots, peer withdraw messages, and digest diff delete entries;
+  - deleted-route digest hashes bind `removed_revision`, so a replayed
+    tombstone with a different delete event revision fails validation;
+  - local relay route-table mutations advance a local `catalog_revision`, and
+    tombstone GC records the highest compacted local delete application revision
+    as `compaction_revision`;
+  - peer tombstone `removed_revision` remains the owner relay's delete event
+    revision and is not treated as the receiving relay's local catalog clock;
+  - GC detail and summary logs include route identity plus removed and
+    compaction revisions.
+- verified for this slice:
+  - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay catalog_revision_advances_for_route_events_and_gc_compacts_removed_revision`;
+  - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay peer_tombstone_gc_compacts_local_revision_not_owner_removed_revision`;
+  - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay deleted_digest_diff_hash_binds_removed_revision`;
+  - `cargo test --manifest-path core/Cargo.toml -p c2-http --features relay`.
 - remaining Phase 5/6 work:
-  - model route state and tombstone compaction by catalog revision rather than
-    only timestamped route-table tombstones.
+  - model full relay route state and watch compaction boundaries over catalog
+    revision; the current slice covers relay tombstone revision metadata and GC
+    compaction logging, not the full watch recovery surface.
 
 Verification:
 
