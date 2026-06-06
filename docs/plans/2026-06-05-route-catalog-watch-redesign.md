@@ -1192,7 +1192,7 @@ Status:
   - `git diff --check`;
   - Phase 6 source scans listed above;
   - `cargo test --manifest-path core/Cargo.toml --workspace`;
-  - `cargo check --manifest-path sdk/python/native/Cargo.toml`;
+  - `cargo test --manifest-path sdk/python/native/Cargo.toml`;
   - `uv sync --reinstall-package c-two`;
   - `C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30`
     (`964 passed`).
