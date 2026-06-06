@@ -26,6 +26,11 @@ class RecordingResource:
         return 'ok'
 
 
+class RouteClosedMessageResource:
+    def op(self):
+        raise RuntimeError('route closed')
+
+
 class FakeScheduler:
     def __init__(self, *, snapshot, method_index):
         self._snapshot = snapshot
@@ -95,3 +100,26 @@ def test_closed_call_direct_fails_before_entering_resource():
         proxy.call_direct('op', ())
     assert exc_info.value.details == {'route': 'grid'}
     assert resource.calls == []
+
+
+def test_resource_runtime_error_named_route_closed_is_not_reclassified():
+    scheduler = FakeScheduler(
+        snapshot=SimpleNamespace(
+            mode=ConcurrencyMode.PARALLEL,
+            max_pending=None,
+            max_workers=None,
+            closed=False,
+            is_unconstrained=True,
+        ),
+        method_index={'op': 0},
+    )
+    proxy = CRMProxy.thread_local(
+        RouteClosedMessageResource(),
+        name='grid',
+        scheduler=scheduler,
+    )
+
+    with pytest.raises(RuntimeError, match='route closed') as exc_info:
+        proxy.call_direct('op', ())
+    assert not isinstance(exc_info.value, ResourceClosed)
+    assert scheduler.guard_calls == [0]

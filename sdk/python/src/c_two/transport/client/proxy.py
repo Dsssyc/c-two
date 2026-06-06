@@ -269,8 +269,7 @@ class CRMProxy:
             return method(*args)
         method_idx = self._scheduler.method_idx(method_name)
         try:
-            with self._scheduler.execution_guard(method_idx):
-                return method(*args)
+            guard = self._scheduler.execution_guard(method_idx)
         except RuntimeError as exc:
             error_bytes = getattr(exc, 'error_bytes', None)
             if error_bytes is not None:
@@ -293,6 +292,8 @@ class CRMProxy:
                 )
                 raise ResourceClosed(message, details=details) from exc
             raise
+        with guard:
+            return method(*args)
 
     def terminate(self) -> None:
         """Release the proxy and invoke cleanup callback if set."""
