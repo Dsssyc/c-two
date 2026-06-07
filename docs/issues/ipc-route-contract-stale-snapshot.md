@@ -1,9 +1,10 @@
 # IPC Route Contract Stale Snapshot
 
 **Date**: 2026-06-05
-**Status**: Addressed by the route catalog/watch redesign. This issue is kept
-as the historical root-cause record; the implemented design and verification
-record live in `docs/plans/2026-06-05-route-catalog-watch-redesign.md`.
+**Status**: Historical root-cause record. The active clean-cut design lives in
+`docs/vision/route-token-endpoint-connection-architecture.md`; the older
+`docs/plans/2026-06-05-route-catalog-watch-redesign.md` file remains historical
+evidence for the watch-heavy implementation attempt.
 **Severity**: High for long-lived multi-route IPC servers
 **Scope**: `c2-ipc` client route catalog, direct IPC acquisition, relay upstream IPC acquisition, relay registration attestation
 
@@ -19,12 +20,12 @@ This affected two production-relevant paths:
 - direct IPC clients reused from the address-keyed `ClientPool`;
 - HTTP relay data-plane calls when the relay reused an upstream `IpcClient`.
 
-The repair moved beyond a single live lookup. IPC servers now expose a route
-catalog with per-route identity and revisions, IPC clients can watch catalog
-events, and relay data-plane calls bind acquisition to the selected route token
-before dispatch. Direct IPC and relay upstream IPC still share the same
-IPC-owned validation path; relay no longer treats route-name lookup alone as
-enough to call an upstream.
+The clean-cut repair moves beyond both handshake snapshots and watch-dependent
+freshness. IPC endpoint connections are server-instance scoped transports; route
+bindings are immutable route tokens acquired from route authority; and all CRM
+calls carry token identity for server admission. Watch/list can remain useful
+for diagnostics and control-plane promptness, but they are not the correctness
+contract for ordinary direct IPC.
 
 ## Reproduced Failure
 
@@ -42,25 +43,21 @@ The failing sequence is:
 
 ## Decision
 
-`c2-ipc` and `c2-server` own route catalog lookup, watch, and call-time route
+`c2-ipc` and `c2-server` own authoritative route acquire and call-time route
 token validation.
 
-- `RouteList`, `RouteLookup`, and `RouteWatch` replace handshake-snapshot
-  authority.
+- `RouteLookup` / route acquire replace handshake-snapshot authority.
 - The old production `refresh_route_contract(...)` path has been removed.
-- Internal route ensure boundaries are route-catalog backed: they use clean
-  directory state only when the watch stream is current, otherwise they perform
-  authoritative lookup or relist.
-- Watch events proactively add, update, close, and remove client-side route
-  records. `Compacted` explicitly tells the client its watch offset is too old
-  and a full relist is required.
+- Internal route ensure boundaries must perform authoritative lookup before
+  creating a route-bound proxy. Watch cache state is optional optimization, not
+  proof of current route validity.
 - Relay HTTP probe/call prechecks keep the selected route snapshot and acquire a
   route-bound upstream binding. If the route is replaced between precheck and
   acquire, relay returns `RouteStale` instead of replaying the call against the
   replacement.
-- Relay authority, upstream control watch, and upstream data-plane pooling are
-  separate mechanisms. Idle eviction affects only relay-created data-plane IPC
-  clients and does not withdraw routes.
+- Relay authority and upstream data-plane pooling are separate mechanisms. Idle
+  eviction affects only relay-created endpoint IPC clients and does not withdraw
+  routes.
 
 This keeps the fast path cheap while removing the assumption that the handshake
 route list is a permanent catalog.
@@ -72,9 +69,9 @@ route list is a permanent catalog.
 - Future remote transports must preserve the same route-token binding and
   canonical error-envelope behavior rather than reintroducing route-name-only
   dispatch.
-- The relay route-authority event log is currently an internal primitive. A
-  public relay watch/list surface should be added only when a concrete mesh
-  consumer needs it.
+- Watch/list surfaces should be added or retained only as diagnostics,
+  control-plane promptness, or mesh tooling. They must not become the direct IPC
+  route correctness contract.
 
 ## HTTP Client Boundary
 
@@ -111,9 +108,9 @@ route attestation token path.
 
 - `c2-ipc`: a pooled direct IPC client connected before `builder` is registered
   must refresh and validate `builder` after the server commits it.
-- `c2-http` relay: an HTTP relay data-plane request must succeed when the relay
-  upstream slot contains an `IpcClient` whose original handshake snapshot lacks
-  the later committed route.
+- `c2-http` relay: an HTTP relay data-plane request must succeed when a reused
+  endpoint IPC connection's original handshake snapshot lacks the later
+  committed route.
 - `c2-http` relay: a call prechecked against one route token must reject a
   same-contract replacement route with canonical `RouteStale`.
 - Python SDK: a canonical relay route error returned during an HTTP CRM call
