@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use futures_util::{Stream, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, oneshot};
 
 use c2_error::ErrorCode;
 use c2_mem::FreeResult;
@@ -40,9 +40,8 @@ use c2_wire::registration_control::{
 use c2_wire::route_catalog_control::{
     RouteContractWire, RouteListRequest, RouteListResponse, RouteLookupRequest,
     RouteLookupResponse, RouteRecordWire, RouteSelector, RouteStateReasonWire, RouteStateWire,
-    RouteWatchEvent, RouteWatchRequest, decode_route_list_response, decode_route_lookup_response,
-    decode_route_nack, decode_route_watch_event, encode_route_list_request,
-    encode_route_lookup_request, encode_route_watch_request,
+    decode_route_list_response, decode_route_lookup_response, decode_route_nack,
+    encode_route_list_request, encode_route_lookup_request,
 };
 
 use c2_mem::config::PoolConfig;
@@ -480,9 +479,7 @@ impl RouteBinding {
 pub(crate) struct RouteDirectory {
     routes: HashMap<String, MethodTable>,
     catalog_revision: u64,
-    min_watch_revision: u64,
     dirty: bool,
-    watch_unavailable: Option<String>,
 }
 
 impl RouteDirectory {
@@ -497,9 +494,7 @@ impl RouteDirectory {
                 .insert(route.name.clone(), MethodTable::from_route(route));
         }
         self.catalog_revision = 0;
-        self.min_watch_revision = 0;
         self.dirty = false;
-        self.watch_unavailable = None;
     }
 
     fn rebuild_from_list(&mut self, response: RouteListResponse) {
@@ -508,9 +503,7 @@ impl RouteDirectory {
             self.apply_record(record);
         }
         self.catalog_revision = response.catalog_revision;
-        self.min_watch_revision = response.min_watch_revision;
         self.dirty = false;
-        self.watch_unavailable = None;
     }
 
     fn apply_record(&mut self, record: RouteRecordWire) {
@@ -529,54 +522,8 @@ impl RouteDirectory {
         }
     }
 
-    fn apply_watch_event(&mut self, event: RouteWatchEvent) -> WatchApplyOutcome {
-        match event {
-            RouteWatchEvent::Added { record } | RouteWatchEvent::Updated { record } => {
-                self.apply_record(record);
-                WatchApplyOutcome::Continue
-            }
-            RouteWatchEvent::Removed {
-                route_name,
-                catalog_revision,
-                ..
-            }
-            | RouteWatchEvent::Closed {
-                route_name,
-                catalog_revision,
-                ..
-            } => {
-                self.routes.remove(&route_name);
-                self.catalog_revision = self.catalog_revision.max(catalog_revision);
-                WatchApplyOutcome::Continue
-            }
-            RouteWatchEvent::Heartbeat { catalog_revision } => {
-                self.catalog_revision = self.catalog_revision.max(catalog_revision);
-                WatchApplyOutcome::BatchComplete
-            }
-            RouteWatchEvent::Compacted {
-                compacted_revision,
-                current_revision,
-            } => {
-                self.routes.clear();
-                self.catalog_revision = current_revision;
-                self.min_watch_revision = compacted_revision.saturating_add(1);
-                self.dirty = true;
-                WatchApplyOutcome::Compacted {
-                    compacted_revision,
-                    current_revision,
-                }
-            }
-        }
-    }
-
     fn mark_dirty(&mut self) {
         self.dirty = true;
-    }
-
-    fn mark_watch_unavailable(&mut self, reason: impl Into<String>) {
-        self.routes.clear();
-        self.dirty = true;
-        self.watch_unavailable = Some(reason.into());
     }
 
     fn remove_route(&mut self, route_name: &str) {
@@ -587,16 +534,8 @@ impl RouteDirectory {
         self.dirty
     }
 
-    fn catalog_revision(&self) -> u64 {
-        self.catalog_revision
-    }
-
     fn route_table(&self, name: &str) -> Option<MethodTable> {
         self.routes.get(name).cloned()
-    }
-
-    fn watch_unavailable_reason(&self) -> Option<&str> {
-        self.watch_unavailable.as_deref()
     }
 
     fn has_route(&self, name: &str) -> bool {
@@ -610,16 +549,6 @@ impl RouteDirectory {
     pub(crate) fn insert_table(&mut self, name: String, table: MethodTable) {
         self.routes.insert(name, table);
     }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum WatchApplyOutcome {
-    Continue,
-    BatchComplete,
-    Compacted {
-        compacted_revision: u64,
-        current_revision: u64,
-    },
 }
 
 impl MethodTable {
@@ -651,7 +580,6 @@ impl MethodTable {
 
 enum PendingResponse {
     Unary(oneshot::Sender<Result<ResponseData, IpcError>>),
-    Watch(mpsc::UnboundedSender<Result<Vec<u8>, IpcError>>),
 }
 
 type PendingMap = HashMap<u32, PendingResponse>;
@@ -761,7 +689,6 @@ pub struct IpcClient {
     /// Server SHM pool state for reading buddy reply responses.
     pub(crate) server_pool: Arc<StdMutex<Option<ServerPoolState>>>,
     recv_handle: Arc<StdMutex<Option<tokio::task::JoinHandle<()>>>>,
-    watch_handle: Arc<StdMutex<Option<tokio::task::JoinHandle<()>>>>,
     connected: Arc<AtomicBool>,
     pub(crate) pool: Option<Arc<StdMutex<MemPool>>>,
     pub(crate) config: ClientIpcConfig,
@@ -838,7 +765,6 @@ impl IpcClient {
             server_identity: None,
             server_pool: Arc::new(StdMutex::new(None)),
             recv_handle: Arc::new(StdMutex::new(None)),
-            watch_handle: Arc::new(StdMutex::new(None)),
             connected: Arc::new(AtomicBool::new(false)),
             pool,
             chunk_registry: Self::make_chunk_registry(&config),
@@ -945,7 +871,6 @@ impl IpcClient {
         *self.writer.lock().await = Some(writer);
 
         self.connected.store(true, Ordering::Release);
-        self.spawn_route_watch_task();
 
         // Spawn the receive loop — replaced below in `do_handshake`.
         // Actually, we need to spawn it with the reader after handshake.
@@ -1150,34 +1075,6 @@ impl IpcClient {
         }
     }
 
-    async fn open_route_watch_stream_raw(
-        writer: Arc<Mutex<Option<tokio::io::WriteHalf<UnixStream>>>>,
-        pending: Arc<StdMutex<PendingMap>>,
-        rid_counter: Arc<AtomicU32>,
-        payload: Vec<u8>,
-    ) -> Result<mpsc::UnboundedReceiver<Result<Vec<u8>, IpcError>>, IpcError> {
-        let rid = rid_counter.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = mpsc::unbounded_channel();
-        {
-            pending.lock().insert(rid, PendingResponse::Watch(tx));
-        }
-
-        let frame = frame::encode_frame(rid as u64, flags::FLAG_CTRL, &payload);
-        let send_result: Result<(), IpcError> = async {
-            let mut writer_guard = writer.lock().await;
-            let writer = writer_guard.as_mut().ok_or(IpcError::Closed)?;
-            writer.write_all(&frame).await?;
-            Ok(())
-        }
-        .await;
-        if let Err(err) = send_result {
-            pending.lock().remove(&rid);
-            return Err(err);
-        }
-
-        Ok(rx)
-    }
-
     async fn list_routes_raw(
         writer: Arc<Mutex<Option<tokio::io::WriteHalf<UnixStream>>>>,
         pending: Arc<StdMutex<PendingMap>>,
@@ -1211,138 +1108,11 @@ impl IpcClient {
         Ok(())
     }
 
-    fn spawn_route_watch_task(&self) {
-        if self.watch_handle.lock().is_some() {
-            return;
-        }
-        let writer = Arc::clone(&self.writer);
-        let pending = Arc::clone(&self.pending);
-        let rid_counter = Arc::clone(&self.rid_counter);
-        let directory = Arc::clone(&self.route_directory);
-        let connected = Arc::clone(&self.connected);
-        let handle = tokio::spawn(async move {
-            let idle_backoff = std::time::Duration::from_millis(100);
-            while connected.load(Ordering::Acquire) {
-                let from_revision = directory.read().catalog_revision();
-                let payload = match encode_route_watch_request(&RouteWatchRequest {
-                    from_revision,
-                    selector: RouteSelector::All,
-                    allow_heartbeat: true,
-                }) {
-                    Ok(payload) => payload,
-                    Err(err) => {
-                        eprintln!("[c-two] route watch request encode failed: {err}");
-                        directory.write().mark_watch_unavailable(format!(
-                            "route watch request encode failed: {err}"
-                        ));
-                        break;
-                    }
-                };
-
-                let mut stream = match Self::open_route_watch_stream_raw(
-                    Arc::clone(&writer),
-                    Arc::clone(&pending),
-                    Arc::clone(&rid_counter),
-                    payload,
-                )
-                .await
-                {
-                    Ok(stream) => stream,
-                    Err(err) => {
-                        eprintln!("[c-two] route watch unavailable: {err}");
-                        directory
-                            .write()
-                            .mark_watch_unavailable(format!("route watch unavailable: {err}"));
-                        break;
-                    }
-                };
-
-                let mut saw_change = false;
-                while let Some(item) = stream.recv().await {
-                    let payload = match item {
-                        Ok(payload) => payload,
-                        Err(err) => {
-                            eprintln!("[c-two] route watch stream failed: {err}");
-                            directory.write().mark_watch_unavailable(format!(
-                                "route watch stream failed: {err}"
-                            ));
-                            return;
-                        }
-                    };
-                    if Self::payload_msg_type(&payload) == Some(MsgType::RouteNack) {
-                        directory.write().mark_dirty();
-                        if let Err(err) = Self::rebuild_directory_raw(
-                            Arc::clone(&writer),
-                            Arc::clone(&pending),
-                            Arc::clone(&rid_counter),
-                            Arc::clone(&directory),
-                        )
-                        .await
-                        {
-                            eprintln!("[c-two] route directory rebuild after NACK failed: {err}");
-                            directory.write().mark_watch_unavailable(format!(
-                                "route directory rebuild after NACK failed: {err}"
-                            ));
-                            return;
-                        }
-                        break;
-                    }
-
-                    let event = match decode_route_watch_event(&payload) {
-                        Ok(event) => event,
-                        Err(err) => {
-                            directory.write().mark_dirty();
-                            eprintln!("[c-two] route watch event decode failed: {err}");
-                            break;
-                        }
-                    };
-                    let outcome = directory.write().apply_watch_event(event);
-                    match outcome {
-                        WatchApplyOutcome::Continue => {
-                            saw_change = true;
-                        }
-                        WatchApplyOutcome::BatchComplete => {
-                            break;
-                        }
-                        WatchApplyOutcome::Compacted { .. } => {
-                            if let Err(err) = Self::rebuild_directory_raw(
-                                Arc::clone(&writer),
-                                Arc::clone(&pending),
-                                Arc::clone(&rid_counter),
-                                Arc::clone(&directory),
-                            )
-                            .await
-                            {
-                                eprintln!(
-                                    "[c-two] route directory rebuild after compaction failed: {err}"
-                                );
-                                directory.write().mark_watch_unavailable(format!(
-                                    "route directory rebuild after compaction failed: {err}"
-                                ));
-                                return;
-                            }
-                            break;
-                        }
-                    }
-                }
-
-                if !saw_change {
-                    tokio::time::sleep(idle_backoff).await;
-                }
-            }
-        });
-        *self.watch_handle.lock() = Some(handle);
-    }
-
     fn bound_route_table(&self, route_name: &str) -> Result<MethodTable, IpcError> {
-        let directory = self.route_directory.read();
-        directory.route_table(route_name).ok_or_else(|| {
-            if let Some(reason) = directory.watch_unavailable_reason() {
-                IpcError::WatchUnavailable(reason.to_string())
-            } else {
-                IpcError::RouteNotFound(route_name.to_string())
-            }
-        })
+        self.route_directory
+            .read()
+            .route_table(route_name)
+            .ok_or_else(|| IpcError::RouteNotFound(route_name.to_string()))
     }
 
     async fn call_resolved_target(
@@ -2646,20 +2416,11 @@ impl IpcClient {
         if let Some(handle) = self.recv_handle.lock().take() {
             handle.abort();
         }
-        if let Some(handle) = self.watch_handle.lock().take() {
-            handle.abort();
-        }
         // Wake pending callers.
         let mut pending = self.pending.lock();
         for (_, pending) in pending.drain() {
-            match pending {
-                PendingResponse::Unary(tx) => {
-                    let _ = tx.send(Err(IpcError::Closed));
-                }
-                PendingResponse::Watch(tx) => {
-                    let _ = tx.send(Err(IpcError::Closed));
-                }
-            }
+            let PendingResponse::Unary(tx) = pending;
+            let _ = tx.send(Err(IpcError::Closed));
         }
     }
 }
@@ -2671,18 +2432,6 @@ const SIG_PING: u8 = 0x01;
 const SIG_PONG: u8 = 0x02;
 const SIG_DISCONNECT: u8 = 0x08;
 const SIG_DISCONNECT_ACK: u8 = 0x09;
-
-fn route_watch_payload_is_terminal(payload: &[u8]) -> bool {
-    match payload.first().and_then(|tag| MsgType::from_byte(*tag)) {
-        Some(MsgType::RouteNack) => true,
-        Some(MsgType::RouteWatchEvent) => match decode_route_watch_event(payload) {
-            Ok(RouteWatchEvent::Heartbeat { .. } | RouteWatchEvent::Compacted { .. }) => true,
-            Ok(_) => false,
-            Err(_) => true,
-        },
-        _ => false,
-    }
-}
 
 fn complete_unary_pending(
     pending: Option<PendingResponse>,
@@ -2757,28 +2506,8 @@ async fn recv_loop(
         let rid = hdr.request_id as u32;
 
         if hdr.is_response() && hdr.is_ctrl() {
-            let watch_tx = {
-                let mut pending_guard = pending.lock();
-                match pending_guard.get(&rid) {
-                    Some(PendingResponse::Watch(tx)) => {
-                        let tx = tx.clone();
-                        if route_watch_payload_is_terminal(&recv_buf) {
-                            pending_guard.remove(&rid);
-                        }
-                        Some(tx)
-                    }
-                    _ => match pending_guard.remove(&rid) {
-                        Some(PendingResponse::Unary(tx)) => {
-                            let _ = tx.send(Ok(ResponseData::Inline(recv_buf.clone())));
-                            None
-                        }
-                        Some(PendingResponse::Watch(tx)) => Some(tx),
-                        None => None,
-                    },
-                }
-            };
-            if let Some(tx) = watch_tx {
-                let _ = tx.send(Ok(recv_buf.clone()));
+            if let Some(PendingResponse::Unary(tx)) = pending.lock().remove(&rid) {
+                let _ = tx.send(Ok(ResponseData::Inline(recv_buf.clone())));
             }
             continue;
         }
@@ -2869,14 +2598,8 @@ async fn recv_loop(
     // Connection lost — wake all pending callers.
     let mut pending_guard = pending.lock();
     for (_, pending) in pending_guard.drain() {
-        match pending {
-            PendingResponse::Unary(tx) => {
-                let _ = tx.send(Err(IpcError::Closed));
-            }
-            PendingResponse::Watch(tx) => {
-                let _ = tx.send(Err(IpcError::Closed));
-            }
-        }
+        let PendingResponse::Unary(tx) = pending;
+        let _ = tx.send(Err(IpcError::Closed));
     }
 }
 
@@ -2958,104 +2681,19 @@ mod tests {
     }
 
     #[test]
-    fn route_directory_compaction_forces_list_rebuild_without_semantic_withdraw() {
-        const ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        const SIG_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
-        let mut directory = RouteDirectory::new();
-        directory.insert_table(
-            "grid".to_string(),
-            MethodTable::from_entries(
-                &[MethodEntry {
-                    name: "ping".to_string(),
-                    index: 0,
-                }],
-                "grid".to_string(),
-                "grid-route-uid-0001".to_string(),
-                1,
-                "test.grid".to_string(),
-                "Grid".to_string(),
-                "0.1.0".to_string(),
-                ABI_HASH.to_string(),
-                SIG_HASH.to_string(),
-                1024,
-            ),
-        );
-
-        let outcome = directory.apply_watch_event(RouteWatchEvent::Compacted {
-            compacted_revision: 7,
-            current_revision: 11,
-        });
-
-        assert_eq!(
-            outcome,
-            WatchApplyOutcome::Compacted {
-                compacted_revision: 7,
-                current_revision: 11,
-            }
-        );
-        assert!(directory.is_dirty());
-        assert!(!directory.has_route("grid"));
-
-        directory.rebuild_from_list(RouteListResponse {
-            catalog_revision: 12,
-            min_watch_revision: 8,
-            routes: vec![RouteRecordWire {
-                route_name: "grid".to_string(),
-                route_uid: "grid-route-uid-0002".to_string(),
-                route_revision: 2,
-                catalog_revision: 12,
-                owner_server_id: "server-a".to_string(),
-                owner_server_instance_id: "server-a-instance".to_string(),
-                owner_epoch: 1,
-                contract: RouteContractWire {
-                    route_name: "grid".to_string(),
-                    crm_ns: "test.grid".to_string(),
-                    crm_name: "Grid".to_string(),
-                    crm_ver: "0.1.0".to_string(),
-                    abi_hash: ABI_HASH.to_string(),
-                    signature_hash: SIG_HASH.to_string(),
-                },
-                methods: vec![c2_wire::route_catalog_control::RouteMethodWire {
-                    name: "ping".to_string(),
-                    index: 0,
-                }],
-                max_payload_size: 2048,
-                state: RouteStateWire::Ready,
-                state_reason: None,
-                lease_deadline_ms: None,
-            }],
-        });
-
-        assert!(!directory.is_dirty());
-        let table = directory.route_table("grid").expect("rebuilt route");
-        assert_eq!(table.route_uid(), "grid-route-uid-0002");
-        assert_eq!(table.max_payload_size(), 2048);
-    }
-
-    #[test]
-    fn route_watch_unavailable_does_not_look_like_route_missing() {
-        let client = IpcClient::new("ipc://watch_unavailable_projection");
-        client
-            .route_directory
-            .write()
-            .mark_watch_unavailable("watch stream closed before catalog could be trusted");
-
-        let expected = c2_contract::ExpectedRouteContract {
-            route_name: "grid".to_string(),
-            crm_ns: "test.grid".to_string(),
-            crm_name: "Grid".to_string(),
-            crm_ver: "0.1.0".to_string(),
-            abi_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                .to_string(),
-            signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
-                .to_string(),
-        };
-        let err = client
-            .bind_cached_route(&expected)
-            .expect_err("untrusted catalog must not look like a semantic route miss");
-
+    fn production_direct_ipc_does_not_start_route_watch_task() {
+        let source = include_str!("client.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("client.rs must have a production section");
         assert!(
-            matches!(err, IpcError::WatchUnavailable(message) if message.contains("watch stream closed"))
+            !production.contains("RouteWatchRequest"),
+            "ordinary direct IPC must not open a route-watch stream"
+        );
+        assert!(
+            !production.contains("PendingResponse::Watch"),
+            "ordinary direct IPC must not depend on watch response state"
         );
     }
 

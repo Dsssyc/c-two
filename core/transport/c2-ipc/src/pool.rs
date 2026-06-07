@@ -568,24 +568,16 @@ mod tests {
                     &payload,
                 );
                 stream.write_all(&frame).unwrap();
-                let mut len_buf = [0_u8; 4];
-                stream.read_exact(&mut len_buf).unwrap();
-                let body_len = u32::from_le_bytes(len_buf) as usize;
-                let mut body = vec![0_u8; body_len];
-                stream.read_exact(&mut body).unwrap();
-                let request_id = u64::from_le_bytes(body[0..8].try_into().unwrap());
-                let heartbeat = c2_wire::route_catalog_control::encode_route_watch_event(
-                    &c2_wire::route_catalog_control::RouteWatchEvent::Heartbeat {
-                        catalog_revision: 1,
-                    },
-                )
-                .unwrap();
-                let response = c2_wire::frame::encode_frame(
-                    request_id,
-                    c2_wire::flags::FLAG_RESPONSE | c2_wire::flags::FLAG_CTRL,
-                    &heartbeat,
-                );
-                stream.write_all(&response).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(150)))
+                    .unwrap();
+                let mut extra_len = [0_u8; 4];
+                match stream.read_exact(&mut extra_len) {
+                    Err(err)
+                        if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                    Ok(()) => panic!("direct IPC connect must not open a route-watch stream"),
+                    Err(err) => panic!("unexpected post-handshake read error: {err}"),
+                }
                 std::thread::sleep(Duration::from_millis(100));
             }
         });
@@ -635,20 +627,12 @@ mod tests {
                 tokio::task::spawn_blocking(move || ensure_client.acquire_route(&ensure_contract))
                     .await
                     .expect("ensure task should complete")
-                    .expect(
-                        "direct pooled IPC client should acquire builder through route catalog",
-                    );
+                    .expect("direct pooled IPC client should acquire builder through route lookup");
             assert_eq!(binding.route_name(), "builder");
 
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while !client.route_names().contains(&"builder".to_string())
-                && Instant::now() < deadline
-            {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
             assert!(
                 client.route_names().contains(&"builder".to_string()),
-                "route directory should contain builder after lookup/watch"
+                "route lookup should cache the acquired builder route without watch"
             );
             pool.release(&address);
 
