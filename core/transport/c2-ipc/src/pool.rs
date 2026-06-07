@@ -266,6 +266,7 @@ impl ClientPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::IpcClient;
     use std::collections::HashMap;
     use std::io::{Read, Write};
     use std::os::unix::net::UnixListener;
@@ -630,12 +631,14 @@ mod tests {
 
             let ensure_client = Arc::clone(&client);
             let ensure_contract = builder_contract.clone();
-            tokio::task::spawn_blocking(move || {
-                ensure_client.ensure_route_contract(&ensure_contract)
-            })
-            .await
-            .expect("ensure task should complete")
-            .expect("direct pooled IPC client should acquire builder through route catalog");
+            let binding =
+                tokio::task::spawn_blocking(move || ensure_client.acquire_route(&ensure_contract))
+                    .await
+                    .expect("ensure task should complete")
+                    .expect(
+                        "direct pooled IPC client should acquire builder through route catalog",
+                    );
+            assert_eq!(binding.route_name(), "builder");
 
             let deadline = Instant::now() + Duration::from_secs(2);
             while !client.route_names().contains(&"builder".to_string())
@@ -649,6 +652,72 @@ mod tests {
             );
             pool.release(&address);
 
+            server
+                .shutdown_and_wait(Duration::from_secs(2))
+                .await
+                .expect("server should shut down");
+            runner.await.unwrap().unwrap();
+        });
+    }
+
+    #[test]
+    fn registration_attestation_accepts_committed_closed_route_without_business_acquire() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let address = unique_ipc_address("registration_closed_route");
+            let server = Arc::new(Server::new(&address, ServerIpcConfig::default()).unwrap());
+            let expected = expected_contract("grid");
+            let built = server
+                .build_route(
+                    RouteBuildSpec {
+                        name: "grid".to_string(),
+                        crm_ns: expected.crm_ns.clone(),
+                        crm_name: expected.crm_name.clone(),
+                        crm_ver: expected.crm_ver.clone(),
+                        abi_hash: expected.abi_hash.clone(),
+                        signature_hash: expected.signature_hash.clone(),
+                        method_names: vec!["ping".to_string()],
+                        access_map: HashMap::new(),
+                        concurrency_mode: ConcurrencyMode::ReadParallel,
+                        limits: SchedulerLimits::default(),
+                    },
+                    Arc::new(Echo),
+                )
+                .expect("test route should build");
+            let reservation = server.reserve_route(built).await.expect("reserve route");
+            let admission = server
+                .commit_reserved_route_closed(reservation)
+                .await
+                .expect("closed registration commit");
+            let runner = {
+                let server = Arc::clone(&server);
+                tokio::spawn(async move { server.run().await })
+            };
+            server
+                .wait_until_responsive(Duration::from_secs(2))
+                .await
+                .expect("server should be responsive");
+
+            let mut client = IpcClient::with_config(&address, ClientIpcConfig::default());
+            client.connect().await.expect("client connects");
+            assert!(
+                matches!(
+                    client.acquire_route(&expected).await,
+                    Err(IpcError::RouteClosed { .. })
+                ),
+                "business acquire must reject closed registration routes"
+            );
+            let binding = client
+                .attest_route_for_registration(&expected)
+                .await
+                .expect("registration attestation accepts committed closed route");
+            assert_eq!(binding.route_name(), "grid");
+
+            server
+                .open_route_admission(admission)
+                .await
+                .expect("route admission opens for cleanup");
+            client.close().await;
             server
                 .shutdown_and_wait(Duration::from_secs(2))
                 .await

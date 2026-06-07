@@ -22,6 +22,7 @@ pub(crate) enum ControlError {
     InvalidServerInstanceId { reason: String },
     InvalidAddress { reason: String },
     ContractMismatch { reason: String },
+    UpstreamUnavailable { reason: String },
     AddressMismatch { existing_address: String },
     DuplicateRoute { existing_address: String },
     OwnerMismatch,
@@ -76,7 +77,24 @@ fn existing_contract_mismatch_reason(
     None
 }
 
-pub(crate) fn read_ipc_route_contract(
+fn control_error_from_ipc_attestation_error(
+    route_name: &str,
+    err: c2_ipc::IpcError,
+) -> ControlError {
+    match err {
+        c2_ipc::IpcError::RouteNotFound(_)
+        | c2_ipc::IpcError::RouteRemoved { .. }
+        | c2_ipc::IpcError::RouteClosed { .. } => ControlError::NotFound,
+        c2_ipc::IpcError::ContractMismatch(reason) | c2_ipc::IpcError::Protocol(reason) => {
+            ControlError::ContractMismatch { reason }
+        }
+        err => ControlError::UpstreamUnavailable {
+            reason: format!("IPC upstream route '{route_name}' acquisition failed: {err}"),
+        },
+    }
+}
+
+pub(crate) async fn read_ipc_route_contract(
     client: &IpcClient,
     route_name: &str,
 ) -> Result<AttestedRouteContract, ControlError> {
@@ -94,10 +112,9 @@ pub(crate) fn read_ipc_route_contract(
         });
     }
     let binding = client
-        .bind_route(&contract)
-        .map_err(|err| ControlError::ContractMismatch {
-            reason: format!("IPC upstream route '{route_name}' token bind failed: {err}"),
-        })?;
+        .attest_route_for_registration(&contract)
+        .await
+        .map_err(|err| control_error_from_ipc_attestation_error(route_name, err))?;
     Ok(AttestedRouteContract {
         route_uid: binding.route_uid().to_string(),
         route_revision: binding.route_revision(),
@@ -106,13 +123,11 @@ pub(crate) fn read_ipc_route_contract(
         crm_ver: contract.crm_ver,
         abi_hash: contract.abi_hash,
         signature_hash: contract.signature_hash,
-        max_payload_size: client
-            .route_max_payload_size(route_name)
-            .ok_or(ControlError::NotFound)?,
+        max_payload_size: binding.max_payload_size(),
     })
 }
 
-pub(crate) fn attest_ipc_route_contract(
+pub(crate) async fn attest_ipc_route_contract(
     client: &IpcClient,
     route_name: &str,
     claimed_crm_ns: &str,
@@ -122,10 +137,6 @@ pub(crate) fn attest_ipc_route_contract(
     claimed_signature_hash: &str,
     claimed_max_payload_size: u64,
 ) -> Result<AttestedRouteContract, ControlError> {
-    let contract = client
-        .route_contract(route_name)
-        .ok_or(ControlError::NotFound)?;
-    read_ipc_route_contract(client, route_name)?;
     let claimed = ExpectedRouteContract {
         route_name: route_name.to_string(),
         crm_ns: claimed_crm_ns.to_string(),
@@ -141,31 +152,11 @@ pub(crate) fn attest_ipc_route_contract(
             ),
         });
     }
-    if claimed != contract {
-        return Err(ControlError::ContractMismatch {
-            reason: format!(
-                "IPC upstream route '{route_name}' CRM contract mismatch: claimed {}/{}/{} hashes={}/{}, got {}/{}/{} hashes={}/{}",
-                claimed.crm_ns,
-                claimed.crm_name,
-                claimed.crm_ver,
-                claimed.abi_hash,
-                claimed.signature_hash,
-                contract.crm_ns,
-                contract.crm_name,
-                contract.crm_ver,
-                contract.abi_hash,
-                contract.signature_hash,
-            ),
-        });
-    }
     let binding = client
-        .bind_route(&claimed)
-        .map_err(|err| ControlError::ContractMismatch {
-            reason: format!("IPC upstream route '{route_name}' token bind failed: {err}"),
-        })?;
-    let max_payload_size = client
-        .route_max_payload_size(route_name)
-        .ok_or(ControlError::NotFound)?;
+        .attest_route_for_registration(&claimed)
+        .await
+        .map_err(|err| control_error_from_ipc_attestation_error(route_name, err))?;
+    let max_payload_size = binding.max_payload_size();
     if claimed_max_payload_size != max_payload_size {
         return Err(ControlError::ContractMismatch {
             reason: format!(
@@ -176,11 +167,11 @@ pub(crate) fn attest_ipc_route_contract(
     Ok(AttestedRouteContract {
         route_uid: binding.route_uid().to_string(),
         route_revision: binding.route_revision(),
-        crm_ns: contract.crm_ns,
-        crm_name: contract.crm_name,
-        crm_ver: contract.crm_ver,
-        abi_hash: contract.abi_hash,
-        signature_hash: contract.signature_hash,
+        crm_ns: claimed.crm_ns,
+        crm_name: claimed.crm_name,
+        crm_ver: claimed.crm_ver,
+        abi_hash: claimed.abi_hash,
+        signature_hash: claimed.signature_hash,
         max_payload_size,
     })
 }
@@ -196,18 +187,14 @@ pub(crate) async fn attest_ipc_pending_route_contract(
     claimed_signature_hash: &str,
     claimed_max_payload_size: u64,
 ) -> Result<AttestedRouteContract, ControlError> {
-    let contract = match client
-        .pending_route_contract(route_name, registration_token)
+    let (contract, binding) = match client
+        .acquire_pending_route_attestation(route_name, registration_token)
         .await
     {
-        Ok(contract) => contract,
+        Ok(attested) => attested,
         Err(c2_ipc::IpcError::RouteNotFound(_)) => return Err(ControlError::NotFound),
         Err(err) => {
-            return Err(ControlError::ContractMismatch {
-                reason: format!(
-                    "IPC upstream pending route '{route_name}' attestation failed: {err}"
-                ),
-            });
+            return Err(control_error_from_ipc_attestation_error(route_name, err));
         }
     };
     let claimed = ExpectedRouteContract {
@@ -218,9 +205,7 @@ pub(crate) async fn attest_ipc_pending_route_contract(
         abi_hash: claimed_abi_hash.to_string(),
         signature_hash: claimed_signature_hash.to_string(),
     };
-    let max_payload_size = client
-        .route_max_payload_size(route_name)
-        .ok_or(ControlError::NotFound)?;
+    let max_payload_size = binding.max_payload_size();
     if c2_contract::validate_expected_route_contract(&claimed).is_err() {
         return Err(ControlError::ContractMismatch {
             reason: format!(
@@ -245,11 +230,6 @@ pub(crate) async fn attest_ipc_pending_route_contract(
             ),
         });
     }
-    let binding = client
-        .bind_route(&claimed)
-        .map_err(|err| ControlError::ContractMismatch {
-            reason: format!("IPC upstream pending route '{route_name}' token bind failed: {err}"),
-        })?;
     if claimed_max_payload_size != max_payload_size {
         return Err(ControlError::ContractMismatch {
             reason: format!(

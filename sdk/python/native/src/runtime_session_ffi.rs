@@ -779,7 +779,7 @@ impl PyRuntimeSession {
         let binding_result = py.detach({
             let client = Arc::clone(&client);
             let expected = expected.clone();
-            move || client.bind_route(&expected)
+            move || client.acquire_route(&expected)
         });
         let binding = match binding_result {
             Ok(binding) => binding,
@@ -1085,7 +1085,7 @@ impl PyRuntimeSession {
         let binding_result = py.detach({
             let client = Arc::clone(&client);
             let expected = expected.clone();
-            move || client.bind_route(&expected)
+            move || client.acquire_route(&expected)
         });
         let binding = match binding_result {
             Ok(binding) => binding,

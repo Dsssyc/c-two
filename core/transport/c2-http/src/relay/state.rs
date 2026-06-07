@@ -189,7 +189,8 @@ impl RelayState {
             | Err(ControlError::InvalidServerId { reason })
             | Err(ControlError::InvalidServerInstanceId { reason })
             | Err(ControlError::InvalidAddress { reason })
-            | Err(ControlError::ContractMismatch { reason }) => {
+            | Err(ControlError::ContractMismatch { reason })
+            | Err(ControlError::UpstreamUnavailable { reason }) => {
                 RegisterCommitResult::Invalid { reason }
             }
             Ok(
@@ -239,7 +240,8 @@ impl RelayState {
             | Err(ControlError::InvalidServerId { .. })
             | Err(ControlError::InvalidServerInstanceId { .. })
             | Err(ControlError::InvalidAddress { .. })
-            | Err(ControlError::ContractMismatch { .. }) => UnregisterResult::OwnerMismatch,
+            | Err(ControlError::ContractMismatch { .. })
+            | Err(ControlError::UpstreamUnavailable { .. }) => UnregisterResult::OwnerMismatch,
             Err(ControlError::DuplicateRoute { .. }) => UnregisterResult::OwnerMismatch,
         }
     }
@@ -355,7 +357,7 @@ impl RelayState {
                         });
                     }
                     let expected_contract = expected_contract_for_route(&expected);
-                    if let Err(err) = client.ensure_route_contract(&expected_contract).await {
+                    if let Err(err) = client.acquire_route(&expected_contract).await {
                         client.close().await;
                         return Err(err);
                     }
@@ -415,7 +417,7 @@ impl RelayState {
         }
         let binding = match lease
             .client()
-            .ensure_route_token(
+            .acquire_route_token(
                 &expected_contract,
                 &expected.route_uid,
                 expected.route_revision,

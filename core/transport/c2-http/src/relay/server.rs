@@ -114,7 +114,8 @@ fn control_error_to_relay_error(err: ControlError) -> RelayControlError {
         | ControlError::InvalidServerId { reason }
         | ControlError::InvalidServerInstanceId { reason }
         | ControlError::InvalidAddress { reason }
-        | ControlError::ContractMismatch { reason } => RelayControlError::Other(reason),
+        | ControlError::ContractMismatch { reason }
+        | ControlError::UpstreamUnavailable { reason } => RelayControlError::Other(reason),
         ControlError::AddressMismatch { .. }
         | ControlError::DuplicateRoute { .. }
         | ControlError::OwnerMismatch
@@ -479,7 +480,8 @@ impl RelayServer {
                         | Err(ControlError::InvalidServerId { reason })
                         | Err(ControlError::InvalidServerInstanceId { reason })
                         | Err(ControlError::InvalidAddress { reason })
-                        | Err(ControlError::ContractMismatch { reason }) => {
+                        | Err(ControlError::ContractMismatch { reason })
+                        | Err(ControlError::UpstreamUnavailable { reason }) => {
                             eprintln!(
                                 "[relay] Register command rejected: name={name} server_id={server_id} address={address} reason={reason}"
                             );
@@ -553,7 +555,9 @@ impl RelayServer {
                                 let contract =
                                     match crate::relay::authority::read_ipc_route_contract(
                                         &client, &name,
-                                    ) {
+                                    )
+                                    .await
+                                    {
                                         Ok(contract) => contract,
                                         Err(ControlError::ContractMismatch { reason }) => {
                                             close_client(client);
@@ -574,6 +578,15 @@ impl RelayServer {
                                                     "IPC upstream at {address} does not export route '{name}'"
                                                 ),
                                             )));
+                                            continue;
+                                        }
+                                        Err(ControlError::UpstreamUnavailable { reason }) => {
+                                            close_client(client);
+                                            eprintln!(
+                                                "[relay] Register command rejected: name={name} server_id={server_id} address={address} reason={reason}"
+                                            );
+                                            let _ =
+                                                reply.send(Err(RelayControlError::Other(reason)));
                                             continue;
                                         }
                                         Err(_) => unreachable!(
@@ -605,7 +618,8 @@ impl RelayServer {
                                     | Err(ControlError::InvalidServerId { reason })
                                     | Err(ControlError::InvalidServerInstanceId { reason })
                                     | Err(ControlError::InvalidAddress { reason })
-                                    | Err(ControlError::ContractMismatch { reason }) => {
+                                    | Err(ControlError::ContractMismatch { reason })
+                                    | Err(ControlError::UpstreamUnavailable { reason }) => {
                                         let close_client = client.clone();
                                         tokio::spawn(
                                             async move { close_client.close_shared().await },

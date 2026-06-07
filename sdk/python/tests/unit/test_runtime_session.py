@@ -460,6 +460,59 @@ def test_failed_native_registration_leaves_no_route_or_identity(monkeypatch) -> 
         cc.shutdown()
 
 
+def test_direct_ipc_acquire_waits_for_dynamic_route_publication() -> None:
+    import threading
+    import time
+
+    import c_two as cc
+    from c_two.transport.registry import _ProcessRegistry
+
+    @cc.crm(namespace='cc.test.runtime_session_dynamic_route', version='0.1.0')
+    class DynamicRouteCRM:
+        def ping(self) -> str:
+            ...
+
+    class DynamicRouteImpl:
+        def ping(self) -> str:
+            return 'pong'
+
+    registrar = _ProcessRegistry()
+    resolver = _ProcessRegistry()
+    crm = None
+
+    try:
+        server = registrar._runtime_session.ensure_server_bridge()  # noqa: SLF001
+        server.start()
+        address = registrar.get_server_address()
+        assert address is not None
+
+        def delayed_register() -> None:
+            time.sleep(0.12)
+            registrar.register(
+                DynamicRouteCRM,
+                DynamicRouteImpl(),
+                name='dynamic-route',
+            )
+
+        thread = threading.Thread(target=delayed_register)
+        thread.start()
+        try:
+            crm = resolver.connect(
+                DynamicRouteCRM,
+                name='dynamic-route',
+                address=address,
+            )
+            assert crm.ping() == 'pong'
+        finally:
+            thread.join(timeout=2)
+            assert not thread.is_alive()
+    finally:
+        if crm is not None:
+            resolver.close(crm)
+        resolver.shutdown()
+        registrar.shutdown()
+
+
 def test_native_runtime_session_projects_client_ipc_overrides_copy() -> None:
     from c_two._native import RuntimeSession
 
@@ -745,9 +798,9 @@ def test_relay_ipc_acceptance_does_not_trust_route_name_only() -> None:
         if (pos := acquire_body.find(needle)) >= 0
     ]
     assert identity_checks
-    bind_pos = acquire_body.find('bind_route(&expected)')
-    assert bind_pos >= 0
-    assert min(identity_checks) < bind_pos
+    acquire_pos = acquire_body.find('acquire_route(&expected)')
+    assert acquire_pos >= 0
+    assert min(identity_checks) < acquire_pos
     assert 'route_names()' not in acquire_body
 
 
@@ -836,4 +889,4 @@ def test_relay_ipc_identity_boundary_is_native_owned() -> None:
 
     assert 'server_instance_id' not in registry_source
     assert 'expected_server_instance_id' in native_source
-    assert 'bind_route(&expected)' in native_source
+    assert 'acquire_route(&expected)' in native_source

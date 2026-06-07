@@ -715,7 +715,8 @@ async fn handle_register(
         | Err(ControlError::InvalidServerId { reason })
         | Err(ControlError::InvalidServerInstanceId { reason })
         | Err(ControlError::InvalidAddress { reason })
-        | Err(ControlError::ContractMismatch { reason }) => {
+        | Err(ControlError::ContractMismatch { reason })
+        | Err(ControlError::UpstreamUnavailable { reason }) => {
             eprintln!(
                 "[relay] Register rejected: name={name} server_id={server_id} address={address} reason={reason}"
             );
@@ -770,60 +771,44 @@ async fn handle_register(
                 .into_response();
         }
         let contract = match claimed_contract.as_ref() {
-            Some(claimed_contract) => match c.ensure_route_contract(claimed_contract).await {
-                Ok(()) => match attest_ipc_route_contract(
-                    &c,
-                    &name,
-                    &claimed_contract.crm_ns,
-                    &claimed_contract.crm_name,
-                    &claimed_contract.crm_ver,
-                    &claimed_contract.abi_hash,
-                    &claimed_contract.signature_hash,
-                    max_payload_size,
-                ) {
-                    Ok(contract) => contract,
-                    Err(ControlError::ContractMismatch { reason }) => {
-                        close_client(c);
-                        eprintln!(
-                            "[relay] Register rejected: name={name} server_id={server_id} address={address} reason={reason}"
-                        );
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json(serde_json::json!({ "error": reason })),
-                        )
-                            .into_response();
-                    }
-                    Err(ControlError::NotFound) => {
-                        close_client(c);
-                        eprintln!(
-                            "[relay] Register rejected: name={name} server_id={server_id} address={address} reason=route_not_exported"
-                        );
-                        return (
-                                StatusCode::BAD_REQUEST,
-                                Json(serde_json::json!({
-                                    "error": format!("IPC upstream at {address} does not export route '{name}'"),
-                                })),
-                            )
-                                .into_response();
-                    }
-                    Err(_) => {
-                        unreachable!("route contract attestation returns only contract errors")
-                    }
-                },
-                Err(c2_ipc::IpcError::RouteNotFound(_)) => {
+            Some(claimed_contract) => match attest_ipc_route_contract(
+                &c,
+                &name,
+                &claimed_contract.crm_ns,
+                &claimed_contract.crm_name,
+                &claimed_contract.crm_ver,
+                &claimed_contract.abi_hash,
+                &claimed_contract.signature_hash,
+                max_payload_size,
+            )
+            .await
+            {
+                Ok(contract) => contract,
+                Err(ControlError::ContractMismatch { reason }) => {
+                    close_client(c);
+                    eprintln!(
+                        "[relay] Register rejected: name={name} server_id={server_id} address={address} reason={reason}"
+                    );
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": reason })),
+                    )
+                        .into_response();
+                }
+                Err(ControlError::NotFound) => {
                     if !prepare_only {
                         close_client(c);
                         eprintln!(
                             "[relay] Register rejected: name={name} server_id={server_id} address={address} reason=pending_route_not_committed"
                         );
                         return (
-                                StatusCode::BAD_REQUEST,
-                                Json(serde_json::json!({
-                                    "error": "PendingRouteNotCommitted",
-                                    "message": format!("IPC upstream at {address} does not export committed route '{name}'"),
-                                })),
-                            )
-                                .into_response();
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": "PendingRouteNotCommitted",
+                                "message": format!("IPC upstream at {address} does not export committed route '{name}'"),
+                            })),
+                        )
+                            .into_response();
                     }
                     let Some(registration_token) = registration_token.as_deref() else {
                         close_client(c);
@@ -836,8 +821,8 @@ async fn handle_register(
                                     "error": "PendingRouteAttestationRequired",
                                     "message": format!("IPC upstream at {address} does not export committed route '{name}' and no registration_token was provided"),
                                 })),
-                            )
-                                .into_response();
+                        )
+                            .into_response();
                     };
                     match attest_ipc_pending_route_contract(
                         &mut c,
@@ -877,39 +862,37 @@ async fn handle_register(
                                 )
                                     .into_response();
                         }
+                        Err(ControlError::UpstreamUnavailable { reason }) => {
+                            close_client(c);
+                            eprintln!(
+                                "[relay] Register rejected: name={name} server_id={server_id} address={address} reason={reason}"
+                            );
+                            return (
+                                StatusCode::BAD_GATEWAY,
+                                Json(serde_json::json!({ "error": reason })),
+                            )
+                                .into_response();
+                        }
                         Err(_) => unreachable!(
                             "pending route contract attestation returns only contract errors"
                         ),
                     }
                 }
-                Err(c2_ipc::IpcError::ContractMismatch(reason))
-                | Err(c2_ipc::IpcError::Protocol(reason)) => {
+                Err(ControlError::UpstreamUnavailable { reason }) => {
                     close_client(c);
                     eprintln!(
                         "[relay] Register rejected: name={name} server_id={server_id} address={address} reason={reason}"
                     );
                     return (
-                        StatusCode::BAD_REQUEST,
+                        StatusCode::BAD_GATEWAY,
                         Json(serde_json::json!({ "error": reason })),
                     )
                         .into_response();
                 }
-                Err(err) => {
-                    close_client(c);
-                    eprintln!(
-                        "[relay] Register rejected: name={name} server_id={server_id} address={address} reason=route_attestation_failed error={err}"
-                    );
-                    return (
-                            StatusCode::BAD_GATEWAY,
-                            Json(serde_json::json!({
-                                "error": format!("Failed to attest upstream '{name}' at {address}: {err}"),
-                            })),
-                        )
-                            .into_response();
-                }
+                Err(_) => unreachable!("route contract attestation returns only contract errors"),
             },
             None => match c.rebuild_route_catalog().await {
-                Ok(()) => match read_ipc_route_contract(&c, &name) {
+                Ok(()) => match read_ipc_route_contract(&c, &name).await {
                     Ok(contract) => contract,
                     Err(ControlError::NotFound) => {
                         close_client(c);
@@ -931,6 +914,17 @@ async fn handle_register(
                         );
                         return (
                             StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({ "error": reason })),
+                        )
+                            .into_response();
+                    }
+                    Err(ControlError::UpstreamUnavailable { reason }) => {
+                        close_client(c);
+                        eprintln!(
+                            "[relay] Register rejected: name={name} server_id={server_id} address={address} reason={reason}"
+                        );
+                        return (
+                            StatusCode::BAD_GATEWAY,
                             Json(serde_json::json!({ "error": reason })),
                         )
                             .into_response();
@@ -1046,7 +1040,8 @@ async fn handle_register(
         | Err(ControlError::InvalidServerId { reason })
         | Err(ControlError::InvalidServerInstanceId { reason })
         | Err(ControlError::InvalidAddress { reason })
-        | Err(ControlError::ContractMismatch { reason }) => {
+        | Err(ControlError::ContractMismatch { reason })
+        | Err(ControlError::UpstreamUnavailable { reason }) => {
             close_arc_client(client);
             eprintln!(
                 "[relay] Register rejected: name={name} server_id={server_id} address={address} reason={reason}"

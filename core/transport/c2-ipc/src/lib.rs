@@ -7,7 +7,8 @@
 //!
 //! ```text
 //! HTTP handler
-//!     -> IpcClient::call(route, method, payload)
+//!     -> IpcClient::acquire_route_token(route contract, route token)
+//!     -> IpcClient::call_bound(binding, method, payload)
 //!         -> select inline / buddy SHM / chunked request transport
 //!         -> send_task:  serialize frame -> write UDS
 //!         -> recv_task:  read UDS -> match request_id -> oneshot -> caller

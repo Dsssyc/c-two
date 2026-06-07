@@ -39,10 +39,10 @@ use c2_wire::registration_control::{
 };
 use c2_wire::route_catalog_control::{
     RouteContractWire, RouteListRequest, RouteListResponse, RouteLookupRequest,
-    RouteLookupResponse, RouteRecordWire, RouteSelector, RouteStateWire, RouteWatchEvent,
-    RouteWatchRequest, decode_route_list_response, decode_route_lookup_response, decode_route_nack,
-    decode_route_watch_event, encode_route_list_request, encode_route_lookup_request,
-    encode_route_watch_request,
+    RouteLookupResponse, RouteRecordWire, RouteSelector, RouteStateReasonWire, RouteStateWire,
+    RouteWatchEvent, RouteWatchRequest, decode_route_list_response, decode_route_lookup_response,
+    decode_route_nack, decode_route_watch_event, encode_route_list_request,
+    encode_route_lookup_request, encode_route_watch_request,
 };
 
 use c2_mem::config::PoolConfig;
@@ -51,6 +51,8 @@ use c2_mem::{MemPool, PoolAllocation};
 use crate::response::ResponseData;
 
 pub use c2_config::ClientIpcConfig;
+
+const ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS: &[u64] = &[10, 25, 50, 100, 200];
 
 // ── Server pool state ────────────────────────────────────────────────────
 
@@ -1332,28 +1334,6 @@ impl IpcClient {
         *self.watch_handle.lock() = Some(handle);
     }
 
-    pub(crate) fn call_target_for(
-        &self,
-        route_name: &str,
-        method_name: &str,
-    ) -> Result<(u16, RouteCallIdentity, u64), IpcError> {
-        let directory = self.route_directory.read();
-        let table = directory.route_table(route_name).ok_or_else(|| {
-            if let Some(reason) = directory.watch_unavailable_reason() {
-                IpcError::WatchUnavailable(reason.to_string())
-            } else {
-                IpcError::RouteNotFound(route_name.to_string())
-            }
-        })?;
-        let method_idx = table
-            .index_of(method_name)
-            .ok_or_else(|| IpcError::MethodNotFound {
-                route_name: route_name.to_string(),
-                method_name: method_name.to_string(),
-            })?;
-        Ok((method_idx, table.call_identity(), table.max_payload_size()))
-    }
-
     fn bound_route_table(&self, route_name: &str) -> Result<MethodTable, IpcError> {
         let directory = self.route_directory.read();
         directory.route_table(route_name).ok_or_else(|| {
@@ -1408,23 +1388,6 @@ impl IpcClient {
         }
     }
 
-    /// Send a CRM call and wait for the response.
-    ///
-    /// This is the canonical semantic call API for direct clients and the
-    /// relay. It selects buddy SHM, chunked, or inline transport from the
-    /// configured IPC policy.
-    pub async fn call(
-        &self,
-        route_name: &str,
-        method_name: &str,
-        data: &[u8],
-    ) -> Result<ResponseData, IpcError> {
-        let (method_idx, identity, max_payload_size) =
-            self.call_target_for(route_name, method_name)?;
-        self.call_resolved_target(route_name, method_idx, identity, max_payload_size, data)
-            .await
-    }
-
     /// Send a CRM call through a previously acquired immutable route binding.
     pub async fn call_bound(
         &self,
@@ -1462,36 +1425,6 @@ impl IpcClient {
             return Err(IpcError::Config(format!(
                 "request payload size {data_len} exceeds route '{}' max_payload_size {max_payload_size}",
                 binding.route_name()
-            )));
-        }
-        self.call_sized_stream_resolved_target(method_idx, identity, data_len, chunks)
-            .await
-    }
-
-    /// Send a CRM call from a body stream with a known total payload size.
-    ///
-    /// This shares the same transport selector as [`IpcClient::call`] but does
-    /// not require the caller to materialize a large request body first. When a
-    /// client-side SHM pool is available the payload is copied directly into a
-    /// pre-allocated buddy/dedicated block as chunks arrive; otherwise the
-    /// chunked IPC path keeps only one IPC chunk-sized buffer in memory.
-    pub async fn call_sized_stream<S, B, E>(
-        &self,
-        route_name: &str,
-        method_name: &str,
-        data_len: u64,
-        chunks: S,
-    ) -> Result<ResponseData, IpcError>
-    where
-        S: Stream<Item = Result<B, E>>,
-        B: AsRef<[u8]>,
-        E: Display,
-    {
-        let (method_idx, identity, max_payload_size) =
-            self.call_target_for(route_name, method_name)?;
-        if data_len > max_payload_size {
-            return Err(IpcError::Config(format!(
-                "request payload size {data_len} exceeds route '{route_name}' max_payload_size {max_payload_size}"
             )));
         }
         self.call_sized_stream_resolved_target(method_idx, identity, data_len, chunks)
@@ -2354,6 +2287,43 @@ impl IpcClient {
         }
     }
 
+    async fn lookup_route_contract_for_acquire(
+        &self,
+        expected: &c2_contract::ExpectedRouteContract,
+    ) -> Result<(), IpcError> {
+        let attempts = ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS.len() + 1;
+        let mut last_not_found = None;
+
+        for attempt in 0..attempts {
+            if attempt > 0 {
+                let delay_ms = ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS[attempt - 1];
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+
+            let result = match self.lookup_route_contract(expected).await {
+                Err(IpcError::CatalogCompacted { .. } | IpcError::WatchUnavailable(_)) => {
+                    self.rebuild_route_directory().await?;
+                    self.lookup_route_contract(expected).await
+                }
+                other => other,
+            };
+
+            match result {
+                Err(IpcError::RouteNotFound(route_name)) if attempt + 1 < attempts => {
+                    last_not_found = Some(route_name);
+                }
+                Err(IpcError::RouteNotFound(route_name)) => {
+                    return Err(IpcError::RouteNotFound(route_name));
+                }
+                other => return other,
+            }
+        }
+
+        Err(IpcError::RouteNotFound(
+            last_not_found.unwrap_or_else(|| expected.route_name.clone()),
+        ))
+    }
+
     /// Ensure the connected server currently exports a route matching the
     /// expected CRM contract, using the route catalog instead of the handshake
     /// snapshot as the authoritative source.
@@ -2412,8 +2382,90 @@ impl IpcClient {
         self.lookup_route_contract(expected).await
     }
 
-    /// Bind the currently acquired route token for a route-bound proxy.
-    pub fn bind_route(
+    /// Authoritatively acquire a route binding for the expected CRM contract.
+    pub async fn acquire_route(
+        &self,
+        expected: &c2_contract::ExpectedRouteContract,
+    ) -> Result<RouteBinding, IpcError> {
+        let attempts = ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS.len() + 1;
+        let mut last_unbound = None;
+
+        for attempt in 0..attempts {
+            self.lookup_route_contract_for_acquire(expected).await?;
+            match self.bind_cached_route(expected) {
+                Ok(binding) => return Ok(binding),
+                Err(IpcError::RouteNotFound(route_name)) if attempt + 1 < attempts => {
+                    last_unbound = Some(IpcError::RouteNotFound(route_name));
+                }
+                Err(IpcError::WatchUnavailable(reason)) if attempt + 1 < attempts => {
+                    last_unbound = Some(IpcError::WatchUnavailable(reason));
+                }
+                Err(err) => return Err(err),
+            }
+            let delay_ms = ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS[attempt];
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
+
+        Err(last_unbound.unwrap_or_else(|| IpcError::RouteNotFound(expected.route_name.clone())))
+    }
+
+    /// Attest a route for relay registration without requiring call admission.
+    ///
+    /// Relay registration has a publish-before-open phase where the server route
+    /// exists in the catalog as `Closed(RegisterCommitted)`. Business clients
+    /// must not call such a route, so [`IpcClient::acquire_route`] rejects it.
+    /// Registration uses this narrower control-plane attestation instead.
+    pub async fn attest_route_for_registration(
+        &self,
+        expected: &c2_contract::ExpectedRouteContract,
+    ) -> Result<RouteBinding, IpcError> {
+        c2_contract::validate_expected_route_contract(expected)
+            .map_err(|err| IpcError::ContractMismatch(err.to_string()))?;
+        let response = Self::list_routes_raw(
+            Arc::clone(&self.writer),
+            Arc::clone(&self.pending),
+            Arc::clone(&self.rid_counter),
+            RouteSelector::RouteName {
+                route_name: expected.route_name.clone(),
+            },
+            None,
+        )
+        .await?;
+        let Some(record) = response
+            .routes
+            .into_iter()
+            .find(|record| record.route_name == expected.route_name)
+        else {
+            return Err(IpcError::RouteNotFound(expected.route_name.clone()));
+        };
+        let table = MethodTable::from_record(&record);
+        Self::validate_method_table_contract(&expected.route_name, &table, expected)?;
+        match record.state {
+            RouteStateWire::Ready => Ok(RouteBinding::from_table(table)),
+            RouteStateWire::Closed
+                if record.state_reason == Some(RouteStateReasonWire::RegisterCommitted) =>
+            {
+                Ok(RouteBinding::from_table(table))
+            }
+            RouteStateWire::Removed => Err(IpcError::RouteRemoved {
+                route_name: record.route_name,
+                route_uid: Some(record.route_uid),
+            }),
+            state => Err(IpcError::RouteClosed {
+                route_name: record.route_name,
+                route_uid: record.route_uid,
+                reason: format!(
+                    "{state:?}:{:?}",
+                    record
+                        .state_reason
+                        .unwrap_or(RouteStateReasonWire::ProtocolViolation)
+                ),
+            }),
+        }
+    }
+
+    /// Bind the cached route record for internal tests and post-lookup callers.
+    pub(crate) fn bind_cached_route(
         &self,
         expected: &c2_contract::ExpectedRouteContract,
     ) -> Result<RouteBinding, IpcError> {
@@ -2424,9 +2476,9 @@ impl IpcClient {
         Ok(RouteBinding::from_table(table))
     }
 
-    /// Bind the route only if the cached server catalog still carries the exact
-    /// route UID and revision observed by the caller.
-    pub fn bind_route_token(
+    /// Bind the cached route only if it still carries the exact route UID and
+    /// revision observed by the caller.
+    pub(crate) fn bind_cached_route_token(
         &self,
         expected: &c2_contract::ExpectedRouteContract,
         route_uid: &str,
@@ -2446,9 +2498,9 @@ impl IpcClient {
         Ok(RouteBinding::from_table(table))
     }
 
-    /// Bind a route token, refreshing the server route catalog before deciding
+    /// Acquire a route token, refreshing the server route catalog before deciding
     /// that a cached missing or mismatched token is authoritative.
-    pub async fn ensure_route_token(
+    pub async fn acquire_route_token(
         &self,
         expected: &c2_contract::ExpectedRouteContract,
         route_uid: &str,
@@ -2456,26 +2508,37 @@ impl IpcClient {
     ) -> Result<RouteBinding, IpcError> {
         c2_contract::validate_expected_route_contract(expected)
             .map_err(|err| IpcError::ContractMismatch(err.to_string()))?;
-        if let Ok(binding) = self.bind_route_token(expected, route_uid, route_revision) {
+        if let Ok(binding) = self.bind_cached_route_token(expected, route_uid, route_revision) {
             return Ok(binding);
         }
 
         if self.route_directory.read().is_dirty() {
             self.rebuild_route_directory().await?;
-            if let Ok(binding) = self.bind_route_token(expected, route_uid, route_revision) {
+            if let Ok(binding) = self.bind_cached_route_token(expected, route_uid, route_revision) {
                 return Ok(binding);
             }
         }
 
-        match self.lookup_route_contract(expected).await {
-            Ok(()) => self.bind_route_token(expected, route_uid, route_revision),
-            Err(IpcError::CatalogCompacted { .. } | IpcError::WatchUnavailable(_)) => {
-                self.rebuild_route_directory().await?;
-                self.lookup_route_contract(expected).await?;
-                self.bind_route_token(expected, route_uid, route_revision)
+        let attempts = ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS.len() + 1;
+        let mut last_unbound = None;
+
+        for attempt in 0..attempts {
+            self.lookup_route_contract_for_acquire(expected).await?;
+            match self.bind_cached_route_token(expected, route_uid, route_revision) {
+                Ok(binding) => return Ok(binding),
+                Err(IpcError::RouteNotFound(route_name)) if attempt + 1 < attempts => {
+                    last_unbound = Some(IpcError::RouteNotFound(route_name));
+                }
+                Err(IpcError::WatchUnavailable(reason)) if attempt + 1 < attempts => {
+                    last_unbound = Some(IpcError::WatchUnavailable(reason));
+                }
+                Err(err) => return Err(err),
             }
-            Err(err) => Err(err),
+            let delay_ms = ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS[attempt];
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
+
+        Err(last_unbound.unwrap_or_else(|| IpcError::RouteNotFound(expected.route_name.clone())))
     }
 
     /// CRM tag advertised by a route, if present.
@@ -2501,11 +2564,17 @@ impl IpcClient {
             .map(|table| table.max_payload_size())
     }
 
-    pub async fn pending_route_contract(
+    /// Attest and acquire a route that is still pending registration.
+    ///
+    /// This is a registration control-plane path: the route is not visible in
+    /// the committed catalog yet, so ordinary authoritative route lookup cannot
+    /// acquire it. The pending attestation response is cached and immediately
+    /// bound to a route token for relay registration proof.
+    pub async fn acquire_pending_route_attestation(
         &mut self,
         route_name: &str,
         registration_token: &str,
-    ) -> Result<c2_contract::ExpectedRouteContract, IpcError> {
+    ) -> Result<(c2_contract::ExpectedRouteContract, RouteBinding), IpcError> {
         let payload = encode_pending_route_attestation_request(route_name, registration_token)
             .map_err(IpcError::Protocol)?;
         let payload = self
@@ -2514,7 +2583,9 @@ impl IpcClient {
         match decode_pending_route_attestation_response(&payload).map_err(IpcError::Protocol)? {
             PendingRouteAttestationResponse::Attested { contract } => {
                 self.cache_attested_contract(&contract);
-                Ok(Self::expected_contract_from_attestation(contract))
+                let expected = Self::expected_contract_from_attestation(contract);
+                let binding = self.bind_cached_route(&expected)?;
+                Ok((expected, binding))
             }
             PendingRouteAttestationResponse::Rejected { code, message } => {
                 if code == PENDING_ROUTE_REJECT_NOT_FOUND {
@@ -2969,8 +3040,18 @@ mod tests {
             .write()
             .mark_watch_unavailable("watch stream closed before catalog could be trusted");
 
+        let expected = c2_contract::ExpectedRouteContract {
+            route_name: "grid".to_string(),
+            crm_ns: "test.grid".to_string(),
+            crm_name: "Grid".to_string(),
+            crm_ver: "0.1.0".to_string(),
+            abi_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_string(),
+            signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                .to_string(),
+        };
         let err = client
-            .call_target_for("grid", "ping")
+            .bind_cached_route(&expected)
             .expect_err("untrusted catalog must not look like a semantic route miss");
 
         assert!(
@@ -3010,7 +3091,7 @@ mod tests {
             signature_hash: SIG_HASH.to_string(),
         };
         let binding = client
-            .bind_route(&expected)
+            .bind_cached_route(&expected)
             .expect("initial route should bind");
 
         client.route_directory.write().insert_table(
@@ -3037,11 +3118,11 @@ mod tests {
             .expect("bound method should still exist");
         assert_eq!(identity.route_uid, "grid-route-uid-0001");
         assert_eq!(identity.observed_route_revision, 1);
-        let (_, current_identity, _) = client
-            .call_target_for("grid", "ping")
+        let current_binding = client
+            .bind_cached_route(&expected)
             .expect("directory should expose current route");
-        assert_eq!(current_identity.route_uid, "grid-route-uid-0002");
-        assert_eq!(current_identity.observed_route_revision, 2);
+        assert_eq!(current_binding.route_uid(), "grid-route-uid-0002");
+        assert_eq!(current_binding.route_revision(), 2);
     }
 
     #[test]
@@ -3124,10 +3205,21 @@ mod tests {
             },
         );
 
+        let binding = client
+            .bind_cached_route(&c2_contract::ExpectedRouteContract {
+                route_name: "grid".to_string(),
+                crm_ns: "test.grid".to_string(),
+                crm_name: "Grid".to_string(),
+                crm_ver: "0.1.0".to_string(),
+                abi_hash: ABI_HASH.to_string(),
+                signature_hash: SIG_HASH.to_string(),
+            })
+            .expect("cached test route should bind");
+
         let err = client
-            .call("grid", "ping", b"12345")
+            .call_bound(&binding, "ping", b"12345")
             .await
-            .expect_err("oversized direct call should be rejected before writer access");
+            .expect_err("oversized bound call should be rejected before writer access");
         assert!(
             matches!(err, IpcError::Config(_)),
             "unexpected error: {err:?}"
@@ -3140,7 +3232,7 @@ mod tests {
             Ok::<&'static [u8], std::io::Error>(b"12345")
         });
         let err = client
-            .call_sized_stream("grid", "ping", 5, stream)
+            .call_bound_sized_stream(&binding, "ping", 5, stream)
             .await
             .expect_err("oversized streaming call should be rejected before body polling");
         assert!(
@@ -3181,10 +3273,21 @@ mod tests {
             },
         );
 
+        let binding = client
+            .bind_cached_route(&c2_contract::ExpectedRouteContract {
+                route_name: "grid".to_string(),
+                crm_ns: "test.grid".to_string(),
+                crm_name: "Grid".to_string(),
+                crm_ver: "0.1.0".to_string(),
+                abi_hash: ABI_HASH.to_string(),
+                signature_hash: SIG_HASH.to_string(),
+            })
+            .expect("cached test route should bind");
+
         let short_stream =
             futures_util::stream::iter(vec![Ok::<Vec<u8>, std::io::Error>(vec![1; 100])]);
         let err = client
-            .call_sized_stream("grid", "ping", 200, short_stream)
+            .call_bound_sized_stream(&binding, "ping", 200, short_stream)
             .await
             .expect_err("short stream should fail before sending a frame");
         assert!(err.to_string().contains("expected 200"));
@@ -3197,7 +3300,7 @@ mod tests {
             Ok::<Vec<u8>, std::io::Error>(vec![2; 51]),
         ]);
         let err = client
-            .call_sized_stream("grid", "ping", 200, long_stream)
+            .call_bound_sized_stream(&binding, "ping", 200, long_stream)
             .await
             .expect_err("long stream should fail before sending a frame");
         assert!(err.to_string().contains("exceeded declared content length"));

@@ -268,8 +268,8 @@ mod client_tests {
     #[test]
     fn canonical_call_transport_selection_is_testable() {
         // Verify ClientIpcConfig thresholds determine the transport path used by
-        // IpcClient::call(). This must stay as a pure selector so relay behavior
-        // is not proven only by comments or a live UDS integration test.
+        // route-bound IPC calls. This must stay as a pure selector so relay
+        // behavior is not proven only by comments or a live UDS integration test.
         let cfg = ClientIpcConfig {
             shm_threshold: 100,
             base: c2_config::BaseIpcConfig {
@@ -340,7 +340,7 @@ mod client_tests {
             .expect("sync_client.rs must contain a production section");
         assert!(
             !sync_production.contains(".call_full("),
-            "SyncClient must delegate to canonical IpcClient::call"
+            "SyncClient must delegate to canonical route-bound IPC calls"
         );
     }
 
