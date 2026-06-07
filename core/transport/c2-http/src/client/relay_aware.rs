@@ -33,6 +33,8 @@ pub struct RelayLocalIpcCandidate {
     pub address: String,
     pub server_id: String,
     pub server_instance_id: String,
+    pub route_uid: String,
+    pub route_revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -478,6 +480,11 @@ fn fallback_denied_body(route_name: &str, failed_candidates: &[RelayLocalIpcCand
             "server_instance_id".to_string(),
             json!(candidate.server_instance_id),
         );
+        details.insert("route_uid".to_string(), json!(candidate.route_uid));
+        details.insert(
+            "route_revision".to_string(),
+            json!(candidate.route_revision.to_string()),
+        );
     }
     json!({
         "version": c2_error::ERROR_WIRE_VERSION,
@@ -530,6 +537,8 @@ fn select_local_ipc_candidate(
             address: route.ipc_address.clone()?,
             server_id: route.server_id.clone()?,
             server_instance_id: route.server_instance_id.clone()?,
+            route_uid: route.route_uid.clone(),
+            route_revision: route.route_revision,
         })
     })
 }
@@ -555,6 +564,8 @@ fn route_matches_local_ipc_candidate(
     route: &RelayRouteInfo,
     failed: &RelayLocalIpcCandidate,
 ) -> bool {
+    // A same-endpoint local IPC retry with a newer token would silently bind a
+    // replacement route. Exclude by endpoint identity, not by route token.
     route.ipc_address.as_deref() == Some(failed.address.as_str())
         && route.server_id.as_deref() == Some(failed.server_id.as_str())
         && route.server_instance_id.as_deref() == Some(failed.server_instance_id.as_str())
@@ -1035,6 +1046,8 @@ mod tests {
             address: "ipc://local-grid".to_string(),
             server_id: "local-grid".to_string(),
             server_instance_id: "inst-local-grid".to_string(),
+            route_uid: "grid-route-uid-0001".to_string(),
+            route_revision: 1,
         };
 
         let target = client
@@ -1085,6 +1098,8 @@ mod tests {
             address: "ipc://local-grid".to_string(),
             server_id: "local-grid".to_string(),
             server_instance_id: "inst-local-grid".to_string(),
+            route_uid: "grid-route-uid-0001".to_string(),
+            route_revision: 1,
         };
 
         let err = client
@@ -1097,6 +1112,30 @@ mod tests {
         );
         assert_eq!(resolve_count.load(Ordering::SeqCst), 1);
         registry_handle.abort();
+    }
+
+    #[test]
+    fn failed_local_ipc_exclusion_ignores_replacement_token_on_same_endpoint() {
+        let failed = RelayLocalIpcCandidate {
+            address: "ipc://local-grid".to_string(),
+            server_id: "local-grid".to_string(),
+            server_instance_id: "inst-local-grid".to_string(),
+            route_uid: "grid-route-uid-0001".to_string(),
+            route_revision: 1,
+        };
+        let refreshed_same_endpoint = RelayRouteInfo {
+            ipc_address: Some("ipc://local-grid".to_string()),
+            server_id: Some("local-grid".to_string()),
+            server_instance_id: Some("inst-local-grid".to_string()),
+            route_uid: "grid-route-uid-0002".to_string(),
+            route_revision: 2,
+            ..route_info("grid".to_string(), "http://127.0.0.1:8080".to_string())
+        };
+
+        assert!(
+            filter_failed_local_ipc_candidates(vec![refreshed_same_endpoint], &[failed]).is_empty(),
+            "same endpoint with a replacement token must stay excluded"
+        );
     }
 
     #[tokio::test]
@@ -1283,6 +1322,8 @@ mod tests {
                 address: "ipc://grid-server".to_string(),
                 server_id: "grid-server".to_string(),
                 server_instance_id: "inst-a".to_string(),
+                route_uid: "grid-route-uid-0001".to_string(),
+                route_revision: 1,
             }),
         );
     }
@@ -1301,6 +1342,8 @@ mod tests {
         assert_eq!(candidate.address, "ipc://grid-server");
         assert_eq!(candidate.server_id, "grid-server");
         assert_eq!(candidate.server_instance_id, "inst-a");
+        assert_eq!(candidate.route_uid, "grid-route-uid-0001");
+        assert_eq!(candidate.route_revision, 1);
     }
 
     #[test]

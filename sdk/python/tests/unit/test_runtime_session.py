@@ -791,16 +791,20 @@ def test_relay_ipc_acceptance_does_not_trust_route_name_only() -> None:
         1,
     )[0]
 
-    assert 'expected_server_id' in acquire_body
-    assert 'expected_server_instance_id' in acquire_body
+    assert 'candidate: &RelayLocalIpcCandidate' in acquire_body
+    assert 'candidate.server_id' in acquire_body
+    assert 'candidate.server_instance_id' in acquire_body
+    assert 'candidate.route_uid' in acquire_body
+    assert 'candidate.route_revision' in acquire_body
     identity_checks = [
         pos for needle in ('server_identity()', 'server_instance_id()')
         if (pos := acquire_body.find(needle)) >= 0
     ]
     assert identity_checks
-    acquire_pos = acquire_body.find('acquire_route(&expected)')
+    acquire_pos = acquire_body.find('acquire_route_token(&expected')
     assert acquire_pos >= 0
     assert min(identity_checks) < acquire_pos
+    assert 'acquire_route(&expected)' not in acquire_body
     assert 'route_names()' not in acquire_body
 
 
@@ -846,6 +850,8 @@ def test_relay_ipc_unavailable_reason_is_reported_before_fallback_denial() -> No
     assert 'fallback denied' in connect_body.lower()
     assert 'direct_ipc_failure' in source
     assert 'direct_ipc_failure_kind' in source
+    assert 'route_uid' in source
+    assert 'route_revision' in source
     assert 'RelayIpcUnavailable::pool_acquire' in acquire_body
     assert 'RelayIpcUnavailable::identity_mismatch' in acquire_body
     assert 'RelayIpcUnavailable::route_missing' in acquire_body
@@ -888,5 +894,5 @@ def test_relay_ipc_identity_boundary_is_native_owned() -> None:
     ).read_text(encoding='utf-8')
 
     assert 'server_instance_id' not in registry_source
-    assert 'expected_server_instance_id' in native_source
+    assert 'candidate.server_instance_id' in native_source
     assert 'acquire_route(&expected)' in native_source

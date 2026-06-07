@@ -954,9 +954,7 @@ impl PyRuntimeSession {
                 } => {
                     match self.acquire_relay_ipc_client(
                         py,
-                        &candidate.address,
-                        &candidate.server_id,
-                        &candidate.server_instance_id,
+                        &candidate,
                         &expected,
                     ) {
                         Ok((client, binding)) => {
@@ -1027,12 +1025,10 @@ impl PyRuntimeSession {
     fn acquire_relay_ipc_client(
         &self,
         py: Python<'_>,
-        address: &str,
-        expected_server_id: &str,
-        expected_server_instance_id: &str,
+        candidate: &RelayLocalIpcCandidate,
         expected: &ExpectedRouteContract,
     ) -> Result<(Arc<SyncClient>, RouteBinding), RelayIpcConnectError> {
-        let addr = address.to_string();
+        let addr = candidate.address.clone();
         let pool = self.pool.inner;
         let mut runtime_overrides = c2_config::RuntimeConfigOverrides::default();
         runtime_overrides.client_ipc = self.inner.client_ipc_overrides().unwrap_or_default();
@@ -1061,8 +1057,8 @@ impl PyRuntimeSession {
 
         let actual_identity = client.server_identity();
         let identity_matches = actual_identity.as_ref().is_some_and(|identity| {
-            identity.server_id == expected_server_id
-                && identity.server_instance_id == expected_server_instance_id
+            identity.server_id == candidate.server_id
+                && identity.server_instance_id == candidate.server_instance_id
         });
         if !identity_matches {
             pool.release(&addr);
@@ -1070,8 +1066,8 @@ impl PyRuntimeSession {
                 RelayIpcUnavailable::identity_mismatch(
                     &addr,
                     &expected.route_name,
-                    expected_server_id,
-                    expected_server_instance_id,
+                    &candidate.server_id,
+                    &candidate.server_instance_id,
                     actual_identity
                         .as_ref()
                         .map(|identity| identity.server_id.clone()),
@@ -1085,7 +1081,9 @@ impl PyRuntimeSession {
         let binding_result = py.detach({
             let client = Arc::clone(&client);
             let expected = expected.clone();
-            move || client.acquire_route(&expected)
+            let route_uid = candidate.route_uid.clone();
+            let route_revision = candidate.route_revision;
+            move || client.acquire_route_token(&expected, &route_uid, route_revision)
         });
         let binding = match binding_result {
             Ok(binding) => binding,
@@ -1274,6 +1272,11 @@ fn relay_ipc_fallback_denied_to_py(
     details.insert(
         "server_instance_id".to_string(),
         failed_candidate.server_instance_id.clone(),
+    );
+    details.insert("route_uid".to_string(), failed_candidate.route_uid.clone());
+    details.insert(
+        "route_revision".to_string(),
+        failed_candidate.route_revision.to_string(),
     );
     details.insert(
         "direct_ipc_failure_kind".to_string(),

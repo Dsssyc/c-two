@@ -2764,6 +2764,57 @@ mod tests {
     }
 
     #[test]
+    fn exact_token_binding_rejects_same_name_replacement() {
+        const ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        const SIG_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let client = IpcClient::new("ipc://route_binding_stale_projection");
+        client.route_directory.write().insert_table(
+            "grid".to_string(),
+            MethodTable::from_entries(
+                &[MethodEntry {
+                    name: "ping".to_string(),
+                    index: 0,
+                }],
+                "grid".to_string(),
+                "grid-route-uid-0002".to_string(),
+                2,
+                "test.grid".to_string(),
+                "Grid".to_string(),
+                "0.1.0".to_string(),
+                ABI_HASH.to_string(),
+                SIG_HASH.to_string(),
+                1024,
+            ),
+        );
+        let expected = c2_contract::ExpectedRouteContract {
+            route_name: "grid".to_string(),
+            crm_ns: "test.grid".to_string(),
+            crm_name: "Grid".to_string(),
+            crm_ver: "0.1.0".to_string(),
+            abi_hash: ABI_HASH.to_string(),
+            signature_hash: SIG_HASH.to_string(),
+        };
+
+        let err = client
+            .bind_cached_route_token(&expected, "grid-route-uid-0001", 1)
+            .expect_err("exact token binding must reject replacement route");
+
+        assert!(
+            matches!(
+                &err,
+                IpcError::RouteStale {
+                    route_name,
+                    current_route_uid,
+                    current_route_revision,
+                } if route_name == "grid"
+                    && current_route_uid == "grid-route-uid-0002"
+                    && *current_route_revision == 2
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
     fn client_validates_route_crm_contract_from_handshake_metadata() {
         const ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         const SIG_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
