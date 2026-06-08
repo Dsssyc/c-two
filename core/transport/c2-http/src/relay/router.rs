@@ -27,7 +27,7 @@ use crate::relay::gossip::{broadcast_route_announce, broadcast_route_withdraw};
 use crate::relay::peer_handlers;
 use crate::relay::route_table::valid_route_name;
 use crate::relay::state::{RegisterCommitResult, RelayState, UpstreamAcquireError};
-use crate::relay::types::RouteEntry;
+use crate::relay::types::{RouteEntry, UpstreamEndpointKey};
 use c2_ipc::{ClientIpcConfig, IpcClient};
 
 const CONTROL_BODY_LIMIT_BYTES: usize = 64 * 1024;
@@ -1551,17 +1551,27 @@ async fn call_handler(
             err_bytes,
         )
             .into_response(),
-        Err(c2_ipc::IpcError::RouteNotFound(route)) => {
+        Err(c2_ipc::IpcError::RouteStale { .. }) => {
             drop(lease);
-            remove_unreachable_route(&state, &acquired_route);
-            resource_not_found_response(&route)
+            route_stale_response(&acquired_route)
         }
         Err(e) => {
-            // Evict dead client so next request triggers reconnect.
-            if let Some(old_client) = lease.evict_current_client() {
-                close_arc_client(old_client);
+            if let Some(reason) = semantic_withdrawal_reason(&e) {
+                let not_found_route = semantic_not_found_route(&e).map(str::to_string);
+                drop(lease);
+                remove_unreachable_route_for_error(&state, &acquired_route, &e, reason);
+                if let Some(route) = not_found_route {
+                    resource_not_found_response(&route)
+                } else {
+                    resource_unavailable_response(&route_name, format!("relay error: {e}"))
+                }
+            } else {
+                // Evict dead client so next request triggers reconnect.
+                if let Some(old_client) = lease.evict_current_client() {
+                    close_arc_client(old_client);
+                }
+                resource_unavailable_response(&route_name, format!("relay error: {e}"))
             }
-            resource_unavailable_response(&route_name, format!("relay error: {e}"))
         }
     }
 }
@@ -1627,8 +1637,8 @@ async fn acquire_request_client_for_route(
             eprintln!(
                 "[relay] Failed to acquire upstream '{route_name}' at {address} ({error_kind}): {error}"
             );
-            if should_withdraw_unreachable_route(&error) {
-                remove_unreachable_route(&state, &route);
+            if let Some(reason) = semantic_withdrawal_reason(&error) {
+                remove_unreachable_route_for_error(&state, &route, &error, reason);
             }
             match error {
                 c2_ipc::IpcError::RouteNotFound(_)
@@ -1680,18 +1690,59 @@ fn upstream_acquire_error_kind(error: &c2_ipc::IpcError) -> &'static str {
     }
 }
 
-fn should_withdraw_unreachable_route(error: &c2_ipc::IpcError) -> bool {
-    matches!(
-        error,
-        c2_ipc::IpcError::IdentityMismatch { .. }
-            | c2_ipc::IpcError::ContractMismatch(_)
-            | c2_ipc::IpcError::RouteNotFound(_)
-            | c2_ipc::IpcError::RouteRemoved { .. }
-            | c2_ipc::IpcError::RouteClosed { .. }
-    )
+fn semantic_withdrawal_reason(error: &c2_ipc::IpcError) -> Option<&'static str> {
+    match error {
+        c2_ipc::IpcError::IdentityMismatch { .. } => Some("identity-mismatch"),
+        c2_ipc::IpcError::ContractMismatch(_) => Some("contract-mismatch"),
+        c2_ipc::IpcError::RouteNotFound(_) => Some("route-missing"),
+        c2_ipc::IpcError::RouteRemoved { .. } => Some("route-removed"),
+        c2_ipc::IpcError::RouteClosed { .. } => Some("route-closed"),
+        _ => None,
+    }
 }
 
-fn remove_unreachable_route(state: &Arc<RelayState>, route: &RouteEntry) {
+fn semantic_not_found_route(error: &c2_ipc::IpcError) -> Option<&str> {
+    match error {
+        c2_ipc::IpcError::RouteNotFound(route) => Some(route.as_str()),
+        c2_ipc::IpcError::RouteRemoved { route_name, .. }
+        | c2_ipc::IpcError::RouteClosed { route_name, .. } => Some(route_name.as_str()),
+        _ => None,
+    }
+}
+
+fn remove_unreachable_route_for_error(
+    state: &Arc<RelayState>,
+    route: &RouteEntry,
+    error: &c2_ipc::IpcError,
+    reason: &'static str,
+) {
+    if matches!(error, c2_ipc::IpcError::IdentityMismatch { .. }) {
+        remove_unreachable_owner_endpoint_routes(state, route, reason);
+    } else {
+        remove_unreachable_route(state, route, reason);
+    }
+}
+
+fn remove_unreachable_owner_endpoint_routes(
+    state: &Arc<RelayState>,
+    route: &RouteEntry,
+    reason: &'static str,
+) {
+    let Some(endpoint) = UpstreamEndpointKey::from_route(route) else {
+        remove_unreachable_route(state, route, reason);
+        return;
+    };
+    let routes = state.local_routes_for_owner(&endpoint);
+    if routes.is_empty() {
+        remove_unreachable_route(state, route, reason);
+        return;
+    }
+    for route in routes {
+        remove_unreachable_route(state, &route, reason);
+    }
+}
+
+fn remove_unreachable_route(state: &Arc<RelayState>, route: &RouteEntry, reason: &'static str) {
     if let Some((entry, removed_at, removed_revision, client)) =
         state.remove_unreachable_local_upstream_if_matches(route)
     {
@@ -1699,8 +1750,29 @@ fn remove_unreachable_route(state: &Arc<RelayState>, route: &RouteEntry) {
         if let Some(client) = client {
             close_arc_client(client);
         }
+        eprintln!(
+            "{}",
+            unreachable_route_removal_log_line(&entry, removed_at, removed_revision, reason)
+        );
         broadcast_route_withdraw(state, &entry, removed_at, removed_revision);
     }
+}
+
+fn unreachable_route_removal_log_line(
+    entry: &RouteEntry,
+    removed_at: f64,
+    removed_revision: u64,
+    reason: &'static str,
+) -> String {
+    format!(
+        "[relay] Removed unreachable route: name={} server_id={} server_instance_id={} address={} removed_at={} removed_revision={} reason={reason}",
+        entry.name,
+        entry.server_id.as_deref().unwrap_or(""),
+        entry.server_instance_id.as_deref().unwrap_or(""),
+        entry.ipc_address.as_deref().unwrap_or(""),
+        removed_at,
+        removed_revision
+    )
 }
 
 /// `POST /_echo` — echo endpoint for benchmarking the relay itself.
@@ -1736,7 +1808,7 @@ mod tests {
         start_live_server_with_identity_and_contracts, start_live_server_with_routes,
         test_state_for_client,
     };
-    use crate::relay::types::RouteInfo;
+    use crate::relay::types::{Locality, RouteEntry, RouteInfo};
 
     const TEST_CRM_NS: &str = "test.relay";
     const TEST_CRM_NAME: &str = "RelayGrid";
@@ -1744,6 +1816,174 @@ mod tests {
     const TEST_ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const TEST_SIGNATURE_HASH: &str =
         "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+    #[test]
+    fn semantic_withdrawal_reason_separates_authority_from_transport() {
+        assert_eq!(
+            semantic_withdrawal_reason(&c2_ipc::IpcError::IdentityMismatch {
+                expected_server_id: "expected".into(),
+                expected_server_instance_id: "expected-instance".into(),
+                actual_server_id: "actual".into(),
+                actual_server_instance_id: "actual-instance".into(),
+            }),
+            Some("identity-mismatch")
+        );
+        assert_eq!(
+            semantic_withdrawal_reason(&c2_ipc::IpcError::ContractMismatch(
+                "wrong contract".into()
+            )),
+            Some("contract-mismatch")
+        );
+        assert_eq!(
+            semantic_withdrawal_reason(&c2_ipc::IpcError::RouteNotFound("grid".into())),
+            Some("route-missing")
+        );
+        assert_eq!(
+            semantic_withdrawal_reason(&c2_ipc::IpcError::RouteRemoved {
+                route_name: "grid".into(),
+                route_uid: Some("grid-uid".into()),
+            }),
+            Some("route-removed")
+        );
+        assert_eq!(
+            semantic_withdrawal_reason(&c2_ipc::IpcError::RouteClosed {
+                route_name: "grid".into(),
+                route_uid: "grid-uid".into(),
+                reason: "shutdown".into(),
+            }),
+            Some("route-closed")
+        );
+        assert_eq!(
+            semantic_not_found_route(&c2_ipc::IpcError::RouteRemoved {
+                route_name: "grid".into(),
+                route_uid: Some("grid-uid".into()),
+            }),
+            Some("grid")
+        );
+
+        assert_eq!(
+            semantic_withdrawal_reason(&c2_ipc::IpcError::Io(std::io::Error::from(
+                std::io::ErrorKind::ConnectionReset,
+            ))),
+            None
+        );
+        assert_eq!(
+            semantic_withdrawal_reason(&c2_ipc::IpcError::Io(std::io::Error::from(
+                std::io::ErrorKind::TimedOut,
+            ))),
+            None
+        );
+        assert_eq!(
+            semantic_withdrawal_reason(&c2_ipc::IpcError::RouteStale {
+                route_name: "grid".into(),
+                current_route_uid: "new-grid-uid".into(),
+                current_route_revision: 2,
+            }),
+            None
+        );
+        assert_eq!(
+            semantic_withdrawal_reason(&c2_ipc::IpcError::WatchUnavailable(
+                "watch disconnected".into()
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn unreachable_route_removal_log_names_route_and_reason() {
+        let entry = RouteEntry {
+            name: "grid".into(),
+            relay_id: "relay-a".into(),
+            relay_url: "http://relay-a:8080".into(),
+            server_id: Some("server-grid".into()),
+            server_instance_id: Some("server-grid-instance".into()),
+            ipc_address: Some("ipc://grid".into()),
+            crm_ns: TEST_CRM_NS.into(),
+            crm_name: TEST_CRM_NAME.into(),
+            crm_ver: TEST_CRM_VER.into(),
+            abi_hash: TEST_ABI_HASH.into(),
+            signature_hash: TEST_SIGNATURE_HASH.into(),
+            max_payload_size: 1024,
+            route_uid: "grid-uid".into(),
+            route_revision: 3,
+            locality: Locality::Local,
+            registered_at: 1.0,
+        };
+
+        let line = unreachable_route_removal_log_line(&entry, 2.0, 4, "route-missing");
+
+        assert!(line.contains("[relay] Removed unreachable route:"));
+        assert!(line.contains("name=grid"));
+        assert!(line.contains("server_id=server-grid"));
+        assert!(line.contains("server_instance_id=server-grid-instance"));
+        assert!(line.contains("address=ipc://grid"));
+        assert!(line.contains("removed_at=2"));
+        assert!(line.contains("removed_revision=4"));
+        assert!(line.contains("reason=route-missing"));
+    }
+
+    #[test]
+    fn identity_mismatch_withdraws_all_routes_on_owner_endpoint() {
+        let state = test_state();
+        let address = "ipc://identity-mismatch-owner";
+        for route_name in ["manager", "builder"] {
+            match state.commit_register_upstream(
+                route_name.into(),
+                "server-grid".into(),
+                "server-grid-instance".into(),
+                address.into(),
+                TEST_CRM_NS.into(),
+                TEST_CRM_NAME.into(),
+                TEST_CRM_VER.into(),
+                TEST_ABI_HASH.into(),
+                TEST_SIGNATURE_HASH.into(),
+                1024,
+                format!("{route_name}-uid"),
+                1,
+                None,
+            ) {
+                RegisterCommitResult::Registered { .. } => {}
+                _ => panic!("unexpected registration result for {route_name}"),
+            }
+        }
+        match state.commit_register_upstream(
+            "other-endpoint".into(),
+            "server-grid".into(),
+            "server-grid-other-instance".into(),
+            "ipc://identity-mismatch-other-owner".into(),
+            TEST_CRM_NS.into(),
+            TEST_CRM_NAME.into(),
+            TEST_CRM_VER.into(),
+            TEST_ABI_HASH.into(),
+            TEST_SIGNATURE_HASH.into(),
+            1024,
+            "other-endpoint-uid".into(),
+            1,
+            None,
+        ) {
+            RegisterCommitResult::Registered { .. } => {}
+            _ => panic!("unexpected registration result for other endpoint"),
+        }
+        let route = state.local_route("manager").expect("manager route");
+        let error = c2_ipc::IpcError::IdentityMismatch {
+            expected_server_id: "server-grid".into(),
+            expected_server_instance_id: "server-grid-instance".into(),
+            actual_server_id: "server-grid-restarted".into(),
+            actual_server_instance_id: "server-grid-restarted-instance".into(),
+        };
+
+        remove_unreachable_route_for_error(&state, &route, &error, "identity-mismatch");
+
+        assert!(state.local_route("manager").is_none());
+        assert!(
+            state.local_route("builder").is_none(),
+            "endpoint identity mismatch invalidates every local route owned by that endpoint"
+        );
+        assert!(
+            state.local_route("other-endpoint").is_some(),
+            "endpoint identity mismatch must not withdraw unrelated endpoints"
+        );
+    }
 
     async fn wait_for_local_route_removed(state: &Arc<RelayState>, name: &str) {
         for _ in 0..40 {
