@@ -4722,6 +4722,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relay_late_route_survives_existing_endpoint_and_idle_eviction() {
+        let state = test_state();
+        let address = format!(
+            "ipc://relay_late_route_idle_reconnect_{}_{}",
+            std::process::id(),
+            unique_suffix()
+        );
+        let server = start_live_server_with_routes(&address, "server-grid", &["manager"]).await;
+
+        assert_eq!(
+            post_register(state.clone(), "manager", "server-grid", &address).await,
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            post_call(state.clone(), "manager", "ping").await,
+            StatusCode::OK
+        );
+
+        register_echo_route(&server, "builder").await;
+        assert_eq!(
+            post_register(state.clone(), "builder", "server-grid", &address).await,
+            StatusCode::CREATED
+        );
+
+        assert_eq!(
+            post_call(state.clone(), "builder", "ping").await,
+            StatusCode::OK,
+            "existing endpoint connection must authoritative-acquire routes registered after handshake"
+        );
+
+        state.evict_connection("builder");
+        assert_eq!(
+            post_call(state.clone(), "builder", "ping").await,
+            StatusCode::OK,
+            "idle-evicted endpoint must reconnect and keep late route usable"
+        );
+        assert_eq!(state.resolve("manager").len(), 1);
+        assert_eq!(state.resolve("builder").len(), 1);
+
+        shutdown_live_server(&server).await;
+    }
+
+    #[tokio::test]
     async fn relay_upstream_stale_snapshot_does_not_bind_later_route_by_name() {
         let state = test_state_for_client();
         let address = format!(
