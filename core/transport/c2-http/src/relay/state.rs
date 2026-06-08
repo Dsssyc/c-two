@@ -254,11 +254,16 @@ impl RelayState {
             let mut route_table = self.route_table.write();
             let (entry, removed_at, removed_revision) =
                 route_table.unregister_local_route_if_matches(expected);
-            let client = if entry.is_some() {
-                self.conn_pool.remove(&expected.name)
-            } else {
-                None
-            };
+            let client = entry
+                .as_ref()
+                .and_then(|entry| UpstreamEndpointKey::from_route(entry))
+                .and_then(|key| {
+                    if route_table.has_local_route_for_endpoint(&key) {
+                        None
+                    } else {
+                        self.conn_pool.remove(&key)
+                    }
+                });
             (entry, removed_at, removed_revision, client)
         };
         entry.map(|entry| (entry, removed_at, removed_revision, client))
@@ -321,23 +326,38 @@ impl RelayState {
             });
         }
 
+        let Some(endpoint_key) = UpstreamEndpointKey::from_route(expected) else {
+            return Err(UpstreamAcquireError::NotFound);
+        };
         let route_name = expected.name.clone();
         let expected_for_connect = expected.clone();
 
         let lease = match self
             .conn_pool
-            .acquire_with(&expected.name, move |address| {
+            .acquire_with(&endpoint_key, move |endpoint| {
                 let expected = expected_for_connect.clone();
                 let route_name = route_name.clone();
                 async move {
-                    if expected.ipc_address.as_deref() != Some(address.as_str()) {
+                    if expected.ipc_address.as_deref() != Some(endpoint.address()) {
                         return Err(c2_ipc::IpcError::Protocol(format!(
-                            "relay upstream address mismatch for route {route_name}: expected {:?}, got {address}",
+                            "relay upstream address mismatch for route {route_name}: expected {:?}, got {}",
+                            expected.ipc_address,
+                            endpoint.address()
+                        )));
+                    }
+                    if expected.server_id.as_deref() != Some(endpoint.server_id())
+                        || expected.server_instance_id.as_deref()
+                            != Some(endpoint.server_instance_id())
+                    {
+                        return Err(c2_ipc::IpcError::Protocol(format!(
+                            "relay upstream endpoint mismatch for route {route_name}: expected server_id={:?} server_instance_id={:?} address={:?}, got {endpoint}",
+                            expected.server_id,
+                            expected.server_instance_id,
                             expected.ipc_address
                         )));
                     }
                     let mut client =
-                        IpcClient::with_config(&address, ClientIpcConfig::default());
+                        IpcClient::with_config(endpoint.address(), ClientIpcConfig::default());
                     client.connect().await?;
                     if client.server_id() != expected.server_id.as_deref()
                         || client.server_instance_id() != expected.server_instance_id.as_deref()
@@ -368,7 +388,7 @@ impl RelayState {
         {
             Ok(lease) => lease,
             Err(PoolAcquireError::NotFound) => return Err(UpstreamAcquireError::NotFound),
-            Err(PoolAcquireError::Unreachable { address, error }) => {
+            Err(PoolAcquireError::Unreachable { endpoint, error }) => {
                 if !self
                     .route_table
                     .read()
@@ -381,7 +401,7 @@ impl RelayState {
                 }
                 return Err(UpstreamAcquireError::Unreachable {
                     route: expected.clone(),
-                    address,
+                    address: endpoint.address().to_string(),
                     error,
                 });
             }
@@ -443,9 +463,9 @@ impl RelayState {
             }
         };
 
-        let lease_address = lease.address();
+        let lease_endpoint = lease.endpoint();
         let route_matches_lease =
-            self.renew_owner_lease_if_current_route(&expected, lease_address.as_str());
+            self.renew_owner_lease_if_current_route(&expected, &lease_endpoint);
 
         if route_matches_lease {
             Ok((lease, expected.clone(), binding))
@@ -462,54 +482,102 @@ impl RelayState {
     fn renew_owner_lease_if_current_route(
         &self,
         expected: &RouteEntry,
-        lease_address: &str,
+        lease_endpoint: &UpstreamEndpointKey,
     ) -> bool {
         let route_table = self.route_table.read();
         let Some(entry) = route_table.local_route(&expected.name) else {
             return false;
         };
         if !local_route_matches(&entry, expected)
-            || entry.ipc_address.as_deref() != Some(lease_address)
+            || UpstreamEndpointKey::from_route(&entry).as_ref() != Some(lease_endpoint)
         {
             return false;
         }
-        self.conn_pool.renew_current_owner_lease(&expected.name)
+        self.conn_pool.renew_current_owner_lease(lease_endpoint)
     }
 
     #[cfg(test)]
     pub(crate) fn get_address(&self, name: &str) -> Option<String> {
-        self.conn_pool.get_address(name)
+        let key = self
+            .route_table
+            .read()
+            .local_route(name)
+            .and_then(|entry| UpstreamEndpointKey::from_route(&entry))?;
+        self.conn_pool.get_address(&key)
     }
 
     pub(crate) fn owner_token(&self, name: &str) -> Option<OwnerToken> {
-        self.conn_pool.owner_token(name)
+        let key = self
+            .route_table
+            .read()
+            .local_route(name)
+            .and_then(|entry| UpstreamEndpointKey::from_route(&entry))?;
+        self.conn_pool.owner_token(&key)
+    }
+
+    pub(crate) fn owner_token_for_endpoint(&self, key: &UpstreamEndpointKey) -> Option<OwnerToken> {
+        self.conn_pool.owner_token(key)
     }
 
     pub(crate) fn matches_owner_token(&self, name: &str, token: &OwnerToken) -> bool {
-        self.conn_pool.matches_owner_token(name, token)
+        let Some(key) = self
+            .route_table
+            .read()
+            .local_route(name)
+            .and_then(|entry| UpstreamEndpointKey::from_route(&entry))
+        else {
+            return false;
+        };
+        self.conn_pool.matches_owner_token(&key, token)
     }
 
+    #[cfg(test)]
     pub(crate) fn renew_owner_lease(&self, name: &str, token: &OwnerToken) -> bool {
-        self.conn_pool.renew_owner_lease(name, token)
+        let Some(key) = self
+            .route_table
+            .read()
+            .local_route(name)
+            .and_then(|entry| UpstreamEndpointKey::from_route(&entry))
+        else {
+            return false;
+        };
+        self.conn_pool.renew_owner_lease(&key, token)
     }
 
-    pub(crate) fn replace_if_owner_token(
+    pub(crate) fn renew_owner_lease_for_endpoint(
         &self,
-        name: &str,
+        key: &UpstreamEndpointKey,
         token: &OwnerToken,
-        new_address: String,
+    ) -> bool {
+        self.conn_pool.renew_owner_lease(key, token)
+    }
+
+    pub(crate) fn validate_replaceable_owner_token(
+        &self,
+        key: &UpstreamEndpointKey,
+        token: &OwnerToken,
         evidence: OwnerReplacementEvidence,
-    ) -> Result<Option<Arc<IpcClient>>, OwnerReplaceError> {
+    ) -> Result<(), OwnerReplaceError> {
         self.conn_pool
-            .replace_if_owner_token(name, token, new_address, evidence)
+            .validate_replaceable_owner_token(key, token, evidence)
     }
 
     pub(crate) fn connection_lookup(&self, name: &str) -> CachedClient {
-        self.conn_pool.lookup(name)
+        let Some(key) = self
+            .route_table
+            .read()
+            .local_route(name)
+            .and_then(|entry| UpstreamEndpointKey::from_route(&entry))
+        else {
+            return CachedClient::Missing;
+        };
+        self.conn_pool.lookup(&key)
     }
 
-    pub(crate) fn insert_owner_slot(&self, name: String, address: String) {
-        self.conn_pool.insert_owner(name, address);
+    pub(crate) fn insert_owner_slot(&self, entry: &RouteEntry) {
+        if let Some(key) = UpstreamEndpointKey::from_route(entry) {
+            self.conn_pool.insert_owner(key);
+        }
     }
 
     pub(crate) fn start_upstream_control(self: &Arc<Self>, entry: &RouteEntry) {
@@ -592,26 +660,48 @@ impl RelayState {
         self.clear_upstream_control_watch_unavailable(&key);
     }
 
-    pub(crate) fn remove_connection(&self, name: &str) -> Option<Arc<IpcClient>> {
-        self.conn_pool.remove(name)
+    pub(crate) fn remove_connection_if_endpoint_unused(
+        &self,
+        key: &UpstreamEndpointKey,
+    ) -> Option<Arc<IpcClient>> {
+        if self.route_table.read().has_local_route_for_endpoint(key) {
+            None
+        } else {
+            self.conn_pool.remove(key)
+        }
     }
 
     pub(crate) fn route_table_write(&self) -> RwLockWriteGuard<'_, RouteTable> {
         self.route_table.write()
     }
 
-    pub(crate) fn evict_idle(&self, idle_timeout_ms: u64) -> Vec<(String, Option<Arc<IpcClient>>)> {
+    pub(crate) fn evict_idle(
+        &self,
+        idle_timeout_ms: u64,
+    ) -> Vec<(UpstreamEndpointKey, Option<Arc<IpcClient>>)> {
         self.conn_pool.evict_idle(idle_timeout_ms)
     }
 
     #[cfg(test)]
     pub(crate) fn evict_connection(&self, name: &str) -> Option<Arc<IpcClient>> {
-        self.conn_pool.evict(name)
+        let key = self
+            .route_table
+            .read()
+            .local_route(name)
+            .and_then(|entry| UpstreamEndpointKey::from_route(&entry))?;
+        self.conn_pool.evict(&key)
     }
 
     #[cfg(test)]
     pub(crate) fn reconnect(&self, name: &str, client: Arc<IpcClient>) {
-        self.conn_pool.reconnect(name, client);
+        if let Some(key) = self
+            .route_table
+            .read()
+            .local_route(name)
+            .and_then(|entry| UpstreamEndpointKey::from_route(&entry))
+        {
+            self.conn_pool.reconnect(&key, client);
+        }
     }
 
     // -- Peer management --
@@ -1019,6 +1109,82 @@ mod tests {
     }
 
     #[test]
+    fn local_routes_on_same_endpoint_share_one_owner_slot() {
+        let state = RelayState::new(test_config(), null_disseminator());
+        let manager = Arc::new(IpcClient::new("ipc://shared"));
+        manager.force_connected(true);
+        register_local_with_contract(
+            &state,
+            "manager",
+            "server-grid",
+            "server-grid-instance",
+            "ipc://shared",
+            TEST_CRM_NS,
+            TEST_CRM_NAME,
+            TEST_CRM_VER,
+            TEST_ABI_HASH,
+            TEST_SIGNATURE_HASH,
+            manager,
+        );
+        let builder = Arc::new(IpcClient::new("ipc://shared"));
+        builder.force_connected(true);
+        register_local_with_contract(
+            &state,
+            "builder",
+            "server-grid",
+            "server-grid-instance",
+            "ipc://shared",
+            TEST_CRM_NS,
+            TEST_CRM_NAME,
+            TEST_CRM_VER,
+            TEST_ABI_HASH,
+            TEST_SIGNATURE_HASH,
+            builder,
+        );
+
+        assert_eq!(state.local_route_count(), 2);
+        assert_eq!(
+            state.conn_pool.list_connections().len(),
+            1,
+            "multiple local routes on one server instance must share one endpoint slot"
+        );
+        assert!(
+            state.evict_idle(0).is_empty(),
+            "registering multiple routes must not install a data-plane client"
+        );
+    }
+
+    #[test]
+    fn unregister_one_route_keeps_shared_endpoint_for_remaining_routes() {
+        let state = RelayState::new(test_config(), null_disseminator());
+        let manager = Arc::new(IpcClient::new("ipc://shared"));
+        manager.force_connected(true);
+        register_local(&state, "manager", "server-grid", "ipc://shared", manager);
+        let builder = Arc::new(IpcClient::new("ipc://shared"));
+        builder.force_connected(true);
+        register_local(&state, "builder", "server-grid", "ipc://shared", builder);
+
+        assert!(matches!(
+            state.unregister_upstream("manager", "server-grid"),
+            UnregisterResult::Removed { client: None, .. }
+        ));
+
+        assert!(state.resolve("manager").is_empty());
+        assert_eq!(state.resolve("builder").len(), 1);
+        assert_eq!(state.conn_pool.list_connections().len(), 1);
+        assert!(matches!(
+            state.connection_lookup("builder"),
+            CachedClient::OwnerOnly { .. }
+        ));
+
+        assert!(matches!(
+            state.unregister_upstream("builder", "server-grid"),
+            UnregisterResult::Removed { .. }
+        ));
+        assert!(state.conn_pool.list_connections().is_empty());
+    }
+
+    #[test]
     fn upstream_watch_unavailable_marks_owner_without_withdrawing_route() {
         let state = RelayState::new(test_config(), null_disseminator());
         let client = Arc::new(IpcClient::new("ipc://grid"));
@@ -1384,6 +1550,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn route_replacement_keeps_old_endpoint_when_other_routes_still_reference_it() {
+        let state = RelayState::new(test_config(), null_disseminator());
+        let manager = Arc::new(IpcClient::new("ipc://old"));
+        manager.force_connected(true);
+        register_local_with_contract(
+            &state,
+            "manager",
+            "server-old",
+            "server-old-instance",
+            "ipc://old",
+            TEST_CRM_NS,
+            TEST_CRM_NAME,
+            TEST_CRM_VER,
+            TEST_ABI_HASH,
+            TEST_SIGNATURE_HASH,
+            manager,
+        );
+        let builder = Arc::new(IpcClient::new("ipc://old"));
+        builder.force_connected(true);
+        register_local_with_contract(
+            &state,
+            "builder",
+            "server-old",
+            "server-old-instance",
+            "ipc://old",
+            TEST_CRM_NS,
+            TEST_CRM_NAME,
+            TEST_CRM_VER,
+            TEST_ABI_HASH,
+            TEST_SIGNATURE_HASH,
+            builder,
+        );
+        let replacement_proof = confirmed_dead_replacement(
+            &state,
+            "manager",
+            "server-new",
+            "server-new-instance",
+            "ipc://new",
+        )
+        .await;
+
+        let result = state.commit_register_upstream(
+            "manager".into(),
+            "server-new".into(),
+            "server-new-instance".into(),
+            "ipc://new".into(),
+            TEST_CRM_NS.to_string(),
+            TEST_CRM_NAME.to_string(),
+            TEST_CRM_VER.to_string(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
+            1024,
+            "manager-server-new-uid".into(),
+            1,
+            Some(replacement_proof),
+        );
+
+        assert!(matches!(result, RegisterCommitResult::Registered { .. }));
+        assert_eq!(state.get_address("manager").as_deref(), Some("ipc://new"));
+        assert_eq!(state.get_address("builder").as_deref(), Some("ipc://old"));
+        assert_eq!(
+            state.conn_pool.list_connections().len(),
+            2,
+            "new owner endpoint and still-referenced old endpoint must coexist"
+        );
+    }
+
+    #[tokio::test]
     async fn replacement_proof_does_not_match_re_registered_same_address_owner() {
         let state = RelayState::new(test_config(), null_disseminator());
         let old = Arc::new(IpcClient::new("ipc://same"));
@@ -1527,7 +1761,8 @@ mod tests {
         let before_snapshot =
             serde_json::to_value(FullSyncSnapshot::from_internal(state.full_snapshot())).unwrap();
         let before_digest = state.route_digest();
-        assert!(state.conn_pool.renew_current_owner_lease("grid"));
+        let token = state.owner_token("grid").expect("owner token");
+        assert!(state.renew_owner_lease("grid", &token));
 
         assert_eq!(
             serde_json::to_value(FullSyncSnapshot::from_internal(state.full_snapshot())).unwrap(),
@@ -1696,7 +1931,7 @@ mod tests {
 
         assert!(matches!(result, RegisterCommitResult::SameOwner { .. }));
         assert!(matches!(
-            state.conn_pool.lookup("grid"),
+            state.connection_lookup("grid"),
             CachedClient::OwnerOnly { .. }
         ));
     }
@@ -1782,7 +2017,7 @@ mod tests {
             Some("instance-new")
         );
         assert!(matches!(
-            state.conn_pool.lookup("grid"),
+            state.connection_lookup("grid"),
             CachedClient::OwnerOnly { .. }
         ));
     }

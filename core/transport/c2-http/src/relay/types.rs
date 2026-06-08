@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::time::Instant;
 
 use crate::relay::peer::PROTOCOL_VERSION;
@@ -29,6 +30,60 @@ pub struct RouteEntry {
     pub route_revision: u64,
     pub locality: Locality,
     pub registered_at: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct UpstreamEndpointKey {
+    address: String,
+    server_id: String,
+    server_instance_id: String,
+}
+
+impl UpstreamEndpointKey {
+    pub(crate) fn new(
+        address: impl Into<String>,
+        server_id: impl Into<String>,
+        server_instance_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            address: address.into(),
+            server_id: server_id.into(),
+            server_instance_id: server_instance_id.into(),
+        }
+    }
+
+    pub(crate) fn from_route(entry: &RouteEntry) -> Option<Self> {
+        if entry.locality != Locality::Local {
+            return None;
+        }
+        Some(Self::new(
+            entry.ipc_address.clone()?,
+            entry.server_id.clone()?,
+            entry.server_instance_id.clone()?,
+        ))
+    }
+
+    pub(crate) fn address(&self) -> &str {
+        &self.address
+    }
+
+    pub(crate) fn server_id(&self) -> &str {
+        &self.server_id
+    }
+
+    pub(crate) fn server_instance_id(&self) -> &str {
+        &self.server_instance_id
+    }
+}
+
+impl fmt::Display for UpstreamEndpointKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "server_id={} server_instance_id={} address={}",
+            self.server_id, self.server_instance_id, self.address
+        )
+    }
 }
 
 fn observed_now() -> Instant {

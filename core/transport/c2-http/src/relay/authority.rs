@@ -13,7 +13,7 @@ use crate::relay::conn_pool::{
 };
 use crate::relay::route_table::{valid_route_name, validate_server_instance_id_value};
 use crate::relay::state::RelayState;
-use crate::relay::types::{Locality, RouteEntry};
+use crate::relay::types::{Locality, RouteEntry, UpstreamEndpointKey};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ControlError {
@@ -705,11 +705,14 @@ impl<'a> RouteAuthority<'a> {
 
         let mut route_table = self.state.route_table_write();
         let mut required_replacement_address = None;
+        let mut old_endpoint_for_cleanup = None;
         if let Some(existing) = route_table.local_route(&name) {
             let existing_address = existing.ipc_address.clone().unwrap_or_default();
             let existing_server_id = existing.server_id.clone().unwrap_or_default();
             let existing_server_instance_id =
                 existing.server_instance_id.clone().unwrap_or_default();
+            let existing_endpoint =
+                UpstreamEndpointKey::from_route(&existing).ok_or(ControlError::OwnerMismatch)?;
             if existing_server_id == server_id {
                 if existing_address == address {
                     if existing_server_instance_id == server_instance_id {
@@ -728,11 +731,16 @@ impl<'a> RouteAuthority<'a> {
                         if existing.route_uid == route_uid
                             && existing.route_revision == route_revision
                         {
-                            if let Some(token) = self.state.owner_token(&name) {
-                                self.state.renew_owner_lease(&name, &token);
+                            if let Some(token) =
+                                self.state.owner_token_for_endpoint(&existing_endpoint)
+                            {
+                                self.state
+                                    .renew_owner_lease_for_endpoint(&existing_endpoint, &token);
                             }
                             return Ok(RouteCommandResult::SameOwner { entry: existing });
                         }
+                    } else {
+                        old_endpoint_for_cleanup = Some(existing_endpoint.clone());
                     }
                 } else {
                     return Err(ControlError::AddressMismatch { existing_address });
@@ -759,6 +767,7 @@ impl<'a> RouteAuthority<'a> {
                     _ => return Err(ControlError::DuplicateRoute { existing_address }),
                 }
                 required_replacement_address = Some(existing_address);
+                old_endpoint_for_cleanup = Some(existing_endpoint);
             }
         }
 
@@ -783,8 +792,10 @@ impl<'a> RouteAuthority<'a> {
         if !route_table.can_register_route(&entry) {
             return Err(ControlError::OwnerMismatch);
         }
+        let new_endpoint =
+            UpstreamEndpointKey::from_route(&entry).ok_or(ControlError::OwnerMismatch)?;
 
-        let old_client = if let Some(required_replacement_address) = required_replacement_address {
+        if let Some(required_replacement_address) = required_replacement_address {
             let Some(token) = replacement else {
                 return Err(ControlError::DuplicateRoute {
                     existing_address: required_replacement_address,
@@ -792,25 +803,35 @@ impl<'a> RouteAuthority<'a> {
             };
             let token_existing_address = token.existing_address.clone();
             let evidence: OwnerReplacementEvidence = token.evidence;
+            let Some(old_endpoint) = old_endpoint_for_cleanup.as_ref() else {
+                return Err(ControlError::DuplicateRoute {
+                    existing_address: token_existing_address,
+                });
+            };
             match self
                 .state
-                .replace_if_owner_token(&name, &token.token, address.clone(), evidence)
+                .validate_replaceable_owner_token(old_endpoint, &token.token, evidence)
             {
-                Ok(old_client) => old_client,
+                Ok(()) => {}
                 Err(OwnerReplaceError::StaleToken | OwnerReplaceError::NotReplaceable) => {
                     return Err(ControlError::DuplicateRoute {
                         existing_address: token_existing_address,
                     });
                 }
             }
-        } else {
-            self.state.insert_owner_slot(name.clone(), address);
-            None
-        };
+        }
+        self.state.insert_owner_slot(&entry);
         route_table.register_prevalidated_route(entry.clone());
         drop(route_table);
-        if let Some(client) = old_client {
-            close_replaced_owner_client(client);
+        if let Some(old_endpoint) = old_endpoint_for_cleanup {
+            if old_endpoint != new_endpoint {
+                if let Some(client) = self
+                    .state
+                    .remove_connection_if_endpoint_unused(&old_endpoint)
+                {
+                    close_replaced_owner_client(client);
+                }
+            }
         }
         Ok(RouteCommandResult::Registered { entry })
     }
@@ -822,15 +843,15 @@ impl<'a> RouteAuthority<'a> {
         let name = existing.name.as_str();
         let existing_address = existing.ipc_address.clone().unwrap_or_default();
         match self.state.connection_lookup(name) {
-            CachedClient::Ready { address, .. } => Err(ControlError::DuplicateRoute {
-                existing_address: address,
+            CachedClient::Ready { endpoint, .. } => Err(ControlError::DuplicateRoute {
+                existing_address: endpoint.address().to_string(),
             }),
-            CachedClient::OwnerOnly { address }
-            | CachedClient::Evicted { address }
-            | CachedClient::Disconnected { address } => {
+            CachedClient::OwnerOnly { endpoint }
+            | CachedClient::Evicted { endpoint }
+            | CachedClient::Disconnected { endpoint } => {
                 let Some(token) = self.state.owner_token(name) else {
                     return Err(ControlError::DuplicateRoute {
-                        existing_address: address,
+                        existing_address: endpoint.address().to_string(),
                     });
                 };
                 Ok(OwnerReplacementCandidate {
@@ -838,7 +859,7 @@ impl<'a> RouteAuthority<'a> {
                     server_id: existing.server_id.clone().unwrap_or_default(),
                     server_instance_id: existing.server_instance_id.clone().unwrap_or_default(),
                     ipc_address: existing_address.clone(),
-                    existing_address: address,
+                    existing_address: endpoint.address().to_string(),
                     crm_ns: existing.crm_ns.clone(),
                     crm_name: existing.crm_name.clone(),
                     crm_ver: existing.crm_ver.clone(),
@@ -862,7 +883,7 @@ impl<'a> RouteAuthority<'a> {
         self.validate_route_name(&name)?;
         self.validate_server_id(&server_id)?;
 
-        let (entry, removed_at, removed_revision, client) = {
+        let (entry, removed_at, removed_revision) = {
             let mut route_table = self.state.route_table_write();
             let Some(existing) = route_table.local_route(&name) else {
                 if route_table.local_tombstone_matches_server(&name, &server_id) {
@@ -875,12 +896,14 @@ impl<'a> RouteAuthority<'a> {
             }
             let (entry, removed_at, removed_revision) =
                 route_table.unregister_local_route_with_tombstone(&name, &server_id);
-            let client = self.state.remove_connection(&name);
-            (entry, removed_at, removed_revision, client)
+            (entry, removed_at, removed_revision)
         };
         let Some(entry) = entry else {
             return Err(ControlError::NotFound);
         };
+        let client = UpstreamEndpointKey::from_route(&entry)
+            .as_ref()
+            .and_then(|key| self.state.remove_connection_if_endpoint_unused(key));
         Ok(RouteCommandResult::Unregistered {
             entry,
             removed_at,

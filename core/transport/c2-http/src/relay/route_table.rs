@@ -400,6 +400,12 @@ impl RouteTable {
             .cloned()
     }
 
+    pub fn has_local_route_for_endpoint(&self, key: &UpstreamEndpointKey) -> bool {
+        self.routes
+            .values()
+            .any(|entry| UpstreamEndpointKey::from_route(entry).as_ref() == Some(key))
+    }
+
     /// Resolve a name → ordered list of RouteInfo.
     /// LOCAL first, then PEER sorted by (registered_at, relay_id).
     #[cfg(test)]

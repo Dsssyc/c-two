@@ -430,14 +430,14 @@ impl RelayServer {
             interval.tick().await;
 
             let evicted = state.evict_idle(idle_timeout_ms);
-            for (name, old_client) in evicted {
+            for (endpoint, old_client) in evicted {
                 if let Some(arc_client) = old_client {
                     let dead = !arc_client.is_connected();
                     tokio::spawn(async move { arc_client.close_shared().await });
                     if dead {
-                        eprintln!("[relay] Evicted dead upstream: {name}");
+                        eprintln!("[relay] Evicted dead upstream endpoint: {endpoint}");
                     } else {
-                        eprintln!("[relay] Evicted idle upstream: {name}");
+                        eprintln!("[relay] Evicted idle upstream endpoint: {endpoint}");
                     }
                 }
             }

@@ -5,31 +5,12 @@ use c2_ipc::IpcClient;
 
 use crate::relay::gossip::broadcast_route_withdraw;
 use crate::relay::state::RelayState;
-use crate::relay::types::{Locality, RouteEntry};
+use crate::relay::types::{RouteEntry, UpstreamEndpointKey};
 
 const CONTROL_RETRY_DELAY: Duration = Duration::from_secs(1);
 const CONTROL_OBSERVE_INTERVAL: Duration = Duration::from_millis(50);
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct UpstreamOwnerKey {
-    server_id: String,
-    server_instance_id: String,
-    address: String,
-}
-
-impl UpstreamOwnerKey {
-    pub(crate) fn address(&self) -> &str {
-        &self.address
-    }
-
-    pub(crate) fn server_id(&self) -> &str {
-        &self.server_id
-    }
-
-    pub(crate) fn server_instance_id(&self) -> &str {
-        &self.server_instance_id
-    }
-}
+pub(crate) type UpstreamOwnerKey = UpstreamEndpointKey;
 
 pub(crate) struct UpstreamControlTask {
     token: Arc<()>,
@@ -51,14 +32,7 @@ impl UpstreamControlTask {
 }
 
 pub(crate) fn owner_key_for_route(entry: &RouteEntry) -> Option<UpstreamOwnerKey> {
-    if entry.locality != Locality::Local {
-        return None;
-    }
-    Some(UpstreamOwnerKey {
-        server_id: entry.server_id.clone()?,
-        server_instance_id: entry.server_instance_id.clone()?,
-        address: entry.ipc_address.clone()?,
-    })
+    UpstreamEndpointKey::from_route(entry)
 }
 
 pub(crate) fn spawn(state: Arc<RelayState>, key: UpstreamOwnerKey) -> UpstreamControlTask {
