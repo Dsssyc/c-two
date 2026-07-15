@@ -4,6 +4,11 @@ use std::path::Path;
 #[cfg(unix)]
 use std::path::PathBuf;
 
+const RELEASE_DESCRIPTOR: &str =
+    include_str!("../../tests/fixtures/contracts/portable-release.contract.json");
+const RELEASE_REFERENCE: &str =
+    include_str!("../../tests/fixtures/contracts/portable-release.ref.json");
+
 fn valid_contract_json() -> String {
     r#"{
       "schema": "c-two.contract.v1",
@@ -246,6 +251,15 @@ fn contract_help_lists_descriptor_commands() {
         .stdout(predicate::str::contains("validate"));
 }
 
+#[test]
+fn contract_help_lists_release_ref() {
+    let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.args(["contract", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("release-ref"));
+}
+
 #[cfg(unix)]
 #[test]
 fn contract_artifacts_wraps_python_without_contract_validation() {
@@ -377,6 +391,56 @@ fn contract_validate_rejects_pickle_wire_ref() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("python-pickle-default"));
+}
+
+#[test]
+fn contract_release_ref_accepts_file_and_writes_canonical_output() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let descriptor = tempdir.path().join("contract.json");
+    std::fs::write(&descriptor, RELEASE_DESCRIPTOR).unwrap();
+
+    let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.env("C2_PYTHON", "c-two-test-python-must-not-run");
+    cmd.args(["contract", "release-ref", descriptor.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(format!("{}\n", RELEASE_REFERENCE.trim_end()));
+}
+
+#[test]
+fn contract_release_ref_accepts_stdin_and_pretty_output_file() {
+    let tempdir = tempfile::tempdir().unwrap();
+    let output = tempdir.path().join("release-ref.json");
+    let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.args([
+        "contract",
+        "release-ref",
+        "-",
+        "--pretty",
+        "--out",
+        output.to_str().unwrap(),
+    ])
+    .write_stdin(RELEASE_DESCRIPTOR)
+    .assert()
+    .success()
+    .stdout(predicate::str::is_empty());
+
+    let written = std::fs::read_to_string(output).unwrap();
+    assert!(written.ends_with('\n'));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&written).unwrap(),
+        serde_json::from_str::<serde_json::Value>(RELEASE_REFERENCE).unwrap(),
+    );
+}
+
+#[test]
+fn contract_release_ref_rejects_invalid_descriptor() {
+    let mut cmd = Command::cargo_bin("c3").unwrap();
+    cmd.args(["contract", "release-ref", "-"])
+        .write_stdin(r#"{"schema":"not-c-two"}"#)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("contract descriptor invalid"));
 }
 
 #[cfg(unix)]

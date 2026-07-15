@@ -21,6 +21,8 @@ pub enum ContractCommand {
     Export(PythonExportArgs),
     /// Infer a portable descriptor or diagnostics from a Python resource class.
     Infer(PythonInferArgs),
+    /// Derive a route-independent release reference from a portable descriptor.
+    ReleaseRef(ReleaseRefArgs),
     /// Validate a portable c-two.contract.v1 descriptor.
     Validate(ValidateArgs),
 }
@@ -29,6 +31,18 @@ pub enum ContractCommand {
 pub struct ValidateArgs {
     /// Descriptor JSON path, or "-" to read from stdin.
     pub path: String,
+}
+
+#[derive(Debug, Args)]
+pub struct ReleaseRefArgs {
+    /// Descriptor JSON path, or "-" to read from stdin.
+    pub path: String,
+    /// Write release-reference JSON to this file instead of stdout.
+    #[arg(long)]
+    pub out: Option<String>,
+    /// Pretty-print release-reference JSON.
+    #[arg(long)]
+    pub pretty: bool,
 }
 
 #[derive(Debug, Args)]
@@ -158,6 +172,7 @@ pub fn run(args: ContractArgs) -> Result<()> {
         ContractCommand::Diagnose(args) => diagnose(args),
         ContractCommand::Export(args) => export(args),
         ContractCommand::Infer(args) => infer(args),
+        ContractCommand::ReleaseRef(args) => release_ref(args),
         ContractCommand::Validate(args) => validate(&args.path),
     }
 }
@@ -209,6 +224,26 @@ fn validate(path: &str) -> Result<()> {
     let label = if path == "-" { "stdin" } else { path };
     println!("{label}: valid c-two.contract.v1 sha256={digest}");
     Ok(())
+}
+
+fn release_ref(args: ReleaseRefArgs) -> Result<()> {
+    let payload = read_payload(&args.path)?;
+    let release = c2_contract::ContractRelease::from_descriptor_json(payload.as_bytes())
+        .map_err(|error| anyhow!("{error}"))?;
+    let compact = release
+        .reference()
+        .to_canonical_json()
+        .map_err(|error| anyhow!("{error}"))?;
+    let output = if args.pretty {
+        let value: serde_json::Value = serde_json::from_str(&compact)
+            .map_err(|error| anyhow!("release reference serialization failed: {error}"))?;
+        serde_json::to_string_pretty(&value)
+            .map(|value| value + "\n")
+            .map_err(|error| anyhow!("release reference serialization failed: {error}"))?
+    } else {
+        compact
+    };
+    write_payload(&output, args.out.as_deref())
 }
 
 fn codegen(args: CodegenArgs) -> Result<()> {
