@@ -557,6 +557,20 @@ fn validate_portable_contract_descriptor(payload: &[u8]) -> PyResult<()> {
         .map_err(|err| PyValueError::new_err(err.to_string()))
 }
 
+#[pyfunction]
+fn canonicalize_portable_contract_descriptor(payload: &[u8]) -> PyResult<String> {
+    c2_contract::ContractRelease::from_descriptor_json(payload)
+        .map(|release| release.canonical_descriptor_json().to_string())
+        .map_err(|error| PyValueError::new_err(error.to_string()))
+}
+
+#[pyfunction]
+fn contract_release_ref_json(payload: &[u8]) -> PyResult<String> {
+    c2_contract::ContractRelease::from_descriptor_json(payload)
+        .and_then(|release| release.reference().to_canonical_json())
+        .map_err(|error| PyValueError::new_err(error.to_string()))
+}
+
 // ── Module registration ─────────────────────────────────────────────────
 
 pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -598,6 +612,11 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(decode_handshake, m)?)?;
     m.add_function(wrap_pyfunction!(contract_descriptor_sha256_hex, m)?)?;
     m.add_function(wrap_pyfunction!(validate_portable_contract_descriptor, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        canonicalize_portable_contract_descriptor,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(contract_release_ref_json, m)?)?;
 
     // ── Flag constants (Python names — no _V2 suffix) ───────────────
     m.add("FLAG_SHM", c2_wire::flags::FLAG_SHM)?;

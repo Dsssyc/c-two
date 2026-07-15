@@ -9,6 +9,7 @@ from .crm.descriptor import (
     contract_descriptor_diagnostics,
     export_contract_payload_abi_artifacts,
     export_contract_descriptor,
+    export_contract_release_ref,
 )
 from .crm.infer import infer_crm_from_resource
 from .crm.meta import crm, read, write, on_shutdown
@@ -43,6 +44,7 @@ __all__ = [
     'contract_descriptor_diagnostics',
     'export_contract_payload_abi_artifacts',
     'export_contract_descriptor',
+    'export_contract_release_ref',
     'infer_crm_from_resource',
     'crm',
     'read',

@@ -1,8 +1,13 @@
 import json
+from pathlib import Path
 
 import pytest
 
 import c_two as cc
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[4]
 
 
 def test_export_contract_descriptor_uses_c_two_contract_schema_and_rejects_pickle_for_unsupported_bytes():
@@ -114,6 +119,63 @@ def test_export_contract_descriptor_returns_canonical_portable_json():
     assert descriptor['methods'][0]['wire']['input']['id'] == 'org.fastdb.call-db'
     assert descriptor['methods'][0]['wire']['output']['id'] == 'org.fastdb.call-db'
     assert 'python-pickle-default' not in exported
+
+
+def test_native_release_projection_matches_shared_golden_vectors():
+    from c_two._native import (
+        canonicalize_portable_contract_descriptor,
+        contract_release_ref_json,
+    )
+
+    fixture_dir = _repo_root() / 'tests' / 'fixtures' / 'contracts'
+    descriptor = (fixture_dir / 'portable-release.contract.json').read_bytes()
+    canonical = (fixture_dir / 'portable-release.canonical.json').read_text().strip()
+    reference = (fixture_dir / 'portable-release.ref.json').read_text().strip()
+
+    assert canonicalize_portable_contract_descriptor(descriptor) == canonical
+    assert contract_release_ref_json(descriptor) == reference
+
+
+def test_export_contract_release_ref_is_rust_derived_and_route_independent():
+    import fastdb4py as fdb
+
+    @cc.crm(namespace='test.release-export', version='0.1.0')
+    class Portable:
+        def echo(self, value: fdb.I32) -> fdb.I32:
+            ...
+
+    descriptor = cc.export_contract_descriptor(Portable)
+    reference = json.loads(cc.export_contract_release_ref(Portable))
+    from c_two._native import contract_release_ref_json
+
+    assert reference == json.loads(contract_release_ref_json(descriptor.encode()))
+    assert reference['schema'] == 'c-two.contract-release-ref.v1'
+    assert reference['contract_schema'] == 'c-two.contract.v1'
+    assert reference['crm'] == {
+        'name': 'Portable',
+        'namespace': 'test.release-export',
+        'version': '0.1.0',
+    }
+    assert 'route_name' not in reference
+    assert 'abi_hash' not in reference
+    assert 'signature_hash' not in reference
+
+
+def test_pretty_descriptor_and_reference_preserve_release_identity():
+    @cc.crm(namespace='test.release-pretty', version='0.1.0')
+    class Ping:
+        def ping(self) -> None:
+            ...
+
+    compact_descriptor = cc.export_contract_descriptor(Ping)
+    pretty_descriptor = cc.export_contract_descriptor(Ping, pretty=True)
+    compact_reference = cc.export_contract_release_ref(Ping)
+    pretty_reference = cc.export_contract_release_ref(Ping, pretty=True)
+    from c_two._native import contract_release_ref_json
+
+    assert json.loads(compact_descriptor) == json.loads(pretty_descriptor)
+    assert json.loads(compact_reference) == json.loads(pretty_reference)
+    assert contract_release_ref_json(pretty_descriptor.encode()) == compact_reference
 
 
 def test_contract_export_cli_writes_descriptor(tmp_path, monkeypatch):

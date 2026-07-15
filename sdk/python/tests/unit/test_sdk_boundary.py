@@ -141,19 +141,67 @@ def test_top_level_exposes_contract_projection_tools():
         contract_descriptor_diagnostics,
         export_contract_payload_abi_artifacts,
         export_contract_descriptor,
+        export_contract_release_ref,
     )
     from c_two.crm.infer import infer_crm_from_resource
 
     assert cc.contract_descriptor_diagnostics is contract_descriptor_diagnostics
     assert cc.export_contract_payload_abi_artifacts is export_contract_payload_abi_artifacts
     assert cc.export_contract_descriptor is export_contract_descriptor
+    assert cc.export_contract_release_ref is export_contract_release_ref
     assert cc.infer_crm_from_resource is infer_crm_from_resource
     assert {
         'contract_descriptor_diagnostics',
         'export_contract_payload_abi_artifacts',
         'export_contract_descriptor',
+        'export_contract_release_ref',
         'infer_crm_from_resource',
     } <= set(cc.__all__)
+
+
+def test_contract_release_identity_is_not_reimplemented_in_python():
+    source_path = (
+        Path(__file__).resolve().parents[2]
+        / 'src'
+        / 'c_two'
+        / 'crm'
+        / 'descriptor.py'
+    )
+    tree = ast.parse(source_path.read_text(encoding='utf-8'))
+    release_export = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == 'export_contract_release_ref'
+    )
+
+    native_imports = {
+        alias.name
+        for node in ast.walk(release_export)
+        if isinstance(node, ast.ImportFrom) and node.module == 'c_two._native'
+        for alias in node.names
+    }
+    calls = {
+        node.func.id
+        for node in ast.walk(release_export)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    all_imports = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    release_literals = {
+        node.value
+        for node in ast.walk(release_export)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+
+    assert 'contract_release_ref_json' in native_imports
+    assert 'contract_release_ref_json' in calls
+    assert 'hashlib' not in all_imports
+    assert 'descriptor_sha256' not in release_literals
 
 
 def test_payload_abi_internals_are_not_public_sdk_surface():
