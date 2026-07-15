@@ -572,8 +572,13 @@ pub(crate) fn canonical_json(value: &Value) -> String {
             format!("[{body}]")
         }
         Value::Object(map) => {
-            let body = map
-                .iter()
+            // serde_json's `preserve_order` feature can be enabled by a
+            // downstream crate through Cargo feature unification. Canonical
+            // identity must not depend on that dependency-graph choice.
+            let mut entries = map.iter().collect::<Vec<_>>();
+            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            let body = entries
+                .into_iter()
                 .map(|(key, value)| {
                     let encoded_key = serde_json::to_string(key).expect("JSON object key encodes");
                     format!("{encoded_key}:{}", canonical_json(value))

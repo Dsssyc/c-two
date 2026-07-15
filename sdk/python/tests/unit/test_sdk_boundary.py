@@ -192,6 +192,11 @@ def test_contract_release_identity_is_not_reimplemented_in_python():
         if isinstance(node, ast.Import)
         for alias in node.names
     }
+    import_from_modules = {
+        node.module
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+    }
     release_literals = {
         node.value
         for node in ast.walk(release_export)
@@ -201,6 +206,7 @@ def test_contract_release_identity_is_not_reimplemented_in_python():
     assert 'contract_release_ref_json' in native_imports
     assert 'contract_release_ref_json' in calls
     assert 'hashlib' not in all_imports
+    assert 'hashlib' not in import_from_modules
     assert 'descriptor_sha256' not in release_literals
 
 

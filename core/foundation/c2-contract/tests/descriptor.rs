@@ -1,4 +1,4 @@
-use c2_contract::ValidatedContractDescriptor;
+use c2_contract::{ContractRelease, ValidatedContractDescriptor};
 
 const SOURCE: &str =
     include_str!("../../../../tests/fixtures/contracts/portable-release.contract.json");
@@ -29,15 +29,19 @@ fn validated_descriptor_extracts_identity_and_canonical_content() {
 #[test]
 fn formatting_and_key_order_do_not_change_descriptor_identity() {
     let source = ValidatedContractDescriptor::from_json(SOURCE.as_bytes()).unwrap();
+    let source_release = ContractRelease::from_descriptor_json(SOURCE.as_bytes()).unwrap();
     let source_value: serde_json::Value = serde_json::from_str(SOURCE).unwrap();
-    let reordered = format!(
+    let reordered_json = format!(
         "{{\"methods\":{},\"fingerprints\":{},\"crm\":{},\"schema\":\"c-two.contract.v1\"}}",
         source_value["methods"], source_value["fingerprints"], source_value["crm"],
     );
-    let reordered = ValidatedContractDescriptor::from_json(reordered.as_bytes()).unwrap();
+    let reordered = ValidatedContractDescriptor::from_json(reordered_json.as_bytes()).unwrap();
+    let reordered_release =
+        ContractRelease::from_descriptor_json(reordered_json.as_bytes()).unwrap();
 
     assert_eq!(source.canonical_json(), reordered.canonical_json());
     assert_eq!(source.descriptor_sha256(), reordered.descriptor_sha256());
+    assert_eq!(source_release.reference(), reordered_release.reference());
 }
 
 #[test]

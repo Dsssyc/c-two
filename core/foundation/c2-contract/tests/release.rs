@@ -76,6 +76,19 @@ fn reference_parser_rejects_non_lowercase_digest() {
 }
 
 #[test]
+fn reference_parser_rejects_wrong_digest_length() {
+    let short = REFERENCE
+        .trim_end()
+        .replace(DIGEST, &DIGEST[..DIGEST.len() - 1]);
+
+    assert!(matches!(
+        ContractReleaseRef::from_json(short.as_bytes()),
+        Err(ContractError::InvalidReleaseRef { path, .. })
+            if path == "$.descriptor_sha256"
+    ));
+}
+
+#[test]
 fn verification_identifies_each_mismatch_field() {
     let release = ContractRelease::from_descriptor_json(DESCRIPTOR.as_bytes()).unwrap();
     for (actual, expected, field) in [
@@ -161,6 +174,17 @@ fn reference_parser_rejects_unknown_nested_crm_field() {
     assert!(matches!(
         ContractReleaseRef::from_json(unknown_nested.as_bytes()),
         Err(ContractError::InvalidReleaseRef { path, .. }) if path == "$.crm.extra"
+    ));
+}
+
+#[test]
+fn reference_parser_rejects_malformed_nested_crm_shape() {
+    let mut malformed: serde_json::Value = serde_json::from_str(REFERENCE).unwrap();
+    malformed["crm"] = serde_json::json!([]);
+
+    assert!(matches!(
+        ContractReleaseRef::from_json(malformed.to_string().as_bytes()),
+        Err(ContractError::InvalidReleaseRef { path, .. }) if path == "$.crm"
     ));
 }
 
