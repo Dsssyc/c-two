@@ -9,7 +9,10 @@ pub use descriptor::{
     ValidatedContractDescriptor, contract_descriptor_sha256_hex,
     validate_portable_contract_descriptor_json, validate_portable_contract_descriptor_value,
 };
-pub use release::ContractDescriptorDigest;
+pub use release::{
+    CONTRACT_RELEASE_REF_SCHEMA, ContractDescriptorDigest, ContractRelease, ContractReleaseRef,
+    ContractReleaseRefField,
+};
 
 #[cfg(test)]
 use serde_json::Value;
@@ -50,6 +53,18 @@ pub enum ContractError {
     InvalidJson(String),
     #[error("contract descriptor invalid at {path}: {message}")]
     InvalidDescriptor { path: String, message: String },
+    #[error("contract release reference must be valid JSON: {0}")]
+    InvalidReleaseRefJson(String),
+    #[error("contract release reference invalid at {path}: {message}")]
+    InvalidReleaseRef { path: String, message: String },
+    #[error(
+        "contract release reference mismatch at {field}: expected {expected:?}, got {actual:?}"
+    )]
+    ReleaseRefMismatch {
+        field: ContractReleaseRefField,
+        expected: String,
+        actual: String,
+    },
 }
 
 pub fn validate_named_route_name(field: &'static str, value: &str) -> Result<(), ContractError> {
