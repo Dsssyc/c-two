@@ -1,0 +1,78 @@
+{
+  "schema": "c-two.contract.v1",
+  "crm": {
+    "namespace": "test.contract-release",
+    "name": "Portable",
+    "version": "0.1.0"
+  },
+  "fingerprints": {
+    "abi_hash": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "signature_hash": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+  },
+  "methods": [
+    {
+      "access": "read",
+      "buffer": "view",
+      "name": "ping",
+      "parameters": [],
+      "return": {"kind": "none"},
+      "wire": {"input": null, "output": null}
+    },
+    {
+      "access": "write",
+      "buffer": "view",
+      "name": "echo",
+      "parameters": [
+        {
+          "name": "value",
+          "kind": "POSITIONAL_OR_KEYWORD",
+          "default": {"kind": "missing"},
+          "type": {
+            "kind": "codec",
+            "codec": {
+              "kind": "codec_ref",
+              "id": "org.fastdb.call-db",
+              "version": "1",
+              "schema": "fastdb.call-db.schema.v1",
+              "schema_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "capabilities": ["bytes", "buffer-view"],
+              "portable": true
+            }
+          }
+        }
+      ],
+      "return": {
+        "kind": "codec",
+        "codec": {
+          "kind": "codec_ref",
+          "id": "org.fastdb.call-db",
+          "version": "1",
+          "schema": "fastdb.call-db.schema.v1",
+          "schema_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "capabilities": ["bytes", "buffer-view"],
+          "portable": true
+        }
+      },
+      "wire": {
+        "input": {
+          "kind": "codec_ref",
+          "id": "org.fastdb.call-db",
+          "version": "1",
+          "schema": "fastdb.call-db.schema.v1",
+          "schema_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "capabilities": ["bytes", "buffer-view"],
+          "portable": true
+        },
+        "output": {
+          "kind": "codec_ref",
+          "id": "org.fastdb.call-db",
+          "version": "1",
+          "schema": "fastdb.call-db.schema.v1",
+          "schema_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "capabilities": ["bytes", "buffer-view"],
+          "portable": true
+        }
+      }
+    }
+  ]
+}
