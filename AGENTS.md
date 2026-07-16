@@ -87,6 +87,7 @@ Path: `sdk/python/src/c_two/crm/`
 - CRM contracts are interface classes decorated with `@cc.crm(namespace='...', version='...')`.
 - Only methods in the contract are exposed remotely.
 - CRM route contracts are identified by route name plus the CRM namespace, CRM name, CRM version, ABI hash, and signature hash. Python may compute the descriptor/fingerprints from the CRM class, but Rust `c2-contract` validates the complete expected route contract at IPC and relay boundaries.
+- A persistent CRM contract release is a Rust-validated `ContractReleaseRef` derived from canonical `c-two.contract.v1` content. It never contains a route name. `ExpectedRouteContract` is derived later from a validated release plus a runtime route name.
 - Resource implementations are plain Python classes and are not decorated.
 - Portable FastDB CRM payloads are inferred from `fastdb4py` annotations and represented by `PayloadAbiRef` values. Python-only fallback values use pickle and must not be treated as portable schema/codegen inputs.
 - FastDB retained response views are selected by call-site `cc.hold(...)`; server-side borrowed inputs are selected only by `cc.register(..., input_lifetime={...: cc.InputLifetime.BORROWED})`.

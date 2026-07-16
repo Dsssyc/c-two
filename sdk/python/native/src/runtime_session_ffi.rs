@@ -6,14 +6,15 @@
 use parking_lot::Mutex;
 use pyo3::exceptions::{PyKeyError, PyLookupError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyDict, PyList};
+use pyo3::types::{PyAny, PyBytes, PyDict, PyList};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
 use c2_contract::ExpectedRouteContract;
-use c2_http::client::RelayAwareHttpClient;
-use c2_ipc::{ClientPool, IpcError, SyncClient};
+use c2_http::client::{RelayAwareHttpClient, RelayLocalIpcCandidate};
+use c2_ipc::{ClientPool, IpcError, RouteBinding, SyncClient};
 use c2_mem::BufferLeaseTracker;
 use c2_runtime::{
     RegisterFailureOutcome, RegisterOutcome, RelayCleanupError, RelayResolvedConnection,
@@ -28,9 +29,9 @@ use crate::config_ffi::{
     parse_server_ipc_overrides, server_ipc_overrides_to_dict,
 };
 use crate::http_ffi::{
-    PyRustHttpClient, acquire_http_client_from_global_pool, call_relay_aware_http_client,
-    http_client_refcount_from_global_pool, release_http_client_from_global_pool,
-    shutdown_http_clients_from_global_pool,
+    PyRustHttpClient, acquire_http_client_from_global_pool, c2_error_wire_bytes_from_http_body,
+    call_relay_aware_http_client, http_client_refcount_from_global_pool,
+    release_http_client_from_global_pool, shutdown_http_clients_from_global_pool,
 };
 use crate::lease_ffi::PyBufferLeaseTracker;
 use crate::server_ffi::{PyServer, parse_concurrency_mode};
@@ -38,6 +39,7 @@ use crate::server_ffi::{PyServer, parse_concurrency_mode};
 enum RelayConnectedInner {
     Ipc {
         client: Arc<SyncClient>,
+        binding: RouteBinding,
         pool: &'static ClientPool,
     },
     Http {
@@ -47,7 +49,7 @@ enum RelayConnectedInner {
 
 enum RelayIpcConnectError {
     Config(PyErr),
-    ContractMismatch(PyErr),
+    ContractMismatch(String),
     Unavailable(RelayIpcUnavailable),
 }
 
@@ -71,6 +73,27 @@ enum RelayIpcUnavailableReason {
     },
     RouteMissing {
         route_name: String,
+    },
+    RouteRemoved {
+        route_name: String,
+        route_uid: Option<String>,
+    },
+    RouteClosed {
+        route_name: String,
+        route_uid: String,
+        reason: String,
+    },
+    RouteStale {
+        route_name: String,
+        current_route_uid: String,
+        current_route_revision: u64,
+    },
+    CatalogCompacted {
+        compacted_revision: u64,
+        current_revision: u64,
+    },
+    WatchUnavailable {
+        error: String,
     },
 }
 
@@ -114,6 +137,54 @@ impl RelayIpcUnavailable {
             },
         }
     }
+
+    fn from_route_state_error(address: &str, route_name: &str, error: IpcError) -> Self {
+        let reason = match error {
+            IpcError::RouteRemoved {
+                route_name,
+                route_uid,
+            } => RelayIpcUnavailableReason::RouteRemoved {
+                route_name,
+                route_uid,
+            },
+            IpcError::RouteClosed {
+                route_name,
+                route_uid,
+                reason,
+            } => RelayIpcUnavailableReason::RouteClosed {
+                route_name,
+                route_uid,
+                reason,
+            },
+            IpcError::RouteStale {
+                route_name,
+                current_route_uid,
+                current_route_revision,
+            } => RelayIpcUnavailableReason::RouteStale {
+                route_name,
+                current_route_uid,
+                current_route_revision,
+            },
+            IpcError::CatalogCompacted {
+                compacted_revision,
+                current_revision,
+            } => RelayIpcUnavailableReason::CatalogCompacted {
+                compacted_revision,
+                current_revision,
+            },
+            IpcError::WatchUnavailable(error) => {
+                RelayIpcUnavailableReason::WatchUnavailable { error }
+            }
+            other => RelayIpcUnavailableReason::PoolAcquire {
+                error: other.to_string(),
+            },
+        };
+        Self {
+            address: address.to_string(),
+            route_name: route_name.to_string(),
+            reason,
+        }
+    }
 }
 
 impl fmt::Display for RelayIpcUnavailable {
@@ -142,6 +213,55 @@ impl fmt::Display for RelayIpcUnavailableReason {
                 actual_server_instance_id.as_deref().unwrap_or("<missing>")
             ),
             Self::RouteMissing { route_name } => write!(f, "route missing: {route_name}"),
+            Self::RouteRemoved {
+                route_name,
+                route_uid,
+            } => {
+                if let Some(route_uid) = route_uid {
+                    write!(f, "route removed: {route_name} uid={route_uid}")
+                } else {
+                    write!(f, "route removed: {route_name}")
+                }
+            }
+            Self::RouteClosed {
+                route_name,
+                route_uid,
+                reason,
+            } => write!(
+                f,
+                "route closed: {route_name} uid={route_uid} reason={reason}"
+            ),
+            Self::RouteStale {
+                route_name,
+                current_route_uid,
+                current_route_revision,
+            } => write!(
+                f,
+                "route stale: {route_name} current_uid={current_route_uid} current_revision={current_route_revision}"
+            ),
+            Self::CatalogCompacted {
+                compacted_revision,
+                current_revision,
+            } => write!(
+                f,
+                "route catalog compacted: compacted_revision={compacted_revision} current_revision={current_revision}"
+            ),
+            Self::WatchUnavailable { error } => write!(f, "route watch unavailable: {error}"),
+        }
+    }
+}
+
+impl RelayIpcUnavailableReason {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::PoolAcquire { .. } => "pool_acquire",
+            Self::IdentityMismatch { .. } => "identity_mismatch",
+            Self::RouteMissing { .. } => "route_missing",
+            Self::RouteRemoved { .. } => "route_removed",
+            Self::RouteClosed { .. } => "route_closed",
+            Self::RouteStale { .. } => "route_stale",
+            Self::CatalogCompacted { .. } => "catalog_compacted",
+            Self::WatchUnavailable { .. } => "watch_unavailable",
         }
     }
 }
@@ -197,8 +317,10 @@ impl PyRelayConnectedClient {
             return Err(PyRuntimeError::new_err("relay connected client is closed"));
         }
         match &self.inner {
-            RelayConnectedInner::Ipc { client, .. } => {
-                let response = call_sync_client(py, client, &self.route_name, method_name, data)?;
+            RelayConnectedInner::Ipc {
+                client, binding, ..
+            } => {
+                let response = call_sync_client(py, client, binding, method_name, data)?;
                 Ok(Py::new(py, response)?.into_any())
             }
             RelayConnectedInner::Http { client } => {
@@ -654,12 +776,20 @@ impl PyRuntimeSession {
             expected_abi_hash,
             expected_signature_hash,
         )?;
-        if let Err(err) = client.validate_route_contract(&expected) {
-            self.pool.inner.release(address);
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!("{err}")));
-        }
+        let binding_result = py.detach({
+            let client = Arc::clone(&client);
+            let expected = expected.clone();
+            move || client.acquire_route(&expected)
+        });
+        let binding = match binding_result {
+            Ok(binding) => binding,
+            Err(err) => {
+                self.pool.inner.release(address);
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(format!("{err}")));
+            }
+        };
         self.inner.mark_client_config_frozen();
-        Ok(PyRustClient::from_arc_bound(client, expected.route_name))
+        Ok(PyRustClient::from_arc_bound(client, binding))
     }
 
     fn release_ipc_client(&self, address: &str) {
@@ -814,55 +944,75 @@ impl PyRuntimeSession {
                 )
             })
             .map_err(runtime_error_to_py)?;
-        match target {
-            RelayResolvedConnection::Ipc {
-                address,
-                server_id,
-                server_instance_id,
-            } => {
-                match self.acquire_relay_ipc_client(
-                    py,
-                    &address,
-                    &server_id,
-                    &server_instance_id,
-                    &expected,
-                ) {
-                    Ok(client) => Ok(PyRelayConnectedClient {
-                        mode: "ipc".to_string(),
-                        target: address,
-                        route_name: expected.route_name.clone(),
-                        inner: RelayConnectedInner::Ipc {
-                            client,
-                            pool: self.pool.inner,
-                        },
-                        closed: Mutex::new(false),
-                    }),
-                    Err(RelayIpcConnectError::Config(err)) => Err(err),
-                    Err(RelayIpcConnectError::ContractMismatch(err)) => Err(err),
-                    Err(RelayIpcConnectError::Unavailable(reason)) => {
-                        eprintln!(
-                            "[c-two] Relay-resolved local IPC acquire failed; falling back to HTTP relay: {reason}"
-                        );
-                        self.acquire_relay_http_client(
-                            py,
-                            use_proxy,
-                            max_attempts,
-                            call_timeout_secs,
-                            remote_payload_chunk_size,
-                            expected,
-                        )
+        let mut target = target;
+        let mut failed_local_ipc_candidates = Vec::new();
+        loop {
+            match target {
+                RelayResolvedConnection::Ipc {
+                    client: relay_client,
+                    candidate,
+                } => {
+                    match self.acquire_relay_ipc_client(
+                        py,
+                        &candidate,
+                        &expected,
+                    ) {
+                        Ok((client, binding)) => {
+                            return Ok(PyRelayConnectedClient {
+                                mode: "ipc".to_string(),
+                                target: candidate.address,
+                                route_name: expected.route_name.clone(),
+                                inner: RelayConnectedInner::Ipc {
+                                    client,
+                                    binding,
+                                    pool: self.pool.inner,
+                                },
+                                closed: Mutex::new(false),
+                            });
+                        }
+                        Err(RelayIpcConnectError::Config(err)) => return Err(err),
+                        Err(RelayIpcConnectError::ContractMismatch(message)) => {
+                            return Err(relay_ipc_contract_mismatch_to_py(&expected, &message));
+                        }
+                        Err(RelayIpcConnectError::Unavailable(reason)) => {
+                            eprintln!(
+                                "[c-two] Relay-resolved local IPC acquire failed; fallback denied unless a distinct route is available: {reason}"
+                            );
+                            let failed_candidate = candidate.clone();
+                            failed_local_ipc_candidates.push(candidate);
+                            let failed = failed_local_ipc_candidates.clone();
+                            let next_target = match py.detach(move || {
+                                RuntimeSession::resolve_relay_connection_after_local_ipc_failures(
+                                    relay_client,
+                                    &failed,
+                                )
+                            }) {
+                                Ok(target) => target,
+                                Err(err) if runtime_error_is_fallback_denied(&err) => {
+                                    return Err(relay_ipc_fallback_denied_to_py(
+                                        &reason,
+                                        &failed_candidate,
+                                    ));
+                                }
+                                Err(err) => return Err(runtime_error_to_py(err)),
+                            };
+                            target = next_target;
+                            continue;
+                        }
                     }
                 }
+                RelayResolvedConnection::Http { client, relay_url } => {
+                    return Ok(PyRelayConnectedClient {
+                        mode: "http".to_string(),
+                        target: relay_url,
+                        route_name: expected.route_name.clone(),
+                        inner: RelayConnectedInner::Http {
+                            client: Arc::new(client),
+                        },
+                        closed: Mutex::new(false),
+                    });
+                }
             }
-            RelayResolvedConnection::Http { client, relay_url } => Ok(PyRelayConnectedClient {
-                mode: "http".to_string(),
-                target: relay_url,
-                route_name: expected.route_name.clone(),
-                inner: RelayConnectedInner::Http {
-                    client: Arc::new(client),
-                },
-                closed: Mutex::new(false),
-            }),
         }
     }
 
@@ -875,12 +1025,10 @@ impl PyRuntimeSession {
     fn acquire_relay_ipc_client(
         &self,
         py: Python<'_>,
-        address: &str,
-        expected_server_id: &str,
-        expected_server_instance_id: &str,
+        candidate: &RelayLocalIpcCandidate,
         expected: &ExpectedRouteContract,
-    ) -> Result<Arc<SyncClient>, RelayIpcConnectError> {
-        let addr = address.to_string();
+    ) -> Result<(Arc<SyncClient>, RouteBinding), RelayIpcConnectError> {
+        let addr = candidate.address.clone();
         let pool = self.pool.inner;
         let mut runtime_overrides = c2_config::RuntimeConfigOverrides::default();
         runtime_overrides.client_ipc = self.inner.client_ipc_overrides().unwrap_or_default();
@@ -909,8 +1057,8 @@ impl PyRuntimeSession {
 
         let actual_identity = client.server_identity();
         let identity_matches = actual_identity.as_ref().is_some_and(|identity| {
-            identity.server_id == expected_server_id
-                && identity.server_instance_id == expected_server_instance_id
+            identity.server_id == candidate.server_id
+                && identity.server_instance_id == candidate.server_instance_id
         });
         if !identity_matches {
             pool.release(&addr);
@@ -918,8 +1066,8 @@ impl PyRuntimeSession {
                 RelayIpcUnavailable::identity_mismatch(
                     &addr,
                     &expected.route_name,
-                    expected_server_id,
-                    expected_server_instance_id,
+                    &candidate.server_id,
+                    &candidate.server_instance_id,
                     actual_identity
                         .as_ref()
                         .map(|identity| identity.server_id.clone()),
@@ -930,56 +1078,43 @@ impl PyRuntimeSession {
             ));
         }
 
-        if !client
-            .route_names()
-            .into_iter()
-            .any(|registered| registered == expected.route_name)
-        {
-            pool.release(&addr);
-            return Err(RelayIpcConnectError::Unavailable(
-                RelayIpcUnavailable::route_missing(&addr, &expected.route_name),
-            ));
-        }
-        if let Err(err) = client.validate_route_contract(expected) {
-            pool.release(&addr);
-            return Err(RelayIpcConnectError::ContractMismatch(
-                PyRuntimeError::new_err(err.to_string()),
-            ));
-        }
+        let binding_result = py.detach({
+            let client = Arc::clone(&client);
+            let expected = expected.clone();
+            let route_uid = candidate.route_uid.clone();
+            let route_revision = candidate.route_revision;
+            move || client.acquire_route_token(&expected, &route_uid, route_revision)
+        });
+        let binding = match binding_result {
+            Ok(binding) => binding,
+            Err(err) => {
+                pool.release(&addr);
+                return match err {
+                    IpcError::RouteNotFound(_) => Err(RelayIpcConnectError::Unavailable(
+                        RelayIpcUnavailable::route_missing(&addr, &expected.route_name),
+                    )),
+                    IpcError::ContractMismatch(message) => {
+                        Err(RelayIpcConnectError::ContractMismatch(message))
+                    }
+                    IpcError::RouteRemoved { .. }
+                    | IpcError::RouteClosed { .. }
+                    | IpcError::RouteStale { .. }
+                    | IpcError::CatalogCompacted { .. }
+                    | IpcError::WatchUnavailable(_) => Err(RelayIpcConnectError::Unavailable(
+                        RelayIpcUnavailable::from_route_state_error(
+                            &addr,
+                            &expected.route_name,
+                            err,
+                        ),
+                    )),
+                    other => Err(RelayIpcConnectError::Unavailable(
+                        RelayIpcUnavailable::pool_acquire(&addr, &expected.route_name, other),
+                    )),
+                };
+            }
+        };
         self.inner.mark_client_config_frozen();
-        Ok(client)
-    }
-
-    fn acquire_relay_http_client(
-        &self,
-        py: Python<'_>,
-        use_proxy: bool,
-        max_attempts: usize,
-        call_timeout_secs: f64,
-        remote_payload_chunk_size: u64,
-        expected: ExpectedRouteContract,
-    ) -> PyResult<PyRelayConnectedClient> {
-        let bound_route_name = expected.route_name.clone();
-        let (client, relay_url) = py
-            .detach(move || {
-                self.inner.connect_relay_http_client(
-                    expected,
-                    use_proxy,
-                    max_attempts,
-                    call_timeout_secs,
-                    remote_payload_chunk_size,
-                )
-            })
-            .map_err(runtime_error_to_py)?;
-        Ok(PyRelayConnectedClient {
-            mode: "http".to_string(),
-            target: relay_url,
-            route_name: bound_route_name,
-            inner: RelayConnectedInner::Http {
-                client: Arc::new(client),
-            },
-            closed: Mutex::new(false),
-        })
+        Ok((client, binding))
     }
 }
 
@@ -1038,7 +1173,12 @@ fn runtime_error_to_py(err: c2_runtime::RuntimeSessionError) -> PyErr {
             Python::attach(|py| {
                 let value = exc.value(py);
                 value.setattr("status_code", status_code).ok();
-                value.setattr("body", message).ok();
+                value.setattr("body", message.clone()).ok();
+                if let Some(error_bytes) = c2_error_wire_bytes_from_http_body(&message) {
+                    value
+                        .setattr("error_bytes", PyBytes::new(py, &error_bytes))
+                        .ok();
+                }
             });
             exc
         }
@@ -1074,6 +1214,87 @@ fn runtime_error_to_py(err: c2_runtime::RuntimeSessionError) -> PyErr {
             PyRuntimeError::new_err(format!("relay error: {message}"))
         }
     }
+}
+
+fn runtime_error_is_fallback_denied(err: &c2_runtime::RuntimeSessionError) -> bool {
+    let c2_runtime::RuntimeSessionError::RelayHttp { message, .. } = err else {
+        return false;
+    };
+    let Some(error_bytes) = c2_error_wire_bytes_from_http_body(message) else {
+        return false;
+    };
+    c2_error::C2Error::from_wire_bytes(&error_bytes)
+        .ok()
+        .flatten()
+        .is_some_and(|error| error.code == c2_error::ErrorCode::FallbackDenied)
+}
+
+fn relay_ipc_contract_mismatch_to_py(expected: &ExpectedRouteContract, reason: &str) -> PyErr {
+    let message = format!(
+        "CRM contract mismatch for relay-resolved IPC route '{}': {reason}",
+        expected.route_name
+    );
+    let mut details = BTreeMap::new();
+    details.insert("route".to_string(), expected.route_name.clone());
+    details.insert("crm_ns".to_string(), expected.crm_ns.clone());
+    details.insert("crm_name".to_string(), expected.crm_name.clone());
+    details.insert("crm_ver".to_string(), expected.crm_ver.clone());
+    details.insert("abi_hash".to_string(), expected.abi_hash.clone());
+    details.insert(
+        "signature_hash".to_string(),
+        expected.signature_hash.clone(),
+    );
+    details.insert("direct_ipc_failure".to_string(), reason.to_string());
+    let error = c2_error::C2Error::new(c2_error::ErrorCode::ContractMismatch, message.clone())
+        .with_details(details);
+    let error_bytes = error.to_wire_bytes();
+    let exc = PyRuntimeError::new_err(message);
+    Python::attach(|py| {
+        exc.value(py)
+            .setattr("error_bytes", PyBytes::new(py, &error_bytes))
+            .ok();
+    });
+    exc
+}
+
+fn relay_ipc_fallback_denied_to_py(
+    reason: &RelayIpcUnavailable,
+    failed_candidate: &RelayLocalIpcCandidate,
+) -> PyErr {
+    let message = format!(
+        "same local relay HTTP fallback denied for route '{}' after direct IPC acquire failed",
+        reason.route_name
+    );
+    let mut details = BTreeMap::new();
+    details.insert("route".to_string(), reason.route_name.clone());
+    details.insert("ipc_address".to_string(), reason.address.clone());
+    details.insert("server_id".to_string(), failed_candidate.server_id.clone());
+    details.insert(
+        "server_instance_id".to_string(),
+        failed_candidate.server_instance_id.clone(),
+    );
+    details.insert("route_uid".to_string(), failed_candidate.route_uid.clone());
+    details.insert(
+        "route_revision".to_string(),
+        failed_candidate.route_revision.to_string(),
+    );
+    details.insert(
+        "direct_ipc_failure_kind".to_string(),
+        reason.reason.kind().to_string(),
+    );
+    details.insert("direct_ipc_failure".to_string(), reason.to_string());
+    let error = c2_error::C2Error::new(c2_error::ErrorCode::FallbackDenied, message.clone())
+        .with_details(details);
+    let error_bytes = error.to_wire_bytes();
+    let exc = PyRuntimeError::new_err(message);
+    Python::attach(|py| {
+        let value = exc.value(py);
+        value.setattr("status_code", 409).ok();
+        value
+            .setattr("error_bytes", PyBytes::new(py, &error_bytes))
+            .ok();
+    });
+    exc
 }
 
 fn resolve_relay_use_proxy_if_needed(

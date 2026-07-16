@@ -6,19 +6,18 @@
 
 ## 0. TL;DR
 
-C-Two 的 endgame 不是"更快的 RPC"，而是一个**以资源为一等公民的分布式运行时协议**，
-让跨进程、跨机、跨语言的资源对象以**统一的 CRM 契约**被发现、调度和消费。在它之上，
-**Toodle**（Tag-Oriented Open Data Linking Environment）是一个**领域无关**的资源图 +
-策略层；**地理资源目录**是 Toodle 在 GIS 这一个领域的实例化（未来也可以有 ML、金融、
-IoT 目录）；**Gridmen** 则是地理目录之上的**人在回路智能地理编辑器**。
+C-Two 的 endgame 不是“更快的 RPC”，而是一个**以运行时资源为一等公民的分布式协议**，让跨进程、跨机、跨语言的资源对象以统一 CRM 契约被调用。
+
+**Toodle**（Trust-Oriented Open Distributed Linking Environment）是更广义的可信开放资源环境：它拥有持久 Resource identity/revision、资源图关系、可选的资源树视图、tag/search 投影、policy、Resource Service 声明、runtime activation 与 federation。C-Two 提供 CRM 契约与运行时机制；活跃 CRM route 是 Resource Service 的运行时投影，不是持久 Toodle Resource 本身。
+
+Toodle 的治理底座不限定 GIS，但它也不是吞并所有领域习惯与工业特性的“大而全”框架；地理、ML、金融或 IoT 等领域仍需各自定义资源语义、服务契约、算法边界与信任约束。**Gridmen** 是地理领域资源与服务之上的人在回路智能编辑器。
 
 本文按四层刻画 endgame，并专门回应四组容易被误读的问题：
 
-1. **Toodle 是不是 c-two 的一部分？** —— 不是。c-two 只提供机制，Toodle 提供策略。
-2. **Toodle 是不是 GIS 专用？** —— 不是。Toodle 领域无关，地理目录是它的一个实例。
-3. **Agent 在架构里扮演什么？** —— CRM 是 Agent 的 tool schema，但空间任务的最终责任人是人。
-4. **"建模扩展"到底是什么形式？** —— 它是 c-two 中的**复合进程**（既注册资源又消费外部资源），
-   可自包含资源、依赖外部资源、对外暴露 CRM。
+1. **Toodle 是不是 C-Two 的一部分？** —— 不是。C-Two 提供通用 CRM/runtime mechanism；Toodle 独立拥有资源治理、信任与策略。
+2. **Toodle 是不是 GIS 专用或大而全？** —— 都不是。治理抽象可跨领域复用，但每个领域的约定、壁垒和特殊问题由领域层承担。
+3. **Agent 在架构里扮演什么？** —— CRM 可投影为 Agent tool schema，但权限来自 Toodle，领域任务的最终责任仍由人和领域系统承担。
+4. **“建模扩展”到底是什么形式？** —— 在 C-Two 运行时中，它可表现为既注册资源又消费外部资源的复合进程；在 Toodle 中，它仍需对应持久 Resource/Resource Service 声明和 policy。
 
 ---
 
@@ -39,17 +38,16 @@ IoT 目录）；**Gridmen** 则是地理目录之上的**人在回路智能地�
 │     • 以 fastdb 作为零反序列化主干，确保跨语言 codec 一致性            │
 │     • 注：其他领域（ML / 金融 / IoT）可以有自己的 L3 Catalog          │
 ├──────────────────────────────────────────────────────────────────────┤
-│ L2  Toodle — Tag-Oriented Open Data Linking Environment（领域无关）    │
-│     • 资源图（Resource Graph）：以标签组织 CRM 的语义拓扑             │
-│     • AuthN / AuthZ：身份、租户前缀、ACL；把签名身份注入 c-two metadata│
-│     • Workspace / Project 抽象：元数据持久化、版本、协作              │
-│     • Extension Registry：发现、安装、依赖求解、能力声明              │
-│     • Agent Runtime：把 CRM 暴露成 tool schema 给 LLM 智能体          │
+│ L2  Toodle — Trust-Oriented Open Distributed Linking Environment      │
+│     • Catalog：Resource / Resource Service identity、revision、graph  │
+│     • Optional tree views + tag/search/semantic discovery projections │
+│     • Policy、Service declarations、runtime activation、federation    │
+│     • 面向人和 Agent 的可信资源访问；领域规则由上层 Resource Service 承担│
 ├──────────────────────────────────────────────────────────────────────┤
 │ L1  c-two — 分布式资源运行时协议                                      │
-│     • CRM 契约  • 注册-获取  • IPC/HTTP 传输  • Relay mesh       │
-│     • auth_hook + call metadata 透传（把安全决策权让给 Toodle）        │
-│     • Python / TypeScript / Rust 多语言客户端                          │
+│     • canonical CRM descriptor / ContractReleaseRef                  │
+│     • 注册-获取  • IPC/HTTP 传输  • Relay mesh  • exact route contract │
+│     • Python SDK；auth metadata、Rust SDK 与 TypeScript SDK 仍按 roadmap 推进│
 └──────────────────────────────────────────────────────────────────────┘
 
 正交视图：计算模型（见 §3）
@@ -59,46 +57,42 @@ IoT 目录）；**Gridmen** 则是地理目录之上的**人在回路智能地�
 
 **三个关键的边界原则：**
 
-1. **c-two 只做机制，不做策略。** 安全、工作区、协作语义全部属于 Toodle；c-two 只提供
-   钩子（`auth_hook`、call metadata）让上层实现它们。
-2. **Toodle 不做领域、不做 UI。** Toodle 只管"资源图怎么组织、谁能看、谁能写、怎么组合"。
-   任何领域专用的 CRM（地理 / ML / 金融）都住在 L3。
-3. **Gridmen 是地理目录的一个前端。** 任何其他客户端（CLI、Python 脚本、Jupyter、
-   移动端）都应该能用同一套资源图，只是 UX 不同。
+1. **C-Two 只做通用 CRM/runtime 机制，不做治理策略。** 它定义契约、精确 route identity、传输和运行时生命周期；Authority identity、policy、Catalog 和 federation 属于 Toodle 等上层系统。
+2. **Toodle 不吞并领域模型或 UI。** 它管理可信资源环境的通用治理对象；地理、ML、金融等领域的格式、算法、服务行为和行业约束由领域 Resource Service 承担。
+3. **Gridmen 是地理领域的一种客户端体验。** CLI、Notebook、Agent 或其他客户端可以消费同一批受治理 Resource/Resource Service，但不要求共用固定 GUI 或工作流。
 
 ## 2. L1 · c-two 协议层：机制非策略
 
 ### 2.1 形态
 
-c-two 是一个**资源运行时协议**。"资源"指一个有状态、有方法的对象；"协议"指描述这个对象
-并远程调用它的规则。它的最小集合只有三件东西：
+C-Two 是一个**资源运行时协议**。这里的 runtime Resource 是实现 CRM 契约的有状态对象，与 Toodle Catalog 中持久、可修订的 Resource 是不同层次的概念。C-Two 的最小集合只有三件东西：
 
-- **CRM**（Core Resource Model）：一个普通 Python 对象，持有状态与域逻辑。
-- **CRM 契约**（Core Resource Model — Contract）：接口声明，带命名空间和版本（`@cc.crm(namespace, version)`），
-  方法体是 `...`。它就是这个资源对外的**契约**。
-- **传输与发现**：IPC / HTTP / Relay Mesh，负责把调用送到对的进程。
+- **Resource**：实现 CRM 契约、持有状态与领域逻辑的运行时对象；当前 Python SDK 中是普通 Python 类实例。
+- **CRM 契约**（Core Resource Model contract）：带命名空间和版本的接口声明；`c-two.contract.v1` 是 canonical descriptor，`ContractReleaseRef` 是它的持久、route-independent 精确引用。
+- **传输与运行时发现**：注册/连接、IPC、HTTP 与 Relay Mesh，负责把带精确 contract expectation 的调用送到活跃 route。
 
 ### 2.2 为什么 c-two 不该再扩张
 
-过去几轮的探索反复证明一件事：**任何看起来"应该加进 c-two"的业务概念，本质上都属于 Toodle**。
-具体边界在 [§9](#9-协议边界清单c-two-做什么不做什么) 里详列，核心结论是：
+边界判断不能把所有上层概念都推给 Toodle：跨领域可复用的 CRM/runtime mechanism 属于 C-Two，持久资源治理与 trust policy 属于 Toodle，文件格式、算法、事务和行业规则属于具体领域 Resource Service。具体边界在 [§9](#9-协议边界清单c-two-做什么不做什么) 里详列：
 
 | 放进 c-two | 不放进 c-two |
 |---|---|
-| 零拷贝、异步、buffer 生命周期 | 认证、授权、租户 |
-| 方法级并发（`@cc.read`/`@cc.write`） | 多节点主从仲裁 |
-| CRM 版本、Hold 语义、Metadata 透传 | Workspace、Project、图层树 |
-| fastdb 零反序列化 codec | 文件格式、地理语义 |
-| Tag 作为**路由提示** | Tag 作为**身份或能力** |
+| canonical CRM descriptor、`ContractReleaseRef`、精确 route contract | Catalog、Resource identity/revision、trust envelope |
+| 注册/连接、IPC/HTTP/relay、buffer 与 lease 生命周期 | Authority、认证、授权、租户与 policy |
+| 方法级并发（`@cc.read`/`@cc.write`）和 runtime lifecycle | Service activation 策略、federation catalog、业务一致性算法 |
+| FastDB payload ABI ref 的契约编排 | FastDB 内部 schema/storage codec、领域文件格式与算法 |
 
-### 2.3 两个即将补齐的关键能力（撑起 endgame 的前提）
+### 2.3 当前仍需补齐的通用机制
 
-| 能力 | 作用 | 对应问题 |
+| 能力 | 当前边界 | 对应目标 |
 |---|---|---|
-| **`auth_hook` + call metadata 透传** | 让 Toodle 注入签名身份、拦截非法调用 | Toodle 如何在 c-two 上构建 AuthN/AuthZ |
-| **TypeScript 客户端 + fastdb 统一 codec** | 前端一等公民，浏览器直连 CRM 不过翻译层 | 多语言一致性、零反序列化延展到 Web |
+| **Contract compatibility** | 已有精确 `ContractReleaseRef`，尚无 semver/range 匹配 | 在不削弱精确校验的前提下解析兼容 release |
+| **`auth_hook` + call metadata** | 尚未形成完整公共契约；C-Two 只提供机制，Toodle 解释身份与 policy | 让受信 Authority 在所有 transport 上执行一致准入 |
+| **Rust SDK + FastDB Rust call-db runtime** | C-Two contract core 已就绪，但真实 SDK 与 FastDB-owned payload runtime 仍缺失 | Rust/Python 双向、payload-bearing interoperability |
+| **TypeScript SDK** | 生成 transport/codec 基础持续演进，完整发布与浏览器边界仍未收敛 | Web/Node 消费同一 CRM contract 与 payload ABI |
+| **Async、streaming、backpressure** | 属于后续 runtime workstream，不能以 chunking 冒充 streaming | 长任务与多语言调用的可取消、有界执行 |
 
-这两点一旦到位，后续 Toodle 的演进基本只是"往上加"，不需要回头改 c-two。
+这些能力按 [`docs/roadmap.md`](../roadmap.md) 推进；ContractRelease 相关延后边界见 [`contract-release-deferred-capabilities.md`](../issues/contract-release-deferred-capabilities.md)。Toodle 可以先消费稳定的 exact release identity，但不得以私有 transport、Python sidecar 或自定义 FastDB parser 填补上游缺口。
 
 ## 3. 计算模型：无状态客户端 · 有状态资源 · 复合服务
 
@@ -171,68 +165,59 @@ Control Plane           ≈   Toodle       (策略 + 治理)
 
 ---
 
-## 4. L2 · Toodle：标签语义与资源图（领域无关）
+## 4. L2 · Toodle：可信开放资源环境
 
 ### 4.1 命名由来
 
-**Toodle = Tag-Oriented Open Data Linking Environment**。相对于 py-noodle 时期以 **node 树**
-（路径字符串为唯一键）为组织骨架，Toodle 的核心骨架是**标签图**（tag graph）。标签给资源
-**赋予语义**，CRM 给资源**圈出行为边界**，二者结合形成一个可被人和 Agent 共同导航的资源
-网络。
+**Toodle = Trust-Oriented Open Distributed Linking Environment**。它不是 C-Two 的 Catalog 插件，也不以路径树、tag 或活跃 route 作为唯一资源身份；它是一个自治、可联邦的资源权威，为人和 Agent 提供持久身份、关系、策略与受限运行能力。
 
 **一句话版本：**
 
-> Toodle 的职责是"给资源赋予语义、管理访问、编排协作"；CRM 定义资源能做什么，
-> tag 定义资源在语义上是什么，Toodle 在这两者之上做策略决定。
+> Toodle 管理“什么资源长期存在、它如何演化和关联、谁能以什么权力使用它，以及一个已声明 Resource Service 何时被激活”；C-Two 定义并承载该服务在运行时暴露的 CRM 契约。
 
-Toodle **本身不包含任何地理语义**。地理领域的 CRM 合同住在 L3（§5）。同一个 Toodle 实例
-理论上可以同时承载地理资源、ML 资源、金融资源等多个领域目录。
+Toodle 的核心模型不硬编码地理语义，但这不意味着用一套抽象抹平所有领域。地理领域的格式、时空规则、计算模型、服务行为与治理约束住在 L3 Resource/Resource Service 实现中；其他领域可以复用治理底座，同时保留自己的行业边界。
 
 ### 4.2 资源图（Resource Graph）
 
-Toodle 维护一张图：
+Toodle Catalog 维护持久资源图；图中的身份和关系在没有运行时进程、没有 relay route 时仍然成立：
 
-- **节点** = 一个 CRM 实例（通过 c-two 注册到 relay，Toodle 拿到它的 name/namespace/version）
-- **标签** = 附在节点上的键值对，形如 `domain=hydro`、`tenant=proj_42`、
-  `capability=gpu`、`role=primary`、`owner=user_123`
-- **边** = 资源之间的语义关系：`depends_on`（建模依赖）、`derived_from`（派生血缘）、
-  `mounted_in`（工作区归属）、`references`（弱引用）
+- **Resource 节点**：受 Toodle 治理的文件、表、数据库、代码、模型、配置、实时源或结果，并具有明确 revision/update model。
+- **Resource Service 节点**：独立于 Resource 的逻辑服务声明，绑定一个或多个 Resource，并声明 CRM contract set、policy projection 与 activation policy。
+- **边**：`depends_on`、`derived_from`、`references`、`binds` 等持久语义关系；具体关系必须由领域契约或 Catalog 规则解释，不能从 route 名称猜测。
+- **资源树**：面向项目、目录或 GUI 的可选视图，可以从图关系和查询结果构建；它不是第二套身份系统，也不是所有资源必须加入的结构。
 
-**这张图是 Toodle 的核心，不是 c-two 的。** c-two 只提供 tag 作为**路由提示**，Toodle
-在它之上做语义、认证、授权、生命周期。
+活跃 CRM route 只是某个 Resource Service 被激活后产生的 RuntimeInstance 投影。Catalog 中的 Service 可以 inactive 而 relay 中没有 route；route 消失也不会删除 Resource、Resource Service 或它们的 revision history。
 
-### 4.3 三类 tag 与它们的信任模型
+### 4.3 发现投影与信任模型
 
-区分这三类是 Toodle 安全模型的基石（详见 [§9](#9-协议边界清单c-two-做什么不做什么)）：
+Tag、时空索引、全文/语义检索和 Agent/LLM 检索都是资源发现与视图投影，不是 Catalog identity 或授权事实。不同来源的投影必须保留不同的信任边界：
 
-| 类别 | 例子 | 可否客户端声明 | 是否信任 |
+| 类别 | 例子 | 来源与约束 | 是否可单独授权 |
 |---|---|---|---|
-| **描述性 tag**（hint） | `zone=cn-east`、`version=2.1` | ✅ | ❌ 不能用于授权 |
-| **身份属性** | `owner=user_123`、`tenant=proj_A` | ❌，Toodle 注入 | ✅ 需签名 |
-| **能力授予**（capability） | `acl=read,write`、`role=primary` | ❌，Toodle 颁发 | ✅ 强校验 |
+| **描述与发现投影** | `domain=hydro`、bbox、时间范围、embedding | 用户、ingestor 或派生索引可以提供，但必须保留 provenance 与 revision | ❌ |
+| **身份与 policy 属性** | `owner=user_123`、Authority、tenant、visibility | 由 Toodle Authority 和 policy 管理，不能接受调用者自报 | 仅经 PolicyDecision |
+| **CRM/capability 投影** | CRM namespace/version、可调用方法、受限能力 | 从验证后的 Resource Service/CRM descriptor 与 policy projection 派生，不能作为用户自报事实 | 仅经 descriptor + policy 校验 |
 
-c-two 全程不解释这三者的含义 —— 它只负责**把 tag 安全地从注册端送到查询端**。解释权在 Toodle。
+C-Two 不拥有上述索引、语义或授权解释。它只提供 canonical CRM contract、精确 runtime route contract 和调用机制；Toodle 在自己的 Catalog/Policy 边界内决定哪些持久对象可被发现、激活和连接。
 
 ### 4.4 Workspace 与协作
 
-Workspace 是 Toodle 给用户看的"项目"。一个 workspace 包含：
+Workspace 是 Git project/worktree 与 Toodle 治理对象的用户工作环境投影，而不是把 live CRM route 收集进一个容器。一个 workspace 可以包含：
 
-- 一组挂载的 CRM 实例（通过 tag 筛选或显式引用）
-- 图层树 / 符号 / 视口等**轻量元数据**（存在 Toodle 的持久化层，而不是资源 CRM 里）
-- 一组 Extension 的启用声明
-- 一组成员与 ACL
+- 一组持久 Resource 或 Resource Service 引用及其选定 revision；
+- 资源图查询、可选资源树、tag/search 过滤和领域 UI 状态等视图；
+- ServiceDefinition、ResourceBindings 与 Extension 启用声明；
+- 成员、policy 与审计上下文。
 
-**协作不靠 OT/CRDT，靠 c-two 的方法级并发。** 多用户同时连同一 `IVectorLayer`，
-`@cc.read` 并行、`@cc.write` 在同一 feature 粒度上串行；复杂一致性需求（比如 feature
-级 CRDT）由具体 CRM 的实现自行承担，Toodle 不在协议层强制。
+当用户连接 Resource Service 时，Toodle 先依据声明与 policy 决定是否允许/激活，再通过 C-Two 将已验证的 CRM release 投影为精确 runtime route contract。普通 Resource 不会被隐式服务化，route 缺失也不改变其持久身份。
+
+C-Two 的方法级读写并发只提供单个 runtime resource 的调度原语，并不自动解决业务事务、跨资源一致性、OT/CRDT 或任意地理资源合并；这些行为必须由具体 Resource Service 和领域规则定义，Toodle 不宣称通用自动合并。
 
 ---
 
 ## 5. L3 · 地理资源目录：领域 CRM 原语
 
-L3 不是一个"crate"，而是一组**约定**：哪些地理资源类型应当被标准化，使得 Toodle / Agent /
-扩展 / UI 面板都能依赖**可预期的类型语义**。它和 Toodle 的关系是 —— **Toodle 是容器，
-地理目录是其中一类装载物**。未来可以并列出现 ML 目录、金融目录等 L3 兄弟。
+L3 不是一个“crate”，而是一组领域约定：哪些地理资源类型、行为、精度、格式和治理约束应被标准化，使 Toodle、Agent、Extension 与 UI 可以依赖可预期的语义。Toodle 只提供持久身份、关系、policy、activation 与 federation 的治理环境，不拥有这些地理语义；ML、金融等领域可以复用治理机制，同时维护各自独立的领域模型。
 
 ### 5.1 标准 CRM 清单（提案）
 
@@ -305,12 +290,11 @@ CRM / Toodle / c-two 这些对普通用户是**不可见的**。它们是基础�
 | Agent Tool 要求 | CRM 对应 |
 |---|---|
 | 命名 | `@cc.crm(namespace='hydro.swmm', version='0.3.0')` + method name |
-| 类型化参数 | `@cc.transfer(input=..., output=...)` + transferable schema |
-| 版本 | CRM `version` 字段 + 注册时的 `icrm_ver` |
-| 权限边界 | `@cc.read` / `@cc.write` + Toodle 的 tag 过滤 + auth_hook |
+| 类型化参数 | canonical descriptor 中的方法签名与 portable `PayloadAbiRef` |
+| 版本 | `c-two.contract.v1` + exact `ContractReleaseRef`；范围兼容仍待实现 |
+| 权限边界 | `@cc.read` / `@cc.write` 是调度元数据；授权由 Toodle PolicyDecision 负责 |
 
-这意味着 Toodle 可以**自动把资源图里的 CRM 导出为标准 tool 协议**（MCP 为首选），无需
-为每个资源手写 tool wrapper。
+这意味着 Toodle 可以把 Catalog 中已获授权 Resource Service 的 validated CRM contract 投影为标准 tool schema（例如 MCP），但投影不能把“可描述”误当作“已授权”，也不能把普通 Resource 隐式服务化。
 
 ### 6.2 Agent Runtime 的三层调度
 
@@ -321,14 +305,14 @@ CRM / Toodle / c-two 这些对普通用户是**不可见的**。它们是基础�
 │   输出: 一个 CRM 方法调用的 DAG              │
 ├────────────────────────────────────────────────┤
 │ Toodle Agent Runtime                           │
-│   • 用 tag 过滤出候选 CRM                      │
+│   • 从 Catalog/search projection 发现候选 Service│
 │   • 用 CRM schema 校验调用类型                │
-│   • 对写调用插入"人工审批"检查点              │
+│   • 经 PolicyDecision / 人工审批控制调用       │
 │   • 执行、收集结果、回传给 Planner            │
 ├────────────────────────────────────────────────┤
 │ c-two Protocol                                 │
-│   • auth_hook 校验调用者是 Agent 身份          │
-│   • 将 `caller=agent:xxx` 写入 metadata        │
+│   • auth_hook / metadata（roadmap capability） │
+│   • 承载精确 contract-bound runtime call       │
 │   • 实际执行 资源方法                          │
 └────────────────────────────────────────────────┘
 ```
@@ -355,7 +339,7 @@ CRM / Toodle / c-two 这些对普通用户是**不可见的**。它们是基础�
 
 ## 8. 建模扩展 = 复合进程：对称的自包含与依赖
 
-### 7.1 关键洞察
+### 8.1 关键洞察
 
 "建模场景扩展"本质上**就是 c-two 文档里的 客户端 概念被放大后的形态**。一个客户端
 是资源的消费者；一个"建模扩展"是**既消费又提供**资源的复合进程。
@@ -387,11 +371,11 @@ CRM / Toodle / c-two 这些对普通用户是**不可见的**。它们是基础�
 这三种形态在 c-two 层面**是同构的**：都是"一个进程，里面有若干资源 + 若干 CRM 连接"。
 区别只是边界选择。
 
-### 7.2 自包含资源 为什么重要
+### 8.2 自包含资源为什么重要
 
 这是 [`sota-patterns.md`](./sota-patterns.md) 里反复强调的一点：
 
-> CRM 本身就是普通资源对象，它可以直接参与计算业务，同时隐式对外提供资源服务。
+> 实现 CRM 的 runtime Resource 可以直接参与计算；只有显式 `cc.register(...)` 后，它才通过 C-Two 对外提供 runtime route。
 
 这意味着**建模扩展不需要拆成"计算进程 + 资源进程"两个部分**。潜水方程求解器的网格状态既
 是它自己计算的对象，又是外部可访问的资源；C-Two 的 registry 只是让后者成为可能，而不强制
@@ -399,57 +383,25 @@ CRM / Toodle / c-two 这些对普通用户是**不可见的**。它们是基础�
 
 **端到端的好处：**
 - 最优局部性：计算和资源同进程，零 IPC 开销
-- 外部协作不失：其他扩展、Agent、前端依然能通过 CRM 访问状态
-- 生命周期清晰：模型进程活着 → 资源可见；模型进程结束 → 资源随之注销
+- 外部协作不失：其他扩展、Agent、前端可在 policy 允许且 route 活跃时通过 CRM 访问状态
+- 生命周期清晰：模型进程活着 → runtime route 可用；模型进程结束 → route 注销，但 Toodle Resource/Resource Service identity 不因此消失
 
-### 7.3 扩展 manifest（与 Toodle 的契约）
+### 8.3 扩展声明与 Toodle 的契约
 
-一个扩展（简化形式）：
+Extension 不是 C-Two 本体。它的代码、模型和 UI artifact 首先是 Toodle Resource；需要运行时能力时，再由明确的 Resource Service declaration 绑定 Resource、CRM contract release、activation policy、权限需求和可审计的 Agent/UI projection。字段名和安装格式属于 Toodle 的独立协议，不在本文中复制定义。
 
-```toml
-# toodle.extension.toml
-[extension]
-name = "swmm-coupler"
-version = "1.2.0"
+C-Two 只拥有两段通用机制：以 canonical `c-two.contract.v1` / `ContractReleaseRef` 表达精确 CRM release，以及在激活后以 `ExpectedRouteContract` 注册、解析和调用 runtime route。Extension 安装、ResourceBindings、PolicyDecision、Activator 算法和是否允许 Agent 调用都不属于 C-Two。
 
-[provides]
-# 这个扩展对外提供的 CRM（其他扩展/Agent/UI 可调用）
-icrms = ["hydro.SWMMModel@0.3", "hydro.Coupler@0.3"]
+### 8.4 扩展之间的依赖
 
-[requires]
-# 这个扩展需要消费的 CRM 合同
-icrms = ["geo.IVectorLayer@>=1.0", "geo.IDEM@>=1.0"]
+Toodle 可以在自己的声明中表达“需要某类 Resource Service/CRM contract”的目标态需求，但当前 C-Two 只实现精确 release identity，不实现 semver/range compatibility。一个可审计的解析过程应当：
 
-[panels]
-# 前端面板（注入到 Gridmen）
-entry = "dist/index.js"
-slots = ["sidebar.right", "layer.context-menu"]
+1. 在 Toodle Catalog 中查找满足 policy 和领域约束的 Resource Service declaration，而不是搜索 live route 充当持久依赖。
+2. 将兼容性需求解析并锁定为一个确切 `ContractReleaseRef`；在 C-Two 的范围兼容规则完成前，调用方必须显式 pin 精确 release。
+3. 需要运行时调用时，由 Toodle 决定是否激活已声明 Service，再用已验证 release 和 route name 构造精确 `ExpectedRouteContract`。
+4. 多个 release 可以对应不同的 Resource Service revision 或逻辑服务并存，但 route name 只解决运行时寻址，不自动解决 ABI 兼容、数据迁移或领域冲突。
 
-[permissions]
-# 声明对 workspace 资源的访问要求，由 Toodle 在安装时向用户确认
-read = ["geo.IVectorLayer", "geo.IDEM"]
-write = ["hydro.*"]
-
-[agent]
-# 是否允许 Agent 调度本扩展提供的 CRM 方法
-expose_to_agents = true
-# 哪些 write 方法必须经过人工审批
-require_human_approval = ["run_simulation", "override_boundary"]
-```
-
-**此处没有 c-two 的身影**：manifest 描述的是 Toodle 层的契约（安装、授权、Agent 曝光），
-c-two 只管 CRM 在 relay 上注册成什么名字、用什么传输。
-
-### 7.4 扩展之间的依赖
-
-`requires.icrms` 是版本范围，Toodle 在安装时：
-
-1. 在资源图里解析：是否已有匹配的 资源实例？
-2. 若无，是否有另一个扩展提供该 CRM？有则提示用户一并安装。
-3. 若冲突（A 要 `@1.x`，B 要 `@2.x`），启动两个独立 资源实例（c-two 的 name 机制天然支持
-   `hydro.SWMMModel-v1` / `hydro.SWMMModel-v2` 并存）。
-
-这是 c-two 现有能力能原生承载的。
+版本范围与 Rust SDK 等缺口的当前限制、影响、owner 和退出条件记录在 [`contract-release-deferred-capabilities.md`](../issues/contract-release-deferred-capabilities.md)。
 
 ## 9. 协议边界清单：c-two 做什么、不做什么
 
@@ -458,25 +410,27 @@ c-two 只管 CRM 在 relay 上注册成什么名字、用什么传输。
 
 | 能力 | 住在哪一层 | 理由 |
 |---|---|---|
+| canonical `c-two.contract.v1` descriptor 与 `ContractReleaseRef` | **C-Two** | CRM contract semantics 与精确、route-independent release identity 属于协议机制 |
 | CRM 注册与获取 | **c-two** | 资源运行时的最基本机制 |
 | IPC / HTTP / Relay 传输 | **c-two** | 跨进程/跨机能力 |
+| `ExpectedRouteContract` 与 contract-scoped route resolve | **C-Two** | 活跃 RuntimeInstance 的精确寻址与调用准入 |
 | 方法级读写并发 (`@cc.read`/`@cc.write`) | **c-two** | 单 CRM 内部的调度 |
-| Tag 作为**路由过滤**（不可信 hint） | **c-two** | 仅影响 resolve() 的候选集 |
 | Buffer 生命周期、零拷贝、Hold | **c-two** | 性能原语 |
-| CRM 版本字段 + 传播到 relay | **c-two** | 让 Toodle 做版本解析 |
 | `auth_hook` + call metadata 透传 | **c-two（待补）** | 让 Toodle 构建安全层的钩子 |
 | Dry-run / 审批预估 | **c-two（待补）** | 让 Toodle / Agent 做影响分析 |
 | Streaming 返回 | **c-two（待补）** | 长任务进度回传 |
 | — | — | — |
 | 认证 (AuthN) | **Toodle** | JWT / OIDC / mTLS 属于策略 |
 | 授权 (AuthZ) / ACL / 租户隔离 | **Toodle** | 身份解释权属于 Toodle |
-| Tag 作为**身份/能力**（签名） | **Toodle** | c-two 不解释 tag 语义 |
+| Resource identity/revision 与 Resource Service declaration | **Toodle** | 持久治理身份不能由 live route 代替 |
+| Resource graph、可选 tree views、tag/search projections | **Toodle** | Catalog 关系与发现视图不是 C-Two runtime registry |
+| Policy、activation、federation 与审计 | **Toodle** | Authority 决定权力并保留治理真相 |
 | 主从仲裁 / leader election | **Toodle 或 K8s** | 业务决策，c-two 不假设 |
-| Workspace / Project / 图层树 | **Toodle** | 元数据管理 |
+| Workspace / Project 绑定 | **Toodle + Git** | Git repository/worktree 是历史与工作环境，Toodle 绑定治理对象 |
 | 扩展安装 / 依赖解析 | **Toodle** | 生态治理 |
 | Agent tool schema 导出 | **Toodle** | 但 c-two 需支持 CRM 自省 |
-| 审计 / 日志 / 合规 | **Toodle** | 身份绑定 |
 | — | — | — |
+| FastDB call-db schema/layout/codec/view runtime | **FastDB** | Portable payload ABI 的内部实现不属于 C-Two contract/runtime |
 | 图层符号 / 渲染 / 视口 | **Gridmen** | UX |
 | 文件格式（GeoTIFF / Shapefile 等） | **L3 CRM 实现** | 与协议无关 |
 | 目视解译、矢量化 | **Gridmen + 专用 CV 模型** | 不是协议能解决的 |
@@ -484,37 +438,40 @@ c-two 只管 CRM 在 relay 上注册成什么名字、用什么传输。
 
 ## 10. 演进路线（非日程，仅相对顺序）
 
-按"相对顺序"而非"时间点"刻画，因为每个里程碑的时长取决于人力与外部需求。
+本节只表达跨仓库依赖方向；C-Two 的可执行顺序以 [`docs/roadmap.md`](../roadmap.md) 为准，Toodle 与 FastDB 分别在自己的仓库维护计划。里程碑按相对依赖而非时间点刻画。
 
 ### Milestone M1 · c-two 自立（当前）
-- Relay mesh 发现、config 架构、transferable redesign —— 基本就绪
-- **收尾项**：`auth_hook` + call metadata、dry-run 钩子、streaming 返回
+- canonical `c-two.contract.v1`、exact `ContractReleaseRef`、contract-scoped route、transport 与 runtime lifecycle 构成稳定地基
+- 后续按 roadmap 补齐 compatibility、call metadata/auth hook、dry-run、async、backpressure 与 streaming，不以私有 SDK 旁路替代
 
-### Milestone M2 · TypeScript 客户端 + fastdb 统一 codec
-- 把"跨语言"从口号变成事实
-- 这是前端成为一等公民的技术前置
-- 依赖：`@cc.transfer` 的 codec 标注（Python 优先，fastdb-eligible 的才曝露给 TS）
+### Milestone M2 · Rust SDK + FastDB Rust call-db runtime
+- C-Two Rust SDK 复用现有 Rust core crate，不创建 placeholder facade
+- FastDB 提供 Rust/C ABI payload runtime；完成 Rust↔Python 双向 no-payload 与 FastDB payload proof
 
-### Milestone M3 · L3 Geospatial CRM Catalog 起步
+### Milestone M3 · TypeScript SDK + FastDB codec
+- TypeScript 消费同一个 canonical CRM descriptor、release identity、route contract 与 FastDB binding
+- 浏览器/Node 支持边界、runtime packaging 与 retained-view lifetime 必须由端到端 proof 收敛
+
+### Milestone M4 · L3 Geospatial CRM Catalog 起步
 - 先确定 2–3 个最核心的 CRM（建议：`IVectorLayer`、`IRasterLayer`、`ITiledGrid`）
 - 给出参考实现 + 版本治理流程
 - 这是上层 Toodle / Gridmen 能稳定迭代的前提
 
-### Milestone M4 · Toodle 起步（py-noodle → Toodle 迁移）
-- 弃用 py-noodle 的全局 SQLite 锁
-- 实现资源图 + 三类 tag 区分 + auth_hook 接入
-- Extension manifest & registry
+### Milestone M5 · Toodle Authority 起步
+- Rust authority kernel：Catalog、Resource/Resource Service identity 与 revision、resource graph 和 optional tree views
+- Policy、Service declaration、runtime activation 与 federation 的同一对象模型；本地与集群只更换宿主 adapter
+- Extension/Agent 作为受治理 Resource 与 Resource Service 消费者，不创建第二套运行时协议
 
-### Milestone M5 · Gridmen endgame
+### Milestone M6 · Gridmen endgame
 - Electron + Web 双端外壳
 - Extension host
 - Agent runtime（基于 CRM 自动导出 MCP tool schema）
 - 人在回路审批流
 
-### Milestone M6 · 联邦 / 公共 relay / 签名路由
+### Milestone M7 · 联邦与跨 Authority 运行时
 - 公共 relay 上托管的 CRM 可被多机构消费
-- Route entry 由 relay 签名以防跨机构伪造
-- 这时 c-two 才真正变成"地理资源的互联网协议"
+- C-Two 提供 route/transport authenticity mechanism；Toodle Authority 负责 peer trust、policy、审计与 federation catalog
+- 远程调用仍先经过本地 Authority/Policy，不能让 peer 绕过治理层直接触发部署根能力
 
 ## 11. 开放问题
 
@@ -538,46 +495,36 @@ arXiv 2308.14600 "SAM for Remote Sensing"；Nature 2023 "Foundation Models for E
 
 ### Q2 · Offline-first 还是 online-first？
 
-QGIS 是纯 offline，Felt 是纯 online。Gridmen 需要同时支持"本地工作区（本地 relay + 本地
-CRM）"与"团队工作区（共享 relay + 云端 CRM）"。这两种模式的 Workspace 持久化后端差异巨大
-（SQLite vs PostgreSQL），Toodle 的存储抽象需要从一开始就考虑双形态。
+Gridmen 需要同时支持本地工作环境与远程/团队 Authority。两种形态使用相同的 Toodle Resource、Resource Service、revision、policy 与 activation 模型；差异落在 Authority 部署、内容位置和 MetaTrigger/transport adapter，而不能把本地模式退化为只保存 live route 的第二套产品。
 
 ### Q3 · 数据如何"入库"？
 
-用户硬盘上一个 GeoTIFF 如何变成 CRM？两条路都需要：
-- **A · Upload 到 Toodle blob store → Toodle 启动 CRM 进程持有它**。适合云部署。
-- **B · 本地 importer 扩展 → 在本地进程启一个资源 → federation 到远端 workspace**。适合
-  "数据重但不能上传"的场景（涉密、超大体积）。
-
-UX 差异很大，需要 Gridmen 层面做统一。
+用户硬盘上的 GeoTIFF、Shapefile 文件组或其他内容进入 Toodle 后首先是 Resource，不会自动“变成 CRM”。Authority 可以按 policy 将内容上传/快照到受管对象存储，也可以登记受限 remote/local reference；只有用户或系统显式声明 Resource Service 并绑定这些 Resource 时，Activator 才构造领域运行时对象并通过 C-Two 注册 CRM route。敏感数据可留在受控位置，由 data black box 式 Resource Service 暴露受限算力/模型/数据访问，而不是要求上传原始内容或隐式服务化。
 
 ### Q4 · 版本依赖地狱
 
-两个扩展分别要求 `IVectorLayer@1.x` 和 `IVectorLayer@2.x`，同 workspace 能否并存？c-two
-的 name 机制支持共存（两个独立的 资源实例），但 Workspace 视图层如何展示、图层树如何合并、
-Agent 如何路由，这些都属于 Toodle 的设计空间。
+两个消费者分别要求 `IVectorLayer@1.x` 和 `IVectorLayer@2.x` 时，C-Two 当前只验证精确 `ContractReleaseRef`，并未实现范围求解。Toodle 可以持久化多个 Resource Service revision，运行时也可给各自实例分配不同 route，但选择兼容 release、执行数据迁移、呈现视图和决定 Agent 权限仍需显式的 compatibility 与 policy 规则；route name 并不能自动解决版本依赖。
 
 ### Q5 · 签名路由的开销 vs 安全
 
-Relay 之间的路由项要不要强制签名？不签名 → 跨机构联邦时有风险；强制签名 → 每跳加开销，
-且需要密钥分发基础设施。建议做成可选特性（`c2-http --signing-enabled`）。
+Route/transport authenticity mechanism 与 Authority trust decision 必须分开：C-Two 可以承载可验证 route provenance 或 transport identity，但它不能决定哪个 publisher/Authority 值得信任，也不能用 `ContractReleaseRef` digest 代替签名、授权或 revocation。具体 wire mechanism 需先定义威胁模型、密钥轮换和 relay mesh 传播语义，再进入 C-Two roadmap；Toodle 等 Authority 层负责解释信任与 policy。
 
 ### Q6 · Agent 的"责任归属"
 
-如果 Agent 代用户执行了写操作并产生错误，审计链条如何界定责任？短期方案：所有 Agent 发起的
-写操作在 Toodle 层落一条签名审计记录，绑定"审批人 = 当时的用户"。长期还需要法律/合规层面的
-进一步讨论，这超出 C-Two 本身的范围。
+如果 Agent 代用户执行写操作并产生错误，Toodle 必须在 PolicyDecision 与 audit context 中区分请求者、Agent、授权者、审批者和实际 Resource Service revision；这些身份不能由 C-Two route 或调用者自报 tag 推导。具体责任与合规规则属于 Authority/领域制度，C-Two 只应可靠透传经过定义的 call metadata 并保留机制层 trace correlation。
 
 ## 附录 A · 术语
 
 | 术语 | 含义 |
 |---|---|
 | **CRM** | Core Resource Model — 接口契约。描述一个资源对外方法签名的接口类，带命名空间和版本（`@cc.crm(namespace, version)`）。 |
-| **Resource** | 实现 CRM 契约的运行时对象。一个有状态、有方法的普通 Python 类，通过 `cc.register(...)` 暴露给外界。命名按领域语义（`NestedGrid`、`PostgresVectorLayer`）。 |
+| **Resource（C-Two runtime）** | 实现 CRM 契约的运行时对象。当前 Python SDK 中是一个有状态、有方法的普通 Python 类，通过 `cc.register(...)` 暴露给外界。 |
+| **Resource（Toodle durable）** | 由 Toodle Catalog 治理的持久内容或状态身份，具有 revision/update model；它不是 live CRM route，也不会被 `connect` 隐式服务化。 |
+| **Resource Service** | Toodle 中绑定 Resource、CRM contract set、policy projection 与 activation policy 的逻辑服务；激活后才产生 C-Two RuntimeInstance route。 |
 | **c-two** | 分布式资源运行时协议（本仓库）。只做机制，不做策略。 |
-| **Toodle** | **T**ag-**O**riented **O**pen **D**ata **L**inking **E**nvironment。构建在 c-two 之上的资源图 / 策略层，py-noodle 的进化形态。 |
+| **Toodle** | **T**rust-**O**riented **O**pen **D**istributed **L**inking **E**nvironment。独立的可信开放资源环境，拥有 Catalog、Resource/Resource Service identity、revision、graph/tree views、policy、activation 与 federation。 |
 | **Gridmen** | 基于 Toodle 的人在回路智能地理编辑器，面向地理数据工作者。 |
-| **Resource Graph** | Toodle 维护的 "资源节点 + tag + 语义边" 图结构。 |
+| **Resource Graph** | Toodle Catalog 维护的持久 Resource/Resource Service identity 与关系图；资源树、tag 和搜索结果是其可选视图或投影。 |
 | **Client** | 任何调用 `cc.connect(...)` 消费资源的代码（脚本、函数、Agent）。不注册自己的资源，就只是一个客户端进程。是 c-two 里"无状态一等公民服务"的对应物（见 §3）。 |
 | **复合进程** | 一个既调用 `cc.register(...)` 托管自己的资源、又调用 `cc.connect(...)` 消费外部资源的进程；建模扩展最常见的形态（见 §3 / §8）。在 c-two 里这不是独立角色，而是"同一个进程同时承担托管者和客户端两种职责"。 |
 | **Extension** | 在 Toodle / Gridmen 中可装卸的功能单元，通常包含资源提供 + CRM 消费 + UI 面板。 |

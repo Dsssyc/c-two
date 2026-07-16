@@ -11,4 +11,6 @@ mod relay_aware;
 pub use client::{HttpClient, HttpError};
 pub use control::{RelayControlClient, RelayRouteInfo};
 pub use pool::HttpClientPool;
-pub use relay_aware::{RelayAwareClientConfig, RelayAwareHttpClient, RelayResolvedTarget};
+pub use relay_aware::{
+    RelayAwareClientConfig, RelayAwareHttpClient, RelayLocalIpcCandidate, RelayResolvedTarget,
+};

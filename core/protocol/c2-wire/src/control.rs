@@ -6,10 +6,19 @@
 //! ## V2 Call Control
 //!
 //! ```text
-//! [1B name_len][route_name UTF-8][2B method_idx LE]
+//! [1B route_name_len][route_name UTF-8]
+//! [1B route_uid_len][route_uid UTF-8]
+//! [8B observed_route_revision LE]
+//! [1B crm_ns_len][crm_ns UTF-8]
+//! [1B crm_name_len][crm_name UTF-8]
+//! [1B crm_ver_len][crm_ver UTF-8]
+//! [1B abi_hash_len][abi_hash UTF-8]
+//! [1B signature_hash_len][signature_hash UTF-8]
+//! [2B method_idx LE]
 //! ```
 //!
-//! `name_len=0` is invalid. CRM calls must carry an explicit route key.
+//! Empty route identity fields are invalid. CRM calls must carry a concrete
+//! route token and expected contract; route name alone is not authoritative.
 //!
 //! ## V2 Reply Control
 //!
@@ -36,6 +45,11 @@ pub enum EncodeError {
         field: &'static str,
         reason: String,
     },
+    BufferTooShort {
+        field: &'static str,
+        need: usize,
+        have: usize,
+    },
 }
 
 impl std::fmt::Display for EncodeError {
@@ -46,6 +60,9 @@ impl std::fmt::Display for EncodeError {
             }
             Self::InvalidText { field, reason } => {
                 write!(f, "{field} is invalid: {reason}")
+            }
+            Self::BufferTooShort { field, need, have } => {
+                write!(f, "{field} buffer is too short: need {need}, have {have}")
             }
         }
     }
@@ -62,33 +79,72 @@ pub const STATUS_ERROR: u8 = 0x01;
 /// Reply status: requested route is no longer present on the IPC server.
 pub const STATUS_ROUTE_NOT_FOUND: u8 = 0x02;
 
-const MAX_CALL_ROUTE_NAME_BYTES: usize = c2_contract::MAX_WIRE_TEXT_BYTES;
+const MAX_CALL_TEXT_BYTES: usize = c2_contract::MAX_WIRE_TEXT_BYTES;
 
 // ── V2 Call Control ──────────────────────────────────────────────────────
+
+/// Route identity observed by a client when it acquired a route.
+///
+/// This token travels on every route-bound call so the server can reject stale
+/// clients before invoking resource code. `route_name` remains a human chosen
+/// routing key; `route_uid` is the authoritative identity of one committed
+/// route registration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteCallIdentity {
+    pub route_name: String,
+    pub route_uid: String,
+    pub observed_route_revision: u64,
+    pub crm_ns: String,
+    pub crm_name: String,
+    pub crm_ver: String,
+    pub abi_hash: String,
+    pub signature_hash: String,
+}
 
 /// Decoded v2 call control.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallControl {
-    /// Explicit route name.
-    pub route_name: String,
+    /// Route and contract identity observed by the caller.
+    pub identity: RouteCallIdentity,
     /// Method index within the route's method table.
     pub method_idx: u16,
 }
 
-/// Encode v2 call control: `[1B name_len][route UTF-8][2B method_idx LE]`.
-pub fn encode_call_control(route_name: &str, method_idx: u16) -> Result<Vec<u8>, EncodeError> {
-    validate_call_route_key("route_name", route_name)?;
-    let name_bytes = route_name.as_bytes();
-    if name_bytes.len() > MAX_CALL_ROUTE_NAME_BYTES {
-        return Err(EncodeError::FieldTooLong {
-            field: "route_name",
-            max: MAX_CALL_ROUTE_NAME_BYTES,
-            actual: name_bytes.len(),
-        });
-    }
-    let mut buf = Vec::with_capacity(1 + name_bytes.len() + 2);
-    buf.push(name_bytes.len() as u8);
-    buf.extend_from_slice(name_bytes);
+/// Return the encoded v2 call-control size for `identity`.
+pub fn encoded_call_control_len(identity: &RouteCallIdentity) -> Result<usize, EncodeError> {
+    validate_route_call_identity(identity)?;
+    Ok(1 + identity.route_name.len()
+        + 1
+        + identity.route_uid.len()
+        + 8
+        + 1
+        + identity.crm_ns.len()
+        + 1
+        + identity.crm_name.len()
+        + 1
+        + identity.crm_ver.len()
+        + 1
+        + identity.abi_hash.len()
+        + 1
+        + identity.signature_hash.len()
+        + 2)
+}
+
+/// Encode v2 call control.
+pub fn encode_call_control(
+    identity: &RouteCallIdentity,
+    method_idx: u16,
+) -> Result<Vec<u8>, EncodeError> {
+    let len = encoded_call_control_len(identity)?;
+    let mut buf = Vec::with_capacity(len);
+    push_text(&mut buf, "route_name", &identity.route_name)?;
+    push_text(&mut buf, "route_uid", &identity.route_uid)?;
+    buf.extend_from_slice(&identity.observed_route_revision.to_le_bytes());
+    push_text(&mut buf, "crm_ns", &identity.crm_ns)?;
+    push_text(&mut buf, "crm_name", &identity.crm_name)?;
+    push_text(&mut buf, "crm_ver", &identity.crm_ver)?;
+    push_text(&mut buf, "abi_hash", &identity.abi_hash)?;
+    push_text(&mut buf, "signature_hash", &identity.signature_hash)?;
     buf.extend_from_slice(&method_idx.to_le_bytes());
     Ok(buf)
 }
@@ -99,23 +155,22 @@ pub fn encode_call_control(route_name: &str, method_idx: u16) -> Result<Vec<u8>,
 pub fn encode_call_control_into(
     buf: &mut [u8],
     offset: usize,
-    route_name: &str,
+    identity: &RouteCallIdentity,
     method_idx: u16,
 ) -> Result<usize, EncodeError> {
-    validate_call_route_key("route_name", route_name)?;
-    let name_bytes = route_name.as_bytes();
-    if name_bytes.len() > MAX_CALL_ROUTE_NAME_BYTES {
-        return Err(EncodeError::FieldTooLong {
-            field: "route_name",
-            max: MAX_CALL_ROUTE_NAME_BYTES,
-            actual: name_bytes.len(),
-        });
-    }
-    let len = 1 + name_bytes.len() + 2;
-    buf[offset] = name_bytes.len() as u8;
-    buf[offset + 1..offset + 1 + name_bytes.len()].copy_from_slice(name_bytes);
-    let idx_off = offset + 1 + name_bytes.len();
-    buf[idx_off..idx_off + 2].copy_from_slice(&method_idx.to_le_bytes());
+    let len = encoded_call_control_len(identity)?;
+    check_write_capacity(buf, offset, len, "call_control")?;
+    let mut cursor = offset;
+    cursor = write_text(buf, cursor, "route_name", &identity.route_name)?;
+    cursor = write_text(buf, cursor, "route_uid", &identity.route_uid)?;
+    buf[cursor..cursor + 8].copy_from_slice(&identity.observed_route_revision.to_le_bytes());
+    cursor += 8;
+    cursor = write_text(buf, cursor, "crm_ns", &identity.crm_ns)?;
+    cursor = write_text(buf, cursor, "crm_name", &identity.crm_name)?;
+    cursor = write_text(buf, cursor, "crm_ver", &identity.crm_ver)?;
+    cursor = write_text(buf, cursor, "abi_hash", &identity.abi_hash)?;
+    cursor = write_text(buf, cursor, "signature_hash", &identity.signature_hash)?;
+    buf[cursor..cursor + 2].copy_from_slice(&method_idx.to_le_bytes());
     Ok(len)
 }
 
@@ -124,43 +179,78 @@ pub fn encode_call_control_into(
 /// Returns `(control, bytes_consumed)`.
 pub fn decode_call_control(buf: &[u8], offset: usize) -> Result<(CallControl, usize), DecodeError> {
     let remaining = buf.len().saturating_sub(offset);
-    if remaining < 3 {
+    if remaining < 1 + 1 + 8 + 1 + 1 + 1 + 1 + 1 + 2 {
         return Err(DecodeError::BufferTooShort {
-            need: 3,
+            need: 17,
             have: remaining,
         });
     }
-    let name_len = buf[offset] as usize;
-    let needed = 1 + name_len + 2;
-    if remaining < needed {
-        return Err(DecodeError::Truncated {
-            field: "call control",
-            need: needed,
-            have: remaining,
-        });
-    }
-    let name_start = offset + 1;
-    let route_name = if name_len > 0 {
-        core::str::from_utf8(&buf[name_start..name_start + name_len])
-            .map_err(|_| DecodeError::Utf8Error)?
-            .into()
-    } else {
-        String::new()
-    };
+    let mut cursor = offset;
+    let route_name = read_text(buf, &mut cursor, "route_name")?;
     c2_contract::validate_call_route_key("route_name", &route_name).map_err(|err| {
         DecodeError::InvalidText {
             field: "route_name",
             reason: err.to_string(),
         }
     })?;
-    let idx_start = name_start + name_len;
-    let method_idx = u16::from_le_bytes([buf[idx_start], buf[idx_start + 1]]);
+    let route_uid = read_text(buf, &mut cursor, "route_uid")?;
+    validate_route_uid(&route_uid).map_err(|reason| DecodeError::InvalidText {
+        field: "route_uid",
+        reason,
+    })?;
+    check_remaining(buf, cursor, 8, "observed_route_revision")?;
+    let observed_route_revision = u64::from_le_bytes([
+        buf[cursor],
+        buf[cursor + 1],
+        buf[cursor + 2],
+        buf[cursor + 3],
+        buf[cursor + 4],
+        buf[cursor + 5],
+        buf[cursor + 6],
+        buf[cursor + 7],
+    ]);
+    cursor += 8;
+    let crm_ns = read_text(buf, &mut cursor, "crm_ns")?;
+    let crm_name = read_text(buf, &mut cursor, "crm_name")?;
+    let crm_ver = read_text(buf, &mut cursor, "crm_ver")?;
+    c2_contract::validate_crm_tag(&crm_ns, &crm_name, &crm_ver).map_err(|err| {
+        DecodeError::InvalidText {
+            field: "crm tag",
+            reason: err.to_string(),
+        }
+    })?;
+    let abi_hash = read_text(buf, &mut cursor, "abi_hash")?;
+    c2_contract::validate_contract_hash("abi_hash", &abi_hash).map_err(|err| {
+        DecodeError::InvalidText {
+            field: "abi_hash",
+            reason: err.to_string(),
+        }
+    })?;
+    let signature_hash = read_text(buf, &mut cursor, "signature_hash")?;
+    c2_contract::validate_contract_hash("signature_hash", &signature_hash).map_err(|err| {
+        DecodeError::InvalidText {
+            field: "signature_hash",
+            reason: err.to_string(),
+        }
+    })?;
+    check_remaining(buf, cursor, 2, "method_idx")?;
+    let method_idx = u16::from_le_bytes([buf[cursor], buf[cursor + 1]]);
+    cursor += 2;
     Ok((
         CallControl {
-            route_name,
+            identity: RouteCallIdentity {
+                route_name,
+                route_uid,
+                observed_route_revision,
+                crm_ns,
+                crm_name,
+                crm_ver,
+                abi_hash,
+                signature_hash,
+            },
             method_idx,
         },
-        needed,
+        cursor - offset,
     ))
 }
 
@@ -169,6 +259,137 @@ fn validate_call_route_key(field: &'static str, value: &str) -> Result<(), Encod
         field,
         reason: err.to_string(),
     })
+}
+
+fn validate_route_uid(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("must not be empty".to_string());
+    }
+    if value.len() > MAX_CALL_TEXT_BYTES {
+        return Err(format!(
+            "is too long: {} bytes > {}",
+            value.len(),
+            MAX_CALL_TEXT_BYTES
+        ));
+    }
+    if value.bytes().any(|b| b <= 0x20 || b == b'/' || b == b'\\') {
+        return Err("contains an invalid character".to_string());
+    }
+    Ok(())
+}
+
+fn validate_route_call_identity(identity: &RouteCallIdentity) -> Result<(), EncodeError> {
+    validate_call_route_key("route_name", &identity.route_name)?;
+    validate_text_len("route_name", &identity.route_name)?;
+    validate_route_uid(&identity.route_uid).map_err(|reason| EncodeError::InvalidText {
+        field: "route_uid",
+        reason,
+    })?;
+    validate_text_len("route_uid", &identity.route_uid)?;
+    c2_contract::validate_crm_tag(&identity.crm_ns, &identity.crm_name, &identity.crm_ver)
+        .map_err(|err| EncodeError::InvalidText {
+            field: "crm tag",
+            reason: err.to_string(),
+        })?;
+    validate_text_len("crm_ns", &identity.crm_ns)?;
+    validate_text_len("crm_name", &identity.crm_name)?;
+    validate_text_len("crm_ver", &identity.crm_ver)?;
+    c2_contract::validate_contract_hash("abi_hash", &identity.abi_hash).map_err(|err| {
+        EncodeError::InvalidText {
+            field: "abi_hash",
+            reason: err.to_string(),
+        }
+    })?;
+    c2_contract::validate_contract_hash("signature_hash", &identity.signature_hash).map_err(
+        |err| EncodeError::InvalidText {
+            field: "signature_hash",
+            reason: err.to_string(),
+        },
+    )?;
+    Ok(())
+}
+
+fn validate_text_len(field: &'static str, value: &str) -> Result<(), EncodeError> {
+    let actual = value.len();
+    if actual > MAX_CALL_TEXT_BYTES {
+        return Err(EncodeError::FieldTooLong {
+            field,
+            max: MAX_CALL_TEXT_BYTES,
+            actual,
+        });
+    }
+    Ok(())
+}
+
+fn push_text(buf: &mut Vec<u8>, field: &'static str, value: &str) -> Result<(), EncodeError> {
+    validate_text_len(field, value)?;
+    buf.push(value.len() as u8);
+    buf.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn write_text(
+    buf: &mut [u8],
+    offset: usize,
+    field: &'static str,
+    value: &str,
+) -> Result<usize, EncodeError> {
+    validate_text_len(field, value)?;
+    check_write_capacity(buf, offset, 1 + value.len(), field)?;
+    buf[offset] = value.len() as u8;
+    let start = offset + 1;
+    let end = start + value.len();
+    buf[start..end].copy_from_slice(value.as_bytes());
+    Ok(end)
+}
+
+fn check_write_capacity(
+    buf: &[u8],
+    offset: usize,
+    need: usize,
+    field: &'static str,
+) -> Result<(), EncodeError> {
+    let have = buf.len().saturating_sub(offset);
+    if have < need {
+        return Err(EncodeError::BufferTooShort { field, need, have });
+    }
+    Ok(())
+}
+
+fn check_remaining(
+    buf: &[u8],
+    offset: usize,
+    need: usize,
+    field: &'static str,
+) -> Result<(), DecodeError> {
+    let remaining = buf.len().saturating_sub(offset);
+    if remaining < need {
+        Err(DecodeError::Truncated {
+            field,
+            need,
+            have: remaining,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn read_text(buf: &[u8], offset: &mut usize, field: &'static str) -> Result<String, DecodeError> {
+    check_remaining(buf, *offset, 1, field)?;
+    let len = buf[*offset] as usize;
+    *offset += 1;
+    check_remaining(buf, *offset, len, field)?;
+    let value = core::str::from_utf8(&buf[*offset..*offset + len])
+        .map_err(|_| DecodeError::Utf8Error)?
+        .to_string();
+    *offset += len;
+    if value.is_empty() {
+        return Err(DecodeError::InvalidText {
+            field,
+            reason: "must not be empty".to_string(),
+        });
+    }
+    Ok(value)
 }
 
 // ── V2 Reply Control ─────────────────────────────────────────────────────

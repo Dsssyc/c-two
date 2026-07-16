@@ -5,7 +5,7 @@ use parking_lot::Mutex;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 
-use super::client::{HttpError, runtime};
+use super::client::{HttpError, HttpRouteToken, runtime};
 use c2_contract::ExpectedRouteContract;
 
 const CONTROL_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
@@ -76,6 +76,8 @@ struct UnregisterRequest<'a> {
 pub struct RelayRouteInfo {
     pub name: String,
     pub relay_url: String,
+    pub route_uid: String,
+    pub route_revision: u64,
     pub ipc_address: Option<String>,
     pub server_id: Option<String>,
     pub server_instance_id: Option<String>,
@@ -85,6 +87,15 @@ pub struct RelayRouteInfo {
     pub abi_hash: String,
     pub signature_hash: String,
     pub max_payload_size: u64,
+}
+
+impl RelayRouteInfo {
+    pub(crate) fn route_token(&self) -> HttpRouteToken {
+        HttpRouteToken {
+            route_uid: self.route_uid.clone(),
+            route_revision: self.route_revision,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -270,6 +281,9 @@ impl RelayControlClient {
                 return Err(HttpError::ServerError(code, text));
             }
         };
+        for route in &routes {
+            validate_resolved_route(route)?;
+        }
 
         self.cache.lock().insert(
             cache_key,
@@ -357,6 +371,17 @@ impl RelayControlClient {
         }
         Some(entry.routes.clone())
     }
+}
+
+fn validate_resolved_route(route: &RelayRouteInfo) -> Result<(), HttpError> {
+    c2_contract::validate_call_route_key("route_uid", &route.route_uid)
+        .map_err(|err| HttpError::Transport(format!("malformed relay route token: {err}")))?;
+    if route.route_revision == 0 {
+        return Err(HttpError::Transport(
+            "malformed relay route token: route_revision must be > 0".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -450,6 +475,8 @@ mod tests {
                 routes: vec![RelayRouteInfo {
                     name: "grid".into(),
                     relay_url: "http://relay-a.test".into(),
+                    route_uid: "grid-route-uid-0001".into(),
+                    route_revision: 1,
                     ipc_address: None,
                     server_id: None,
                     server_instance_id: None,

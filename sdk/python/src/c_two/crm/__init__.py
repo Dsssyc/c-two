@@ -8,6 +8,7 @@ from .descriptor import (
     contract_descriptor_diagnostics,
     export_contract_payload_abi_artifacts,
     export_contract_descriptor,
+    export_contract_release_ref,
 )
 from .infer import infer_crm_from_resource
 from .methods import rpc_method_names

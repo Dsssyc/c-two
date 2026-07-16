@@ -9,6 +9,8 @@ use c2_ipc::IpcClient;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
+use crate::relay::types::UpstreamEndpointKey;
+
 const RECONNECT_MAX_ATTEMPTS: usize = 2;
 const RECONNECT_RETRY_DELAY_MS: u64 = 10;
 
@@ -35,14 +37,14 @@ fn is_retryable_connect_error(error: &c2_ipc::IpcError) -> bool {
     )
 }
 
-/// A single route/address upstream slot.
+/// A single upstream IPC endpoint slot.
 struct UpstreamSlot {
+    key: UpstreamEndpointKey,
     inner: Mutex<SlotInner>,
     notify: Notify,
 }
 
 struct SlotInner {
-    address: String,
     client: Option<Arc<IpcClient>>,
     last_activity: u64,
     active_requests: usize,
@@ -66,7 +68,7 @@ enum SlotState {
 pub enum AcquireError {
     NotFound,
     Unreachable {
-        address: String,
+        endpoint: UpstreamEndpointKey,
         error: c2_ipc::IpcError,
     },
 }
@@ -77,10 +79,10 @@ pub struct UpstreamLease {
 }
 
 pub enum CachedClient {
-    Ready { address: String },
-    OwnerOnly { address: String },
-    Evicted { address: String },
-    Disconnected { address: String },
+    Ready { endpoint: UpstreamEndpointKey },
+    OwnerOnly { endpoint: UpstreamEndpointKey },
+    Evicted { endpoint: UpstreamEndpointKey },
+    Disconnected { endpoint: UpstreamEndpointKey },
     Missing,
 }
 
@@ -99,7 +101,7 @@ pub enum OwnerReplaceError {
 #[derive(Clone)]
 pub struct OwnerSlotToken {
     slot: Arc<UpstreamSlot>,
-    address: String,
+    key: UpstreamEndpointKey,
     owner_generation: u64,
     owner_lease_epoch: u64,
 }
@@ -107,11 +109,11 @@ pub struct OwnerSlotToken {
 pub type OwnerToken = OwnerSlotToken;
 
 struct PoolInner {
-    entries: HashMap<String, Arc<UpstreamSlot>>,
+    entries: HashMap<UpstreamEndpointKey, Arc<UpstreamSlot>>,
     next_owner_generation: u64,
 }
 
-/// Pool of IPC connections keyed by route name.
+/// Pool of IPC connections keyed by upstream endpoint identity.
 ///
 /// Separated from RouteTable to keep route metadata independent of
 /// connection lifecycle. Supports lazy reconnection and idle eviction.
@@ -136,12 +138,12 @@ impl ConnectionPool {
         }
     }
 
-    fn slot(&self, name: &str) -> Option<Arc<UpstreamSlot>> {
-        self.inner.lock().entries.get(name).cloned()
+    fn slot(&self, key: &UpstreamEndpointKey) -> Option<Arc<UpstreamSlot>> {
+        self.inner.lock().entries.get(key).cloned()
     }
 
-    fn slot_matches(&self, name: &str, expected: &Arc<UpstreamSlot>) -> bool {
-        self.slot(name)
+    fn slot_matches(&self, key: &UpstreamEndpointKey, expected: &Arc<UpstreamSlot>) -> bool {
+        self.slot(key)
             .is_some_and(|current| Arc::ptr_eq(&current, expected))
     }
 
@@ -152,14 +154,14 @@ impl ConnectionPool {
 
     pub async fn acquire_with<C, Fut>(
         &self,
-        name: &str,
+        key: &UpstreamEndpointKey,
         connector: C,
     ) -> Result<UpstreamLease, AcquireError>
     where
-        C: Fn(String) -> Fut,
+        C: Fn(UpstreamEndpointKey) -> Fut,
         Fut: Future<Output = Result<Arc<IpcClient>, c2_ipc::IpcError>>,
     {
-        let Some(slot) = self.slot(name) else {
+        let Some(slot) = self.slot(key) else {
             return Err(AcquireError::NotFound);
         };
         let mut attempts = 0;
@@ -178,15 +180,15 @@ impl ConnectionPool {
         }
     }
 
-    /// Insert a pre-connected client for a route name.
+    /// Insert a pre-connected client for an endpoint.
     #[cfg(test)]
-    pub fn insert(&self, name: String, address: String, client: Arc<IpcClient>) {
+    pub fn insert(&self, key: UpstreamEndpointKey, client: Arc<IpcClient>) {
         let mut inner = self.inner.lock();
         let owner_generation = next_owner_generation(&mut inner);
         let old_slot = inner.entries.insert(
-            name,
+            key.clone(),
             Arc::new(UpstreamSlot::new(
-                address,
+                key,
                 Some(client),
                 SlotState::Ready,
                 owner_generation,
@@ -202,29 +204,28 @@ impl ConnectionPool {
     }
 
     /// Insert route owner metadata without attaching a relay data-plane client.
-    pub fn insert_owner(&self, name: String, address: String) {
+    pub fn insert_owner(&self, key: UpstreamEndpointKey) {
         let mut inner = self.inner.lock();
+        if let Some(slot) = inner.entries.get(&key).cloned() {
+            drop(inner);
+            slot.renew_current_owner_lease(self.owner_lease_deadline());
+            return;
+        }
         let owner_generation = next_owner_generation(&mut inner);
-        let old_slot = inner.entries.insert(
-            name,
+        inner.entries.insert(
+            key.clone(),
             Arc::new(UpstreamSlot::new(
-                address,
+                key,
                 None,
                 SlotState::OwnerOnly,
                 owner_generation,
                 self.owner_lease_deadline(),
             )),
         );
-        drop(inner);
-        if let Some(old_slot) = old_slot {
-            if let Some(client) = old_slot.retire() {
-                close_replaced_client(client);
-            }
-        }
     }
 
-    pub fn lookup(&self, name: &str) -> CachedClient {
-        let Some(slot) = self.slot(name) else {
+    pub fn lookup(&self, key: &UpstreamEndpointKey) -> CachedClient {
+        let Some(slot) = self.slot(key) else {
             return CachedClient::Missing;
         };
         slot.lookup()
@@ -232,57 +233,63 @@ impl ConnectionPool {
 
     /// Get stored address for reconnection.
     #[cfg(test)]
-    pub fn get_address(&self, name: &str) -> Option<String> {
-        self.slot(name).map(|slot| slot.address())
+    pub fn get_address(&self, key: &UpstreamEndpointKey) -> Option<String> {
+        self.slot(key).map(|slot| slot.address())
     }
 
     /// Capture the current owner identity before awaiting a probe.
-    pub fn owner_token(&self, name: &str) -> Option<OwnerToken> {
-        let slot = self.slot(name)?;
+    pub fn owner_token(&self, key: &UpstreamEndpointKey) -> Option<OwnerToken> {
+        let slot = self.slot(key)?;
         slot.owner_token()
     }
 
-    /// Names of entries to evict (dead or idle beyond timeout_ms).
-    pub fn idle_entries(&self, idle_timeout_ms: u64) -> Vec<String> {
+    /// Endpoint entries to evict (dead or idle beyond timeout_ms).
+    pub fn idle_entries(&self, idle_timeout_ms: u64) -> Vec<UpstreamEndpointKey> {
         self.inner
             .lock()
             .entries
             .iter()
             .filter(|(_, slot)| slot.is_idle_candidate(idle_timeout_ms))
-            .map(|(name, _)| name.clone())
+            .map(|(key, _)| key.clone())
             .collect()
     }
 
     /// Evict idle clients with a slot-local recheck before removing them.
-    pub fn evict_idle(&self, idle_timeout_ms: u64) -> Vec<(String, Option<Arc<IpcClient>>)> {
-        let names = self.idle_entries(idle_timeout_ms);
-        names
-            .into_iter()
-            .map(|name| {
+    pub fn evict_idle(
+        &self,
+        idle_timeout_ms: u64,
+    ) -> Vec<(UpstreamEndpointKey, Option<Arc<IpcClient>>)> {
+        let keys = self.idle_entries(idle_timeout_ms);
+        keys.into_iter()
+            .map(|key| {
                 let client = self
-                    .slot(&name)
+                    .slot(&key)
                     .and_then(|slot| slot.evict_if_idle(idle_timeout_ms));
-                (name, client)
+                (key, client)
             })
             .collect()
     }
 
     /// Evict a client — returns old Arc for async close.
     #[cfg(test)]
-    pub fn evict(&self, name: &str) -> Option<Arc<IpcClient>> {
-        self.slot(name)?.evict()
+    pub fn evict(&self, key: &UpstreamEndpointKey) -> Option<Arc<IpcClient>> {
+        self.slot(key)?.evict()
     }
 
     /// Evict a request client only if it is still the current cached client.
     #[cfg(test)]
-    pub fn evict_client(&self, name: &str, client: &Arc<IpcClient>) -> Option<Arc<IpcClient>> {
-        self.slot(name)?.evict_client(client)
+    pub fn evict_client(
+        &self,
+        key: &UpstreamEndpointKey,
+        client: &Arc<IpcClient>,
+    ) -> Option<Arc<IpcClient>> {
+        self.slot(key)?.evict_client(client)
     }
 
     /// Re-attach a freshly connected client.
     #[cfg(test)]
-    pub fn reconnect(&self, name: &str, client: Arc<IpcClient>) {
-        if let Some(slot) = self.slot(name) {
+    pub fn reconnect(&self, key: &UpstreamEndpointKey, client: Arc<IpcClient>) {
+        if let Some(slot) = self.slot(key) {
             let owner_generation = {
                 let mut inner = self.inner.lock();
                 next_owner_generation(&mut inner)
@@ -292,62 +299,55 @@ impl ConnectionPool {
     }
 
     /// Remove entry entirely.
-    pub fn remove(&self, name: &str) -> Option<Arc<IpcClient>> {
+    pub fn remove(&self, key: &UpstreamEndpointKey) -> Option<Arc<IpcClient>> {
         self.inner
             .lock()
             .entries
-            .remove(name)
+            .remove(key)
             .and_then(|slot| slot.retire())
     }
 
-    /// List route names with addresses.
+    /// List endpoint keys.
     #[cfg(test)]
-    pub fn list_connections(&self) -> Vec<(String, String)> {
-        self.inner
-            .lock()
-            .entries
-            .iter()
-            .map(|(n, slot)| (n.clone(), slot.address()))
-            .collect()
+    pub fn list_connections(&self) -> Vec<UpstreamEndpointKey> {
+        self.inner.lock().entries.keys().cloned().collect()
     }
 
-    pub fn matches_owner_token(&self, name: &str, token: &OwnerToken) -> bool {
-        self.slot_matches(name, &token.slot) && token.slot.matches_owner_token(token)
+    pub fn matches_owner_token(&self, key: &UpstreamEndpointKey, token: &OwnerToken) -> bool {
+        self.slot_matches(key, &token.slot) && token.slot.matches_owner_token(token)
     }
 
-    pub fn renew_owner_lease(&self, name: &str, token: &OwnerToken) -> bool {
-        self.slot_matches(name, &token.slot)
+    pub fn renew_owner_lease(&self, key: &UpstreamEndpointKey, token: &OwnerToken) -> bool {
+        self.slot_matches(key, &token.slot)
             && token
                 .slot
                 .renew_owner_lease(token, self.owner_lease_deadline())
     }
 
-    pub fn renew_current_owner_lease(&self, name: &str) -> bool {
-        let Some(slot) = self.slot(name) else {
+    pub fn renew_current_owner_lease(&self, key: &UpstreamEndpointKey) -> bool {
+        let Some(slot) = self.slot(key) else {
             return false;
         };
         slot.renew_current_owner_lease(self.owner_lease_deadline())
     }
 
-    pub fn replace_if_owner_token(
+    pub fn validate_replaceable_owner_token(
         &self,
-        name: &str,
+        key: &UpstreamEndpointKey,
         token: &OwnerToken,
-        new_address: String,
         evidence: OwnerReplacementEvidence,
-    ) -> Result<Option<Arc<IpcClient>>, OwnerReplaceError> {
-        let evidence: OwnerReplacementEvidence = evidence;
-        let mut inner = self.inner.lock();
-        let Some(current) = inner.entries.get(name).cloned() else {
+    ) -> Result<(), OwnerReplaceError> {
+        let inner = self.inner.lock();
+        let Some(current) = inner.entries.get(key).cloned() else {
             return Err(OwnerReplaceError::StaleToken);
         };
         if !Arc::ptr_eq(&current, &token.slot) {
             return Err(OwnerReplaceError::StaleToken);
         }
 
-        let old_client = {
-            let mut locked = current.inner.lock();
-            if locked.address != token.address
+        {
+            let locked = current.inner.lock();
+            if current.key != token.key
                 || locked.owner_generation != token.owner_generation
                 || locked.owner_lease_epoch != token.owner_lease_epoch
             {
@@ -359,29 +359,13 @@ impl ConnectionPool {
             if !replacement_evidence_allows_locked(&locked, token, evidence) {
                 return Err(OwnerReplaceError::NotReplaceable);
             }
-            locked.state = SlotState::Retired;
-            locked.client.take()
         };
-
-        let owner_generation = next_owner_generation(&mut inner);
-        inner.entries.insert(
-            name.to_string(),
-            Arc::new(UpstreamSlot::new(
-                new_address,
-                None,
-                SlotState::OwnerOnly,
-                owner_generation,
-                self.owner_lease_deadline(),
-            )),
-        );
-        drop(inner);
-        current.notify.notify_waiters();
-        Ok(old_client)
+        Ok(())
     }
 
     #[cfg(test)]
-    fn begin_request_for_test(&self, name: &str) -> Option<UpstreamLease> {
-        self.slot(name)?.begin_request_for_test()
+    fn begin_request_for_test(&self, key: &UpstreamEndpointKey) -> Option<UpstreamLease> {
+        self.slot(key)?.begin_request_for_test()
     }
 }
 
@@ -391,6 +375,7 @@ fn next_owner_generation(inner: &mut PoolInner) -> u64 {
     generation
 }
 
+#[cfg(test)]
 fn close_replaced_client(client: Arc<IpcClient>) {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle.spawn(async move { client.close_shared().await });
@@ -399,15 +384,15 @@ fn close_replaced_client(client: Arc<IpcClient>) {
 
 impl UpstreamSlot {
     fn new(
-        address: String,
+        key: UpstreamEndpointKey,
         client: Option<Arc<IpcClient>>,
         state: SlotState,
         owner_generation: u64,
         owner_lease_deadline: Option<Instant>,
     ) -> Self {
         Self {
+            key,
             inner: Mutex::new(SlotInner {
-                address,
                 client,
                 last_activity: now_millis(),
                 active_requests: 0,
@@ -425,20 +410,20 @@ impl UpstreamSlot {
         connector: C,
     ) -> Result<UpstreamLease, AcquireError>
     where
-        C: Fn(String) -> Fut,
+        C: Fn(UpstreamEndpointKey) -> Fut,
         Fut: Future<Output = Result<Arc<IpcClient>, c2_ipc::IpcError>>,
     {
         loop {
             let notified = self.notify.notified();
             let mut notified = pin!(notified);
             notified.as_mut().enable();
-            let address = {
+            let key = {
                 let mut inner = self.inner.lock();
                 match inner.state {
                     SlotState::Retired => return Err(AcquireError::NotFound),
                     SlotState::OwnerOnly => {
                         inner.state = SlotState::Reconnecting;
-                        Some(inner.address.clone())
+                        Some(self.key.clone())
                     }
                     SlotState::Ready => {
                         if let Some(client) = inner.client.clone() {
@@ -453,18 +438,18 @@ impl UpstreamSlot {
                         }
                         inner.client = None;
                         inner.state = SlotState::Reconnecting;
-                        Some(inner.address.clone())
+                        Some(self.key.clone())
                     }
                     SlotState::Evicted | SlotState::Disconnected => {
                         inner.state = SlotState::Reconnecting;
-                        Some(inner.address.clone())
+                        Some(self.key.clone())
                     }
                     SlotState::Reconnecting => None,
                 }
             };
 
-            match address {
-                Some(address) => match connector(address.clone()).await {
+            match key {
+                Some(key) => match connector(key.clone()).await {
                     Ok(client) => {
                         let acquire = {
                             let mut inner = self.inner.lock();
@@ -500,7 +485,7 @@ impl UpstreamSlot {
                         drop(inner);
                         self.notify.notify_waiters();
                         return Err(AcquireError::Unreachable {
-                            address,
+                            endpoint: key,
                             error: err,
                         });
                     }
@@ -516,28 +501,28 @@ impl UpstreamSlot {
         let mut inner = self.inner.lock();
         match inner.state {
             SlotState::OwnerOnly => CachedClient::OwnerOnly {
-                address: inner.address.clone(),
+                endpoint: self.key.clone(),
             },
             SlotState::Ready => match &inner.client {
                 Some(client) if client.is_connected() => CachedClient::Ready {
-                    address: inner.address.clone(),
+                    endpoint: self.key.clone(),
                 },
                 Some(_) => {
                     inner.client = None;
                     inner.state = SlotState::Disconnected;
                     CachedClient::Disconnected {
-                        address: inner.address.clone(),
+                        endpoint: self.key.clone(),
                     }
                 }
                 None => CachedClient::Evicted {
-                    address: inner.address.clone(),
+                    endpoint: self.key.clone(),
                 },
             },
             SlotState::Evicted => CachedClient::Evicted {
-                address: inner.address.clone(),
+                endpoint: self.key.clone(),
             },
             SlotState::Disconnected | SlotState::Reconnecting => CachedClient::Disconnected {
-                address: inner.address.clone(),
+                endpoint: self.key.clone(),
             },
             SlotState::Retired => CachedClient::Missing,
         }
@@ -572,7 +557,7 @@ impl UpstreamSlot {
     }
 
     fn address(&self) -> String {
-        self.inner.lock().address.clone()
+        self.key.address().to_string()
     }
 
     fn owner_token(self: Arc<Self>) -> Option<OwnerToken> {
@@ -582,7 +567,7 @@ impl UpstreamSlot {
         }
         Some(OwnerToken {
             slot: self.clone(),
-            address: inner.address.clone(),
+            key: self.key.clone(),
             owner_generation: inner.owner_generation,
             owner_lease_epoch: inner.owner_lease_epoch,
         })
@@ -590,7 +575,7 @@ impl UpstreamSlot {
 
     fn matches_owner_token(&self, token: &OwnerToken) -> bool {
         let inner = self.inner.lock();
-        inner.address == token.address
+        self.key == token.key
             && inner.owner_generation == token.owner_generation
             && inner.owner_lease_epoch == token.owner_lease_epoch
             && inner.state != SlotState::Retired
@@ -598,7 +583,7 @@ impl UpstreamSlot {
 
     fn renew_owner_lease(&self, token: &OwnerToken, deadline: Option<Instant>) -> bool {
         let mut inner = self.inner.lock();
-        if inner.address != token.address
+        if self.key != token.key
             || inner.owner_generation != token.owner_generation
             || inner.owner_lease_epoch != token.owner_lease_epoch
             || inner.state == SlotState::Retired
@@ -706,8 +691,7 @@ fn replacement_evidence_allows_locked(
     token: &OwnerToken,
     evidence: OwnerReplacementEvidence,
 ) -> bool {
-    if inner.address != token.address
-        || inner.owner_generation != token.owner_generation
+    if inner.owner_generation != token.owner_generation
         || inner.owner_lease_epoch != token.owner_lease_epoch
     {
         return false;
@@ -751,6 +735,10 @@ impl UpstreamLease {
         self.slot.address()
     }
 
+    pub fn endpoint(&self) -> UpstreamEndpointKey {
+        self.slot.key.clone()
+    }
+
     pub fn evict_current_client(&self) -> Option<Arc<IpcClient>> {
         self.slot.evict_client(&self.client)
     }
@@ -768,6 +756,10 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
 
+    fn key(address: &str) -> UpstreamEndpointKey {
+        UpstreamEndpointKey::new(address, "server-grid", "server-grid-instance")
+    }
+
     #[test]
     fn new_pool_is_empty() {
         let pool = ConnectionPool::new();
@@ -777,19 +769,21 @@ mod tests {
     #[test]
     fn insert_and_lookup_ready() {
         let pool = ConnectionPool::new();
+        let endpoint = key("ipc://test");
         let client = Arc::new(IpcClient::new("ipc://test"));
         client.force_connected(true);
-        pool.insert("grid".into(), "ipc://test".into(), client);
-        assert!(matches!(pool.lookup("grid"), CachedClient::Ready { .. }));
+        pool.insert(endpoint.clone(), client);
+        assert!(matches!(pool.lookup(&endpoint), CachedClient::Ready { .. }));
     }
 
     #[test]
     fn insert_owner_only_slot_is_not_idle_evictable() {
         let pool = ConnectionPool::new();
-        pool.insert_owner("grid".into(), "ipc://test".into());
+        let endpoint = key("ipc://test");
+        pool.insert_owner(endpoint.clone());
 
         assert!(matches!(
-            pool.lookup("grid"),
+            pool.lookup(&endpoint),
             CachedClient::OwnerOnly { .. }
         ));
         assert!(pool.idle_entries(0).is_empty());
@@ -797,57 +791,92 @@ mod tests {
     }
 
     #[test]
+    fn owner_routes_on_same_endpoint_share_one_slot() {
+        let pool = ConnectionPool::new();
+        let endpoint = key("ipc://same");
+
+        pool.insert_owner(endpoint.clone());
+        pool.insert_owner(endpoint);
+
+        assert_eq!(
+            pool.list_connections().len(),
+            1,
+            "relay upstream pool must be keyed by endpoint, not route name"
+        );
+    }
+
+    #[test]
+    fn repeated_owner_insert_for_same_endpoint_renews_owner_token_without_repairing_client() {
+        let pool = ConnectionPool::new();
+        let endpoint = key("ipc://same");
+        pool.insert_owner(endpoint.clone());
+        let stale = pool.owner_token(&endpoint).unwrap();
+
+        pool.insert_owner(endpoint.clone());
+
+        assert!(
+            !pool.matches_owner_token(&endpoint, &stale),
+            "fresh owner activity on the same endpoint must invalidate captured replacement proofs"
+        );
+        assert!(matches!(
+            pool.lookup(&endpoint),
+            CachedClient::OwnerOnly { .. }
+        ));
+    }
+
+    #[test]
     fn lookup_distinguishes_ready_evicted_disconnected_and_missing() {
         let pool = ConnectionPool::new();
+        let ready_key = key("ipc://ready");
+        let disconnected_key = key("ipc://disconnected");
+        let evicted_key = key("ipc://evicted");
+        let missing_key = key("ipc://missing");
         let ready = Arc::new(IpcClient::new("ipc://ready"));
         ready.force_connected(true);
-        pool.insert("ready".into(), "ipc://ready".into(), ready);
+        pool.insert(ready_key.clone(), ready);
         let disconnected = Arc::new(IpcClient::new("ipc://disconnected"));
-        pool.insert(
-            "disconnected".into(),
-            "ipc://disconnected".into(),
-            disconnected,
-        );
+        pool.insert(disconnected_key.clone(), disconnected);
         let evicted = Arc::new(IpcClient::new("ipc://evicted"));
         evicted.force_connected(true);
-        pool.insert("evicted".into(), "ipc://evicted".into(), evicted);
-        pool.evict("evicted");
+        pool.insert(evicted_key.clone(), evicted);
+        pool.evict(&evicted_key);
 
-        match pool.lookup("ready") {
-            CachedClient::Ready { address, .. } => {
-                assert_eq!(address, "ipc://ready");
+        match pool.lookup(&ready_key) {
+            CachedClient::Ready { endpoint, .. } => {
+                assert_eq!(endpoint.address(), "ipc://ready");
             }
             _ => panic!("ready connection should be explicit"),
         }
-        match pool.lookup("evicted") {
-            CachedClient::Evicted { address } => {
-                assert_eq!(address, "ipc://evicted");
+        match pool.lookup(&evicted_key) {
+            CachedClient::Evicted { endpoint } => {
+                assert_eq!(endpoint.address(), "ipc://evicted");
             }
             _ => panic!("evicted connection should be explicit"),
         }
-        match pool.lookup("disconnected") {
-            CachedClient::Disconnected { address } => {
-                assert_eq!(address, "ipc://disconnected");
+        match pool.lookup(&disconnected_key) {
+            CachedClient::Disconnected { endpoint } => {
+                assert_eq!(endpoint.address(), "ipc://disconnected");
             }
             _ => panic!("disconnected connection should be explicit"),
         }
-        assert!(matches!(pool.lookup("missing"), CachedClient::Missing));
+        assert!(matches!(pool.lookup(&missing_key), CachedClient::Missing));
     }
 
     #[tokio::test]
     async fn owner_only_slot_acquires_data_plane_client_lazily() {
         let pool = Arc::new(ConnectionPool::new());
-        pool.insert_owner("grid".into(), "ipc://lazy".into());
+        let endpoint = key("ipc://lazy");
+        pool.insert_owner(endpoint.clone());
 
         let attempts = Arc::new(AtomicUsize::new(0));
         let lease = pool
-            .acquire_with("grid", {
+            .acquire_with(&endpoint, {
                 let attempts = attempts.clone();
-                move |address| {
+                move |endpoint| {
                     let attempts = attempts.clone();
                     async move {
                         attempts.fetch_add(1, Ordering::SeqCst);
-                        let client = Arc::new(IpcClient::new(&address));
+                        let client = Arc::new(IpcClient::new(endpoint.address()));
                         client.force_connected(true);
                         Ok(client)
                     }
@@ -859,17 +888,18 @@ mod tests {
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
         assert!(lease.client().is_connected());
         drop(lease);
-        assert!(matches!(pool.lookup("grid"), CachedClient::Ready { .. }));
+        assert!(matches!(pool.lookup(&endpoint), CachedClient::Ready { .. }));
     }
 
     #[test]
     fn lookup_returns_disconnected_for_disconnected() {
         let pool = ConnectionPool::new();
+        let endpoint = key("ipc://test");
         let client = Arc::new(IpcClient::new("ipc://test"));
         // Client starts disconnected.
-        pool.insert("grid".into(), "ipc://test".into(), client);
+        pool.insert(endpoint.clone(), client);
         assert!(matches!(
-            pool.lookup("grid"),
+            pool.lookup(&endpoint),
             CachedClient::Disconnected { .. }
         ));
     }
@@ -877,43 +907,49 @@ mod tests {
     #[test]
     fn evict_and_reconnect() {
         let pool = ConnectionPool::new();
+        let endpoint = key("ipc://test");
         let c1 = Arc::new(IpcClient::new("ipc://test"));
         c1.force_connected(true);
-        pool.insert("grid".into(), "ipc://test".into(), c1);
-        pool.evict("grid");
-        assert!(matches!(pool.lookup("grid"), CachedClient::Evicted { .. }));
+        pool.insert(endpoint.clone(), c1);
+        pool.evict(&endpoint);
+        assert!(matches!(
+            pool.lookup(&endpoint),
+            CachedClient::Evicted { .. }
+        ));
 
         let c2 = Arc::new(IpcClient::new("ipc://test"));
         c2.force_connected(true);
-        pool.reconnect("grid", c2);
-        assert!(matches!(pool.lookup("grid"), CachedClient::Ready { .. }));
+        pool.reconnect(&endpoint, c2);
+        assert!(matches!(pool.lookup(&endpoint), CachedClient::Ready { .. }));
     }
 
     #[test]
     fn remove_deletes_entry() {
         let pool = ConnectionPool::new();
+        let endpoint = key("ipc://test");
         let client = Arc::new(IpcClient::new("ipc://test"));
-        pool.insert("grid".into(), "ipc://test".into(), client);
-        pool.remove("grid");
-        assert!(matches!(pool.lookup("grid"), CachedClient::Missing));
+        pool.insert(endpoint.clone(), client);
+        pool.remove(&endpoint);
+        assert!(matches!(pool.lookup(&endpoint), CachedClient::Missing));
     }
 
     #[test]
     fn idle_entries_detects_disconnected() {
         let pool = ConnectionPool::new();
         let client = Arc::new(IpcClient::new("ipc://dead"));
-        pool.insert("d".into(), "ipc://dead".into(), client);
+        pool.insert(key("ipc://dead"), client);
         assert_eq!(pool.idle_entries(u64::MAX).len(), 1);
     }
 
     #[test]
     fn idle_entries_do_not_evict_active_connected_client() {
         let pool = ConnectionPool::new();
+        let endpoint = key("ipc://active");
         let client = Arc::new(IpcClient::new("ipc://active"));
         client.force_connected(true);
-        pool.insert("grid".into(), "ipc://active".into(), client);
+        pool.insert(endpoint.clone(), client);
 
-        let lease = pool.begin_request_for_test("grid").unwrap();
+        let lease = pool.begin_request_for_test(&endpoint).unwrap();
 
         assert!(pool.idle_entries(0).is_empty());
         drop(lease);
@@ -922,318 +958,344 @@ mod tests {
     #[test]
     fn idle_entries_can_evict_inactive_connected_client() {
         let pool = ConnectionPool::new();
+        let endpoint = key("ipc://idle");
         let client = Arc::new(IpcClient::new("ipc://idle"));
         client.force_connected(true);
-        pool.insert("grid".into(), "ipc://idle".into(), client);
+        pool.insert(endpoint.clone(), client);
 
-        assert_eq!(pool.idle_entries(0), vec!["grid".to_string()]);
+        assert_eq!(pool.idle_entries(0), vec![endpoint]);
     }
 
     #[test]
     fn end_request_makes_client_idle_candidate_again() {
         let pool = ConnectionPool::new();
+        let endpoint = key("ipc://active");
         let client = Arc::new(IpcClient::new("ipc://active"));
         client.force_connected(true);
-        pool.insert("grid".into(), "ipc://active".into(), client);
+        pool.insert(endpoint.clone(), client);
 
-        let lease = pool.begin_request_for_test("grid").unwrap();
+        let lease = pool.begin_request_for_test(&endpoint).unwrap();
         drop(lease);
 
-        assert_eq!(pool.idle_entries(0), vec!["grid".to_string()]);
+        assert_eq!(pool.idle_entries(0), vec![endpoint]);
     }
 
     #[test]
     fn disconnected_client_is_evicted_even_when_not_idle_by_time() {
         let pool = ConnectionPool::new();
+        let endpoint = key("ipc://dead");
         let client = Arc::new(IpcClient::new("ipc://dead"));
         client.force_connected(false);
-        pool.insert("grid".into(), "ipc://dead".into(), client);
+        pool.insert(endpoint.clone(), client);
 
-        assert_eq!(pool.idle_entries(u64::MAX), vec!["grid".to_string()]);
+        assert_eq!(pool.idle_entries(u64::MAX), vec![endpoint]);
     }
 
     #[test]
     fn active_disconnected_client_is_not_evicted_until_request_finishes() {
         let pool = ConnectionPool::new();
+        let endpoint = key("ipc://active-dead");
         let client = Arc::new(IpcClient::new("ipc://active-dead"));
         client.force_connected(true);
-        pool.insert("grid".into(), "ipc://active-dead".into(), client.clone());
+        pool.insert(endpoint.clone(), client.clone());
 
-        let lease = pool.begin_request_for_test("grid").unwrap();
+        let lease = pool.begin_request_for_test(&endpoint).unwrap();
         client.force_connected(false);
 
         assert!(pool.idle_entries(u64::MAX).is_empty());
         assert_eq!(pool.evict_idle(u64::MAX).len(), 0);
 
         drop(lease);
-        assert_eq!(pool.idle_entries(u64::MAX), vec!["grid".to_string()]);
+        assert_eq!(pool.idle_entries(u64::MAX), vec![endpoint]);
     }
 
     #[test]
     fn stale_lease_drop_after_reinsert_does_not_touch_new_slot() {
         let pool = ConnectionPool::new();
+        let old_endpoint = key("ipc://old");
+        let new_endpoint = key("ipc://new");
         let old_client = Arc::new(IpcClient::new("ipc://old"));
         old_client.force_connected(true);
-        pool.insert("grid".into(), "ipc://old".into(), old_client);
-        let old_lease = pool.begin_request_for_test("grid").unwrap();
+        pool.insert(old_endpoint.clone(), old_client);
+        let old_lease = pool.begin_request_for_test(&old_endpoint).unwrap();
 
-        pool.remove("grid");
+        pool.remove(&old_endpoint);
 
         let new_client = Arc::new(IpcClient::new("ipc://new"));
         new_client.force_connected(true);
-        pool.insert("grid".into(), "ipc://new".into(), new_client);
+        pool.insert(new_endpoint.clone(), new_client);
         drop(old_lease);
 
-        assert_eq!(pool.idle_entries(0), vec!["grid".to_string()]);
+        assert_eq!(pool.idle_entries(0), vec![new_endpoint]);
     }
 
     #[test]
     fn stale_lease_drop_after_reinsert_does_not_release_new_active_request() {
         let pool = ConnectionPool::new();
+        let old_endpoint = key("ipc://old");
+        let new_endpoint = key("ipc://new");
         let old_client = Arc::new(IpcClient::new("ipc://old"));
         old_client.force_connected(true);
-        pool.insert("grid".into(), "ipc://old".into(), old_client);
-        let old_lease = pool.begin_request_for_test("grid").unwrap();
+        pool.insert(old_endpoint.clone(), old_client);
+        let old_lease = pool.begin_request_for_test(&old_endpoint).unwrap();
 
-        pool.remove("grid");
+        pool.remove(&old_endpoint);
 
         let new_client = Arc::new(IpcClient::new("ipc://new"));
         new_client.force_connected(true);
-        pool.insert("grid".into(), "ipc://new".into(), new_client);
-        let new_lease = pool.begin_request_for_test("grid").unwrap();
+        pool.insert(new_endpoint.clone(), new_client);
+        let new_lease = pool.begin_request_for_test(&new_endpoint).unwrap();
 
         drop(old_lease);
         assert!(pool.idle_entries(0).is_empty());
 
         drop(new_lease);
-        assert_eq!(pool.idle_entries(0), vec!["grid".to_string()]);
+        assert_eq!(pool.idle_entries(0), vec![new_endpoint]);
     }
 
     #[test]
     fn stale_lease_evict_after_reinsert_does_not_evict_new_entry() {
         let pool = ConnectionPool::new();
+        let old_endpoint = key("ipc://old");
+        let new_endpoint = key("ipc://new");
         let old_client = Arc::new(IpcClient::new("ipc://old"));
         old_client.force_connected(true);
-        pool.insert("grid".into(), "ipc://old".into(), old_client);
-        let old_lease = pool.begin_request_for_test("grid").unwrap();
+        pool.insert(old_endpoint.clone(), old_client);
+        let old_lease = pool.begin_request_for_test(&old_endpoint).unwrap();
 
-        pool.remove("grid");
+        pool.remove(&old_endpoint);
 
         let new_client = Arc::new(IpcClient::new("ipc://new"));
         new_client.force_connected(true);
-        pool.insert("grid".into(), "ipc://new".into(), new_client);
+        pool.insert(new_endpoint.clone(), new_client);
 
-        assert!(pool.evict_client("grid", &old_lease.client()).is_none());
-        assert!(matches!(pool.lookup("grid"), CachedClient::Ready { .. }));
+        assert!(
+            pool.evict_client(&new_endpoint, &old_lease.client())
+                .is_none()
+        );
+        assert!(matches!(
+            pool.lookup(&new_endpoint),
+            CachedClient::Ready { .. }
+        ));
     }
 
     #[test]
     fn matching_client_evict_removes_current_entry_client() {
         let pool = ConnectionPool::new();
+        let endpoint = key("ipc://current");
         let client = Arc::new(IpcClient::new("ipc://current"));
         client.force_connected(true);
-        pool.insert("grid".into(), "ipc://current".into(), client);
-        let lease = pool.begin_request_for_test("grid").unwrap();
+        pool.insert(endpoint.clone(), client);
+        let lease = pool.begin_request_for_test(&endpoint).unwrap();
 
-        assert!(pool.evict_client("grid", &lease.client()).is_some());
-        assert!(matches!(pool.lookup("grid"), CachedClient::Evicted { .. }));
+        assert!(pool.evict_client(&endpoint, &lease.client()).is_some());
+        assert!(matches!(
+            pool.lookup(&endpoint),
+            CachedClient::Evicted { .. }
+        ));
     }
 
     #[test]
     fn stale_client_evict_after_reconnect_does_not_evict_reconnected_client() {
         let pool = ConnectionPool::new();
+        let endpoint = key("ipc://old");
         let old_client = Arc::new(IpcClient::new("ipc://old"));
         old_client.force_connected(true);
-        pool.insert("grid".into(), "ipc://old".into(), old_client);
-        let old_lease = pool.begin_request_for_test("grid").unwrap();
+        pool.insert(endpoint.clone(), old_client);
+        let old_lease = pool.begin_request_for_test(&endpoint).unwrap();
 
-        assert!(pool.evict_client("grid", &old_lease.client()).is_some());
+        assert!(pool.evict_client(&endpoint, &old_lease.client()).is_some());
 
-        let new_client = Arc::new(IpcClient::new("ipc://new"));
+        let new_client = Arc::new(IpcClient::new("ipc://old"));
         new_client.force_connected(true);
-        pool.reconnect("grid", new_client);
+        pool.reconnect(&endpoint, new_client);
 
-        assert!(pool.evict_client("grid", &old_lease.client()).is_none());
-        assert!(matches!(pool.lookup("grid"), CachedClient::Ready { .. }));
+        assert!(pool.evict_client(&endpoint, &old_lease.client()).is_none());
+        assert!(matches!(pool.lookup(&endpoint), CachedClient::Ready { .. }));
     }
 
     #[test]
     fn stale_lease_drop_after_reconnect_does_not_release_new_active_request() {
         let pool = ConnectionPool::new();
+        let endpoint = key("ipc://old");
         let old_client = Arc::new(IpcClient::new("ipc://old"));
         old_client.force_connected(true);
-        pool.insert("grid".into(), "ipc://old".into(), old_client);
-        let old_lease = pool.begin_request_for_test("grid").unwrap();
+        pool.insert(endpoint.clone(), old_client);
+        let old_lease = pool.begin_request_for_test(&endpoint).unwrap();
 
-        let new_client = Arc::new(IpcClient::new("ipc://new"));
+        let new_client = Arc::new(IpcClient::new("ipc://old"));
         new_client.force_connected(true);
-        pool.reconnect("grid", new_client);
+        pool.reconnect(&endpoint, new_client);
         assert!(pool.idle_entries(0).is_empty());
 
-        let new_lease = pool.begin_request_for_test("grid").unwrap();
+        let new_lease = pool.begin_request_for_test(&endpoint).unwrap();
 
         drop(old_lease);
         assert!(pool.idle_entries(0).is_empty());
 
         drop(new_lease);
-        assert_eq!(pool.idle_entries(0), vec!["grid".to_string()]);
+        assert_eq!(pool.idle_entries(0), vec![endpoint]);
     }
 
     #[test]
     fn stale_owner_token_after_reinsert_does_not_match_new_entry() {
         let pool = ConnectionPool::new();
+        let old_endpoint = key("ipc://old");
+        let current_endpoint = key("ipc://current");
         let old_client = Arc::new(IpcClient::new("ipc://old"));
         old_client.force_connected(true);
-        pool.insert("grid".into(), "ipc://old".into(), old_client);
-        let token = pool.owner_token("grid").unwrap();
+        pool.insert(old_endpoint.clone(), old_client);
+        let token = pool.owner_token(&old_endpoint).unwrap();
 
-        pool.remove("grid");
+        pool.remove(&old_endpoint);
 
         let current_client = Arc::new(IpcClient::new("ipc://current"));
         current_client.force_connected(true);
-        pool.insert(
-            "grid".into(),
-            "ipc://current".into(),
-            current_client.clone(),
-        );
+        pool.insert(current_endpoint.clone(), current_client.clone());
 
-        assert!(!pool.matches_owner_token("grid", &token));
+        assert!(!pool.matches_owner_token(&current_endpoint, &token));
 
-        let lease = pool.begin_request_for_test("grid").unwrap();
+        let lease = pool.begin_request_for_test(&current_endpoint).unwrap();
         assert!(Arc::ptr_eq(&lease.client(), &current_client));
-        assert!(matches!(pool.lookup("grid"), CachedClient::Ready { .. }));
+        assert!(matches!(
+            pool.lookup(&current_endpoint),
+            CachedClient::Ready { .. }
+        ));
     }
 
     #[test]
     fn owner_token_does_not_match_same_slot_after_reconnect() {
         let pool = ConnectionPool::new();
+        let endpoint = key("ipc://old");
         let old_client = Arc::new(IpcClient::new("ipc://old"));
         old_client.force_connected(true);
-        pool.insert("grid".into(), "ipc://old".into(), old_client);
-        let token = pool.owner_token("grid").unwrap();
+        pool.insert(endpoint.clone(), old_client);
+        let token = pool.owner_token(&endpoint).unwrap();
 
-        let new_client = Arc::new(IpcClient::new("ipc://new"));
+        let new_client = Arc::new(IpcClient::new("ipc://old"));
         new_client.force_connected(true);
-        pool.reconnect("grid", new_client.clone());
+        pool.reconnect(&endpoint, new_client.clone());
 
-        let lease = pool.begin_request_for_test("grid").unwrap();
+        let lease = pool.begin_request_for_test(&endpoint).unwrap();
         assert!(Arc::ptr_eq(&lease.client(), &new_client));
-        assert!(!pool.matches_owner_token("grid", &token));
+        assert!(!pool.matches_owner_token(&endpoint, &token));
     }
 
     #[test]
     fn owner_token_does_not_match_reinsert_with_same_address() {
         let pool = ConnectionPool::new();
+        let endpoint = key("ipc://same");
         let old_client = Arc::new(IpcClient::new("ipc://same"));
         old_client.force_connected(true);
-        pool.insert("grid".into(), "ipc://same".into(), old_client);
-        let token = pool.owner_token("grid").unwrap();
+        pool.insert(endpoint.clone(), old_client);
+        let token = pool.owner_token(&endpoint).unwrap();
 
-        pool.remove("grid");
+        pool.remove(&endpoint);
 
         let new_client = Arc::new(IpcClient::new("ipc://same"));
         new_client.force_connected(true);
-        pool.insert("grid".into(), "ipc://same".into(), new_client);
+        pool.insert(endpoint.clone(), new_client);
 
-        assert!(!pool.matches_owner_token("grid", &token));
+        assert!(!pool.matches_owner_token(&endpoint, &token));
     }
 
     #[test]
     fn owner_token_does_not_match_after_lease_renewal() {
         let pool = ConnectionPool::new();
+        let endpoint = key("ipc://same-slot");
         let old_client = Arc::new(IpcClient::new("ipc://same-slot"));
         old_client.force_connected(true);
-        pool.insert("grid".into(), "ipc://same-slot".into(), old_client);
-        let token = pool.owner_token("grid").unwrap();
+        pool.insert(endpoint.clone(), old_client);
+        let token = pool.owner_token(&endpoint).unwrap();
 
-        assert!(pool.renew_owner_lease("grid", &token));
+        assert!(pool.renew_owner_lease(&endpoint, &token));
 
-        assert!(!pool.matches_owner_token("grid", &token));
+        assert!(!pool.matches_owner_token(&endpoint, &token));
     }
 
     #[test]
     fn current_owner_lease_renewal_is_not_stale_token_based() {
         let pool = ConnectionPool::new();
+        let endpoint = key("ipc://same-slot");
         let old_client = Arc::new(IpcClient::new("ipc://same-slot"));
         old_client.force_connected(true);
-        pool.insert("grid".into(), "ipc://same-slot".into(), old_client);
-        let token = pool.owner_token("grid").unwrap();
+        pool.insert(endpoint.clone(), old_client);
+        let token = pool.owner_token(&endpoint).unwrap();
 
-        assert!(pool.renew_current_owner_lease("grid"));
-        assert!(pool.renew_current_owner_lease("grid"));
+        assert!(pool.renew_current_owner_lease(&endpoint));
+        assert!(pool.renew_current_owner_lease(&endpoint));
 
-        assert!(!pool.matches_owner_token("grid", &token));
+        assert!(!pool.matches_owner_token(&endpoint, &token));
     }
 
     #[test]
-    fn disabled_owner_lease_deadline_does_not_block_evidence_based_replacement() {
+    fn disabled_owner_lease_deadline_does_not_block_evidence_based_replacement_validation() {
         let pool = ConnectionPool::with_owner_lease_duration(None);
+        let endpoint = key("ipc://old");
         let old_client = Arc::new(IpcClient::new("ipc://old"));
         old_client.force_connected(true);
-        pool.insert("grid".into(), "ipc://old".into(), old_client);
-        let token = pool.owner_token("grid").unwrap();
+        pool.insert(endpoint.clone(), old_client);
+        let token = pool.owner_token(&endpoint).unwrap();
         assert!(token.slot.inner.lock().owner_lease_deadline.is_none());
 
-        assert!(pool.renew_current_owner_lease("grid"));
+        assert!(pool.renew_current_owner_lease(&endpoint));
         assert!(token.slot.inner.lock().owner_lease_deadline.is_none());
-        pool.evict("grid");
+        pool.evict(&endpoint);
 
-        let result = pool.replace_if_owner_token(
-            "grid",
-            &pool.owner_token("grid").unwrap(),
-            "ipc://replacement".to_string(),
+        let result = pool.validate_replaceable_owner_token(
+            &endpoint,
+            &pool.owner_token(&endpoint).unwrap(),
             OwnerReplacementEvidence::ConfirmedDead,
         );
 
         assert!(result.is_ok());
-        assert_eq!(
-            pool.get_address("grid").as_deref(),
-            Some("ipc://replacement")
-        );
+        assert_eq!(pool.get_address(&endpoint).as_deref(), Some("ipc://old"));
     }
 
     #[test]
-    fn replace_if_owner_token_rejects_active_disconnected_slot() {
+    fn validate_replaceable_owner_token_rejects_active_disconnected_slot() {
         let pool = ConnectionPool::new();
+        let endpoint = key("ipc://old");
         let old_client = Arc::new(IpcClient::new("ipc://old"));
         old_client.force_connected(true);
-        pool.insert("grid".into(), "ipc://old".into(), old_client);
-        let token = pool.owner_token("grid").unwrap();
-        let lease = pool.begin_request_for_test("grid").unwrap();
+        pool.insert(endpoint.clone(), old_client);
+        let token = pool.owner_token(&endpoint).unwrap();
+        let lease = pool.begin_request_for_test(&endpoint).unwrap();
         lease.client().force_connected(false);
 
-        let result = pool.replace_if_owner_token(
-            "grid",
+        let result = pool.validate_replaceable_owner_token(
+            &endpoint,
             &token,
-            "ipc://replacement".to_string(),
             OwnerReplacementEvidence::ConfirmedDead,
         );
 
         assert!(matches!(result, Err(OwnerReplaceError::NotReplaceable)));
-        assert!(pool.matches_owner_token("grid", &token));
+        assert!(pool.matches_owner_token(&endpoint, &token));
         drop(lease);
     }
 
     #[tokio::test]
     async fn concurrent_acquire_after_eviction_shares_one_reconnect() {
         let pool = Arc::new(ConnectionPool::new());
+        let endpoint = key("ipc://shared");
         let client = Arc::new(IpcClient::new("ipc://shared"));
         client.force_connected(true);
-        pool.insert("grid".into(), "ipc://shared".into(), client);
-        pool.evict("grid");
+        pool.insert(endpoint.clone(), client);
+        pool.evict(&endpoint);
 
         let connect_count = Arc::new(AtomicUsize::new(0));
         let mut tasks = Vec::new();
 
         for _ in 0..16 {
             let pool = pool.clone();
+            let endpoint = endpoint.clone();
             let connect_count = connect_count.clone();
             tasks.push(tokio::spawn(async move {
-                pool.acquire_with("grid", move |address| {
+                pool.acquire_with(&endpoint, move |endpoint| {
                     let connect_count = connect_count.clone();
                     async move {
                         connect_count.fetch_add(1, Ordering::SeqCst);
-                        let client = Arc::new(IpcClient::new(&address));
+                        let client = Arc::new(IpcClient::new(endpoint.address()));
                         client.force_connected(true);
                         Ok(client)
                     }
@@ -1260,16 +1322,17 @@ mod tests {
     #[tokio::test]
     async fn acquire_after_eviction_retries_one_transient_connector_error() {
         let pool = Arc::new(ConnectionPool::new());
+        let endpoint = key("ipc://flaky");
         let client = Arc::new(IpcClient::new("ipc://flaky"));
         client.force_connected(true);
-        pool.insert("grid".into(), "ipc://flaky".into(), client);
-        pool.evict("grid");
+        pool.insert(endpoint.clone(), client);
+        pool.evict(&endpoint);
 
         let attempts = Arc::new(AtomicUsize::new(0));
         let lease = pool
-            .acquire_with("grid", {
+            .acquire_with(&endpoint, {
                 let attempts = attempts.clone();
-                move |address| {
+                move |endpoint| {
                     let attempts = attempts.clone();
                     async move {
                         let attempt = attempts.fetch_add(1, Ordering::SeqCst);
@@ -1279,7 +1342,7 @@ mod tests {
                                 "peer reset during idle reconnect",
                             )));
                         }
-                        let client = Arc::new(IpcClient::new(&address));
+                        let client = Arc::new(IpcClient::new(endpoint.address()));
                         client.force_connected(true);
                         Ok(client)
                     }
@@ -1295,10 +1358,11 @@ mod tests {
     #[tokio::test]
     async fn remove_during_reconnect_makes_waiting_acquire_not_found() {
         let pool = Arc::new(ConnectionPool::new());
+        let endpoint = key("ipc://removed");
         let client = Arc::new(IpcClient::new("ipc://removed"));
         client.force_connected(true);
-        pool.insert("grid".into(), "ipc://removed".into(), client);
-        pool.evict("grid");
+        pool.insert(endpoint.clone(), client);
+        pool.evict(&endpoint);
 
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let started_tx = Arc::new(std::sync::Mutex::new(Some(started_tx)));
@@ -1307,10 +1371,11 @@ mod tests {
 
         let acquire = {
             let pool = pool.clone();
+            let endpoint = endpoint.clone();
             let finish_rx = finish_rx.clone();
             let started_tx = started_tx.clone();
             tokio::spawn(async move {
-                pool.acquire_with("grid", move |address| {
+                pool.acquire_with(&endpoint, move |endpoint| {
                     let finish_rx = finish_rx.clone();
                     let started_tx = started_tx.clone();
                     async move {
@@ -1319,7 +1384,7 @@ mod tests {
                         }
                         let rx = finish_rx.lock().await.take().unwrap();
                         rx.await.unwrap();
-                        let client = Arc::new(IpcClient::new(&address));
+                        let client = Arc::new(IpcClient::new(endpoint.address()));
                         client.force_connected(true);
                         Ok(client)
                     }
@@ -1329,7 +1394,7 @@ mod tests {
         };
 
         started_rx.await.unwrap();
-        pool.remove("grid");
+        pool.remove(&endpoint);
         finish_tx.send(()).unwrap();
 
         assert!(matches!(
@@ -1341,10 +1406,12 @@ mod tests {
     #[tokio::test]
     async fn insert_retires_replaced_slot_before_waiting_reconnect_completes() {
         let pool = Arc::new(ConnectionPool::new());
+        let old_endpoint = key("ipc://old");
+        let new_endpoint = key("ipc://new");
         let old_client = Arc::new(IpcClient::new("ipc://old"));
         old_client.force_connected(true);
-        pool.insert("grid".into(), "ipc://old".into(), old_client);
-        pool.evict("grid");
+        pool.insert(old_endpoint.clone(), old_client);
+        pool.evict(&old_endpoint);
 
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let started_tx = Arc::new(std::sync::Mutex::new(Some(started_tx)));
@@ -1353,10 +1420,11 @@ mod tests {
 
         let acquire = {
             let pool = pool.clone();
+            let old_endpoint = old_endpoint.clone();
             let finish_rx = finish_rx.clone();
             let started_tx = started_tx.clone();
             tokio::spawn(async move {
-                pool.acquire_with("grid", move |address| {
+                pool.acquire_with(&old_endpoint, move |endpoint| {
                     let finish_rx = finish_rx.clone();
                     let started_tx = started_tx.clone();
                     async move {
@@ -1365,7 +1433,7 @@ mod tests {
                         }
                         let rx = finish_rx.lock().await.take().unwrap();
                         rx.await.unwrap();
-                        let client = Arc::new(IpcClient::new(&address));
+                        let client = Arc::new(IpcClient::new(endpoint.address()));
                         client.force_connected(true);
                         Ok(client)
                     }
@@ -1377,14 +1445,15 @@ mod tests {
         started_rx.await.unwrap();
         let replacement = Arc::new(IpcClient::new("ipc://new"));
         replacement.force_connected(true);
-        pool.insert("grid".into(), "ipc://new".into(), replacement.clone());
+        pool.remove(&old_endpoint);
+        pool.insert(new_endpoint.clone(), replacement.clone());
         finish_tx.send(()).unwrap();
 
         assert!(matches!(
             acquire.await.unwrap(),
             Err(AcquireError::NotFound)
         ));
-        let current = pool.begin_request_for_test("grid").unwrap();
+        let current = pool.begin_request_for_test(&new_endpoint).unwrap();
         assert!(Arc::ptr_eq(&current.client(), &replacement));
     }
 }

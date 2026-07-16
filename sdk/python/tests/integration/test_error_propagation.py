@@ -178,7 +178,7 @@ class TestErrorDeserialization:
 
     def test_unknown_code_returns_ccerror(self):
         """An unrecognised numeric code should deserialize as plain CCError."""
-        raw = b'0:mysterious failure'
+        raw = CCError.serialize(CCError(ERROR_Code.ERROR_UNKNOWN, "mysterious failure"))
         restored = CCError.deserialize(memoryview(raw))
         assert type(restored) is CCError
         assert restored.code == ERROR_Code.ERROR_UNKNOWN

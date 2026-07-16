@@ -5,8 +5,8 @@ use crate::relay::types::{
     valid_route_digest_hash, valid_wire_relay_id,
 };
 
-pub const PROTOCOL_VERSION: u32 = 4;
-pub const ROUTE_HASH_PEER_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 6;
+pub const ROUTE_HASH_PEER_VERSION: u32 = 6;
 
 /// Envelope wrapping every peer-to-peer message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +31,8 @@ pub enum PeerMessage {
         abi_hash: String,
         signature_hash: String,
         max_payload_size: u64,
+        route_uid: String,
+        route_revision: u64,
         registered_at: f64,
     },
     /// A CRM route was unregistered.
@@ -38,6 +40,7 @@ pub enum PeerMessage {
         name: String,
         relay_id: String,
         removed_at: f64,
+        removed_revision: u64,
     },
     /// A relay wants to join the mesh.
     RelayJoin { relay_id: String, url: String },
@@ -78,6 +81,8 @@ pub enum DigestDiffEntry {
         abi_hash: String,
         signature_hash: String,
         max_payload_size: u64,
+        route_uid: String,
+        route_revision: u64,
         registered_at: f64,
         hash: RouteDigestHash,
     },
@@ -85,6 +90,7 @@ pub enum DigestDiffEntry {
         name: String,
         relay_id: String,
         removed_at: f64,
+        removed_revision: u64,
         hash: RouteDigestHash,
     },
 }
@@ -122,6 +128,8 @@ pub(crate) struct ValidatedDigestDiffActive {
     pub abi_hash: String,
     pub signature_hash: String,
     pub max_payload_size: u64,
+    pub route_uid: String,
+    pub route_revision: u64,
     pub registered_at: f64,
 }
 
@@ -130,6 +138,7 @@ pub(crate) struct ValidatedDigestDiffDeleted {
     pub name: String,
     pub relay_id: String,
     pub removed_at: f64,
+    pub removed_revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,6 +178,8 @@ impl From<ValidatedDigestDiffActive> for RouteEntry {
             abi_hash: active.abi_hash,
             signature_hash: active.signature_hash,
             max_payload_size: active.max_payload_size,
+            route_uid: active.route_uid,
+            route_revision: active.route_revision,
             locality: Locality::Peer,
             registered_at: active.registered_at,
         }
@@ -215,6 +226,8 @@ pub fn validate_route_state_envelope(
             abi_hash,
             signature_hash,
             max_payload_size,
+            route_uid,
+            route_revision,
             registered_at,
         } => {
             if relay_id != &envelope.sender_relay_id
@@ -228,6 +241,8 @@ pub fn validate_route_state_envelope(
                     abi_hash,
                     signature_hash,
                     *max_payload_size,
+                    route_uid,
+                    *route_revision,
                     *registered_at,
                 )
             {
@@ -241,9 +256,10 @@ pub fn validate_route_state_envelope(
             name,
             relay_id,
             removed_at,
+            removed_revision,
         } => {
             if relay_id != &envelope.sender_relay_id
-                || !valid_deleted_route_fields(name, relay_id, *removed_at)
+                || !valid_deleted_route_fields(name, relay_id, *removed_at, *removed_revision)
             {
                 return Err(PeerRouteStateError::InvalidRouteWithdraw {
                     reason: "invalid route withdrawal".to_string(),
@@ -313,6 +329,8 @@ fn validate_digest_diff_entries(
                 abi_hash,
                 signature_hash,
                 max_payload_size,
+                route_uid,
+                route_revision,
                 registered_at,
                 hash,
             } => {
@@ -327,6 +345,8 @@ fn validate_digest_diff_entries(
                         abi_hash,
                         signature_hash,
                         *max_payload_size,
+                        route_uid,
+                        *route_revision,
                         *registered_at,
                     )
                     || hash != &expected_hash
@@ -346,6 +366,8 @@ fn validate_digest_diff_entries(
                         abi_hash: abi_hash.clone(),
                         signature_hash: signature_hash.clone(),
                         max_payload_size: *max_payload_size,
+                        route_uid: route_uid.clone(),
+                        route_revision: *route_revision,
                         registered_at: *registered_at,
                     },
                 ));
@@ -354,10 +376,11 @@ fn validate_digest_diff_entries(
                 name,
                 relay_id,
                 removed_at,
+                removed_revision,
                 hash,
             } => {
                 if relay_id != sender_relay_id
-                    || !valid_deleted_route_fields(name, relay_id, *removed_at)
+                    || !valid_deleted_route_fields(name, relay_id, *removed_at, *removed_revision)
                     || hash != &expected_hash
                 {
                     return Err(PeerRouteStateError::InvalidDigestDiff {
@@ -369,6 +392,7 @@ fn validate_digest_diff_entries(
                         name: name.clone(),
                         relay_id: relay_id.clone(),
                         removed_at: *removed_at,
+                        removed_revision: *removed_revision,
                     },
                 ));
             }
@@ -391,6 +415,8 @@ pub fn route_digest_hash_for_diff_entry(
             abi_hash,
             signature_hash,
             max_payload_size,
+            route_uid,
+            route_revision,
             registered_at,
             ..
         } => {
@@ -404,6 +430,8 @@ pub fn route_digest_hash_for_diff_entry(
                 abi_hash,
                 signature_hash,
                 *max_payload_size,
+                route_uid,
+                *route_revision,
                 *registered_at,
             ) {
                 return Err(PeerRouteStateError::InvalidDigestDiff {
@@ -420,6 +448,8 @@ pub fn route_digest_hash_for_diff_entry(
                 abi_hash,
                 signature_hash,
                 *max_payload_size,
+                route_uid,
+                *route_revision,
                 *registered_at,
             ))
         }
@@ -427,14 +457,20 @@ pub fn route_digest_hash_for_diff_entry(
             name,
             relay_id,
             removed_at,
+            removed_revision,
             ..
         } => {
-            if !valid_deleted_route_fields(name, relay_id, *removed_at) {
+            if !valid_deleted_route_fields(name, relay_id, *removed_at, *removed_revision) {
                 return Err(PeerRouteStateError::InvalidDigestDiff {
                     reason: format!("invalid deleted diff for route {name}/{relay_id}"),
                 });
             }
-            Ok(deleted_route_digest_hash(name, relay_id, *removed_at))
+            Ok(deleted_route_digest_hash(
+                name,
+                relay_id,
+                *removed_at,
+                *removed_revision,
+            ))
         }
     }
 }
@@ -450,6 +486,8 @@ fn valid_active_route_fields(
     abi_hash: &str,
     signature_hash: &str,
     max_payload_size: u64,
+    route_uid: &str,
+    route_revision: u64,
     registered_at: f64,
 ) -> bool {
     crate::relay::route_table::valid_route_name(name)
@@ -459,13 +497,21 @@ fn valid_active_route_fields(
         && c2_contract::validate_contract_hash("abi_hash", abi_hash).is_ok()
         && c2_contract::validate_contract_hash("signature_hash", signature_hash).is_ok()
         && max_payload_size > 0
+        && c2_contract::validate_call_route_key("route_uid", route_uid).is_ok()
+        && route_revision > 0
         && registered_at.is_finite()
 }
 
-fn valid_deleted_route_fields(name: &str, relay_id: &str, removed_at: f64) -> bool {
+fn valid_deleted_route_fields(
+    name: &str,
+    relay_id: &str,
+    removed_at: f64,
+    removed_revision: u64,
+) -> bool {
     crate::relay::route_table::valid_route_name(name)
         && valid_wire_relay_id(relay_id)
         && removed_at.is_finite()
+        && removed_revision > 0
 }
 
 #[cfg(test)]
@@ -512,6 +558,8 @@ mod tests {
                 signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
                     .into(),
                 max_payload_size: 1024,
+                route_uid: "grid-route-uid-0001".into(),
+                route_revision: 1,
                 registered_at: 1000.0,
             },
         );
@@ -541,6 +589,8 @@ mod tests {
                 signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
                     .into(),
                 max_payload_size: 1024,
+                route_uid: "grid-route-uid-0001".into(),
+                route_revision: 1,
                 registered_at: 1000.0,
             },
         );
@@ -565,6 +615,8 @@ mod tests {
             signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
                 .into(),
             max_payload_size: 1024,
+            route_uid: "grid-route-uid-0001".into(),
+            route_revision: 1,
             registered_at: 1000.0,
             hash: String::new(),
         };
@@ -579,6 +631,38 @@ mod tests {
             "relay-a",
             PeerMessage::DigestDiff {
                 entries: vec![active],
+            },
+        );
+
+        assert!(matches!(
+            validate_route_state_envelope(env, Some("relay-a")),
+            Err(PeerRouteStateError::InvalidDigestDiff { .. }),
+        ));
+    }
+
+    #[test]
+    fn deleted_digest_diff_hash_binds_removed_revision() {
+        let mut deleted = DigestDiffEntry::Deleted {
+            name: "grid".into(),
+            relay_id: "relay-a".into(),
+            removed_at: 1001.0,
+            removed_revision: 7,
+            hash: String::new(),
+        };
+        let valid_hash = route_digest_hash_for_diff_entry(&deleted).unwrap();
+        if let DigestDiffEntry::Deleted { hash, .. } = &mut deleted {
+            *hash = valid_hash;
+        }
+        if let DigestDiffEntry::Deleted {
+            removed_revision, ..
+        } = &mut deleted
+        {
+            *removed_revision = 8;
+        }
+        let env = PeerEnvelope::new(
+            "relay-a",
+            PeerMessage::DigestDiff {
+                entries: vec![deleted],
             },
         );
 

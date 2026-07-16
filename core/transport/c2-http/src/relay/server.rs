@@ -26,6 +26,9 @@ use crate::relay::url::peer_endpoint_url;
 use c2_config::RelayConfig;
 use c2_ipc::{ClientIpcConfig, IpcClient};
 
+const REGISTER_ATTESTATION_CONNECT_ATTEMPTS: usize = 3;
+const REGISTER_ATTESTATION_RETRY_DELAY: Duration = Duration::from_millis(20);
+
 /// Errors from the relay control API.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelayControlError {
@@ -111,7 +114,8 @@ fn control_error_to_relay_error(err: ControlError) -> RelayControlError {
         | ControlError::InvalidServerId { reason }
         | ControlError::InvalidServerInstanceId { reason }
         | ControlError::InvalidAddress { reason }
-        | ControlError::ContractMismatch { reason } => RelayControlError::Other(reason),
+        | ControlError::ContractMismatch { reason }
+        | ControlError::UpstreamUnavailable { reason } => RelayControlError::Other(reason),
         ControlError::AddressMismatch { .. }
         | ControlError::DuplicateRoute { .. }
         | ControlError::OwnerMismatch
@@ -126,6 +130,39 @@ fn close_client(client: IpcClient) {
         let mut client = client;
         client.close().await;
     });
+}
+
+fn should_retry_register_attestation_connect(error: &c2_ipc::IpcError) -> bool {
+    matches!(
+        error,
+        c2_ipc::IpcError::Io(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::WouldBlock
+            )
+    )
+}
+
+async fn connect_register_attestation_client(address: &str) -> Result<IpcClient, c2_ipc::IpcError> {
+    for attempt in 1..=REGISTER_ATTESTATION_CONNECT_ATTEMPTS {
+        let mut client = IpcClient::with_config(address, ClientIpcConfig::default());
+        match client.connect().await {
+            Ok(()) => return Ok(client),
+            Err(err)
+                if attempt < REGISTER_ATTESTATION_CONNECT_ATTEMPTS
+                    && should_retry_register_attestation_connect(&err) =>
+            {
+                tokio::time::sleep(REGISTER_ATTESTATION_RETRY_DELAY).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    unreachable!("register attestation connect loop always returns");
 }
 
 /// Relay server with a synchronous control API.
@@ -393,14 +430,14 @@ impl RelayServer {
             interval.tick().await;
 
             let evicted = state.evict_idle(idle_timeout_ms);
-            for (name, old_client) in evicted {
+            for (endpoint, old_client) in evicted {
                 if let Some(arc_client) = old_client {
                     let dead = !arc_client.is_connected();
                     tokio::spawn(async move { arc_client.close_shared().await });
                     if dead {
-                        eprintln!("[relay] Evicted dead upstream: {name}");
+                        eprintln!("[relay] Evicted dead upstream endpoint: {endpoint}");
                     } else {
-                        eprintln!("[relay] Evicted idle upstream: {name}");
+                        eprintln!("[relay] Evicted idle upstream endpoint: {endpoint}");
                     }
                 }
             }
@@ -443,7 +480,8 @@ impl RelayServer {
                         | Err(ControlError::InvalidServerId { reason })
                         | Err(ControlError::InvalidServerInstanceId { reason })
                         | Err(ControlError::InvalidAddress { reason })
-                        | Err(ControlError::ContractMismatch { reason }) => {
+                        | Err(ControlError::ContractMismatch { reason })
+                        | Err(ControlError::UpstreamUnavailable { reason }) => {
                             eprintln!(
                                 "[relay] Register command rejected: name={name} server_id={server_id} address={address} reason={reason}"
                             );
@@ -459,10 +497,8 @@ impl RelayServer {
                         }
                     };
                     let result = {
-                        let mut client =
-                            IpcClient::with_config(&address, ClientIpcConfig::default());
-                        match client.connect().await {
-                            Ok(()) => {
+                        match connect_register_attestation_client(&address).await {
+                            Ok(client) => {
                                 let server_identity_matches =
                                     client.server_id() == Some(server_id.as_str());
                                 if !server_identity_matches {
@@ -498,20 +534,30 @@ impl RelayServer {
                                     let _ = reply.send(Err(RelayControlError::Other(reason)));
                                     continue;
                                 }
-                                if !client.has_route(&name) {
+                                if let Err(err) = client.rebuild_route_catalog().await {
+                                    let reason = match err {
+                                        c2_ipc::IpcError::RouteNotFound(_) => {
+                                            "route_not_exported".to_string()
+                                        }
+                                        c2_ipc::IpcError::ContractMismatch(reason)
+                                        | c2_ipc::IpcError::Protocol(reason) => reason,
+                                        other => format!("route_attestation_failed: {other}"),
+                                    };
                                     close_client(client);
                                     eprintln!(
-                                        "[relay] Register command rejected: name={name} server_id={server_id} address={address} reason=route_not_exported"
+                                        "[relay] Register command rejected: name={name} server_id={server_id} address={address} reason={reason}"
                                     );
                                     let _ = reply.send(Err(RelayControlError::Other(format!(
                                         "IPC upstream at {address} does not export route '{name}'"
                                     ))));
                                     continue;
-                                };
+                                }
                                 let contract =
                                     match crate::relay::authority::read_ipc_route_contract(
                                         &client, &name,
-                                    ) {
+                                    )
+                                    .await
+                                    {
                                         Ok(contract) => contract,
                                         Err(ControlError::ContractMismatch { reason }) => {
                                             close_client(client);
@@ -532,6 +578,15 @@ impl RelayServer {
                                                     "IPC upstream at {address} does not export route '{name}'"
                                                 ),
                                             )));
+                                            continue;
+                                        }
+                                        Err(ControlError::UpstreamUnavailable { reason }) => {
+                                            close_client(client);
+                                            eprintln!(
+                                                "[relay] Register command rejected: name={name} server_id={server_id} address={address} reason={reason}"
+                                            );
+                                            let _ =
+                                                reply.send(Err(RelayControlError::Other(reason)));
                                             continue;
                                         }
                                         Err(_) => unreachable!(
@@ -563,7 +618,8 @@ impl RelayServer {
                                     | Err(ControlError::InvalidServerId { reason })
                                     | Err(ControlError::InvalidServerInstanceId { reason })
                                     | Err(ControlError::InvalidAddress { reason })
-                                    | Err(ControlError::ContractMismatch { reason }) => {
+                                    | Err(ControlError::ContractMismatch { reason })
+                                    | Err(ControlError::UpstreamUnavailable { reason }) => {
                                         let close_client = client.clone();
                                         tokio::spawn(
                                             async move { close_client.close_shared().await },
@@ -586,6 +642,8 @@ impl RelayServer {
                                     contract.abi_hash,
                                     contract.signature_hash,
                                     contract.max_payload_size,
+                                    contract.route_uid,
+                                    contract.route_revision,
                                     replacement,
                                 ) {
                                     RegisterCommitResult::Registered { entry } => {
@@ -600,6 +658,7 @@ impl RelayServer {
                                             entry.crm_name,
                                             entry.crm_ver
                                         );
+                                        state.start_upstream_control(&entry);
                                         broadcast_route_announce(&state, &entry);
                                         Ok(())
                                     }
@@ -615,6 +674,7 @@ impl RelayServer {
                                             entry.crm_name,
                                             entry.crm_ver
                                         );
+                                        state.start_upstream_control(&entry);
                                         Ok(())
                                     }
                                     RegisterCommitResult::Duplicate { .. }
@@ -654,17 +714,18 @@ impl RelayServer {
                         UnregisterResult::Removed {
                             entry,
                             removed_at,
+                            removed_revision,
                             client,
                         } => {
                             if let Some(arc_client) = client {
                                 tokio::spawn(async move { arc_client.close_shared().await });
                             }
                             eprintln!(
-                                "[relay] Unregister command removed: name={} server_id={} removed_at={removed_at}",
+                                "[relay] Unregister command removed: name={} server_id={} removed_at={removed_at} removed_revision={removed_revision}",
                                 entry.name,
                                 entry.server_id.as_deref().unwrap_or("")
                             );
-                            broadcast_route_withdraw(&state, &entry, removed_at);
+                            broadcast_route_withdraw(&state, &entry, removed_at, removed_revision);
                             let _ = reply.send(Ok(()));
                         }
                         UnregisterResult::AlreadyRemoved => {
@@ -716,7 +777,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use super::{Command, RelayControlError, RelayServer};
+    use super::{
+        Command, RelayControlError, RelayServer, should_retry_register_attestation_connect,
+    };
     use c2_config::RelayConfig;
     use tokio::sync::{mpsc, oneshot};
 
@@ -756,7 +819,7 @@ mod tests {
             .find(".prepare_candidate_registration(")
             .expect("command registration must prepare replacement eligibility");
         let connect = body
-            .find("client.connect().await")
+            .find("connect_register_attestation_client(&address).await")
             .expect("command registration must connect candidate IPC");
         let read = body
             .find("read_ipc_route_contract")
@@ -903,6 +966,27 @@ mod tests {
 
         assert_eq!(c2.code, c2_error::ErrorCode::ResourceAlreadyRegistered);
         assert_eq!(c2.message, "Route name already registered: 'grid'");
+    }
+
+    #[test]
+    fn register_attestation_retry_policy_is_transport_only() {
+        assert!(should_retry_register_attestation_connect(
+            &c2_ipc::IpcError::Io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
+        ));
+        assert!(should_retry_register_attestation_connect(
+            &c2_ipc::IpcError::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+        ));
+        assert!(!should_retry_register_attestation_connect(
+            &c2_ipc::IpcError::IdentityMismatch {
+                expected_server_id: "server-a".into(),
+                expected_server_instance_id: "instance-a".into(),
+                actual_server_id: "server-b".into(),
+                actual_server_instance_id: "instance-b".into(),
+            }
+        ));
+        assert!(!should_retry_register_attestation_connect(
+            &c2_ipc::IpcError::ContractMismatch("wrong contract".into())
+        ));
     }
 
     #[test]
@@ -1148,6 +1232,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-server-grid-uid".into(),
+            1,
             None,
         ) {
             RegisterCommitResult::Registered { .. } => {}

@@ -18,6 +18,16 @@ pub enum MsgType {
     DisconnectAck = 0x09,
     PendingRouteAttest = 0x0A,
     PendingRouteAttestAck = 0x0B,
+    RouteContract = 0x0C,
+    RouteContractAck = 0x0D,
+    RouteList = 0x0E,
+    RouteListAck = 0x0F,
+    RouteLookup = 0x10,
+    RouteLookupAck = 0x11,
+    RouteWatch = 0x12,
+    RouteWatchEvent = 0x13,
+    RouteAck = 0x14,
+    RouteNack = 0x15,
 }
 
 impl MsgType {
@@ -35,6 +45,16 @@ impl MsgType {
             0x09 => Some(Self::DisconnectAck),
             0x0A => Some(Self::PendingRouteAttest),
             0x0B => Some(Self::PendingRouteAttestAck),
+            0x0C => Some(Self::RouteContract),
+            0x0D => Some(Self::RouteContractAck),
+            0x0E => Some(Self::RouteList),
+            0x0F => Some(Self::RouteListAck),
+            0x10 => Some(Self::RouteLookup),
+            0x11 => Some(Self::RouteLookupAck),
+            0x12 => Some(Self::RouteWatch),
+            0x13 => Some(Self::RouteWatchEvent),
+            0x14 => Some(Self::RouteAck),
+            0x15 => Some(Self::RouteNack),
             _ => None,
         }
     }
@@ -91,6 +111,16 @@ mod tests {
             (0x09, MsgType::DisconnectAck),
             (0x0A, MsgType::PendingRouteAttest),
             (0x0B, MsgType::PendingRouteAttestAck),
+            (0x0C, MsgType::RouteContract),
+            (0x0D, MsgType::RouteContractAck),
+            (0x0E, MsgType::RouteList),
+            (0x0F, MsgType::RouteListAck),
+            (0x10, MsgType::RouteLookup),
+            (0x11, MsgType::RouteLookupAck),
+            (0x12, MsgType::RouteWatch),
+            (0x13, MsgType::RouteWatchEvent),
+            (0x14, MsgType::RouteAck),
+            (0x15, MsgType::RouteNack),
         ] {
             let parsed = MsgType::from_byte(byte).unwrap();
             assert_eq!(parsed, expected);

@@ -518,6 +518,16 @@ fn strict_codec_mode_allows_fastdb_call_db_codecs() {
         "C-Two IPC SHM and chunked responses are not supported by this generated inline transport yet."
     ));
     assert!(output.contains("function encodeIpcCallControl"));
+    assert!(output.contains("readonly routeUid: string;"));
+    assert!(output.contains("readonly routeRevision: number;"));
+    assert!(output.contains(
+        "function encodeIpcCallControl(route: C2IpcRouteInfo, methodIndex: number): Uint8Array"
+    ));
+    assert!(output.contains("const routeUid = readText(`route ${routeIndex} route_uid`);"));
+    assert!(output.contains("writeU64LE(route.routeRevision, \"route_revision\")"));
+    assert!(!output.contains(
+        "function encodeIpcCallControl(routeName: string, methodIndex: number): Uint8Array"
+    ));
     assert!(output.contains("function decodeServerIpcHandshake"));
     assert!(output.contains("return { kind: \"success\", payload: payload.subarray(1) };"));
     assert!(output.contains("Object.setPrototypeOf(this, C2HttpTransportError.prototype);"));

@@ -17,6 +17,8 @@ pub(crate) fn broadcast_route_announce(state: &Arc<RelayState>, entry: &RouteEnt
             abi_hash: entry.abi_hash.clone(),
             signature_hash: entry.signature_hash.clone(),
             max_payload_size: entry.max_payload_size,
+            route_uid: entry.route_uid.clone(),
+            route_revision: entry.route_revision,
             registered_at: entry.registered_at,
         },
     );
@@ -28,6 +30,7 @@ pub(crate) fn broadcast_route_withdraw(
     state: &Arc<RelayState>,
     entry: &RouteEntry,
     removed_at: f64,
+    removed_revision: u64,
 ) {
     let envelope = PeerEnvelope::new(
         state.relay_id(),
@@ -35,6 +38,7 @@ pub(crate) fn broadcast_route_withdraw(
             name: entry.name.clone(),
             relay_id: entry.relay_id.clone(),
             removed_at,
+            removed_revision,
         },
     );
     let peers = state.list_peers();

@@ -6,16 +6,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use serde::Deserialize;
 use serde_json::json;
 
 use super::{HttpClient, HttpClientPool, HttpError, RelayControlClient, RelayRouteInfo};
 use c2_contract::ExpectedRouteContract;
-
-#[derive(Debug, Deserialize)]
-struct RelayErrorBody {
-    error: String,
-}
 
 #[derive(Debug, Clone, Copy)]
 pub struct RelayAwareClientConfig {
@@ -39,6 +33,8 @@ pub struct RelayLocalIpcCandidate {
     pub address: String,
     pub server_id: String,
     pub server_instance_id: String,
+    pub route_uid: String,
+    pub route_revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,6 +120,15 @@ impl RelayAwareHttpClient {
             .block_on(self.resolve_http_target_async())
     }
 
+    pub fn resolve_target_after_local_ipc_failures(
+        &self,
+        failed_candidates: &[RelayLocalIpcCandidate],
+    ) -> Result<RelayResolvedTarget, HttpError> {
+        super::client::runtime()
+            .handle()
+            .block_on(self.resolve_target_after_local_ipc_failures_async(failed_candidates))
+    }
+
     async fn connect_async(&self) -> Result<(), HttpError> {
         match self.select_target_async(false).await? {
             RelayResolvedTarget::Http { .. } => Ok(()),
@@ -139,21 +144,42 @@ impl RelayAwareHttpClient {
         self.select_target_async(false).await
     }
 
+    pub async fn resolve_target_after_local_ipc_failures_async(
+        &self,
+        failed_candidates: &[RelayLocalIpcCandidate],
+    ) -> Result<RelayResolvedTarget, HttpError> {
+        self.select_target_with_local_exclusions_async(true, failed_candidates, true)
+            .await
+    }
+
     async fn select_target_async(
         &self,
         prefer_local_ipc: bool,
+    ) -> Result<RelayResolvedTarget, HttpError> {
+        self.select_target_with_local_exclusions_async(prefer_local_ipc, &[], false)
+            .await
+    }
+
+    async fn select_target_with_local_exclusions_async(
+        &self,
+        prefer_local_ipc: bool,
+        excluded_local_ipc_candidates: &[RelayLocalIpcCandidate],
+        fallback_denied_when_only_excluded: bool,
     ) -> Result<RelayResolvedTarget, HttpError> {
         let attempts = self.config.max_attempts.max(1);
         let mut last_error = None;
         let mut excluded_routes = HashSet::new();
 
         for attempt in 0..attempts {
-            let routes = match self.resolve_routes_async(attempt > 0).await {
+            let routes = match self
+                .resolve_routes_async(attempt > 0 || fallback_denied_when_only_excluded)
+                .await
+            {
                 Ok(routes) if !routes.is_empty() => routes,
                 Ok(_) => {
                     return Err(HttpError::ServerError(
                         404,
-                        relay_error_body("ResourceNotFound", self.route_name()),
+                        resource_not_found_body(self.route_name()),
                     ));
                 }
                 Err(err) => {
@@ -164,6 +190,17 @@ impl RelayAwareHttpClient {
                     return Err(err);
                 }
             };
+            let had_routes_before_local_exclusion = !routes.is_empty();
+            let routes = filter_failed_local_ipc_candidates(routes, excluded_local_ipc_candidates);
+            if routes.is_empty()
+                && fallback_denied_when_only_excluded
+                && had_routes_before_local_exclusion
+            {
+                return Err(HttpError::ServerError(
+                    409,
+                    fallback_denied_body(self.route_name(), excluded_local_ipc_candidates),
+                ));
+            }
 
             if let Some(candidate) = select_local_ipc_candidate(
                 prefer_local_ipc,
@@ -177,10 +214,7 @@ impl RelayAwareHttpClient {
             let ordered = self.order_routes(routes, &excluded_routes);
             if ordered.is_empty() {
                 return Err(last_error.unwrap_or_else(|| {
-                    HttpError::ServerError(
-                        404,
-                        relay_error_body("ResourceNotFound", self.route_name()),
-                    )
+                    HttpError::ServerError(404, resource_not_found_body(self.route_name()))
                 }));
             }
 
@@ -205,7 +239,7 @@ impl RelayAwareHttpClient {
 
                 match client
                     .client
-                    .probe_route_with_expected_crm_async(&self.expected)
+                    .probe_route_with_token_async(&self.expected, &route.route_token())
                     .await
                 {
                     Ok(()) => {
@@ -228,7 +262,7 @@ impl RelayAwareHttpClient {
         }
 
         Err(last_error.unwrap_or_else(|| {
-            HttpError::ServerError(404, relay_error_body("ResourceNotFound", self.route_name()))
+            HttpError::ServerError(404, resource_not_found_body(self.route_name()))
         }))
     }
 
@@ -247,7 +281,7 @@ impl RelayAwareHttpClient {
                 Ok(_) => {
                     return Err(HttpError::ServerError(
                         404,
-                        relay_error_body("ResourceNotFound", self.route_name()),
+                        resource_not_found_body(self.route_name()),
                     ));
                 }
                 Err(err) => {
@@ -262,10 +296,7 @@ impl RelayAwareHttpClient {
             let ordered = self.order_routes(routes, &excluded_routes);
             if ordered.is_empty() {
                 return Err(last_error.unwrap_or_else(|| {
-                    HttpError::ServerError(
-                        404,
-                        relay_error_body("ResourceNotFound", self.route_name()),
-                    )
+                    HttpError::ServerError(404, resource_not_found_body(self.route_name()))
                 }));
             }
             for route in ordered {
@@ -289,7 +320,12 @@ impl RelayAwareHttpClient {
 
                 match client
                     .client
-                    .call_with_expected_crm_async(&self.expected, method_name, data)
+                    .call_with_route_token_async(
+                        &self.expected,
+                        &route.route_token(),
+                        method_name,
+                        data,
+                    )
                     .await
                 {
                     Ok(bytes) => {
@@ -312,7 +348,7 @@ impl RelayAwareHttpClient {
         }
 
         Err(last_error.unwrap_or_else(|| {
-            HttpError::ServerError(404, relay_error_body("ResourceNotFound", self.route_name()))
+            HttpError::ServerError(404, resource_not_found_body(self.route_name()))
         }))
     }
 
@@ -389,29 +425,90 @@ impl Drop for RelayPoolGuard {
 
 fn route_is_stale(err: &HttpError) -> bool {
     match err {
-        HttpError::ServerError(404, body) => relay_error_is(body, "ResourceNotFound"),
-        HttpError::ServerError(502, body) => relay_error_is(body, "UpstreamUnavailable"),
+        HttpError::ServerError(404, body) => {
+            relay_error_code_is(body, c2_error::ErrorCode::ResourceNotFound)
+        }
+        HttpError::ServerError(409, body) => {
+            relay_error_code_is(body, c2_error::ErrorCode::RouteStale)
+        }
+        HttpError::ServerError(502, body) => {
+            relay_error_code_is(body, c2_error::ErrorCode::ResourceUnavailable)
+        }
         _ => false,
     }
 }
 
-fn relay_error_is(body: &str, expected: &str) -> bool {
-    serde_json::from_str::<RelayErrorBody>(body).is_ok_and(|parsed| parsed.error == expected)
+fn relay_error_code_is(body: &str, expected: c2_error::ErrorCode) -> bool {
+    let Ok(envelope) = serde_json::from_str::<c2_error::C2ErrorEnvelope>(body) else {
+        return false;
+    };
+    c2_error::C2Error::from_envelope(envelope).is_ok_and(|err| err.code == expected)
 }
 
-fn relay_error_body(error: &str, route_name: &str) -> String {
+fn resource_not_found_body(route_name: &str) -> String {
+    canonical_relay_error_body(
+        c2_error::ErrorCode::ResourceNotFound,
+        &format!("route not found: {route_name}"),
+        route_name,
+    )
+}
+
+fn crm_contract_mismatch_body(route_name: &str) -> String {
+    canonical_relay_error_body(
+        c2_error::ErrorCode::ContractMismatch,
+        &format!("CRM contract mismatch for route {route_name}"),
+        route_name,
+    )
+}
+
+fn fallback_denied_body(route_name: &str, failed_candidates: &[RelayLocalIpcCandidate]) -> String {
+    let last_failed = failed_candidates.last();
+    let mut details = serde_json::Map::new();
+    details.insert("route".to_string(), json!(route_name));
+    details.insert(
+        "reason".to_string(),
+        json!("only_failed_local_ipc_candidates"),
+    );
+    details.insert(
+        "failed_local_ipc_candidates".to_string(),
+        json!(failed_candidates.len().to_string()),
+    );
+    if let Some(candidate) = last_failed {
+        details.insert("ipc_address".to_string(), json!(candidate.address));
+        details.insert("server_id".to_string(), json!(candidate.server_id));
+        details.insert(
+            "server_instance_id".to_string(),
+            json!(candidate.server_instance_id),
+        );
+        details.insert("route_uid".to_string(), json!(candidate.route_uid));
+        details.insert(
+            "route_revision".to_string(),
+            json!(candidate.route_revision.to_string()),
+        );
+    }
     json!({
-        "error": error,
-        "route": route_name,
+        "version": c2_error::ERROR_WIRE_VERSION,
+        "code": u16::from(c2_error::ErrorCode::FallbackDenied),
+        "name": c2_error::ErrorCode::FallbackDenied.name(),
+        "message": format!("same local relay HTTP fallback denied for route {route_name}"),
+        "details": details,
     })
     .to_string()
 }
 
-fn crm_contract_mismatch_body(route_name: &str) -> String {
+fn canonical_relay_error_body(
+    code: c2_error::ErrorCode,
+    message: &str,
+    route_name: &str,
+) -> String {
     json!({
-        "error": "CRMContractMismatch",
-        "route": route_name,
-        "message": format!("CRM contract mismatch for route {route_name}"),
+        "version": c2_error::ERROR_WIRE_VERSION,
+        "code": u16::from(code),
+        "name": code.name(),
+        "message": message,
+        "details": {
+            "route": route_name,
+        },
     })
     .to_string()
 }
@@ -440,8 +537,38 @@ fn select_local_ipc_candidate(
             address: route.ipc_address.clone()?,
             server_id: route.server_id.clone()?,
             server_instance_id: route.server_instance_id.clone()?,
+            route_uid: route.route_uid.clone(),
+            route_revision: route.route_revision,
         })
     })
+}
+
+fn filter_failed_local_ipc_candidates(
+    routes: Vec<RelayRouteInfo>,
+    failed_candidates: &[RelayLocalIpcCandidate],
+) -> Vec<RelayRouteInfo> {
+    if failed_candidates.is_empty() {
+        return routes;
+    }
+    routes
+        .into_iter()
+        .filter(|route| {
+            !failed_candidates
+                .iter()
+                .any(|failed| route_matches_local_ipc_candidate(route, failed))
+        })
+        .collect()
+}
+
+fn route_matches_local_ipc_candidate(
+    route: &RelayRouteInfo,
+    failed: &RelayLocalIpcCandidate,
+) -> bool {
+    // A same-endpoint local IPC retry with a newer token would silently bind a
+    // replacement route. Exclude by endpoint identity, not by route token.
+    route.ipc_address.as_deref() == Some(failed.address.as_str())
+        && route.server_id.as_deref() == Some(failed.server_id.as_str())
+        && route.server_instance_id.as_deref() == Some(failed.server_instance_id.as_str())
 }
 
 fn filter_routes_by_expected_contract(
@@ -521,6 +648,8 @@ mod tests {
         RelayRouteInfo {
             name,
             relay_url,
+            route_uid: "grid-route-uid-0001".to_string(),
+            route_revision: 1,
             ipc_address: None,
             server_id: None,
             server_instance_id: None,
@@ -545,10 +674,32 @@ mod tests {
         .into_response()
     }
 
-    async fn stale_call() -> Response {
+    fn canonical_error_json(
+        code: u16,
+        name: &str,
+        message: &str,
+        route: &str,
+    ) -> serde_json::Value {
+        json!({
+            "version": 1,
+            "code": code,
+            "name": name,
+            "message": message,
+            "details": {
+                "route": route,
+            },
+        })
+    }
+
+    async fn stale_call(Path((route, _method)): Path<(String, String)>) -> Response {
         (
             StatusCode::BAD_GATEWAY,
-            Json(serde_json::json!({"error": "UpstreamUnavailable"})),
+            Json(canonical_error_json(
+                702,
+                "ResourceUnavailable",
+                "relay upstream unavailable",
+                &route,
+            )),
         )
             .into_response()
     }
@@ -588,10 +739,15 @@ mod tests {
             .into_response()
     }
 
-    async fn stale_not_found() -> Response {
+    async fn stale_not_found(Path((route, _method)): Path<(String, String)>) -> Response {
         (
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "ResourceNotFound"})),
+            Json(canonical_error_json(
+                701,
+                "ResourceNotFound",
+                "relay route not found",
+                &route,
+            )),
         )
             .into_response()
     }
@@ -621,6 +777,21 @@ mod tests {
                 ..route_info(name, state.stale_url.clone())
             },
         ])
+        .into_response()
+    }
+
+    async fn registry_resolve_only_failed_local_ipc(
+        State(state): State<RegistryState>,
+        Path(name): Path<String>,
+    ) -> Response {
+        state.resolve_count.fetch_add(1, Ordering::SeqCst);
+        Json(vec![RelayRouteInfo {
+            relay_url: state.stale_url.clone(),
+            ipc_address: Some("ipc://local-grid".to_string()),
+            server_id: Some("local-grid".to_string()),
+            server_instance_id: Some("inst-local-grid".to_string()),
+            ..route_info(name, state.stale_url.clone())
+        }])
         .into_response()
     }
 
@@ -666,16 +837,25 @@ mod tests {
                 .is_some_and(|v| v == TEST_SIGNATURE_HASH)
     }
 
+    fn route_token_headers_match(headers: &HeaderMap) -> bool {
+        headers
+            .get("x-c2-route-uid")
+            .is_some_and(|v| v == "grid-route-uid-0001")
+            && headers.get("x-c2-route-revision").is_some_and(|v| v == "1")
+    }
+
     async fn probe_requires_expected_crm_headers(headers: HeaderMap) -> Response {
-        if expected_crm_headers_match(&headers) {
+        if expected_crm_headers_match(&headers) && route_token_headers_match(&headers) {
             StatusCode::OK.into_response()
         } else {
             (
                 StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "CRMContractMismatch",
-                    "message": "CRM contract mismatch for route grid",
-                })),
+                Json(canonical_error_json(
+                    709,
+                    "ContractMismatch",
+                    "CRM contract mismatch for route grid",
+                    "grid",
+                )),
             )
                 .into_response()
         }
@@ -683,20 +863,22 @@ mod tests {
 
     async fn call_requires_expected_crm_headers(
         headers: HeaderMap,
-        Path((_route, _method)): Path<(String, String)>,
+        Path((route, _method)): Path<(String, String)>,
         body: Bytes,
     ) -> Response {
-        if expected_crm_headers_match(&headers) {
+        if expected_crm_headers_match(&headers) && route_token_headers_match(&headers) {
             let mut out = b"ok:".to_vec();
             out.extend_from_slice(&body);
             (StatusCode::OK, out).into_response()
         } else {
             (
                 StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "CRMContractMismatch",
-                    "message": "CRM contract mismatch for route grid",
-                })),
+                Json(canonical_error_json(
+                    709,
+                    "ContractMismatch",
+                    "CRM contract mismatch for route grid",
+                    &route,
+                )),
             )
                 .into_response()
         }
@@ -830,6 +1012,130 @@ mod tests {
         );
 
         registry_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn local_ipc_failure_selects_distinct_http_candidate_only() {
+        let (live_url, live_handle) =
+            spawn_app(Router::new().route("/_probe/{route}", get(|| async { StatusCode::OK })))
+                .await;
+        let resolve_count = Arc::new(AtomicUsize::new(0));
+        let registry_state = RegistryState {
+            stale_url: "http://127.0.0.1:9".to_string(),
+            live_url: live_url.clone(),
+            resolve_count: resolve_count.clone(),
+        };
+        let (registry_url, registry_handle) = spawn_app(
+            Router::new()
+                .route("/_resolve/{name}", get(registry_resolve_with_local_ipc))
+                .with_state(registry_state),
+        )
+        .await;
+
+        let client = RelayAwareHttpClient::new(
+            &registry_url,
+            expected_contract(),
+            false,
+            RelayAwareClientConfig {
+                max_attempts: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let failed = RelayLocalIpcCandidate {
+            address: "ipc://local-grid".to_string(),
+            server_id: "local-grid".to_string(),
+            server_instance_id: "inst-local-grid".to_string(),
+            route_uid: "grid-route-uid-0001".to_string(),
+            route_revision: 1,
+        };
+
+        let target = client
+            .resolve_target_after_local_ipc_failures_async(std::slice::from_ref(&failed))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            target,
+            RelayResolvedTarget::Http {
+                relay_url: live_url
+            }
+        );
+        assert_eq!(resolve_count.load(Ordering::SeqCst), 1);
+        registry_handle.abort();
+        live_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn local_ipc_failure_without_distinct_http_candidate_is_fallback_denied() {
+        let resolve_count = Arc::new(AtomicUsize::new(0));
+        let registry_state = RegistryState {
+            stale_url: "http://127.0.0.1:9".to_string(),
+            live_url: String::new(),
+            resolve_count: resolve_count.clone(),
+        };
+        let (registry_url, registry_handle) = spawn_app(
+            Router::new()
+                .route(
+                    "/_resolve/{name}",
+                    get(registry_resolve_only_failed_local_ipc),
+                )
+                .with_state(registry_state),
+        )
+        .await;
+
+        let client = RelayAwareHttpClient::new(
+            &registry_url,
+            expected_contract(),
+            false,
+            RelayAwareClientConfig {
+                max_attempts: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let failed = RelayLocalIpcCandidate {
+            address: "ipc://local-grid".to_string(),
+            server_id: "local-grid".to_string(),
+            server_instance_id: "inst-local-grid".to_string(),
+            route_uid: "grid-route-uid-0001".to_string(),
+            route_revision: 1,
+        };
+
+        let err = client
+            .resolve_target_after_local_ipc_failures_async(std::slice::from_ref(&failed))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, HttpError::ServerError(409, body) if relay_error_code_is(body.as_str(), c2_error::ErrorCode::FallbackDenied))
+        );
+        assert_eq!(resolve_count.load(Ordering::SeqCst), 1);
+        registry_handle.abort();
+    }
+
+    #[test]
+    fn failed_local_ipc_exclusion_ignores_replacement_token_on_same_endpoint() {
+        let failed = RelayLocalIpcCandidate {
+            address: "ipc://local-grid".to_string(),
+            server_id: "local-grid".to_string(),
+            server_instance_id: "inst-local-grid".to_string(),
+            route_uid: "grid-route-uid-0001".to_string(),
+            route_revision: 1,
+        };
+        let refreshed_same_endpoint = RelayRouteInfo {
+            ipc_address: Some("ipc://local-grid".to_string()),
+            server_id: Some("local-grid".to_string()),
+            server_instance_id: Some("inst-local-grid".to_string()),
+            route_uid: "grid-route-uid-0002".to_string(),
+            route_revision: 2,
+            ..route_info("grid".to_string(), "http://127.0.0.1:8080".to_string())
+        };
+
+        assert!(
+            filter_failed_local_ipc_candidates(vec![refreshed_same_endpoint], &[failed]).is_empty(),
+            "same endpoint with a replacement token must stay excluded"
+        );
     }
 
     #[tokio::test]
@@ -1016,6 +1322,8 @@ mod tests {
                 address: "ipc://grid-server".to_string(),
                 server_id: "grid-server".to_string(),
                 server_instance_id: "inst-a".to_string(),
+                route_uid: "grid-route-uid-0001".to_string(),
+                route_revision: 1,
             }),
         );
     }
@@ -1034,6 +1342,8 @@ mod tests {
         assert_eq!(candidate.address, "ipc://grid-server");
         assert_eq!(candidate.server_id, "grid-server");
         assert_eq!(candidate.server_instance_id, "inst-a");
+        assert_eq!(candidate.route_uid, "grid-route-uid-0001");
+        assert_eq!(candidate.route_revision, 1);
     }
 
     #[test]

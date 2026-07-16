@@ -617,6 +617,7 @@ def test_grid_fastdb_export_feeds_fastdb_typescript_codegen(monkeypatch, tmp_pat
         } from './dist/fastdb-c2-codecs.js';
         import {
           GridFastdbClient,
+          C2CrmMethodError,
           createC2MemFfiNativeBuddyRequestShmWriter,
           createC2MemFfiNativeBuddyResponseShmReader,
           createGridFastdbClientCodecTransport,
@@ -629,6 +630,18 @@ def test_grid_fastdb_export_feeds_fastdb_typescript_codegen(monkeypatch, tmp_pat
           if (actual !== expected) {
             throw new Error(`${label}: expected ${String(expected)}, got ${String(actual)}`);
           }
+        }
+
+        function decodeC2ErrorEnvelope(payload) {
+          if (!(payload instanceof Uint8Array)) {
+            throw new Error(`expected C2 error payload to be Uint8Array, got ${typeof payload}`);
+          }
+          const decoder = new TextDecoder();
+          const prefix = decoder.decode(payload.subarray(0, 4));
+          if (prefix !== 'C2E1') {
+            throw new Error(`expected C2E1 error envelope, got ${prefix}`);
+          }
+          return JSON.parse(decoder.decode(payload.subarray(4)));
         }
 
         const module = await initFastdb();
@@ -975,9 +988,14 @@ def test_grid_fastdb_export_feeds_fastdb_typescript_codegen(monkeypatch, tmp_pat
             await staleRouteTypedClient.get_grid_infos(1, [0, 1]);
             throw new Error('stale-route IPC call unexpectedly succeeded');
           } catch (error) {
-            const message = String(error);
-            if (error?.name !== 'C2IpcRouteNotFoundError' || !message.includes('examples/grid')) {
+            if (!(error instanceof C2CrmMethodError)) {
               throw error;
+            }
+            const envelope = decodeC2ErrorEnvelope(error.payload);
+            assertEqual(envelope.code, 708, 'stale-route removed error code');
+            assertEqual(envelope.name, 'ResourceRemoved', 'stale-route removed error name');
+            if (!String(envelope.message).includes('examples/grid')) {
+              throw new Error(`stale-route removed error did not name route: ${JSON.stringify(envelope)}`);
             }
           }
           await staleRouteIpcTransport.close();

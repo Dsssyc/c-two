@@ -386,6 +386,8 @@ interface C2IpcMethodInfo {
 
 interface C2IpcRouteInfo {
   readonly name: string;
+  readonly routeUid: string;
+  readonly routeRevision: number;
   readonly crmNs: string;
   readonly crmName: string;
   readonly crmVer: string;
@@ -511,7 +513,7 @@ export function createIpcEncodedTransport<Payload extends C2ResponsePayload = C2
         nextRequestId = nextRequestId === Number.MAX_SAFE_INTEGER ? 1 : nextRequestId + 1;
         let requestShmBlock: C2IpcRequestShmBlock | undefined;
         try {
-          requestShmBlock = await writeIpcCallRequestFrames(open.connection, BigInt(requestId), open.handshake, routeName, methodInfo.index, requestPayload, requestShmWriter, requestShmThreshold, requestChunkSize);
+          requestShmBlock = await writeIpcCallRequestFrames(open.connection, BigInt(requestId), open.handshake, route, methodInfo.index, requestPayload, requestShmWriter, requestShmThreshold, requestChunkSize);
         } catch (error) {
           connectionPromise = undefined;
           if (error instanceof C2IpcTransportError) {
@@ -2368,29 +2370,49 @@ function requireIpcHandshakeText(value: string, field: string): void {
   }
 }
 
-function encodeIpcCallControl(routeName: string, methodIndex: number): Uint8Array {
-  const routeBytes = utf8Encode(routeName);
+function encodeIpcCallControl(route: C2IpcRouteInfo, methodIndex: number): Uint8Array {
+  const routeBytes = utf8Encode(route.name);
   if (routeBytes.byteLength === 0 || routeBytes.byteLength > C2_MAX_WIRE_TEXT_BYTES) {
     throw new C2IpcTransportError(`C-Two IPC route_name is too long: ${routeBytes.byteLength} bytes.`);
   }
+  const routeUidBytes = encodeIpcHandshakeText(route.routeUid, "route_uid");
+  if (routeUidBytes.byteLength === 1) {
+    throw new C2IpcTransportError("C-Two IPC route_uid must not be empty.");
+  }
+  const crmNsBytes = encodeIpcHandshakeText(route.crmNs, "crm_ns");
+  const crmNameBytes = encodeIpcHandshakeText(route.crmName, "crm_name");
+  const crmVerBytes = encodeIpcHandshakeText(route.crmVer, "crm_ver");
+  const abiHashBytes = encodeIpcHandshakeText(route.abiHash, "abi_hash");
+  const signatureHashBytes = encodeIpcHandshakeText(route.signatureHash, "signature_hash");
   if (!Number.isSafeInteger(methodIndex) || methodIndex < 0 || methodIndex > 0xffff) {
     throw new C2IpcTransportError(`C-Two IPC method index ${methodIndex} is invalid.`);
   }
-  return concatUint8Arrays([new Uint8Array([routeBytes.byteLength]), routeBytes, writeU16LE(methodIndex)]);
+  return concatUint8Arrays([
+    new Uint8Array([routeBytes.byteLength]),
+    routeBytes,
+    routeUidBytes,
+    writeU64LE(route.routeRevision, "route_revision"),
+    crmNsBytes,
+    crmNameBytes,
+    crmVerBytes,
+    abiHashBytes,
+    signatureHashBytes,
+    writeU16LE(methodIndex),
+  ]);
 }
 
 async function writeIpcCallRequestFrames(
   connection: C2IpcConnection,
   requestId: bigint,
   handshake: C2IpcHandshake,
-  routeName: string,
+  route: C2IpcRouteInfo,
   methodIndex: number,
   requestPayload: Uint8Array,
   requestShmWriter: C2IpcRequestShmWriter | undefined,
   requestShmThreshold: number,
   requestChunkSize: number,
 ): Promise<C2IpcRequestShmBlock | undefined> {
-  const callControl = encodeIpcCallControl(routeName, methodIndex);
+  const callControl = encodeIpcCallControl(route, methodIndex);
   if (requestShmWriter !== undefined && requestPayload.byteLength > requestShmThreshold && requestPayload.byteLength <= 0xffffffff) {
     return await writeIpcBuddyCallRequestFrame(connection, requestId, callControl, requestPayload, requestShmWriter);
   }
@@ -2741,6 +2763,8 @@ function decodeServerIpcHandshake(payload: Uint8Array): C2IpcHandshake {
   const routes: C2IpcRouteInfo[] = [];
   for (let routeIndex = 0; routeIndex < routeCount; routeIndex += 1) {
     const name = readText(`route ${routeIndex} name`);
+    const routeUid = readText(`route ${routeIndex} route_uid`);
+    const routeRevision = readU64(`route ${routeIndex} route_revision`);
     const crmNs = readText(`route ${routeIndex} crm_ns`);
     const crmName = readText(`route ${routeIndex} crm_name`);
     const crmVer = readText(`route ${routeIndex} crm_ver`);
@@ -2749,6 +2773,10 @@ function decodeServerIpcHandshake(payload: Uint8Array): C2IpcHandshake {
     const maxPayloadSize = readU64(`route ${routeIndex} max_payload_size`);
     const methodCount = readU16(`route ${routeIndex} method count`);
     requireRouteNamePathValue(name);
+    requireIpcHandshakeText(routeUid, `route ${routeIndex} route_uid`);
+    if (routeUid.length === 0) {
+      throw new C2IpcTransportError(`C-Two IPC route ${routeIndex} route_uid must not be empty.`);
+    }
     requireRouteContractTextField(crmNs, "namespace");
     requireRouteContractTextField(crmName, "name");
     requireRouteContractTextField(crmVer, "version");
@@ -2767,6 +2795,8 @@ function decodeServerIpcHandshake(payload: Uint8Array): C2IpcHandshake {
     }
     routes.push({
       name,
+      routeUid,
+      routeRevision,
       crmNs,
       crmName,
       crmVer,
@@ -3148,6 +3178,15 @@ function readU16LE(value: Uint8Array, offset: number): number {
 function writeU32LE(value: number): Uint8Array {
   const out = new Uint8Array(4);
   new DataView(out.buffer).setUint32(0, value, true);
+  return out;
+}
+
+function writeU64LE(value: number, field: string): Uint8Array {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new C2IpcTransportError(`C-Two IPC ${field} must be a non-negative safe integer.`);
+  }
+  const out = new Uint8Array(8);
+  new DataView(out.buffer).setBigUint64(0, BigInt(value), true);
   return out;
 }
 

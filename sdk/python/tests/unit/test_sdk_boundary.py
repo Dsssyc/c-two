@@ -141,19 +141,73 @@ def test_top_level_exposes_contract_projection_tools():
         contract_descriptor_diagnostics,
         export_contract_payload_abi_artifacts,
         export_contract_descriptor,
+        export_contract_release_ref,
     )
     from c_two.crm.infer import infer_crm_from_resource
 
     assert cc.contract_descriptor_diagnostics is contract_descriptor_diagnostics
     assert cc.export_contract_payload_abi_artifacts is export_contract_payload_abi_artifacts
     assert cc.export_contract_descriptor is export_contract_descriptor
+    assert cc.export_contract_release_ref is export_contract_release_ref
     assert cc.infer_crm_from_resource is infer_crm_from_resource
     assert {
         'contract_descriptor_diagnostics',
         'export_contract_payload_abi_artifacts',
         'export_contract_descriptor',
+        'export_contract_release_ref',
         'infer_crm_from_resource',
     } <= set(cc.__all__)
+
+
+def test_contract_release_identity_is_not_reimplemented_in_python():
+    source_path = (
+        Path(__file__).resolve().parents[2]
+        / 'src'
+        / 'c_two'
+        / 'crm'
+        / 'descriptor.py'
+    )
+    tree = ast.parse(source_path.read_text(encoding='utf-8'))
+    release_export = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == 'export_contract_release_ref'
+    )
+
+    native_imports = {
+        alias.name
+        for node in ast.walk(release_export)
+        if isinstance(node, ast.ImportFrom) and node.module == 'c_two._native'
+        for alias in node.names
+    }
+    calls = {
+        node.func.id
+        for node in ast.walk(release_export)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    all_imports = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    import_from_modules = {
+        node.module
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+    }
+    release_literals = {
+        node.value
+        for node in ast.walk(release_export)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+
+    assert 'contract_release_ref_json' in native_imports
+    assert 'contract_release_ref_json' in calls
+    assert 'hashlib' not in all_imports
+    assert 'hashlib' not in import_from_modules
+    assert 'descriptor_sha256' not in release_literals
 
 
 def test_payload_abi_internals_are_not_public_sdk_surface():
@@ -221,6 +275,60 @@ def test_error_facade_does_not_reimplement_wire_codec():
     assert "_native.error_registry" in source
     assert "_native.encode_error_wire" in source
     assert "_native.decode_error_wire_parts" in source
+
+
+def test_registry_does_not_own_generic_relay_or_route_authority():
+    source_path = (
+        Path(__file__).resolve().parents[2]
+        / "src"
+        / "c_two"
+        / "transport"
+        / "registry.py"
+    )
+    source = source_path.read_text(encoding="utf-8")
+
+    forbidden = [
+        "_relay_control_client",
+        "_relay_control_address",
+        "_relay_control_client_for",
+        "_http_pool",
+        "RustHttpClientPool",
+        "RustRelayAwareHttpClient",
+        "RelayControlClient",
+        "resolve_matching",
+        "resolve_routes",
+        "route_uid",
+        "route_revision",
+        "FallbackDenied(",
+    ]
+    offenders = [needle for needle in forbidden if needle in source]
+    assert offenders == []
+    assert "self._runtime_session.acquire_ipc_client" in source
+    assert "self._runtime_session.connect_via_relay" in source
+    assert "self._runtime_session.connect_explicit_relay_http" in source
+
+
+def test_explicit_ipc_connect_branch_bypasses_relay_facade():
+    source_path = (
+        Path(__file__).resolve().parents[2]
+        / "src"
+        / "c_two"
+        / "transport"
+        / "registry.py"
+    )
+    source = source_path.read_text(encoding="utf-8")
+    ipc_branch = source.split("elif address is not None:", 1)[1].split("else:", 1)[0]
+
+    assert "self._runtime_session.acquire_ipc_client" in ipc_branch
+    forbidden = [
+        "_sync_relay_override",
+        "connect_via_relay",
+        "connect_explicit_relay_http",
+        "ResourceUnavailable",
+        "RegistryUnavailable",
+    ]
+    offenders = [needle for needle in forbidden if needle in ipc_branch]
+    assert offenders == []
 
 
 def test_python_does_not_own_buffer_lease_accounting():

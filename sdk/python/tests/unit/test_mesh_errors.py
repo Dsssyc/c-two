@@ -3,7 +3,7 @@ from c_two.error import (
     ResourceNotFound,
     ResourceUnavailable,
     RegistryUnavailable,
-    StaleResource,
+    RouteStale,
     WriteConflict,
 )
 
@@ -25,8 +25,8 @@ class TestMeshErrors:
         err = RegistryUnavailable("no relay configured")
         assert err.ERROR_CODE == 705
 
-    def test_stale_resource_code(self):
-        err = StaleResource("grid stale")
+    def test_route_stale_code(self):
+        err = RouteStale("grid stale")
         assert err.ERROR_CODE == 704
 
     def test_write_conflict_code(self):

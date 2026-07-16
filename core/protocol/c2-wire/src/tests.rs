@@ -154,29 +154,83 @@ mod buddy_tests {
 mod control_tests {
     use crate::control::*;
 
+    const ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const SIG_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+    fn call_identity(route_name: &str) -> RouteCallIdentity {
+        RouteCallIdentity {
+            route_name: route_name.into(),
+            route_uid: format!("{route_name}-uid-0001"),
+            observed_route_revision: 1,
+            crm_ns: "test.grid".into(),
+            crm_name: "Grid".into(),
+            crm_ver: "0.1.0".into(),
+            abi_hash: ABI_HASH.into(),
+            signature_hash: SIG_HASH.into(),
+        }
+    }
+
     #[test]
     fn call_control_roundtrip() {
-        let encoded = encode_call_control("grid", 42).unwrap();
+        let identity = call_identity("grid");
+        let encoded = encode_call_control(&identity, 42).unwrap();
         let (decoded, consumed) = decode_call_control(&encoded, 0).unwrap();
         assert_eq!(consumed, encoded.len());
-        assert_eq!(decoded.route_name, "grid");
+        assert_eq!(decoded.identity, identity);
+        assert_eq!(decoded.method_idx, 42);
+    }
+
+    #[test]
+    fn call_control_roundtrip_preserves_route_identity_and_contract() {
+        let identity = RouteCallIdentity {
+            route_name: "grid".into(),
+            route_uid: "route-uid-0001".into(),
+            observed_route_revision: 17,
+            crm_ns: "test.grid".into(),
+            crm_name: "Grid".into(),
+            crm_ver: "0.1.0".into(),
+            abi_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                .into(),
+        };
+
+        let encoded = encode_call_control(&identity, 42).unwrap();
+        let (decoded, consumed) = decode_call_control(&encoded, 0).unwrap();
+
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(decoded.identity, identity);
         assert_eq!(decoded.method_idx, 42);
     }
 
     #[test]
     fn call_control_rejects_empty_route_name() {
-        assert!(encode_call_control("", 0).is_err());
+        let mut identity = call_identity("grid");
+        identity.route_name.clear();
+        assert!(encode_call_control(&identity, 0).is_err());
         assert!(decode_call_control(&[0, 0, 0], 0).is_err());
     }
 
     #[test]
     fn call_control_with_offset() {
         let mut buf = vec![0xAA, 0xBB]; // prefix
-        buf.extend_from_slice(&encode_call_control("net", 7).unwrap());
+        let identity = call_identity("net");
+        buf.extend_from_slice(&encode_call_control(&identity, 7).unwrap());
         let (decoded, consumed) = decode_call_control(&buf, 2).unwrap();
-        assert_eq!(decoded.route_name, "net");
+        assert_eq!(decoded.identity, identity);
         assert_eq!(decoded.method_idx, 7);
-        assert_eq!(consumed, 1 + 3 + 2); // name_len + "net" + idx
+        assert_eq!(consumed, buf.len() - 2);
+    }
+
+    #[test]
+    fn encode_call_control_into_rejects_short_buffer_without_panic() {
+        let identity = call_identity("grid");
+        let len = encoded_call_control_len(&identity).unwrap();
+        let mut buf = vec![0u8; len - 1];
+
+        let err = encode_call_control_into(&mut buf, 0, &identity, 0)
+            .expect_err("short call-control buffer must be reported");
+
+        assert!(err.to_string().contains("buffer is too short"), "{err}");
     }
 
     #[test]
@@ -190,7 +244,7 @@ mod control_tests {
 
     #[test]
     fn reply_control_error_roundtrip() {
-        let err = b"3:test error".to_vec();
+        let err = br#"C2E1{"version":1,"code":3,"name":"ResourceFunctionExecuting","message":"test error","details":{}}"#.to_vec();
         let encoded = try_encode_reply_control(&ReplyControl::Error(err.clone())).unwrap();
         let (decoded, consumed) = decode_reply_control(&encoded, 0).unwrap();
         assert_eq!(consumed, encoded.len());
@@ -242,19 +296,200 @@ mod control_tests {
 
     #[test]
     fn canonical_call_control_fixture_matches() {
-        // Canonical call-control fixture for route `grid`, method index 5
-        // = [4] + b"grid" + struct.pack('<H', 5)
-        // = [0x04, 0x67, 0x72, 0x69, 0x64, 0x05, 0x00]
-        let expected = vec![0x04, 0x67, 0x72, 0x69, 0x64, 0x05, 0x00];
-        let encoded = encode_call_control("grid", 5).unwrap();
+        let identity = call_identity("grid");
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"\x04grid");
+        expected.extend_from_slice(b"\x0dgrid-uid-0001");
+        expected.extend_from_slice(&1u64.to_le_bytes());
+        expected.extend_from_slice(b"\x09test.grid");
+        expected.extend_from_slice(b"\x04Grid");
+        expected.extend_from_slice(b"\x050.1.0");
+        expected.push(64);
+        expected.extend_from_slice(ABI_HASH.as_bytes());
+        expected.push(64);
+        expected.extend_from_slice(SIG_HASH.as_bytes());
+        expected.extend_from_slice(&5u16.to_le_bytes());
+
+        let encoded = encode_call_control(&identity, 5).unwrap();
         assert_eq!(encoded, expected);
     }
 
     #[test]
     fn call_control_rejects_route_name_longer_than_one_byte_length() {
         let long_name = "x".repeat(c2_contract::MAX_WIRE_TEXT_BYTES + 1);
-        let err = encode_call_control(&long_name, 0).unwrap_err();
+        let mut identity = call_identity("grid");
+        identity.route_name = long_name;
+        let err = encode_call_control(&identity, 0).unwrap_err();
         assert!(err.to_string().contains("route_name"));
+    }
+}
+
+mod route_catalog_control_tests {
+    use crate::route_catalog_control::*;
+    use c2_error::{C2Error, ErrorCode};
+
+    const ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const SIG_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+    fn contract(route_name: &str) -> RouteContractWire {
+        RouteContractWire {
+            route_name: route_name.into(),
+            crm_ns: "test.grid".into(),
+            crm_name: "Grid".into(),
+            crm_ver: "0.1.0".into(),
+            abi_hash: ABI_HASH.into(),
+            signature_hash: SIG_HASH.into(),
+        }
+    }
+
+    fn record(route_name: &str, revision: u64) -> RouteRecordWire {
+        RouteRecordWire {
+            route_name: route_name.into(),
+            route_uid: format!("{route_name}-uid-0001"),
+            route_revision: revision,
+            catalog_revision: revision,
+            owner_server_id: "server-grid".into(),
+            owner_server_instance_id: "instance-grid-0001".into(),
+            owner_epoch: 1,
+            contract: contract(route_name),
+            methods: vec![
+                RouteMethodWire {
+                    name: "step".into(),
+                    index: 0,
+                },
+                RouteMethodWire {
+                    name: "query".into(),
+                    index: 1,
+                },
+            ],
+            max_payload_size: 1024,
+            state: RouteStateWire::Ready,
+            state_reason: Some(RouteStateReasonWire::RegisterCommitted),
+            lease_deadline_ms: None,
+        }
+    }
+
+    #[test]
+    fn route_list_request_matches_canonical_fixture() {
+        let request = RouteListRequest {
+            selector: RouteSelector::All,
+            min_revision: None,
+        };
+        let encoded = encode_route_list_request(&request).unwrap();
+        let expected = b"\x0e{\"selector\":{\"type\":\"all\"},\"min_revision\":null}".to_vec();
+
+        assert_eq!(encoded, expected);
+        assert_eq!(decode_route_list_request(&expected).unwrap(), request);
+    }
+
+    #[test]
+    fn route_lookup_stale_response_round_trips_current_record() {
+        let current = record("grid", 3);
+        let response = RouteLookupResponse::Stale {
+            current: current.clone(),
+        };
+        let encoded = encode_route_lookup_response(&response).unwrap();
+        let decoded = decode_route_lookup_response(&encoded).unwrap();
+
+        assert_eq!(decoded, response);
+        match decoded {
+            RouteLookupResponse::Stale {
+                current: decoded_current,
+            } => {
+                assert_eq!(decoded_current.route_uid, "grid-uid-0001");
+                assert_eq!(decoded_current.route_revision, 3);
+                assert_eq!(decoded_current.contract.abi_hash, ABI_HASH);
+            }
+            other => panic!("expected stale response, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn route_watch_compacted_event_is_history_boundary_not_removal() {
+        let event = RouteWatchEvent::Compacted {
+            compacted_revision: 7,
+            current_revision: 11,
+        };
+        let encoded = encode_route_watch_event(&event).unwrap();
+        let expected =
+            b"\x13{\"event\":\"compacted\",\"compacted_revision\":7,\"current_revision\":11}"
+                .to_vec();
+
+        assert_eq!(encoded, expected);
+        assert_eq!(decode_route_watch_event(&expected).unwrap(), event);
+    }
+
+    #[test]
+    fn route_nack_carries_registered_c2_error_envelope() {
+        let error =
+            C2Error::new(ErrorCode::RouteCatalogCompacted, "watch history compacted").envelope();
+        let nack = RouteNack {
+            nonce: 55,
+            rejected_revision: 9,
+            error,
+        };
+        let encoded = encode_route_nack(&nack).unwrap();
+        let decoded = decode_route_nack(&encoded).unwrap();
+
+        assert_eq!(decoded, nack);
+        assert_eq!(decoded.error.name, "RouteCatalogCompacted");
+        assert_eq!(decoded.error.code, 711);
+    }
+
+    #[test]
+    fn route_lookup_request_requires_complete_observed_token() {
+        let request = RouteLookupRequest {
+            expected: contract("grid"),
+            observed_route_uid: Some("grid-uid-0001".into()),
+            observed_route_revision: None,
+        };
+
+        let err = encode_route_lookup_request(&request)
+            .expect_err("observed route token must include uid and revision together");
+
+        assert!(err.contains("observed route token"), "{err}");
+    }
+
+    #[test]
+    fn route_list_response_rejects_duplicate_routes() {
+        let response = RouteListResponse {
+            catalog_revision: 2,
+            min_watch_revision: 1,
+            routes: vec![record("grid", 1), record("grid", 2)],
+        };
+
+        let err = encode_route_list_response(&response)
+            .expect_err("duplicate route names must be rejected");
+
+        assert!(err.contains("duplicate route_name"), "{err}");
+    }
+
+    #[test]
+    fn route_record_rejects_contract_route_name_mismatch() {
+        let mut current = record("grid", 1);
+        current.contract.route_name = "other-grid".into();
+        let response = RouteLookupResponse::Ready { current };
+
+        let err = encode_route_lookup_response(&response)
+            .expect_err("record contract route_name must match route_name");
+
+        assert!(err.contains("contract route_name"), "{err}");
+    }
+
+    #[test]
+    fn route_nack_rejects_error_code_name_mismatch() {
+        let mut error =
+            C2Error::new(ErrorCode::RouteCatalogCompacted, "watch history compacted").envelope();
+        error.name = "ResourceUnavailable".into();
+        let nack = RouteNack {
+            nonce: 55,
+            rejected_revision: 9,
+            error,
+        };
+
+        let err = encode_route_nack(&nack).expect_err("error envelope code/name mismatch fails");
+
+        assert!(err.contains("name mismatch"), "{err}");
     }
 }
 
@@ -274,6 +509,8 @@ mod handshake_tests {
     fn route(name: &str, methods: &[&str]) -> RouteInfo {
         RouteInfo {
             name: name.into(),
+            route_uid: format!("{name}-route-uid-0001"),
+            route_revision: 1,
             crm_ns: "test.grid".into(),
             crm_name: "Grid".into(),
             crm_ver: "0.1.0".into(),
@@ -294,6 +531,8 @@ mod handshake_tests {
     fn route_hash(name: &str) -> RouteInfo {
         RouteInfo {
             name: name.into(),
+            route_uid: format!("{name}-route-uid-0001"),
+            route_revision: 1,
             crm_ns: "test.grid".into(),
             crm_name: "Grid".into(),
             crm_ver: "0.1.0".into(),
@@ -406,6 +645,8 @@ mod handshake_tests {
     fn server_handshake_decode_rejects_invalid_crm_tag_fields() {
         let route = RouteInfo {
             name: "grid".into(),
+            route_uid: "grid-route-uid-0001".into(),
+            route_revision: 1,
             crm_ns: "test.grid".into(),
             crm_name: "Grid".into(),
             crm_ver: "0.1.0".into(),
@@ -454,6 +695,8 @@ mod handshake_tests {
     fn server_handshake_roundtrip_includes_server_identity() {
         let routes = vec![RouteInfo {
             name: "grid".to_string(),
+            route_uid: "grid-route-uid-0001".to_string(),
+            route_revision: 1,
             crm_ns: "test.grid".to_string(),
             crm_name: "Grid".to_string(),
             crm_ver: "1.2.3".to_string(),
@@ -519,6 +762,8 @@ mod handshake_tests {
         let routes = vec![
             RouteInfo {
                 name: "grid".into(),
+                route_uid: "grid-route-uid-0001".into(),
+                route_revision: 1,
                 crm_ns: "test.grid".into(),
                 crm_name: "Grid".into(),
                 crm_ver: "0.1.0".into(),
@@ -542,6 +787,8 @@ mod handshake_tests {
             },
             RouteInfo {
                 name: "counter".into(),
+                route_uid: "counter-route-uid-0001".into(),
+                route_revision: 1,
                 crm_ns: "test.counter".into(),
                 crm_name: "Counter".into(),
                 crm_ver: "0.1.0".into(),
@@ -587,6 +834,8 @@ mod handshake_tests {
     fn server_handshake_rejects_overlong_route_name() {
         let routes = vec![RouteInfo {
             name: "x".repeat(c2_contract::MAX_WIRE_TEXT_BYTES + 1),
+            route_uid: "overlong-route-uid-0001".into(),
+            route_revision: 1,
             crm_ns: "test.overlong".into(),
             crm_name: "Overlong".into(),
             crm_ver: "0.1.0".into(),
@@ -605,6 +854,8 @@ mod handshake_tests {
     fn server_handshake_rejects_overlong_crm_metadata() {
         let routes = vec![RouteInfo {
             name: "grid".into(),
+            route_uid: "grid-route-uid-0001".into(),
+            route_revision: 1,
             crm_ns: "x".repeat(c2_contract::MAX_WIRE_TEXT_BYTES + 1),
             crm_name: "Grid".into(),
             crm_ver: "0.1.0".into(),
@@ -620,6 +871,8 @@ mod handshake_tests {
 
         let routes = vec![RouteInfo {
             name: "grid".into(),
+            route_uid: "grid-route-uid-0001".into(),
+            route_revision: 1,
             crm_ns: "test.grid".into(),
             crm_name: "x".repeat(c2_contract::MAX_WIRE_TEXT_BYTES + 1),
             crm_ver: "0.1.0".into(),
@@ -635,6 +888,8 @@ mod handshake_tests {
 
         let routes = vec![RouteInfo {
             name: "grid".into(),
+            route_uid: "grid-route-uid-0001".into(),
+            route_revision: 1,
             crm_ns: "test.grid".into(),
             crm_name: "Grid".into(),
             crm_ver: "x".repeat(c2_contract::MAX_WIRE_TEXT_BYTES + 1),
@@ -653,6 +908,8 @@ mod handshake_tests {
     fn server_handshake_rejects_too_many_methods() {
         let routes = vec![RouteInfo {
             name: "grid".into(),
+            route_uid: "grid-route-uid-0001".into(),
+            route_revision: 1,
             crm_ns: "test.grid".into(),
             crm_name: "Grid".into(),
             crm_ver: "0.1.0".into(),
@@ -711,6 +968,19 @@ mod cross_lang_tests {
             .collect()
     }
 
+    fn call_identity(route_name: &str) -> RouteCallIdentity {
+        RouteCallIdentity {
+            route_name: route_name.into(),
+            route_uid: format!("{route_name}-route-uid-0001"),
+            observed_route_revision: 1,
+            crm_ns: "test.grid".into(),
+            crm_name: "Grid".into(),
+            crm_ver: "0.1.0".into(),
+            abi_hash: ABI_HASH.into(),
+            signature_hash: SIG_HASH.into(),
+        }
+    }
+
     #[test]
     fn canonical_frame_fixture_decodes() {
         let bytes = hex_to_bytes("180000003930000000000000c2010000746573745f7061796c6f6164");
@@ -722,19 +992,20 @@ mod cross_lang_tests {
 
     #[test]
     fn canonical_call_control_fixture_decodes() {
-        let bytes = hex_to_bytes("0568656c6c6f0700");
+        let identity = call_identity("hello");
+        let bytes = encode_call_control(&identity, 7).unwrap();
         let (ctrl, consumed) = decode_call_control(&bytes, 0).unwrap();
-        assert_eq!(ctrl.route_name, "hello");
+        assert_eq!(ctrl.identity, identity);
         assert_eq!(ctrl.method_idx, 7);
         assert_eq!(consumed, bytes.len());
     }
 
     #[test]
-    fn canonical_empty_call_control_fixture_rejects_default_route() {
+    fn legacy_short_call_control_fixture_is_rejected() {
         let bytes = hex_to_bytes("000000");
         let err = decode_call_control(&bytes, 0)
-            .expect_err("empty call-control route names are not a compatibility fixture");
-        assert!(err.to_string().contains("route_name"), "{err}");
+            .expect_err("legacy name-only call control is not a compatibility fixture");
+        assert!(err.to_string().contains("too short"), "{err}");
     }
 
     #[test]
@@ -747,11 +1018,16 @@ mod cross_lang_tests {
 
     #[test]
     fn canonical_reply_error_fixture_decodes() {
-        let bytes = hex_to_bytes("010c000000333a74657374206572726f72");
+        let bytes = hex_to_bytes(
+            "0161000000433245317b2276657273696f6e223a312c22636f6465223a332c226e616d65223a225265736f7572636546756e6374696f6e457865637574696e67222c226d657373616765223a2274657374206572726f72222c2264657461696c73223a7b7d7d",
+        );
         let (ctrl, consumed) = decode_reply_control(&bytes, 0).unwrap();
         match ctrl {
             ReplyControl::Error(data) => {
-                assert_eq!(data, b"3:test error");
+                assert_eq!(
+                    data,
+                    br#"C2E1{"version":1,"code":3,"name":"ResourceFunctionExecuting","message":"test error","details":{}}"#
+                );
             }
             _ => panic!("expected error"),
         }
@@ -788,7 +1064,7 @@ mod cross_lang_tests {
         // v10: client handshake prefix, server identity, then route table
         // with per-route full CRM tag and contract hashes.
         let bytes = hex_to_bytes(
-            "0a00010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696409746573742e67726964044772696405302e312e3040303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566303132333435363738396162636465664061626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839000400000000000002000568656c6c6f0000036164640100",
+            "0a00010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696413677269642d726f7574652d7569642d30303031010000000000000009746573742e67726964044772696405302e312e3040303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566303132333435363738396162636465664061626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839000400000000000002000568656c6c6f0000036164640100",
         );
         let hs = decode_handshake(&bytes).unwrap();
         assert_eq!(hs.prefix, "");
@@ -805,6 +1081,8 @@ mod cross_lang_tests {
         );
         assert_eq!(hs.routes.len(), 1);
         assert_eq!(hs.routes[0].name, "grid");
+        assert_eq!(hs.routes[0].route_uid, "grid-route-uid-0001");
+        assert_eq!(hs.routes[0].route_revision, 1);
         assert_eq!(hs.routes[0].crm_ns, "test.grid");
         assert_eq!(hs.routes[0].crm_name, "Grid");
         assert_eq!(hs.routes[0].crm_ver, "0.1.0");
@@ -819,8 +1097,20 @@ mod cross_lang_tests {
 
     #[test]
     fn rust_encode_matches_canonical_call_control_fixture() {
-        let encoded = encode_call_control("hello", 7).unwrap();
-        let expected = hex_to_bytes("0568656c6c6f0700");
+        let identity = call_identity("hello");
+        let encoded = encode_call_control(&identity, 7).unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"\x05hello");
+        expected.extend_from_slice(b"\x14hello-route-uid-0001");
+        expected.extend_from_slice(&1u64.to_le_bytes());
+        expected.extend_from_slice(b"\x09test.grid");
+        expected.extend_from_slice(b"\x04Grid");
+        expected.extend_from_slice(b"\x050.1.0");
+        expected.push(64);
+        expected.extend_from_slice(ABI_HASH.as_bytes());
+        expected.push(64);
+        expected.extend_from_slice(SIG_HASH.as_bytes());
+        expected.extend_from_slice(&7u16.to_le_bytes());
         assert_eq!(encoded, expected);
     }
 
@@ -832,9 +1122,11 @@ mod cross_lang_tests {
 
     #[test]
     fn rust_encode_matches_canonical_reply_error_fixture() {
-        let err = b"3:test error".to_vec();
+        let err = br#"C2E1{"version":1,"code":3,"name":"ResourceFunctionExecuting","message":"test error","details":{}}"#.to_vec();
         let encoded = try_encode_reply_control(&ReplyControl::Error(err)).unwrap();
-        let expected = hex_to_bytes("010c000000333a74657374206572726f72");
+        let expected = hex_to_bytes(
+            "0161000000433245317b2276657273696f6e223a312c22636f6465223a332c226e616d65223a225265736f7572636546756e6374696f6e457865637574696e67222c226d657373616765223a2274657374206572726f72222c2264657461696c73223a7b7d7d",
+        );
         assert_eq!(encoded, expected);
     }
 
@@ -865,6 +1157,8 @@ mod cross_lang_tests {
         let segments = vec![("srv0".into(), 134_217_728u32)];
         let routes = vec![RouteInfo {
             name: "grid".into(),
+            route_uid: "grid-route-uid-0001".into(),
+            route_revision: 1,
             crm_ns: "test.grid".into(),
             crm_name: "Grid".into(),
             crm_ver: "0.1.0".into(),
@@ -897,7 +1191,7 @@ mod cross_lang_tests {
         // v10: [0a][00 prefix_len] then segments/caps, identity, and route table
         // with per-route full CRM tag and contract hash metadata.
         let expected = hex_to_bytes(
-            "0a00010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696409746573742e67726964044772696405302e312e3040303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566303132333435363738396162636465664061626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839000400000000000002000568656c6c6f0000036164640100",
+            "0a00010000000008047372763003000b7365727665722d6772696409696e73742d677269640100046772696413677269642d726f7574652d7569642d30303031010000000000000009746573742e67726964044772696405302e312e3040303132333435363738396162636465663031323334353637383961626364656630313233343536373839616263646566303132333435363738396162636465664061626364656630313233343536373839616263646566303132333435363738396162636465663031323334353637383961626364656630313233343536373839000400000000000002000568656c6c6f0000036164640100",
         );
         assert_eq!(encoded, expected);
     }

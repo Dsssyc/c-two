@@ -9,7 +9,6 @@ default = []
 relay = [
     "dep:axum",
     "dep:tower-http",
-    "dep:c2-error",
     "dep:c2-wire",
     "dep:c2-ipc",
     "dep:tracing",
@@ -30,12 +29,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
 c2-contract = { path = "../../foundation/c2-contract" }
 c2-config = { path = "../../foundation/c2-config" }
+c2-error = { path = "../../foundation/c2-error" }
 futures = { version = "0.3" }
 
 # Relay-only dependencies (behind feature gate)
 axum = { version = "0.8", optional = true }
 tower-http = { version = "0.7", features = ["cors"], optional = true }
-c2-error = { path = "../../foundation/c2-error", optional = true }
 c2-wire = { path = "../../protocol/c2-wire", optional = true }
 c2-ipc = { path = "../c2-ipc", optional = true }
 tracing = { version = "0.1", optional = true }

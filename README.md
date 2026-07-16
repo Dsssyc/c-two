@@ -261,6 +261,23 @@ Multiple relays can form a **mesh cluster** via gossip — any relay can resolve
 
 > **When do I need a relay?** Use a relay for cross-machine or name-and-contract-based discovery. Same-process and same-host IPC usage can connect directly.
 
+### Contract Releases — Persistent Identity
+
+A runtime route identifies one active resource instance; it is not a durable CRM contract release. C-Two derives a route-independent `ContractReleaseRef` from the canonical validated `c-two.contract.v1` descriptor so catalogs and lockfiles can retain exact contract identity before a route exists and after it disappears.
+
+```python
+descriptor = cc.export_contract_descriptor(Geometry)
+release_ref = cc.export_contract_release_ref(Geometry)
+```
+
+The language-neutral Rust CLI produces the same reference directly from descriptor JSON without starting Python:
+
+```bash
+c3 contract release-ref contract.json
+```
+
+The reference contains the descriptor schema, CRM namespace/name/version, and canonical descriptor SHA-256; it deliberately contains no route. The digest proves content identity and integrity, not publisher identity, authorization, revocation status, or trust. C-Two does not provide a contract registry, storage location, or resolver: a consumer must resolve descriptor bytes through its own catalog or deployment layer, reconstruct and verify the `ContractRelease`, and only then add a runtime route name. See the [deferred-capabilities issue](docs/issues/contract-release-deferred-capabilities.md) for the explicit compatibility, trust, Rust SDK, and FastDB Rust-runtime boundaries.
+
 ### Payload Model — FastDB First
 
 C-Two CRM payload planning has three internal outcomes: `FDB`, `PYTHON_PICKLE`, and `NO_PAYLOAD`. Portable, cross-language contracts use FastDB call-db payload ABI refs derived from `fastdb4py` annotations. Plain Python annotations run through Python pickle fallback for Python-only prototyping; strict portable export rejects those methods.
@@ -528,6 +545,7 @@ uv run pytest sdk/python/tests/unit/test_python_examples_syntax.py::test_python_
 | Disk spill for extreme payloads | ✅ Stable |
 | FastDB held response views through `cc.hold()` | ✅ Stable |
 | SHM residence monitoring (`cc.hold_stats()`) | ✅ Stable |
+| Route-independent contract release identity | ✅ Stable |
 | Contract version compatibility negotiation | 🔜 Planned |
 | `auth_hook` + call metadata | 🔜 Planned |
 | Dry-run hooks | 🔜 Planned |

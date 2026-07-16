@@ -266,8 +266,26 @@ class TestCcConnectHttp:
     def test_connect_http_rejects_crm_contract_mismatch_before_call(self, relay_stack):
         relay_url, _ = relay_stack
 
-        with pytest.raises(ResourceNotFound, match="Resource 'hello' not found"):
+        with pytest.raises(ResourceNotFound, match="route not found: hello"):
             cc.connect(Counter, name='hello', address=relay_url)
+
+    def test_connect_http_call_route_not_found_raises_cc_error(self, relay_stack):
+        relay_url, _ = relay_stack
+        server_id = cc.server_id()
+
+        crm = cc.connect(Hello, name='hello', address=relay_url)
+        try:
+            with httpx.Client(trust_env=False, timeout=5.0) as http:
+                resp = http.post(
+                    f'{relay_url}/_unregister',
+                    json={'name': 'hello', 'server_id': server_id},
+                )
+                assert resp.status_code == 200, resp.text
+
+            with pytest.raises(ResourceNotFound, match='route not found: hello'):
+                crm.greeting('stale')
+        finally:
+            cc.close(crm)
 
     def test_relay_call_rejects_invalid_expected_crm_header(self, start_c3_relay):
         relay = start_c3_relay()
@@ -465,7 +483,7 @@ class TestCcConnectHttp:
         registry = _ProcessRegistry()
         try:
             registry.set_relay_anchor(relay.url)
-            with pytest.raises(ResourceNotFound, match="Resource 'missing-route' not found"):
+            with pytest.raises(ResourceNotFound, match="route not found: missing-route"):
                 registry.connect(Hello, name='missing-route')
         finally:
             registry.shutdown()
@@ -705,5 +723,7 @@ class TestRelayControlPlane:
             )
             assert resp.status_code == 404
             data = resp.json()
-            assert data['error'] == 'ResourceNotFound'
-            assert data['route'] == 'nonexistent'
+            assert data['version'] == 1
+            assert data['code'] == 701
+            assert data['name'] == 'ResourceNotFound'
+            assert data['details']['route'] == 'nonexistent'

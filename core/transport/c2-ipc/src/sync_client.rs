@@ -9,8 +9,8 @@ use std::sync::{Arc, OnceLock};
 use c2_mem::{MemPool, PoolAllocation};
 
 use crate::client::{
-    ClientIpcConfig, IpcClient, IpcError, MethodTable, RequestTransportKind, ServerPoolState,
-    choose_request_transport,
+    ClientIpcConfig, IpcClient, IpcError, MethodTable, RequestTransportKind, RouteBinding,
+    ServerPoolState, choose_request_transport,
 };
 use crate::response::ResponseData;
 
@@ -73,15 +73,15 @@ impl SyncClient {
         })
     }
 
-    /// Synchronous CRM call — blocks until reply.
-    pub fn call(
+    /// Synchronous CRM call through an immutable route binding.
+    pub fn call_bound(
         &self,
-        route_name: &str,
+        binding: &RouteBinding,
         method_name: &str,
         data: &[u8],
     ) -> Result<ResponseData, IpcError> {
         self.rt
-            .block_on(self.inner.call(route_name, method_name, data))
+            .block_on(self.inner.call_bound(binding, method_name, data))
     }
 
     /// Whether the client has a SHM pool and data exceeds the threshold.
@@ -93,7 +93,7 @@ impl SyncClient {
     /// Allocate from the client SHM pool and write data in a single lock scope.
     ///
     /// Returns the allocation coordinates. On error, the caller should fall
-    /// back to the canonical `call()` path.
+    /// back to the canonical route-bound call path.
     pub fn pool_alloc_and_write(&self, data: &[u8]) -> Result<PoolAllocation, IpcError> {
         let pool_arc = self
             .inner
@@ -163,33 +163,26 @@ impl SyncClient {
         }
     }
 
-    /// Synchronous CRM call with pre-allocated SHM data — blocks until reply.
-    pub fn call_prealloc(
+    /// Synchronous CRM call with pre-allocated SHM data through an immutable route binding.
+    pub fn call_bound_prealloc(
         &self,
-        route_name: &str,
+        binding: &RouteBinding,
         method_name: &str,
         alloc: &PoolAllocation,
         data_size: usize,
     ) -> Result<ResponseData, IpcError> {
-        let method_idx = match (|| {
-            let table = self
-                .inner
-                .route_tables
-                .get(route_name)
-                .ok_or_else(|| IpcError::Handshake(format!("unknown route: {route_name}")))?;
-            let method_idx = table
-                .index_of(method_name)
-                .ok_or_else(|| IpcError::Handshake(format!("unknown method: {method_name}")))?;
-            let max_payload_size = table.max_payload_size();
+        let (method_idx, identity) = match (|| {
+            let (method_idx, identity, max_payload_size) = binding.call_target_for(method_name)?;
             let data_size_u64 = u64::try_from(data_size).unwrap_or(u64::MAX);
             if data_size_u64 > max_payload_size {
                 return Err(IpcError::Config(format!(
-                    "request payload size {data_size_u64} exceeds route '{route_name}' max_payload_size {max_payload_size}"
+                    "request payload size {data_size_u64} exceeds route '{}' max_payload_size {max_payload_size}",
+                    binding.route_name()
                 )));
             }
-            Ok(method_idx)
+            Ok((method_idx, identity))
         })() {
-            Ok(method_idx) => method_idx,
+            Ok(target) => target,
             Err(err) => {
                 self.inner.free_prealloc(alloc);
                 return Err(err);
@@ -197,7 +190,7 @@ impl SyncClient {
         };
         self.rt.block_on(
             self.inner
-                .call_with_prealloc(route_name, method_idx, alloc, data_size),
+                .call_with_prealloc(&identity, method_idx, alloc, data_size),
         )
     }
 
@@ -222,12 +215,12 @@ impl SyncClient {
     }
 
     /// Get the route table for a named route.
-    pub fn route_table(&self, name: &str) -> Option<&MethodTable> {
+    pub fn route_table(&self, name: &str) -> Option<MethodTable> {
         self.inner.route_table(name)
     }
 
     /// Get all route names.
-    pub fn route_names(&self) -> Vec<&str> {
+    pub fn route_names(&self) -> Vec<String> {
         self.inner.route_names()
     }
 
@@ -237,6 +230,35 @@ impl SyncClient {
         expected: &c2_contract::ExpectedRouteContract,
     ) -> Result<(), IpcError> {
         self.inner.validate_route_contract(expected)
+    }
+
+    /// Ensure the connected server currently exports a route matching an expected CRM contract.
+    pub fn ensure_route_contract(
+        &self,
+        expected: &c2_contract::ExpectedRouteContract,
+    ) -> Result<(), IpcError> {
+        self.rt.block_on(self.inner.ensure_route_contract(expected))
+    }
+
+    /// Authoritatively acquire and bind a route against an expected CRM contract.
+    pub fn acquire_route(
+        &self,
+        expected: &c2_contract::ExpectedRouteContract,
+    ) -> Result<RouteBinding, IpcError> {
+        self.rt.block_on(self.inner.acquire_route(expected))
+    }
+
+    /// Authoritatively acquire one exact route token.
+    pub fn acquire_route_token(
+        &self,
+        expected: &c2_contract::ExpectedRouteContract,
+        route_uid: &str,
+        route_revision: u64,
+    ) -> Result<RouteBinding, IpcError> {
+        self.rt.block_on(
+            self.inner
+                .acquire_route_token(expected, route_uid, route_revision),
+        )
     }
 
     /// CRM tag advertised by a route, if present.
@@ -267,7 +289,7 @@ impl SyncClient {
     /// Create an unconnected `SyncClient` for pool bookkeeping tests.
     ///
     /// The resulting client is **not** connected to any server —
-    /// `is_connected()` returns `false` and `call()` will fail.
+    /// `is_connected()` returns `false` and route-bound calls will fail.
     pub(crate) fn new_unconnected(address: &str) -> Self {
         let rt = get_or_create_runtime();
         let inner = IpcClient::new(address);
@@ -366,19 +388,22 @@ pub(crate) mod tests {
             ..ClientIpcConfig::default()
         };
         let pool = Arc::new(Mutex::new(MemPool::new(c2_mem::PoolConfig::default())));
-        let mut inner = IpcClient::with_pool("ipc://sync_payload_limit", pool.clone(), config);
-        inner.route_tables.insert(
+        let inner = IpcClient::with_pool("ipc://sync_payload_limit", pool.clone(), config);
+        inner.route_directory.write().insert_table(
             "grid".to_string(),
             MethodTable::from_entries(
                 &[c2_wire::handshake::MethodEntry {
                     name: "ping".to_string(),
                     index: 0,
                 }],
+                "grid".to_string(),
+                "grid-route-uid-0001".to_string(),
+                1,
                 "cc.test".to_string(),
                 "Grid".to_string(),
                 "0.1.0".to_string(),
-                "abi".to_string(),
-                "sig".to_string(),
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+                "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string(),
                 4,
             ),
         );
@@ -389,9 +414,40 @@ pub(crate) mod tests {
 
         let alloc = client.pool_alloc_and_write(&[1, 2, 3, 4, 5]).unwrap();
         assert_eq!(pool.lock().stats().alloc_count, 1);
-        let err = client.call_prealloc("grid", "ping", &alloc, 5).unwrap_err();
+        let expected = c2_contract::ExpectedRouteContract {
+            route_name: "grid".to_string(),
+            crm_ns: "cc.test".to_string(),
+            crm_name: "Grid".to_string(),
+            crm_ver: "0.1.0".to_string(),
+            abi_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_string(),
+            signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                .to_string(),
+        };
+        let binding = client
+            .inner
+            .bind_cached_route(&expected)
+            .expect("cached test route should bind");
+        let err = client
+            .call_bound_prealloc(&binding, "ping", &alloc, 5)
+            .unwrap_err();
 
         assert!(err.to_string().contains("max_payload_size"));
         assert_eq!(pool.lock().stats().alloc_count, 0);
+    }
+
+    #[test]
+    fn production_sync_client_api_is_route_acquire_and_bound_call_only() {
+        let source = include_str!("sync_client.rs");
+        let production = source
+            .split("// ── Test-only helpers")
+            .next()
+            .expect("sync_client.rs must contain a production section");
+        assert!(production.contains("pub fn acquire_route("));
+        assert!(production.contains("pub fn acquire_route_token("));
+        assert!(!production.contains(concat!("pub fn ", "call(\n")));
+        assert!(!production.contains(concat!("pub fn ", "call_prealloc(")));
+        assert!(production.contains("pub fn call_bound("));
+        assert!(production.contains("pub fn call_bound_prealloc("));
     }
 }

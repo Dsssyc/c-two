@@ -329,13 +329,32 @@ def export_contract_descriptor(
     pretty: bool = False,
 ) -> str:
     descriptor = build_portable_contract_descriptor(crm_class, methods)
-    compact = json.dumps(descriptor, sort_keys=True, separators=(',', ':'))
-    from c_two._native import validate_portable_contract_descriptor
+    compact = _canonical_portable_descriptor(descriptor)
+    return _pretty_json(compact) if pretty else compact
 
-    validate_portable_contract_descriptor(compact.encode())
-    if pretty:
-        return json.dumps(descriptor, sort_keys=True, indent=2) + '\n'
-    return compact
+
+def export_contract_release_ref(
+    crm_class: type,
+    methods: list[str] | None = None,
+    *,
+    pretty: bool = False,
+) -> str:
+    from c_two._native import contract_release_ref_json
+
+    descriptor = export_contract_descriptor(crm_class, methods)
+    compact = contract_release_ref_json(descriptor.encode())
+    return _pretty_json(compact) if pretty else compact
+
+
+def _canonical_portable_descriptor(descriptor: dict[str, Any]) -> str:
+    from c_two._native import canonicalize_portable_contract_descriptor
+
+    candidate = json.dumps(descriptor, sort_keys=True, separators=(',', ':')).encode()
+    return canonicalize_portable_contract_descriptor(candidate)
+
+
+def _pretty_json(compact: str) -> str:
+    return json.dumps(json.loads(compact), sort_keys=True, indent=2) + '\n'
 
 
 def _hash_descriptor(descriptor: dict[str, Any]) -> str:

@@ -68,6 +68,10 @@ dependencies = [
 [[package]]
 name = "c2-error"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "c2-http"
@@ -76,6 +80,7 @@ dependencies = [
  "bytes",
  "c2-config",
  "c2-contract",
+ "c2-error",
  "futures",
  "parking_lot",
  "percent-encoding",
@@ -93,6 +98,7 @@ version = "0.1.0"
 dependencies = [
  "c2-config",
  "c2-contract",
+ "c2-error",
  "c2-mem",
  "c2-wire",
  "futures-util",
@@ -164,6 +170,7 @@ version = "0.1.0"
 dependencies = [
  "c2-config",
  "c2-contract",
+ "c2-error",
  "c2-mem",
  "parking_lot",
  "serde",

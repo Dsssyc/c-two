@@ -173,6 +173,14 @@ impl BuiltRoute {
         self.route.name()
     }
 
+    pub fn route_uid(&self) -> &str {
+        self.route.route_uid()
+    }
+
+    pub fn route_revision(&self) -> u64 {
+        self.route.route_revision()
+    }
+
     pub fn crm_ns(&self) -> &str {
         self.route.crm_ns()
     }
@@ -210,6 +218,10 @@ impl BuiltRoute {
 pub(crate) struct CrmRoute {
     /// Route name (e.g., "grid", "solver")
     pub(crate) name: String,
+    /// Unique identity for this committed route registration.
+    pub(crate) route_uid: String,
+    /// Monotonic revision for this route identity. Starts at 1 on creation.
+    pub(crate) route_revision: u64,
     /// CRM namespace from the language-neutral contract descriptor.
     pub(crate) crm_ns: String,
     /// CRM contract class/model name from the language-neutral contract descriptor.
@@ -236,6 +248,8 @@ impl CrmRoute {
     ) -> Self {
         Self {
             name: spec.name,
+            route_uid: uuid::Uuid::new_v4().simple().to_string(),
+            route_revision: 1,
             crm_ns: spec.crm_ns,
             crm_name: spec.crm_name,
             crm_ver: spec.crm_ver,
@@ -258,6 +272,14 @@ impl CrmRoute {
 
     pub(crate) fn name(&self) -> &str {
         &self.name
+    }
+
+    pub(crate) fn route_uid(&self) -> &str {
+        &self.route_uid
+    }
+
+    pub(crate) fn route_revision(&self) -> u64 {
+        self.route_revision
     }
 
     pub(crate) fn crm_ns(&self) -> &str {
@@ -368,6 +390,8 @@ mod tests {
     fn make_route(name: &str) -> CrmRoute {
         CrmRoute {
             name: name.to_string(),
+            route_uid: format!("{name}-uid-0001"),
+            route_revision: 1,
             crm_ns: "test.grid".to_string(),
             crm_name: "Grid".to_string(),
             crm_ver: "0.1.0".to_string(),

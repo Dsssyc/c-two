@@ -166,6 +166,10 @@ jobs:
         if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
         run: uv sync
 
+      - name: Test native extension crate
+        if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
+        run: cargo test --manifest-path sdk/python/native/Cargo.toml
+
       - name: Run tests
         if: (github.event_name == 'merge_group' || needs.changes.outputs.sdk == 'true' || needs.changes.outputs.core == 'true' || needs.changes.outputs.ci == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.user.login != 'dependabot[bot]' || matrix.python == '3.12')
         run: uv run pytest sdk/python/tests -q --timeout=30

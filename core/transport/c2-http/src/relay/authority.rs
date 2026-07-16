@@ -13,7 +13,7 @@ use crate::relay::conn_pool::{
 };
 use crate::relay::route_table::{valid_route_name, validate_server_instance_id_value};
 use crate::relay::state::RelayState;
-use crate::relay::types::{Locality, RouteEntry};
+use crate::relay::types::{Locality, RouteEntry, UpstreamEndpointKey};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ControlError {
@@ -22,6 +22,7 @@ pub(crate) enum ControlError {
     InvalidServerInstanceId { reason: String },
     InvalidAddress { reason: String },
     ContractMismatch { reason: String },
+    UpstreamUnavailable { reason: String },
     AddressMismatch { existing_address: String },
     DuplicateRoute { existing_address: String },
     OwnerMismatch,
@@ -30,6 +31,8 @@ pub(crate) enum ControlError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AttestedRouteContract {
+    pub route_uid: String,
+    pub route_revision: u64,
     pub crm_ns: String,
     pub crm_name: String,
     pub crm_ver: String,
@@ -74,7 +77,24 @@ fn existing_contract_mismatch_reason(
     None
 }
 
-pub(crate) fn read_ipc_route_contract(
+fn control_error_from_ipc_attestation_error(
+    route_name: &str,
+    err: c2_ipc::IpcError,
+) -> ControlError {
+    match err {
+        c2_ipc::IpcError::RouteNotFound(_)
+        | c2_ipc::IpcError::RouteRemoved { .. }
+        | c2_ipc::IpcError::RouteClosed { .. } => ControlError::NotFound,
+        c2_ipc::IpcError::ContractMismatch(reason) | c2_ipc::IpcError::Protocol(reason) => {
+            ControlError::ContractMismatch { reason }
+        }
+        err => ControlError::UpstreamUnavailable {
+            reason: format!("IPC upstream route '{route_name}' acquisition failed: {err}"),
+        },
+    }
+}
+
+pub(crate) async fn read_ipc_route_contract(
     client: &IpcClient,
     route_name: &str,
 ) -> Result<AttestedRouteContract, ControlError> {
@@ -91,19 +111,23 @@ pub(crate) fn read_ipc_route_contract(
             reason: format!("IPC upstream route '{route_name}' advertised an invalid CRM contract"),
         });
     }
+    let binding = client
+        .attest_route_for_registration(&contract)
+        .await
+        .map_err(|err| control_error_from_ipc_attestation_error(route_name, err))?;
     Ok(AttestedRouteContract {
+        route_uid: binding.route_uid().to_string(),
+        route_revision: binding.route_revision(),
         crm_ns: contract.crm_ns,
         crm_name: contract.crm_name,
         crm_ver: contract.crm_ver,
         abi_hash: contract.abi_hash,
         signature_hash: contract.signature_hash,
-        max_payload_size: client
-            .route_max_payload_size(route_name)
-            .ok_or(ControlError::NotFound)?,
+        max_payload_size: binding.max_payload_size(),
     })
 }
 
-pub(crate) fn attest_ipc_route_contract(
+pub(crate) async fn attest_ipc_route_contract(
     client: &IpcClient,
     route_name: &str,
     claimed_crm_ns: &str,
@@ -113,10 +137,6 @@ pub(crate) fn attest_ipc_route_contract(
     claimed_signature_hash: &str,
     claimed_max_payload_size: u64,
 ) -> Result<AttestedRouteContract, ControlError> {
-    let contract = client
-        .route_contract(route_name)
-        .ok_or(ControlError::NotFound)?;
-    read_ipc_route_contract(client, route_name)?;
     let claimed = ExpectedRouteContract {
         route_name: route_name.to_string(),
         crm_ns: claimed_crm_ns.to_string(),
@@ -132,26 +152,11 @@ pub(crate) fn attest_ipc_route_contract(
             ),
         });
     }
-    if claimed != contract {
-        return Err(ControlError::ContractMismatch {
-            reason: format!(
-                "IPC upstream route '{route_name}' CRM contract mismatch: claimed {}/{}/{} hashes={}/{}, got {}/{}/{} hashes={}/{}",
-                claimed.crm_ns,
-                claimed.crm_name,
-                claimed.crm_ver,
-                claimed.abi_hash,
-                claimed.signature_hash,
-                contract.crm_ns,
-                contract.crm_name,
-                contract.crm_ver,
-                contract.abi_hash,
-                contract.signature_hash,
-            ),
-        });
-    }
-    let max_payload_size = client
-        .route_max_payload_size(route_name)
-        .ok_or(ControlError::NotFound)?;
+    let binding = client
+        .attest_route_for_registration(&claimed)
+        .await
+        .map_err(|err| control_error_from_ipc_attestation_error(route_name, err))?;
+    let max_payload_size = binding.max_payload_size();
     if claimed_max_payload_size != max_payload_size {
         return Err(ControlError::ContractMismatch {
             reason: format!(
@@ -160,11 +165,13 @@ pub(crate) fn attest_ipc_route_contract(
         });
     }
     Ok(AttestedRouteContract {
-        crm_ns: contract.crm_ns,
-        crm_name: contract.crm_name,
-        crm_ver: contract.crm_ver,
-        abi_hash: contract.abi_hash,
-        signature_hash: contract.signature_hash,
+        route_uid: binding.route_uid().to_string(),
+        route_revision: binding.route_revision(),
+        crm_ns: claimed.crm_ns,
+        crm_name: claimed.crm_name,
+        crm_ver: claimed.crm_ver,
+        abi_hash: claimed.abi_hash,
+        signature_hash: claimed.signature_hash,
         max_payload_size,
     })
 }
@@ -180,18 +187,14 @@ pub(crate) async fn attest_ipc_pending_route_contract(
     claimed_signature_hash: &str,
     claimed_max_payload_size: u64,
 ) -> Result<AttestedRouteContract, ControlError> {
-    let contract = match client
-        .pending_route_contract(route_name, registration_token)
+    let (contract, binding) = match client
+        .acquire_pending_route_attestation(route_name, registration_token)
         .await
     {
-        Ok(contract) => contract,
+        Ok(attested) => attested,
         Err(c2_ipc::IpcError::RouteNotFound(_)) => return Err(ControlError::NotFound),
         Err(err) => {
-            return Err(ControlError::ContractMismatch {
-                reason: format!(
-                    "IPC upstream pending route '{route_name}' attestation failed: {err}"
-                ),
-            });
+            return Err(control_error_from_ipc_attestation_error(route_name, err));
         }
     };
     let claimed = ExpectedRouteContract {
@@ -202,9 +205,7 @@ pub(crate) async fn attest_ipc_pending_route_contract(
         abi_hash: claimed_abi_hash.to_string(),
         signature_hash: claimed_signature_hash.to_string(),
     };
-    let max_payload_size = client
-        .route_max_payload_size(route_name)
-        .ok_or(ControlError::NotFound)?;
+    let max_payload_size = binding.max_payload_size();
     if c2_contract::validate_expected_route_contract(&claimed).is_err() {
         return Err(ControlError::ContractMismatch {
             reason: format!(
@@ -237,6 +238,8 @@ pub(crate) async fn attest_ipc_pending_route_contract(
         });
     }
     Ok(AttestedRouteContract {
+        route_uid: binding.route_uid().to_string(),
+        route_revision: binding.route_revision(),
         crm_ns: contract.crm_ns,
         crm_name: contract.crm_name,
         crm_ver: contract.crm_ver,
@@ -277,6 +280,8 @@ pub(crate) struct OwnerReplacement {
     abi_hash: String,
     signature_hash: String,
     max_payload_size: u64,
+    route_uid: String,
+    route_revision: u64,
     token: OwnerToken,
     evidence: OwnerReplacementEvidence,
 }
@@ -294,6 +299,8 @@ pub(crate) struct OwnerReplacementCandidate {
     abi_hash: String,
     signature_hash: String,
     max_payload_size: u64,
+    route_uid: String,
+    route_revision: u64,
     token: OwnerToken,
 }
 
@@ -311,6 +318,8 @@ impl OwnerReplacementCandidate {
             abi_hash: self.abi_hash,
             signature_hash: self.signature_hash,
             max_payload_size: self.max_payload_size,
+            route_uid: self.route_uid,
+            route_revision: self.route_revision,
             token: self.token,
             evidence,
         }
@@ -329,6 +338,8 @@ pub(crate) enum RouteCommand {
         abi_hash: String,
         signature_hash: String,
         max_payload_size: u64,
+        route_uid: String,
+        route_revision: u64,
         replacement: Option<OwnerReplacement>,
     },
     UnregisterLocal {
@@ -344,6 +355,7 @@ pub(crate) enum RouteCommand {
         name: String,
         relay_id: String,
         removed_at: f64,
+        removed_revision: u64,
     },
     RemovePeerRoutes {
         relay_id: String,
@@ -360,6 +372,7 @@ pub(crate) enum RouteCommandResult {
     Unregistered {
         entry: RouteEntry,
         removed_at: f64,
+        removed_revision: u64,
         client: Option<Arc<IpcClient>>,
     },
     AlreadyUnregistered,
@@ -598,6 +611,8 @@ impl<'a> RouteAuthority<'a> {
                 abi_hash,
                 signature_hash,
                 max_payload_size,
+                route_uid,
+                route_revision,
                 replacement,
             } => self.register_local(
                 name,
@@ -610,6 +625,8 @@ impl<'a> RouteAuthority<'a> {
                 abi_hash,
                 signature_hash,
                 max_payload_size,
+                route_uid,
+                route_revision,
                 replacement,
             ),
             RouteCommand::UnregisterLocal { name, server_id } => {
@@ -624,7 +641,14 @@ impl<'a> RouteAuthority<'a> {
                 name,
                 relay_id,
                 removed_at,
-            } => self.withdraw_peer(sender_relay_id, name, relay_id, removed_at),
+                removed_revision,
+            } => self.withdraw_peer(
+                sender_relay_id,
+                name,
+                relay_id,
+                removed_at,
+                removed_revision,
+            ),
             RouteCommand::RemovePeerRoutes { relay_id } => {
                 self.remove_peer_routes(&relay_id);
                 Ok(RouteCommandResult::PeerRoutesRemoved)
@@ -644,6 +668,8 @@ impl<'a> RouteAuthority<'a> {
         abi_hash: String,
         signature_hash: String,
         max_payload_size: u64,
+        route_uid: String,
+        route_revision: u64,
         replacement: Option<OwnerReplacement>,
     ) -> Result<RouteCommandResult, ControlError> {
         self.validate_route_name(&name)?;
@@ -666,13 +692,27 @@ impl<'a> RouteAuthority<'a> {
                 reason: "max_payload_size must be > 0".to_string(),
             });
         }
+        c2_contract::validate_call_route_key("route_uid", &route_uid).map_err(|err| {
+            ControlError::ContractMismatch {
+                reason: err.to_string(),
+            }
+        })?;
+        if route_revision == 0 {
+            return Err(ControlError::ContractMismatch {
+                reason: "route_revision must be > 0".to_string(),
+            });
+        }
 
         let mut route_table = self.state.route_table_write();
+        let mut required_replacement_address = None;
+        let mut old_endpoint_for_cleanup = None;
         if let Some(existing) = route_table.local_route(&name) {
             let existing_address = existing.ipc_address.clone().unwrap_or_default();
             let existing_server_id = existing.server_id.clone().unwrap_or_default();
             let existing_server_instance_id =
                 existing.server_instance_id.clone().unwrap_or_default();
+            let existing_endpoint =
+                UpstreamEndpointKey::from_route(&existing).ok_or(ControlError::OwnerMismatch)?;
             if existing_server_id == server_id {
                 if existing_address == address {
                     if existing_server_instance_id == server_instance_id {
@@ -688,10 +728,19 @@ impl<'a> RouteAuthority<'a> {
                         ) {
                             return Err(ControlError::ContractMismatch { reason });
                         }
-                        if let Some(token) = self.state.owner_token(&name) {
-                            self.state.renew_owner_lease(&name, &token);
+                        if existing.route_uid == route_uid
+                            && existing.route_revision == route_revision
+                        {
+                            if let Some(token) =
+                                self.state.owner_token_for_endpoint(&existing_endpoint)
+                            {
+                                self.state
+                                    .renew_owner_lease_for_endpoint(&existing_endpoint, &token);
+                            }
+                            return Ok(RouteCommandResult::SameOwner { entry: existing });
                         }
-                        return Ok(RouteCommandResult::SameOwner { entry: existing });
+                    } else {
+                        old_endpoint_for_cleanup = Some(existing_endpoint.clone());
                     }
                 } else {
                     return Err(ControlError::AddressMismatch { existing_address });
@@ -709,12 +758,16 @@ impl<'a> RouteAuthority<'a> {
                             || token.abi_hash != existing.abi_hash
                             || token.signature_hash != existing.signature_hash
                             || token.max_payload_size != existing.max_payload_size
+                            || token.route_uid != existing.route_uid
+                            || token.route_revision != existing.route_revision
                         {
                             return Err(ControlError::DuplicateRoute { existing_address });
                         }
                     }
                     _ => return Err(ControlError::DuplicateRoute { existing_address }),
                 }
+                required_replacement_address = Some(existing_address);
+                old_endpoint_for_cleanup = Some(existing_endpoint);
             }
         }
 
@@ -731,35 +784,54 @@ impl<'a> RouteAuthority<'a> {
             abi_hash,
             signature_hash,
             max_payload_size,
+            route_uid,
+            route_revision,
             locality: Locality::Local,
             registered_at: route_table.next_local_timestamp(),
         };
         if !route_table.can_register_route(&entry) {
             return Err(ControlError::OwnerMismatch);
         }
+        let new_endpoint =
+            UpstreamEndpointKey::from_route(&entry).ok_or(ControlError::OwnerMismatch)?;
 
-        let old_client = if let Some(token) = replacement {
+        if let Some(required_replacement_address) = required_replacement_address {
+            let Some(token) = replacement else {
+                return Err(ControlError::DuplicateRoute {
+                    existing_address: required_replacement_address,
+                });
+            };
             let token_existing_address = token.existing_address.clone();
             let evidence: OwnerReplacementEvidence = token.evidence;
+            let Some(old_endpoint) = old_endpoint_for_cleanup.as_ref() else {
+                return Err(ControlError::DuplicateRoute {
+                    existing_address: token_existing_address,
+                });
+            };
             match self
                 .state
-                .replace_if_owner_token(&name, &token.token, address.clone(), evidence)
+                .validate_replaceable_owner_token(old_endpoint, &token.token, evidence)
             {
-                Ok(old_client) => old_client,
+                Ok(()) => {}
                 Err(OwnerReplaceError::StaleToken | OwnerReplaceError::NotReplaceable) => {
                     return Err(ControlError::DuplicateRoute {
                         existing_address: token_existing_address,
                     });
                 }
             }
-        } else {
-            self.state.insert_owner_slot(name.clone(), address);
-            None
-        };
+        }
+        self.state.insert_owner_slot(&entry);
         route_table.register_prevalidated_route(entry.clone());
         drop(route_table);
-        if let Some(client) = old_client {
-            close_replaced_owner_client(client);
+        if let Some(old_endpoint) = old_endpoint_for_cleanup {
+            if old_endpoint != new_endpoint {
+                if let Some(client) = self
+                    .state
+                    .remove_connection_if_endpoint_unused(&old_endpoint)
+                {
+                    close_replaced_owner_client(client);
+                }
+            }
         }
         Ok(RouteCommandResult::Registered { entry })
     }
@@ -771,15 +843,15 @@ impl<'a> RouteAuthority<'a> {
         let name = existing.name.as_str();
         let existing_address = existing.ipc_address.clone().unwrap_or_default();
         match self.state.connection_lookup(name) {
-            CachedClient::Ready { address, .. } => Err(ControlError::DuplicateRoute {
-                existing_address: address,
+            CachedClient::Ready { endpoint, .. } => Err(ControlError::DuplicateRoute {
+                existing_address: endpoint.address().to_string(),
             }),
-            CachedClient::OwnerOnly { address }
-            | CachedClient::Evicted { address }
-            | CachedClient::Disconnected { address } => {
+            CachedClient::OwnerOnly { endpoint }
+            | CachedClient::Evicted { endpoint }
+            | CachedClient::Disconnected { endpoint } => {
                 let Some(token) = self.state.owner_token(name) else {
                     return Err(ControlError::DuplicateRoute {
-                        existing_address: address,
+                        existing_address: endpoint.address().to_string(),
                     });
                 };
                 Ok(OwnerReplacementCandidate {
@@ -787,13 +859,15 @@ impl<'a> RouteAuthority<'a> {
                     server_id: existing.server_id.clone().unwrap_or_default(),
                     server_instance_id: existing.server_instance_id.clone().unwrap_or_default(),
                     ipc_address: existing_address.clone(),
-                    existing_address: address,
+                    existing_address: endpoint.address().to_string(),
                     crm_ns: existing.crm_ns.clone(),
                     crm_name: existing.crm_name.clone(),
                     crm_ver: existing.crm_ver.clone(),
                     abi_hash: existing.abi_hash.clone(),
                     signature_hash: existing.signature_hash.clone(),
                     max_payload_size: existing.max_payload_size,
+                    route_uid: existing.route_uid.clone(),
+                    route_revision: existing.route_revision,
                     token,
                 })
             }
@@ -809,7 +883,7 @@ impl<'a> RouteAuthority<'a> {
         self.validate_route_name(&name)?;
         self.validate_server_id(&server_id)?;
 
-        let (entry, removed_at, client) = {
+        let (entry, removed_at, removed_revision) = {
             let mut route_table = self.state.route_table_write();
             let Some(existing) = route_table.local_route(&name) else {
                 if route_table.local_tombstone_matches_server(&name, &server_id) {
@@ -820,17 +894,20 @@ impl<'a> RouteAuthority<'a> {
             if existing.server_id.as_deref() != Some(server_id.as_str()) {
                 return Err(ControlError::OwnerMismatch);
             }
-            let (entry, removed_at) =
+            let (entry, removed_at, removed_revision) =
                 route_table.unregister_local_route_with_tombstone(&name, &server_id);
-            let client = self.state.remove_connection(&name);
-            (entry, removed_at, client)
+            (entry, removed_at, removed_revision)
         };
         let Some(entry) = entry else {
             return Err(ControlError::NotFound);
         };
+        let client = UpstreamEndpointKey::from_route(&entry)
+            .as_ref()
+            .and_then(|key| self.state.remove_connection_if_endpoint_unused(key));
         Ok(RouteCommandResult::Unregistered {
             entry,
             removed_at,
+            removed_revision,
             client,
         })
     }
@@ -885,6 +962,7 @@ impl<'a> RouteAuthority<'a> {
         name: String,
         relay_id: String,
         removed_at: f64,
+        removed_revision: u64,
     ) -> Result<RouteCommandResult, ControlError> {
         self.validate_route_name(&name)?;
         self.validate_relay_id(&sender_relay_id)?;
@@ -897,7 +975,7 @@ impl<'a> RouteAuthority<'a> {
         }
         self.state
             .route_table_write()
-            .unregister_route_with_tombstone(&name, &relay_id, removed_at);
+            .unregister_route_with_tombstone(&name, &relay_id, removed_at, removed_revision);
         Ok(RouteCommandResult::PeerRouteChanged)
     }
 
@@ -1084,6 +1162,8 @@ mod tests {
             signature_hash: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
                 .into(),
             max_payload_size: 1024,
+            route_uid: format!("{name}-{relay_id}-uid"),
+            route_revision: 1,
             locality: Locality::Peer,
             registered_at: 1000.0,
         }

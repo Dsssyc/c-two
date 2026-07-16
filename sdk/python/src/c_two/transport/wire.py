@@ -20,8 +20,8 @@ from c_two._native import (
 
 def decode_call_control(
     data: bytes | memoryview, offset: int = 0,
-) -> tuple[str, int, int]:
-    """Decode call control -> (route_name, method_idx, bytes_consumed)."""
+) -> tuple[str, str, int, str, str, str, str, str, int, int]:
+    """Decode call control -> route identity fields, method_idx, bytes_consumed."""
     return _ffi_decode_call_control(bytes(data), offset)
 
 

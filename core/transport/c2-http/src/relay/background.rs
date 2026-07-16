@@ -106,7 +106,13 @@ async fn tombstone_gc_loop(state: Arc<RelayState>, cancel: CancellationToken) {
             eprintln!("{}", tombstone_gc_detail_line(tombstone));
         }
         if !removed.is_empty() {
-            eprintln!("[relay] GC removed {} route tombstones", removed.len());
+            let (catalog_revision, compaction_revision) = state.route_catalog_revisions();
+            eprintln!(
+                "[relay] GC removed {} route tombstones catalog_revision={} compaction_revision={}",
+                removed.len(),
+                catalog_revision,
+                compaction_revision
+            );
         }
     }
 }
@@ -115,11 +121,13 @@ fn tombstone_gc_detail_line(removed: &TombstoneGcEntry) -> String {
     let tombstone = &removed.tombstone;
     let server_id = tombstone.server_id.as_deref().unwrap_or("<none>");
     format!(
-        "[relay] GC removed route tombstone: name={} relay_id={} server_id={} removed_at={} reason={}",
+        "[relay] GC removed route tombstone: name={} relay_id={} server_id={} removed_at={} removed_revision={} compaction_revision={} reason={}",
         tombstone.name,
         tombstone.relay_id,
         server_id,
         tombstone.removed_at,
+        tombstone.removed_revision,
+        removed.compaction_revision,
         removed.reason.as_str()
     )
 }
@@ -148,10 +156,13 @@ mod tests {
                 name: "grid".into(),
                 relay_id: "relay-a".into(),
                 removed_at: 2000.0,
+                removed_revision: 17,
+                local_catalog_revision: 17,
                 server_id: Some("server-grid".into()),
                 observed_at: std::time::Instant::now(),
             },
             reason: TombstoneGcReason::RetentionExpired,
+            compaction_revision: 17,
         };
 
         let line = tombstone_gc_detail_line(&removed);
@@ -161,6 +172,8 @@ mod tests {
         assert!(line.contains("relay_id=relay-a"));
         assert!(line.contains("server_id=server-grid"));
         assert!(line.contains("removed_at=2000"));
+        assert!(line.contains("removed_revision=17"));
+        assert!(line.contains("compaction_revision=17"));
         assert!(line.contains("reason=retention-expired"));
     }
 }
@@ -279,12 +292,14 @@ fn apply_digest_diff(state: &RelayState, peer_id: &str, diff_entry: ValidatedDig
                 name,
                 relay_id,
                 removed_at,
+                removed_revision,
             } = deleted;
             let _ = RouteAuthority::new(state).execute(RouteCommand::WithdrawPeer {
                 sender_relay_id: peer_id.to_string(),
                 name,
                 relay_id,
                 removed_at,
+                removed_revision,
             });
         }
     }

@@ -15,22 +15,33 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::{Mutex, oneshot};
 
+use c2_error::ErrorCode;
 use c2_mem::FreeResult;
 use c2_wire::buddy::{
     BUDDY_PAYLOAD_SIZE, BuddyPayload, decode_buddy_payload, encode_buddy_payload,
 };
 use c2_wire::chunk::encode_chunk_header;
 use c2_wire::chunk::{ChunkConfig, ChunkRegistry};
-use c2_wire::control::{ReplyControl, decode_reply_control, encode_call_control};
+use c2_wire::control::{
+    ReplyControl, RouteCallIdentity, decode_reply_control, encode_call_control,
+    encoded_call_control_len,
+};
 use c2_wire::flags;
 use c2_wire::frame::{self, DecodeError, FrameHeader, HEADER_SIZE};
 use c2_wire::handshake::{
     CAP_CALL_V2, CAP_CHUNKED, CAP_METHOD_IDX, Handshake, MethodEntry, RouteInfo, decode_handshake,
     encode_client_handshake,
 };
+use c2_wire::msg_type::MsgType;
 use c2_wire::registration_control::{
-    PENDING_ROUTE_REJECT_NOT_FOUND, PendingRouteAttestationResponse,
+    PENDING_ROUTE_REJECT_NOT_FOUND, PendingRouteAttestation, PendingRouteAttestationResponse,
     decode_pending_route_attestation_response, encode_pending_route_attestation_request,
+};
+use c2_wire::route_catalog_control::{
+    RouteContractWire, RouteListRequest, RouteListResponse, RouteLookupRequest,
+    RouteLookupResponse, RouteRecordWire, RouteSelector, RouteStateReasonWire, RouteStateWire,
+    decode_route_list_response, decode_route_lookup_response, decode_route_nack,
+    encode_route_list_request, encode_route_lookup_request,
 };
 
 use c2_mem::config::PoolConfig;
@@ -39,6 +50,8 @@ use c2_mem::{MemPool, PoolAllocation};
 use crate::response::ResponseData;
 
 pub use c2_config::ClientIpcConfig;
+
+const ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS: &[u64] = &[10, 25, 50, 100, 200];
 
 // ── Server pool state ────────────────────────────────────────────────────
 
@@ -143,8 +156,52 @@ pub enum IpcError {
     Decode(DecodeError),
     /// Handshake failed or incompatible server.
     Handshake(String),
+    /// Peer violated IPC route/control protocol after the transport connected.
+    Protocol(String),
+    /// Connected server identity does not match the expected owner.
+    IdentityMismatch {
+        expected_server_id: String,
+        expected_server_instance_id: String,
+        actual_server_id: String,
+        actual_server_instance_id: String,
+    },
+    /// Connected route contract does not match the expected CRM contract.
+    ContractMismatch(String),
     /// Requested route no longer exists on the connected IPC server.
     RouteNotFound(String),
+    /// Requested route was explicitly removed from the connected IPC server.
+    RouteRemoved {
+        route_name: String,
+        route_uid: Option<String>,
+    },
+    /// Requested route exists but no longer accepts new calls.
+    RouteClosed {
+        route_name: String,
+        route_uid: String,
+        reason: String,
+    },
+    /// Client observed an older route token than the connected server catalog.
+    RouteStale {
+        route_name: String,
+        current_route_uid: String,
+        current_route_revision: u64,
+    },
+    /// Route watch history was compacted and the directory must be rebuilt.
+    CatalogCompacted {
+        compacted_revision: u64,
+        current_revision: u64,
+    },
+    /// Route watch state is unavailable, so cached route state cannot be trusted.
+    WatchUnavailable(String),
+    /// Requested method does not exist on the connected route.
+    MethodNotFound {
+        route_name: String,
+        method_name: String,
+    },
+    /// Shared-memory request/response setup failed.
+    Shm(String),
+    /// Chunked response assembly failed.
+    Chunk(String),
     /// CRM method returned an error (serialized error bytes).
     CrmError(Vec<u8>),
     /// Client is closed or connection lost.
@@ -160,7 +217,61 @@ impl std::fmt::Display for IpcError {
             Self::Config(msg) => write!(f, "IPC config error: {msg}"),
             Self::Decode(e) => write!(f, "IPC decode error: {e}"),
             Self::Handshake(msg) => write!(f, "IPC handshake failed: {msg}"),
+            Self::Protocol(msg) => write!(f, "IPC protocol violation: {msg}"),
+            Self::IdentityMismatch {
+                expected_server_id,
+                expected_server_instance_id,
+                actual_server_id,
+                actual_server_instance_id,
+            } => write!(
+                f,
+                "IPC server identity mismatch: expected {expected_server_id}/{expected_server_instance_id}, got {actual_server_id}/{actual_server_instance_id}"
+            ),
+            Self::ContractMismatch(msg) => write!(f, "IPC contract mismatch: {msg}"),
             Self::RouteNotFound(route) => write!(f, "IPC route not found: {route}"),
+            Self::RouteRemoved {
+                route_name,
+                route_uid,
+            } => {
+                if let Some(route_uid) = route_uid {
+                    write!(f, "IPC route removed: {route_name} uid={route_uid}")
+                } else {
+                    write!(f, "IPC route removed: {route_name}")
+                }
+            }
+            Self::RouteClosed {
+                route_name,
+                route_uid,
+                reason,
+            } => write!(
+                f,
+                "IPC route closed: {route_name} uid={route_uid} reason={reason}"
+            ),
+            Self::RouteStale {
+                route_name,
+                current_route_uid,
+                current_route_revision,
+            } => write!(
+                f,
+                "IPC route stale: {route_name} current_uid={current_route_uid} current_revision={current_route_revision}"
+            ),
+            Self::CatalogCompacted {
+                compacted_revision,
+                current_revision,
+            } => write!(
+                f,
+                "IPC route catalog compacted: compacted_revision={compacted_revision} current_revision={current_revision}"
+            ),
+            Self::WatchUnavailable(msg) => write!(f, "IPC route watch unavailable: {msg}"),
+            Self::MethodNotFound {
+                route_name,
+                method_name,
+            } => write!(
+                f,
+                "IPC method not found: route={route_name} method={method_name}"
+            ),
+            Self::Shm(msg) => write!(f, "IPC SHM error: {msg}"),
+            Self::Chunk(msg) => write!(f, "IPC chunk error: {msg}"),
             Self::CrmError(_) => write!(f, "CRM method error"),
             Self::Closed => write!(f, "IPC client closed"),
             Self::Pool(msg) => write!(f, "Pool error: {msg}"),
@@ -184,7 +295,7 @@ impl From<DecodeError> for IpcError {
 
 impl From<c2_wire::control::EncodeError> for IpcError {
     fn from(e: c2_wire::control::EncodeError) -> Self {
-        Self::Handshake(e.to_string())
+        Self::Protocol(e.to_string())
     }
 }
 
@@ -193,6 +304,9 @@ impl From<c2_wire::control::EncodeError> for IpcError {
 /// Per-route method table (name ↔ index).
 #[derive(Debug, Clone)]
 pub struct MethodTable {
+    route_name: String,
+    route_uid: String,
+    route_revision: u64,
     crm_ns: String,
     crm_name: String,
     crm_ver: String,
@@ -206,6 +320,9 @@ impl MethodTable {
     fn from_route(route: &RouteInfo) -> Self {
         Self::from_entries(
             &route.methods,
+            route.name.clone(),
+            route.route_uid.clone(),
+            route.route_revision,
             route.crm_ns.clone(),
             route.crm_name.clone(),
             route.crm_ver.clone(),
@@ -217,6 +334,9 @@ impl MethodTable {
 
     pub(crate) fn from_entries(
         entries: &[MethodEntry],
+        route_name: String,
+        route_uid: String,
+        route_revision: u64,
         crm_ns: String,
         crm_name: String,
         crm_ver: String,
@@ -229,6 +349,9 @@ impl MethodTable {
             name_to_idx.insert(e.name.clone(), e.index);
         }
         Self {
+            route_name,
+            route_uid,
+            route_revision,
             crm_ns,
             crm_name,
             crm_ver,
@@ -275,11 +398,191 @@ impl MethodTable {
     pub fn max_payload_size(&self) -> u64 {
         self.max_payload_size
     }
+
+    pub fn route_uid(&self) -> &str {
+        &self.route_uid
+    }
+
+    pub fn route_revision(&self) -> u64 {
+        self.route_revision
+    }
+
+    pub(crate) fn call_identity(&self) -> RouteCallIdentity {
+        RouteCallIdentity {
+            route_name: self.route_name.clone(),
+            route_uid: self.route_uid.clone(),
+            observed_route_revision: self.route_revision,
+            crm_ns: self.crm_ns.clone(),
+            crm_name: self.crm_name.clone(),
+            crm_ver: self.crm_ver.clone(),
+            abi_hash: self.abi_hash.clone(),
+            signature_hash: self.signature_hash.clone(),
+        }
+    }
+}
+
+/// Immutable route token acquired by one route-bound client/proxy.
+///
+/// A binding intentionally keeps the route UID and revision observed at acquire
+/// time. Long-lived clients may keep their shared connection directory fresh,
+/// but an existing proxy must not silently retarget itself to a newer resource
+/// instance with the same route name.
+#[derive(Debug, Clone)]
+pub struct RouteBinding {
+    table: MethodTable,
+}
+
+impl RouteBinding {
+    fn from_table(table: MethodTable) -> Self {
+        Self { table }
+    }
+
+    pub fn route_name(&self) -> &str {
+        &self.table.route_name
+    }
+
+    pub fn route_uid(&self) -> &str {
+        self.table.route_uid()
+    }
+
+    pub fn route_revision(&self) -> u64 {
+        self.table.route_revision()
+    }
+
+    pub fn max_payload_size(&self) -> u64 {
+        self.table.max_payload_size()
+    }
+
+    pub(crate) fn call_target_for(
+        &self,
+        method_name: &str,
+    ) -> Result<(u16, RouteCallIdentity, u64), IpcError> {
+        let method_idx =
+            self.table
+                .index_of(method_name)
+                .ok_or_else(|| IpcError::MethodNotFound {
+                    route_name: self.table.route_name.clone(),
+                    method_name: method_name.to_string(),
+                })?;
+        Ok((
+            method_idx,
+            self.table.call_identity(),
+            self.table.max_payload_size(),
+        ))
+    }
+}
+
+// ── Route directory ──────────────────────────────────────────────────────
+
+/// Client-side projection of the connected server route catalog.
+#[derive(Debug, Default)]
+pub(crate) struct RouteDirectory {
+    routes: HashMap<String, MethodTable>,
+    catalog_revision: u64,
+    dirty: bool,
+}
+
+impl RouteDirectory {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn seed_from_handshake(&mut self, routes: &[RouteInfo]) {
+        self.routes.clear();
+        for route in routes {
+            self.routes
+                .insert(route.name.clone(), MethodTable::from_route(route));
+        }
+        self.catalog_revision = 0;
+        self.dirty = false;
+    }
+
+    fn rebuild_from_list(&mut self, response: RouteListResponse) {
+        self.routes.clear();
+        for record in response.routes {
+            self.apply_record(record);
+        }
+        self.catalog_revision = response.catalog_revision;
+        self.dirty = false;
+    }
+
+    fn apply_record(&mut self, record: RouteRecordWire) {
+        self.catalog_revision = self.catalog_revision.max(record.catalog_revision);
+        match record.state {
+            RouteStateWire::Ready => {
+                self.routes
+                    .insert(record.route_name.clone(), MethodTable::from_record(&record));
+            }
+            RouteStateWire::Pending
+            | RouteStateWire::Draining
+            | RouteStateWire::Closed
+            | RouteStateWire::Removed => {
+                self.routes.remove(&record.route_name);
+            }
+        }
+    }
+
+    fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    fn remove_route(&mut self, route_name: &str) {
+        self.routes.remove(route_name);
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    fn route_table(&self, name: &str) -> Option<MethodTable> {
+        self.routes.get(name).cloned()
+    }
+
+    fn has_route(&self, name: &str) -> bool {
+        self.routes.contains_key(name)
+    }
+
+    fn route_names(&self) -> Vec<String> {
+        self.routes.keys().cloned().collect()
+    }
+
+    pub(crate) fn insert_table(&mut self, name: String, table: MethodTable) {
+        self.routes.insert(name, table);
+    }
+}
+
+impl MethodTable {
+    fn from_record(record: &RouteRecordWire) -> Self {
+        let methods = record
+            .methods
+            .iter()
+            .map(|method| MethodEntry {
+                name: method.name.clone(),
+                index: method.index,
+            })
+            .collect::<Vec<_>>();
+        Self::from_entries(
+            &methods,
+            record.route_name.clone(),
+            record.route_uid.clone(),
+            record.route_revision,
+            record.contract.crm_ns.clone(),
+            record.contract.crm_name.clone(),
+            record.contract.crm_ver.clone(),
+            record.contract.abi_hash.clone(),
+            record.contract.signature_hash.clone(),
+            record.max_payload_size,
+        )
+    }
 }
 
 // ── Pending call ─────────────────────────────────────────────────────────
 
-type PendingMap = HashMap<u32, oneshot::Sender<Result<ResponseData, IpcError>>>;
+enum PendingResponse {
+    Unary(oneshot::Sender<Result<ResponseData, IpcError>>),
+}
+
+type PendingMap = HashMap<u32, PendingResponse>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RequestTransportKind {
@@ -379,8 +682,8 @@ pub struct IpcClient {
     address_error: Option<String>,
     writer: Arc<Mutex<Option<tokio::io::WriteHalf<UnixStream>>>>,
     pending: Arc<StdMutex<PendingMap>>,
-    rid_counter: AtomicU32,
-    pub(crate) route_tables: HashMap<String, MethodTable>,
+    rid_counter: Arc<AtomicU32>,
+    pub(crate) route_directory: Arc<RwLock<RouteDirectory>>,
     server_segments: Vec<(String, u32)>,
     pub(crate) server_identity: Option<c2_wire::handshake::ServerIdentity>,
     /// Server SHM pool state for reading buddy reply responses.
@@ -456,8 +759,8 @@ impl IpcClient {
             address_error,
             writer: Arc::new(Mutex::new(None)),
             pending: Arc::new(StdMutex::new(HashMap::new())),
-            rid_counter: AtomicU32::new(1),
-            route_tables: HashMap::new(),
+            rid_counter: Arc::new(AtomicU32::new(1)),
+            route_directory: Arc::new(RwLock::new(RouteDirectory::new())),
             server_segments: Vec::new(),
             server_identity: None,
             server_pool: Arc::new(StdMutex::new(None)),
@@ -530,15 +833,12 @@ impl IpcClient {
 
         // Perform handshake.
         let hs = self.do_handshake(&mut writer, reader).await?;
-        let server_identity = hs.server_identity.clone().ok_or_else(|| {
-            IpcError::Handshake("server handshake missing server identity".into())
-        })?;
+        let server_identity = hs
+            .server_identity
+            .clone()
+            .ok_or_else(|| IpcError::Protocol("server handshake missing server identity".into()))?;
 
-        // Store method tables from the handshake response.
-        for route in &hs.routes {
-            let table = MethodTable::from_route(route);
-            self.route_tables.insert(route.name.clone(), table);
-        }
+        self.route_directory.write().seed_from_handshake(&hs.routes);
         self.server_segments = hs.segments.clone();
         self.server_identity = Some(server_identity);
 
@@ -602,7 +902,7 @@ impl IpcClient {
         };
 
         let payload = encode_client_handshake(&segments, cap_flags, &prefix)
-            .map_err(|e| IpcError::Handshake(e.to_string()))?;
+            .map_err(|e| IpcError::Protocol(e.to_string()))?;
         let frame_bytes = frame::encode_frame(0, flags::FLAG_HANDSHAKE, &payload);
         writer.write_all(&frame_bytes).await?;
 
@@ -613,7 +913,7 @@ impl IpcClient {
         let (hdr, _hdr_payload) = frame::decode_frame_body(body_rest, total_len)?;
 
         if !hdr.is_handshake() {
-            return Err(IpcError::Handshake(
+            return Err(IpcError::Protocol(
                 "Server response is not a handshake frame".into(),
             ));
         }
@@ -624,16 +924,15 @@ impl IpcClient {
             reader.read_exact(&mut payload_buf).await?;
         }
 
-        let hs = decode_handshake(&payload_buf)
-            .map_err(|e| IpcError::Handshake(format!("decode: {e}")))?;
+        let hs = decode_handshake(&payload_buf)?;
 
         if hs.capability_flags & CAP_CALL_V2 == 0 {
-            return Err(IpcError::Handshake(
+            return Err(IpcError::Protocol(
                 "Server does not support v2 call frames".into(),
             ));
         }
         if hs.server_identity.is_none() {
-            return Err(IpcError::Handshake(
+            return Err(IpcError::Protocol(
                 "server handshake missing server identity".into(),
             ));
         }
@@ -691,49 +990,151 @@ impl IpcClient {
             .map(|identity| identity.server_instance_id.as_str())
     }
 
-    fn method_idx_for(&self, route_name: &str, method_name: &str) -> Result<u16, IpcError> {
-        let table = self
-            .route_tables
-            .get(route_name)
-            .ok_or_else(|| IpcError::Handshake(format!("unknown route: {route_name}")))?;
-        table
-            .index_of(method_name)
-            .ok_or_else(|| IpcError::Handshake(format!("unknown method: {method_name}")))
+    fn expected_contract_wire(expected: &c2_contract::ExpectedRouteContract) -> RouteContractWire {
+        RouteContractWire {
+            route_name: expected.route_name.clone(),
+            crm_ns: expected.crm_ns.clone(),
+            crm_name: expected.crm_name.clone(),
+            crm_ver: expected.crm_ver.clone(),
+            abi_hash: expected.abi_hash.clone(),
+            signature_hash: expected.signature_hash.clone(),
+        }
     }
 
-    fn ensure_route_payload_size(&self, route_name: &str, data_len: u64) -> Result<(), IpcError> {
-        let table = self
-            .route_tables
-            .get(route_name)
-            .ok_or_else(|| IpcError::Handshake(format!("unknown route: {route_name}")))?;
-        let max_payload_size = table.max_payload_size();
+    fn observed_token_for(&self, route_name: &str) -> Option<(String, u64)> {
+        self.route_directory
+            .read()
+            .route_table(route_name)
+            .map(|table| (table.route_uid().to_string(), table.route_revision()))
+    }
+
+    fn payload_msg_type(payload: &[u8]) -> Option<MsgType> {
+        payload.first().and_then(|tag| MsgType::from_byte(*tag))
+    }
+
+    fn route_nack_error(payload: &[u8]) -> IpcError {
+        match decode_route_nack(payload) {
+            Ok(nack) => match ErrorCode::try_from(nack.error.code) {
+                Ok(ErrorCode::RouteCatalogCompacted) => IpcError::CatalogCompacted {
+                    compacted_revision: nack.rejected_revision,
+                    current_revision: nack.rejected_revision,
+                },
+                Ok(ErrorCode::RouteWatchUnavailable) => {
+                    IpcError::WatchUnavailable(nack.error.message)
+                }
+                Ok(ErrorCode::ProtocolViolation) => IpcError::Protocol(nack.error.message),
+                Ok(code) => IpcError::Protocol(format!(
+                    "route catalog NACK {}: {}",
+                    code.name(),
+                    nack.error.message
+                )),
+                Err(()) => IpcError::Protocol(format!(
+                    "route catalog NACK unknown code {}: {}",
+                    nack.error.code, nack.error.message
+                )),
+            },
+            Err(err) => IpcError::Protocol(format!("invalid route catalog NACK: {err}")),
+        }
+    }
+
+    async fn send_control_unary_raw(
+        writer: Arc<Mutex<Option<tokio::io::WriteHalf<UnixStream>>>>,
+        pending: Arc<StdMutex<PendingMap>>,
+        rid_counter: Arc<AtomicU32>,
+        payload: Vec<u8>,
+        description: &str,
+    ) -> Result<Vec<u8>, IpcError> {
+        let rid = rid_counter.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        {
+            pending.lock().insert(rid, PendingResponse::Unary(tx));
+        }
+
+        let frame = frame::encode_frame(rid as u64, flags::FLAG_CTRL, &payload);
+        let send_result: Result<(), IpcError> = async {
+            let mut writer_guard = writer.lock().await;
+            let writer = writer_guard.as_mut().ok_or(IpcError::Closed)?;
+            writer.write_all(&frame).await?;
+            Ok(())
+        }
+        .await;
+        if let Err(err) = send_result {
+            pending.lock().remove(&rid);
+            return Err(err);
+        }
+
+        let response = match rx.await {
+            Ok(result) => result?,
+            Err(_) => return Err(IpcError::Closed),
+        };
+        match response {
+            ResponseData::Inline(payload) => Ok(payload),
+            _ => Err(IpcError::Protocol(format!(
+                "{description} returned non-inline response"
+            ))),
+        }
+    }
+
+    async fn list_routes_raw(
+        writer: Arc<Mutex<Option<tokio::io::WriteHalf<UnixStream>>>>,
+        pending: Arc<StdMutex<PendingMap>>,
+        rid_counter: Arc<AtomicU32>,
+        selector: RouteSelector,
+        min_revision: Option<u64>,
+    ) -> Result<RouteListResponse, IpcError> {
+        let payload = encode_route_list_request(&RouteListRequest {
+            selector,
+            min_revision,
+        })
+        .map_err(IpcError::Protocol)?;
+        let payload =
+            Self::send_control_unary_raw(writer, pending, rid_counter, payload, "route list")
+                .await?;
+        if Self::payload_msg_type(&payload) == Some(MsgType::RouteNack) {
+            return Err(Self::route_nack_error(&payload));
+        }
+        decode_route_list_response(&payload).map_err(IpcError::Protocol)
+    }
+
+    async fn rebuild_directory_raw(
+        writer: Arc<Mutex<Option<tokio::io::WriteHalf<UnixStream>>>>,
+        pending: Arc<StdMutex<PendingMap>>,
+        rid_counter: Arc<AtomicU32>,
+        directory: Arc<RwLock<RouteDirectory>>,
+    ) -> Result<(), IpcError> {
+        let response =
+            Self::list_routes_raw(writer, pending, rid_counter, RouteSelector::All, None).await?;
+        directory.write().rebuild_from_list(response);
+        Ok(())
+    }
+
+    fn bound_route_table(&self, route_name: &str) -> Result<MethodTable, IpcError> {
+        self.route_directory
+            .read()
+            .route_table(route_name)
+            .ok_or_else(|| IpcError::RouteNotFound(route_name.to_string()))
+    }
+
+    async fn call_resolved_target(
+        &self,
+        route_name: &str,
+        method_idx: u16,
+        identity: RouteCallIdentity,
+        max_payload_size: u64,
+        data: &[u8],
+    ) -> Result<ResponseData, IpcError> {
+        let data_len = u64::try_from(data.len()).unwrap_or(u64::MAX);
         if data_len > max_payload_size {
             return Err(IpcError::Config(format!(
                 "request payload size {data_len} exceeds route '{route_name}' max_payload_size {max_payload_size}"
             )));
         }
-        Ok(())
-    }
-
-    /// Send a CRM call and wait for the response.
-    ///
-    /// This is the canonical semantic call API for direct clients and the
-    /// relay. It selects buddy SHM, chunked, or inline transport from the
-    /// configured IPC policy.
-    pub async fn call(
-        &self,
-        route_name: &str,
-        method_name: &str,
-        data: &[u8],
-    ) -> Result<ResponseData, IpcError> {
-        let method_idx = self.method_idx_for(route_name, method_name)?;
-        self.ensure_route_payload_size(route_name, u64::try_from(data.len()).unwrap_or(u64::MAX))?;
 
         match choose_request_transport(&self.config, self.pool.is_some(), data.len()) {
             RequestTransportKind::Buddy => {
-                match self.call_buddy(route_name, method_idx, data).await {
+                match self.call_buddy(&identity, method_idx, data).await {
                     Ok(result) => return Ok(result),
-                    Err(IpcError::Handshake(_)) => {
+                    Err(IpcError::Shm(_)) => {
                         // Pool allocation or SHM setup failed. Fall back through the
                         // non-SHM policy below rather than failing large relay calls
                         // that can still use chunked transfer.
@@ -742,31 +1143,44 @@ impl IpcClient {
                 }
             }
             RequestTransportKind::Chunked => {
-                return self.call_chunked(route_name, method_idx, data).await;
+                return self.call_chunked(&identity, method_idx, data).await;
             }
             RequestTransportKind::Inline => {
-                return self.call_inline(route_name, method_idx, data).await;
+                return self.call_inline(&identity, method_idx, data).await;
             }
         }
 
         match choose_request_transport(&self.config, false, data.len()) {
-            RequestTransportKind::Chunked => self.call_chunked(route_name, method_idx, data).await,
+            RequestTransportKind::Chunked => self.call_chunked(&identity, method_idx, data).await,
             RequestTransportKind::Inline | RequestTransportKind::Buddy => {
-                self.call_inline(route_name, method_idx, data).await
+                self.call_inline(&identity, method_idx, data).await
             }
         }
     }
 
-    /// Send a CRM call from a body stream with a known total payload size.
-    ///
-    /// This shares the same transport selector as [`IpcClient::call`] but does
-    /// not require the caller to materialize a large request body first. When a
-    /// client-side SHM pool is available the payload is copied directly into a
-    /// pre-allocated buddy/dedicated block as chunks arrive; otherwise the
-    /// chunked IPC path keeps only one IPC chunk-sized buffer in memory.
-    pub async fn call_sized_stream<S, B, E>(
+    /// Send a CRM call through a previously acquired immutable route binding.
+    pub async fn call_bound(
         &self,
-        route_name: &str,
+        binding: &RouteBinding,
+        method_name: &str,
+        data: &[u8],
+    ) -> Result<ResponseData, IpcError> {
+        let (method_idx, identity, max_payload_size) = binding.call_target_for(method_name)?;
+        self.call_resolved_target(
+            binding.route_name(),
+            method_idx,
+            identity,
+            max_payload_size,
+            data,
+        )
+        .await
+    }
+
+    /// Send a CRM call from a known-size body stream through a previously
+    /// acquired immutable route binding.
+    pub async fn call_bound_sized_stream<S, B, E>(
+        &self,
+        binding: &RouteBinding,
         method_name: &str,
         data_len: u64,
         chunks: S,
@@ -776,38 +1190,59 @@ impl IpcClient {
         B: AsRef<[u8]>,
         E: Display,
     {
-        let method_idx = self.method_idx_for(route_name, method_name)?;
-        self.ensure_route_payload_size(route_name, data_len)?;
+        let (method_idx, identity, max_payload_size) = binding.call_target_for(method_name)?;
+        if data_len > max_payload_size {
+            return Err(IpcError::Config(format!(
+                "request payload size {data_len} exceeds route '{}' max_payload_size {max_payload_size}",
+                binding.route_name()
+            )));
+        }
+        self.call_sized_stream_resolved_target(method_idx, identity, data_len, chunks)
+            .await
+    }
+
+    async fn call_sized_stream_resolved_target<S, B, E>(
+        &self,
+        method_idx: u16,
+        identity: RouteCallIdentity,
+        data_len: u64,
+        chunks: S,
+    ) -> Result<ResponseData, IpcError>
+    where
+        S: Stream<Item = Result<B, E>>,
+        B: AsRef<[u8]>,
+        E: Display,
+    {
         let data_len = checked_payload_len_usize(data_len)?;
         if data_len == 0 {
-            return self.call_inline(route_name, method_idx, &[]).await;
+            return self.call_inline(&identity, method_idx, &[]).await;
         }
 
         match choose_request_transport(&self.config, self.pool.is_some(), data_len) {
             RequestTransportKind::Buddy => {
                 if let Some(alloc) = self.try_alloc_request_block(data_len)? {
                     return self
-                        .call_buddy_stream(route_name, method_idx, alloc, data_len, chunks)
+                        .call_buddy_stream(&identity, method_idx, alloc, data_len, chunks)
                         .await;
                 }
                 match choose_request_transport(&self.config, false, data_len) {
                     RequestTransportKind::Chunked => {
-                        self.call_chunked_stream(route_name, method_idx, data_len, chunks)
+                        self.call_chunked_stream(&identity, method_idx, data_len, chunks)
                             .await
                     }
                     RequestTransportKind::Inline | RequestTransportKind::Buddy => {
                         let data = collect_exact_stream(data_len, chunks).await?;
-                        self.call_inline(route_name, method_idx, &data).await
+                        self.call_inline(&identity, method_idx, &data).await
                     }
                 }
             }
             RequestTransportKind::Chunked => {
-                self.call_chunked_stream(route_name, method_idx, data_len, chunks)
+                self.call_chunked_stream(&identity, method_idx, data_len, chunks)
                     .await
             }
             RequestTransportKind::Inline => {
                 let data = collect_exact_stream(data_len, chunks).await?;
-                self.call_inline(route_name, method_idx, &data).await
+                self.call_inline(&identity, method_idx, &data).await
             }
         }
     }
@@ -815,7 +1250,7 @@ impl IpcClient {
     /// Inline call path — sends call control + data in a single frame.
     async fn call_inline(
         &self,
-        route_name: &str,
+        identity: &RouteCallIdentity,
         method_idx: u16,
         data: &[u8],
     ) -> Result<ResponseData, IpcError> {
@@ -824,12 +1259,11 @@ impl IpcClient {
         // Register pending call.
         let (tx, rx) = oneshot::channel();
         {
-            self.pending.lock().insert(rid, tx);
+            self.pending.lock().insert(rid, PendingResponse::Unary(tx));
         }
 
         // Build and send the frame.
-        // Compute ctrl size: 1 byte name_len + name + 2 bytes method_idx
-        let ctrl_len = 1 + route_name.len() + 2;
+        let ctrl_len = encoded_call_control_len(identity)?;
         let payload_len = ctrl_len + data.len();
         let total_len = (12 + payload_len) as u32;
         let frame_size = frame::HEADER_SIZE + payload_len;
@@ -847,7 +1281,7 @@ impl IpcClient {
                 let ctrl_written = c2_wire::control::encode_call_control_into(
                     &mut buf,
                     frame::HEADER_SIZE,
-                    route_name,
+                    identity,
                     method_idx,
                 )?;
                 let data_off = frame::HEADER_SIZE + ctrl_written;
@@ -859,7 +1293,7 @@ impl IpcClient {
                 hdr_buf[0..4].copy_from_slice(&total_len.to_le_bytes());
                 hdr_buf[4..12].copy_from_slice(&(rid as u64).to_le_bytes());
                 hdr_buf[12..16].copy_from_slice(&flags::FLAG_CALL_V2.to_le_bytes());
-                let ctrl = encode_call_control(route_name, method_idx)?;
+                let ctrl = encode_call_control(identity, method_idx)?;
                 writer.write_all(&hdr_buf).await?;
                 writer.write_all(&ctrl).await?;
                 writer.write_all(data).await?;
@@ -885,7 +1319,7 @@ impl IpcClient {
     /// The server reads data from SHM and frees the allocation.
     async fn call_buddy(
         &self,
-        route_name: &str,
+        identity: &RouteCallIdentity,
         method_idx: u16,
         data: &[u8],
     ) -> Result<ResponseData, IpcError> {
@@ -902,7 +1336,7 @@ impl IpcClient {
         let alloc = {
             let mut pool = pool_arc.lock();
             pool.alloc(data.len())
-                .map_err(|e| IpcError::Handshake(format!("buddy alloc failed: {e}")))?
+                .map_err(|e| IpcError::Shm(format!("buddy alloc failed: {e}")))?
         };
 
         // Write data into the SHM region.
@@ -913,7 +1347,7 @@ impl IpcClient {
                 Err(e) => {
                     drop(pool);
                     let _ = pool_arc.lock().free(&alloc);
-                    return Err(IpcError::Handshake(format!("buddy data_ptr failed: {e}")));
+                    return Err(IpcError::Shm(format!("buddy data_ptr failed: {e}")));
                 }
             };
             unsafe {
@@ -931,7 +1365,7 @@ impl IpcClient {
         let buddy_bytes = encode_buddy_payload(&bp);
 
         // Build call control.
-        let ctrl = encode_call_control(route_name, method_idx)?;
+        let ctrl = encode_call_control(identity, method_idx)?;
 
         // Assemble frame payload: [11B buddy][call_control]
         let payload_len = buddy_bytes.len() + ctrl.len();
@@ -944,7 +1378,7 @@ impl IpcClient {
         // Register pending call.
         let (tx, rx) = oneshot::channel();
         {
-            self.pending.lock().insert(rid, tx);
+            self.pending.lock().insert(rid, PendingResponse::Unary(tx));
         }
 
         // Send frame — free buddy allocation if send fails.
@@ -1007,7 +1441,7 @@ impl IpcClient {
 
     async fn call_buddy_stream<S, B, E>(
         &self,
-        route_name: &str,
+        identity: &RouteCallIdentity,
         method_idx: u16,
         alloc: PoolAllocation,
         data_size: usize,
@@ -1056,7 +1490,7 @@ impl IpcClient {
                     Err(err) => {
                         drop(pool);
                         self.free_request_block(&alloc);
-                        return Err(IpcError::Handshake(format!("buddy data_ptr failed: {err}")));
+                        return Err(IpcError::Shm(format!("buddy data_ptr failed: {err}")));
                     }
                 };
                 unsafe {
@@ -1073,7 +1507,7 @@ impl IpcClient {
             )));
         }
 
-        self.call_with_prealloc(route_name, method_idx, &alloc, data_size)
+        self.call_with_prealloc(identity, method_idx, &alloc, data_size)
             .await
     }
 
@@ -1084,7 +1518,7 @@ impl IpcClient {
     /// already did that. On send failure, frees the allocation from the pool.
     pub(crate) async fn call_with_prealloc(
         &self,
-        route_name: &str,
+        identity: &RouteCallIdentity,
         method_idx: u16,
         alloc: &PoolAllocation,
         data_size: usize,
@@ -1106,7 +1540,7 @@ impl IpcClient {
         let buddy_bytes = encode_buddy_payload(&bp);
 
         // Build call control.
-        let ctrl = match encode_call_control(route_name, method_idx) {
+        let ctrl = match encode_call_control(identity, method_idx) {
             Ok(ctrl) => ctrl,
             Err(err) => {
                 self.free_prealloc(alloc);
@@ -1125,7 +1559,7 @@ impl IpcClient {
         // Register pending call.
         let (tx, rx) = oneshot::channel();
         {
-            self.pending.lock().insert(rid, tx);
+            self.pending.lock().insert(rid, PendingResponse::Unary(tx));
         }
 
         // Send buddy frame.
@@ -1173,7 +1607,7 @@ impl IpcClient {
     /// Chunked call path — splits data into chunks and sends with FLAG_CHUNKED.
     async fn call_chunked(
         &self,
-        route_name: &str,
+        identity: &RouteCallIdentity,
         method_idx: u16,
         data: &[u8],
     ) -> Result<ResponseData, IpcError> {
@@ -1185,11 +1619,11 @@ impl IpcClient {
         // Register pending call ONCE — reply comes after last chunk.
         let (tx, rx) = oneshot::channel();
         {
-            self.pending.lock().insert(rid, tx);
+            self.pending.lock().insert(rid, PendingResponse::Unary(tx));
         }
 
         // Build call control (included only in chunk 0).
-        let ctrl = encode_call_control(route_name, method_idx)?;
+        let ctrl = encode_call_control(identity, method_idx)?;
 
         let send_result: Result<(), IpcError> = async {
             let mut writer_guard = self.writer.lock().await;
@@ -1239,7 +1673,7 @@ impl IpcClient {
 
     async fn call_chunked_stream<S, B, E>(
         &self,
-        route_name: &str,
+        identity: &RouteCallIdentity,
         method_idx: u16,
         data_size: usize,
         chunks: S,
@@ -1252,16 +1686,16 @@ impl IpcClient {
         let chunk_size = self.config.chunk_size as usize;
         let total_chunks = request_chunk_count(data_size, chunk_size)?;
         if total_chunks == 0 {
-            return self.call_inline(route_name, method_idx, &[]).await;
+            return self.call_inline(identity, method_idx, &[]).await;
         }
 
         let rid = self.rid_counter.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         {
-            self.pending.lock().insert(rid, tx);
+            self.pending.lock().insert(rid, PendingResponse::Unary(tx));
         }
 
-        let ctrl = encode_call_control(route_name, method_idx)?;
+        let ctrl = encode_call_control(identity, method_idx)?;
         let send_result = self
             .send_chunked_stream_frames(rid, total_chunks, chunk_size, data_size, &ctrl, chunks)
             .await;
@@ -1427,27 +1861,11 @@ impl IpcClient {
         Ok(())
     }
 
-    /// Get the method table for a route.
-    pub fn route_table(&self, name: &str) -> Option<&MethodTable> {
-        self.route_tables.get(name)
-    }
-
-    /// Whether the handshake route table contains a route.
-    pub fn has_route(&self, name: &str) -> bool {
-        self.route_tables.contains_key(name)
-    }
-
-    /// Validate that the connected route matches the complete expected route contract.
-    pub fn validate_route_contract(
-        &self,
+    fn validate_method_table_contract(
+        route_name: &str,
+        table: &MethodTable,
         expected: &c2_contract::ExpectedRouteContract,
     ) -> Result<(), IpcError> {
-        c2_contract::validate_expected_route_contract(expected)
-            .map_err(|err| IpcError::Handshake(err.to_string()))?;
-        let table = self
-            .route_tables
-            .get(&expected.route_name)
-            .ok_or_else(|| IpcError::RouteNotFound(expected.route_name.clone()))?;
         if table.crm_ns() == expected.crm_ns
             && table.crm_name() == expected.crm_name
             && table.crm_ver() == expected.crm_ver
@@ -1456,9 +1874,9 @@ impl IpcClient {
         {
             return Ok(());
         }
-        Err(IpcError::Handshake(format!(
+        Err(IpcError::ContractMismatch(format!(
             "CRM contract mismatch for route {}: expected {}/{}/{} abi_hash={} signature_hash={}, got {}/{}/{} abi_hash={} signature_hash={}",
-            expected.route_name,
+            route_name,
             expected.crm_ns,
             expected.crm_name,
             expected.crm_ver,
@@ -1472,10 +1890,432 @@ impl IpcClient {
         )))
     }
 
+    fn method_table_from_attestation(contract: &PendingRouteAttestation) -> MethodTable {
+        let method_entries = contract
+            .method_names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| MethodEntry {
+                name: name.clone(),
+                index: index as u16,
+            })
+            .collect::<Vec<_>>();
+        MethodTable::from_entries(
+            &method_entries,
+            contract.route_name.clone(),
+            contract.route_uid.clone(),
+            contract.route_revision,
+            contract.crm_ns.clone(),
+            contract.crm_name.clone(),
+            contract.crm_ver.clone(),
+            contract.abi_hash.clone(),
+            contract.signature_hash.clone(),
+            contract.max_payload_size,
+        )
+    }
+
+    fn expected_contract_from_attestation(
+        contract: PendingRouteAttestation,
+    ) -> c2_contract::ExpectedRouteContract {
+        c2_contract::ExpectedRouteContract {
+            route_name: contract.route_name,
+            crm_ns: contract.crm_ns,
+            crm_name: contract.crm_name,
+            crm_ver: contract.crm_ver,
+            abi_hash: contract.abi_hash,
+            signature_hash: contract.signature_hash,
+        }
+    }
+
+    fn cache_attested_contract(&self, contract: &PendingRouteAttestation) {
+        self.route_directory.write().insert_table(
+            contract.route_name.clone(),
+            Self::method_table_from_attestation(contract),
+        );
+    }
+
+    async fn send_control_inline(
+        &self,
+        payload: Vec<u8>,
+        description: &str,
+    ) -> Result<Vec<u8>, IpcError> {
+        Self::send_control_unary_raw(
+            Arc::clone(&self.writer),
+            Arc::clone(&self.pending),
+            Arc::clone(&self.rid_counter),
+            payload,
+            description,
+        )
+        .await
+    }
+
+    /// Get the method table for a route.
+    pub fn route_table(&self, name: &str) -> Option<MethodTable> {
+        self.route_directory.read().route_table(name)
+    }
+
+    /// Whether the cached route table contains a route.
+    pub fn has_route(&self, name: &str) -> bool {
+        self.route_directory.read().has_route(name)
+    }
+
+    /// Validate that the cached route matches the complete expected route contract.
+    pub fn validate_route_contract(
+        &self,
+        expected: &c2_contract::ExpectedRouteContract,
+    ) -> Result<(), IpcError> {
+        c2_contract::validate_expected_route_contract(expected)
+            .map_err(|err| IpcError::ContractMismatch(err.to_string()))?;
+        let table = self
+            .route_directory
+            .read()
+            .route_table(&expected.route_name)
+            .ok_or_else(|| IpcError::RouteNotFound(expected.route_name.clone()))?;
+        Self::validate_method_table_contract(&expected.route_name, &table, expected)
+    }
+
+    async fn rebuild_route_directory(&self) -> Result<(), IpcError> {
+        Self::rebuild_directory_raw(
+            Arc::clone(&self.writer),
+            Arc::clone(&self.pending),
+            Arc::clone(&self.rid_counter),
+            Arc::clone(&self.route_directory),
+        )
+        .await
+    }
+
+    async fn lookup_route_contract(
+        &self,
+        expected: &c2_contract::ExpectedRouteContract,
+    ) -> Result<(), IpcError> {
+        let observed = self.observed_token_for(&expected.route_name);
+        let (observed_route_uid, observed_route_revision) = match observed {
+            Some((uid, revision)) => (Some(uid), Some(revision)),
+            None => (None, None),
+        };
+        let request = RouteLookupRequest {
+            expected: Self::expected_contract_wire(expected),
+            observed_route_uid,
+            observed_route_revision,
+        };
+        let payload = encode_route_lookup_request(&request).map_err(IpcError::Protocol)?;
+        let payload = self.send_control_inline(payload, "route lookup").await?;
+        if Self::payload_msg_type(&payload) == Some(MsgType::RouteNack) {
+            self.route_directory.write().mark_dirty();
+            return Err(Self::route_nack_error(&payload));
+        }
+        let response = decode_route_lookup_response(&payload).map_err(IpcError::Protocol)?;
+        match response {
+            RouteLookupResponse::Ready { current } | RouteLookupResponse::Stale { current } => {
+                self.route_directory.write().apply_record(current);
+                self.validate_route_contract(expected)
+            }
+            RouteLookupResponse::NotFound { route_name } => {
+                self.route_directory.write().remove_route(&route_name);
+                Err(IpcError::RouteNotFound(route_name))
+            }
+            RouteLookupResponse::Removed {
+                route_name,
+                route_uid,
+            } => {
+                self.route_directory.write().remove_route(&route_name);
+                Err(IpcError::RouteRemoved {
+                    route_name,
+                    route_uid,
+                })
+            }
+            RouteLookupResponse::Closed {
+                route_name,
+                route_uid,
+                reason,
+            } => {
+                self.route_directory.write().remove_route(&route_name);
+                Err(IpcError::RouteClosed {
+                    route_name,
+                    route_uid,
+                    reason: format!("{reason:?}"),
+                })
+            }
+            RouteLookupResponse::ContractMismatch { current } => {
+                let message = format!(
+                    "CRM contract mismatch for route {}: expected {}/{}/{} abi_hash={} signature_hash={}, got {}/{}/{} abi_hash={} signature_hash={}",
+                    expected.route_name,
+                    expected.crm_ns,
+                    expected.crm_name,
+                    expected.crm_ver,
+                    expected.abi_hash,
+                    expected.signature_hash,
+                    current.contract.crm_ns,
+                    current.contract.crm_name,
+                    current.contract.crm_ver,
+                    current.contract.abi_hash,
+                    current.contract.signature_hash,
+                );
+                self.route_directory.write().apply_record(current);
+                Err(IpcError::ContractMismatch(message))
+            }
+        }
+    }
+
+    async fn lookup_route_contract_for_acquire(
+        &self,
+        expected: &c2_contract::ExpectedRouteContract,
+    ) -> Result<(), IpcError> {
+        let attempts = ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS.len() + 1;
+        let mut last_not_found = None;
+
+        for attempt in 0..attempts {
+            if attempt > 0 {
+                let delay_ms = ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS[attempt - 1];
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+
+            let result = match self.lookup_route_contract(expected).await {
+                Err(IpcError::CatalogCompacted { .. } | IpcError::WatchUnavailable(_)) => {
+                    self.rebuild_route_directory().await?;
+                    self.lookup_route_contract(expected).await
+                }
+                other => other,
+            };
+
+            match result {
+                Err(IpcError::RouteNotFound(route_name)) if attempt + 1 < attempts => {
+                    last_not_found = Some(route_name);
+                }
+                Err(IpcError::RouteNotFound(route_name)) => {
+                    return Err(IpcError::RouteNotFound(route_name));
+                }
+                other => return other,
+            }
+        }
+
+        Err(IpcError::RouteNotFound(
+            last_not_found.unwrap_or_else(|| expected.route_name.clone()),
+        ))
+    }
+
+    /// Ensure the connected server currently exports a route matching the
+    /// expected CRM contract, using the route catalog instead of the handshake
+    /// snapshot as the authoritative source.
+    pub async fn ensure_route_contract(
+        &self,
+        expected: &c2_contract::ExpectedRouteContract,
+    ) -> Result<(), IpcError> {
+        c2_contract::validate_expected_route_contract(expected)
+            .map_err(|err| IpcError::ContractMismatch(err.to_string()))?;
+        {
+            let directory = self.route_directory.read();
+            if !directory.is_dirty() {
+                if let Some(table) = directory.route_table(&expected.route_name) {
+                    if Self::validate_method_table_contract(&expected.route_name, &table, expected)
+                        .is_ok()
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        if self.route_directory.read().is_dirty() {
+            self.rebuild_route_directory().await?;
+            {
+                let directory = self.route_directory.read();
+                if let Some(table) = directory.route_table(&expected.route_name) {
+                    if Self::validate_method_table_contract(&expected.route_name, &table, expected)
+                        .is_ok()
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        match self.lookup_route_contract(expected).await {
+            Err(IpcError::CatalogCompacted { .. } | IpcError::WatchUnavailable(_)) => {
+                self.rebuild_route_directory().await?;
+                self.lookup_route_contract(expected).await
+            }
+            other => other,
+        }
+    }
+
+    /// Rebuild the route directory from the connected server catalog.
+    pub async fn rebuild_route_catalog(&self) -> Result<(), IpcError> {
+        self.rebuild_route_directory().await
+    }
+
+    /// Perform a contract-scoped route lookup against the connected server catalog.
+    pub async fn lookup_route(
+        &self,
+        expected: &c2_contract::ExpectedRouteContract,
+    ) -> Result<(), IpcError> {
+        self.lookup_route_contract(expected).await
+    }
+
+    /// Authoritatively acquire a route binding for the expected CRM contract.
+    pub async fn acquire_route(
+        &self,
+        expected: &c2_contract::ExpectedRouteContract,
+    ) -> Result<RouteBinding, IpcError> {
+        let attempts = ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS.len() + 1;
+        let mut last_unbound = None;
+
+        for attempt in 0..attempts {
+            self.lookup_route_contract_for_acquire(expected).await?;
+            match self.bind_cached_route(expected) {
+                Ok(binding) => return Ok(binding),
+                Err(IpcError::RouteNotFound(route_name)) if attempt + 1 < attempts => {
+                    last_unbound = Some(IpcError::RouteNotFound(route_name));
+                }
+                Err(IpcError::WatchUnavailable(reason)) if attempt + 1 < attempts => {
+                    last_unbound = Some(IpcError::WatchUnavailable(reason));
+                }
+                Err(err) => return Err(err),
+            }
+            let delay_ms = ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS[attempt];
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
+
+        Err(last_unbound.unwrap_or_else(|| IpcError::RouteNotFound(expected.route_name.clone())))
+    }
+
+    /// Attest a route for relay registration without requiring call admission.
+    ///
+    /// Relay registration has a publish-before-open phase where the server route
+    /// exists in the catalog as `Closed(RegisterCommitted)`. Business clients
+    /// must not call such a route, so [`IpcClient::acquire_route`] rejects it.
+    /// Registration uses this narrower control-plane attestation instead.
+    pub async fn attest_route_for_registration(
+        &self,
+        expected: &c2_contract::ExpectedRouteContract,
+    ) -> Result<RouteBinding, IpcError> {
+        c2_contract::validate_expected_route_contract(expected)
+            .map_err(|err| IpcError::ContractMismatch(err.to_string()))?;
+        let response = Self::list_routes_raw(
+            Arc::clone(&self.writer),
+            Arc::clone(&self.pending),
+            Arc::clone(&self.rid_counter),
+            RouteSelector::RouteName {
+                route_name: expected.route_name.clone(),
+            },
+            None,
+        )
+        .await?;
+        let Some(record) = response
+            .routes
+            .into_iter()
+            .find(|record| record.route_name == expected.route_name)
+        else {
+            return Err(IpcError::RouteNotFound(expected.route_name.clone()));
+        };
+        let table = MethodTable::from_record(&record);
+        Self::validate_method_table_contract(&expected.route_name, &table, expected)?;
+        match record.state {
+            RouteStateWire::Ready => Ok(RouteBinding::from_table(table)),
+            RouteStateWire::Closed
+                if record.state_reason == Some(RouteStateReasonWire::RegisterCommitted) =>
+            {
+                Ok(RouteBinding::from_table(table))
+            }
+            RouteStateWire::Removed => Err(IpcError::RouteRemoved {
+                route_name: record.route_name,
+                route_uid: Some(record.route_uid),
+            }),
+            state => Err(IpcError::RouteClosed {
+                route_name: record.route_name,
+                route_uid: record.route_uid,
+                reason: format!(
+                    "{state:?}:{:?}",
+                    record
+                        .state_reason
+                        .unwrap_or(RouteStateReasonWire::ProtocolViolation)
+                ),
+            }),
+        }
+    }
+
+    /// Bind the cached route record for internal tests and post-lookup callers.
+    pub(crate) fn bind_cached_route(
+        &self,
+        expected: &c2_contract::ExpectedRouteContract,
+    ) -> Result<RouteBinding, IpcError> {
+        c2_contract::validate_expected_route_contract(expected)
+            .map_err(|err| IpcError::ContractMismatch(err.to_string()))?;
+        let table = self.bound_route_table(&expected.route_name)?;
+        Self::validate_method_table_contract(&expected.route_name, &table, expected)?;
+        Ok(RouteBinding::from_table(table))
+    }
+
+    /// Bind the cached route only if it still carries the exact route UID and
+    /// revision observed by the caller.
+    pub(crate) fn bind_cached_route_token(
+        &self,
+        expected: &c2_contract::ExpectedRouteContract,
+        route_uid: &str,
+        route_revision: u64,
+    ) -> Result<RouteBinding, IpcError> {
+        c2_contract::validate_expected_route_contract(expected)
+            .map_err(|err| IpcError::ContractMismatch(err.to_string()))?;
+        let table = self.bound_route_table(&expected.route_name)?;
+        Self::validate_method_table_contract(&expected.route_name, &table, expected)?;
+        if table.route_uid() != route_uid || table.route_revision() != route_revision {
+            return Err(IpcError::RouteStale {
+                route_name: expected.route_name.clone(),
+                current_route_uid: table.route_uid().to_string(),
+                current_route_revision: table.route_revision(),
+            });
+        }
+        Ok(RouteBinding::from_table(table))
+    }
+
+    /// Acquire a route token, refreshing the server route catalog before deciding
+    /// that a cached missing or mismatched token is authoritative.
+    pub async fn acquire_route_token(
+        &self,
+        expected: &c2_contract::ExpectedRouteContract,
+        route_uid: &str,
+        route_revision: u64,
+    ) -> Result<RouteBinding, IpcError> {
+        c2_contract::validate_expected_route_contract(expected)
+            .map_err(|err| IpcError::ContractMismatch(err.to_string()))?;
+        if let Ok(binding) = self.bind_cached_route_token(expected, route_uid, route_revision) {
+            return Ok(binding);
+        }
+
+        if self.route_directory.read().is_dirty() {
+            self.rebuild_route_directory().await?;
+            if let Ok(binding) = self.bind_cached_route_token(expected, route_uid, route_revision) {
+                return Ok(binding);
+            }
+        }
+
+        let attempts = ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS.len() + 1;
+        let mut last_unbound = None;
+
+        for attempt in 0..attempts {
+            self.lookup_route_contract_for_acquire(expected).await?;
+            match self.bind_cached_route_token(expected, route_uid, route_revision) {
+                Ok(binding) => return Ok(binding),
+                Err(IpcError::RouteNotFound(route_name)) if attempt + 1 < attempts => {
+                    last_unbound = Some(IpcError::RouteNotFound(route_name));
+                }
+                Err(IpcError::WatchUnavailable(reason)) if attempt + 1 < attempts => {
+                    last_unbound = Some(IpcError::WatchUnavailable(reason));
+                }
+                Err(err) => return Err(err),
+            }
+            let delay_ms = ROUTE_PUBLICATION_LOOKUP_RETRY_DELAYS_MS[attempt];
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
+
+        Err(last_unbound.unwrap_or_else(|| IpcError::RouteNotFound(expected.route_name.clone())))
+    }
+
     /// CRM tag advertised by a route, if present.
     pub fn route_contract(&self, route_name: &str) -> Option<c2_contract::ExpectedRouteContract> {
-        self.route_tables
-            .get(route_name)
+        self.route_directory
+            .read()
+            .route_table(route_name)
             .map(|table| c2_contract::ExpectedRouteContract {
                 route_name: route_name.to_string(),
                 crm_ns: table.crm_ns().to_string(),
@@ -1488,94 +2328,48 @@ impl IpcClient {
 
     /// Maximum logical payload size advertised by a route, if present.
     pub fn route_max_payload_size(&self, route_name: &str) -> Option<u64> {
-        self.route_tables
-            .get(route_name)
-            .map(MethodTable::max_payload_size)
+        self.route_directory
+            .read()
+            .route_table(route_name)
+            .map(|table| table.max_payload_size())
     }
 
-    pub async fn pending_route_contract(
+    /// Attest and acquire a route that is still pending registration.
+    ///
+    /// This is a registration control-plane path: the route is not visible in
+    /// the committed catalog yet, so ordinary authoritative route lookup cannot
+    /// acquire it. The pending attestation response is cached and immediately
+    /// bound to a route token for relay registration proof.
+    pub async fn acquire_pending_route_attestation(
         &mut self,
         route_name: &str,
         registration_token: &str,
-    ) -> Result<c2_contract::ExpectedRouteContract, IpcError> {
+    ) -> Result<(c2_contract::ExpectedRouteContract, RouteBinding), IpcError> {
         let payload = encode_pending_route_attestation_request(route_name, registration_token)
-            .map_err(IpcError::Handshake)?;
-        let rid = self.rid_counter.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = oneshot::channel();
-        {
-            self.pending.lock().insert(rid, tx);
-        }
-
-        let frame = frame::encode_frame(rid as u64, flags::FLAG_CTRL, &payload);
-        let send_result: Result<(), IpcError> = async {
-            let mut writer_guard = self.writer.lock().await;
-            let writer = writer_guard.as_mut().ok_or(IpcError::Closed)?;
-            writer.write_all(&frame).await?;
-            Ok(())
-        }
-        .await;
-        if let Err(err) = send_result {
-            self.pending.lock().remove(&rid);
-            return Err(err);
-        }
-
-        let response = match rx.await {
-            Ok(result) => result?,
-            Err(_) => return Err(IpcError::Closed),
-        };
-        let payload = match response {
-            ResponseData::Inline(payload) => payload,
-            _ => {
-                return Err(IpcError::Handshake(
-                    "pending route attestation returned non-inline response".to_string(),
-                ));
-            }
-        };
-        match decode_pending_route_attestation_response(&payload).map_err(IpcError::Handshake)? {
+            .map_err(IpcError::Protocol)?;
+        let payload = self
+            .send_control_inline(payload, "pending route attestation")
+            .await?;
+        match decode_pending_route_attestation_response(&payload).map_err(IpcError::Protocol)? {
             PendingRouteAttestationResponse::Attested { contract } => {
-                let method_entries = contract
-                    .method_names
-                    .iter()
-                    .enumerate()
-                    .map(|(index, name)| MethodEntry {
-                        name: name.clone(),
-                        index: index as u16,
-                    })
-                    .collect::<Vec<_>>();
-                self.route_tables.insert(
-                    contract.route_name.clone(),
-                    MethodTable::from_entries(
-                        &method_entries,
-                        contract.crm_ns.clone(),
-                        contract.crm_name.clone(),
-                        contract.crm_ver.clone(),
-                        contract.abi_hash.clone(),
-                        contract.signature_hash.clone(),
-                        contract.max_payload_size,
-                    ),
-                );
-                Ok(c2_contract::ExpectedRouteContract {
-                    route_name: contract.route_name,
-                    crm_ns: contract.crm_ns,
-                    crm_name: contract.crm_name,
-                    crm_ver: contract.crm_ver,
-                    abi_hash: contract.abi_hash,
-                    signature_hash: contract.signature_hash,
-                })
+                self.cache_attested_contract(&contract);
+                let expected = Self::expected_contract_from_attestation(contract);
+                let binding = self.bind_cached_route(&expected)?;
+                Ok((expected, binding))
             }
             PendingRouteAttestationResponse::Rejected { code, message } => {
                 if code == PENDING_ROUTE_REJECT_NOT_FOUND {
                     Err(IpcError::RouteNotFound(route_name.to_string()))
                 } else {
-                    Err(IpcError::Handshake(message))
+                    Err(IpcError::ContractMismatch(message))
                 }
             }
         }
     }
 
     /// Get all route names.
-    pub fn route_names(&self) -> Vec<&str> {
-        self.route_tables.keys().map(|s| s.as_str()).collect()
+    pub fn route_names(&self) -> Vec<String> {
+        self.route_directory.read().route_names()
     }
 
     /// Whether the client has an active connection.
@@ -1624,7 +2418,8 @@ impl IpcClient {
         }
         // Wake pending callers.
         let mut pending = self.pending.lock();
-        for (_, tx) in pending.drain() {
+        for (_, pending) in pending.drain() {
+            let PendingResponse::Unary(tx) = pending;
             let _ = tx.send(Err(IpcError::Closed));
         }
     }
@@ -1637,6 +2432,15 @@ const SIG_PING: u8 = 0x01;
 const SIG_PONG: u8 = 0x02;
 const SIG_DISCONNECT: u8 = 0x08;
 const SIG_DISCONNECT_ACK: u8 = 0x09;
+
+fn complete_unary_pending(
+    pending: Option<PendingResponse>,
+    result: Result<ResponseData, IpcError>,
+) {
+    if let Some(PendingResponse::Unary(tx)) = pending {
+        let _ = tx.send(result);
+    }
+}
 
 async fn recv_loop(
     mut reader: tokio::io::ReadHalf<UnixStream>,
@@ -1702,8 +2506,7 @@ async fn recv_loop(
         let rid = hdr.request_id as u32;
 
         if hdr.is_response() && hdr.is_ctrl() {
-            let tx = { pending.lock().remove(&rid) };
-            if let Some(tx) = tx {
+            if let Some(PendingResponse::Unary(tx)) = pending.lock().remove(&rid) {
                 let _ = tx.send(Ok(ResponseData::Inline(recv_buf.clone())));
             }
             continue;
@@ -1735,11 +2538,12 @@ async fn recv_loop(
                 {
                     eprintln!("Warning: reply chunk assembler creation failed: {e}");
                     let tx = pending.lock().remove(&rid);
-                    if let Some(tx) = tx {
-                        let _ = tx.send(Err(IpcError::Handshake(format!(
+                    complete_unary_pending(
+                        tx,
+                        Err(IpcError::Chunk(format!(
                             "chunked reply assembler failed: {e}"
-                        ))));
-                    }
+                        ))),
+                    );
                     continue;
                 }
             }
@@ -1751,17 +2555,19 @@ async fn recv_loop(
                         match chunk_registry.finish(conn_id, rid as u64) {
                             Ok(finished) => {
                                 let tx = pending.lock().remove(&rid);
-                                if let Some(tx) = tx {
-                                    let _ = tx.send(Ok(ResponseData::Handle(finished.handle)));
-                                }
+                                complete_unary_pending(
+                                    tx,
+                                    Ok(ResponseData::Handle(finished.handle)),
+                                );
                             }
                             Err(e) => {
                                 let tx = pending.lock().remove(&rid);
-                                if let Some(tx) = tx {
-                                    let _ = tx.send(Err(IpcError::Handshake(format!(
+                                complete_unary_pending(
+                                    tx,
+                                    Err(IpcError::Chunk(format!(
                                         "chunked reply finish error: {e}"
-                                    ))));
-                                }
+                                    ))),
+                                );
                             }
                         }
                     }
@@ -1769,11 +2575,10 @@ async fn recv_loop(
                 Err(e) => {
                     eprintln!("Warning: reply chunk feed error: {e}");
                     let tx = pending.lock().remove(&rid);
-                    if let Some(tx) = tx {
-                        let _ = tx.send(Err(IpcError::Handshake(format!(
-                            "chunked reply feed error: {e}"
-                        ))));
-                    }
+                    complete_unary_pending(
+                        tx,
+                        Err(IpcError::Chunk(format!("chunked reply feed error: {e}"))),
+                    );
                 }
             }
             continue; // Don't fall through to decode_response.
@@ -1784,9 +2589,7 @@ async fn recv_loop(
 
         // Dispatch to pending caller.
         let tx = { pending.lock().remove(&rid) };
-        if let Some(tx) = tx {
-            let _ = tx.send(result);
-        }
+        complete_unary_pending(tx, result);
     }
 
     // Connection lost — cleanup all in-flight assemblies for this connection.
@@ -1794,7 +2597,8 @@ async fn recv_loop(
 
     // Connection lost — wake all pending callers.
     let mut pending_guard = pending.lock();
-    for (_, tx) in pending_guard.drain() {
+    for (_, pending) in pending_guard.drain() {
+        let PendingResponse::Unary(tx) = pending;
         let _ = tx.send(Err(IpcError::Closed));
     }
 }
@@ -1877,15 +2681,152 @@ mod tests {
     }
 
     #[test]
+    fn production_direct_ipc_does_not_start_route_watch_task() {
+        let source = include_str!("client.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("client.rs must have a production section");
+        assert!(
+            !production.contains("RouteWatchRequest"),
+            "ordinary direct IPC must not open a route-watch stream"
+        );
+        assert!(
+            !production.contains("PendingResponse::Watch"),
+            "ordinary direct IPC must not depend on watch response state"
+        );
+    }
+
+    #[test]
+    fn route_binding_keeps_acquired_token_after_directory_update() {
+        const ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        const SIG_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let client = IpcClient::new("ipc://route_binding_projection");
+        client.route_directory.write().insert_table(
+            "grid".to_string(),
+            MethodTable::from_entries(
+                &[MethodEntry {
+                    name: "ping".to_string(),
+                    index: 0,
+                }],
+                "grid".to_string(),
+                "grid-route-uid-0001".to_string(),
+                1,
+                "test.grid".to_string(),
+                "Grid".to_string(),
+                "0.1.0".to_string(),
+                ABI_HASH.to_string(),
+                SIG_HASH.to_string(),
+                1024,
+            ),
+        );
+        let expected = c2_contract::ExpectedRouteContract {
+            route_name: "grid".to_string(),
+            crm_ns: "test.grid".to_string(),
+            crm_name: "Grid".to_string(),
+            crm_ver: "0.1.0".to_string(),
+            abi_hash: ABI_HASH.to_string(),
+            signature_hash: SIG_HASH.to_string(),
+        };
+        let binding = client
+            .bind_cached_route(&expected)
+            .expect("initial route should bind");
+
+        client.route_directory.write().insert_table(
+            "grid".to_string(),
+            MethodTable::from_entries(
+                &[MethodEntry {
+                    name: "ping".to_string(),
+                    index: 0,
+                }],
+                "grid".to_string(),
+                "grid-route-uid-0002".to_string(),
+                2,
+                "test.grid".to_string(),
+                "Grid".to_string(),
+                "0.1.0".to_string(),
+                ABI_HASH.to_string(),
+                SIG_HASH.to_string(),
+                1024,
+            ),
+        );
+
+        let (_, identity, _) = binding
+            .call_target_for("ping")
+            .expect("bound method should still exist");
+        assert_eq!(identity.route_uid, "grid-route-uid-0001");
+        assert_eq!(identity.observed_route_revision, 1);
+        let current_binding = client
+            .bind_cached_route(&expected)
+            .expect("directory should expose current route");
+        assert_eq!(current_binding.route_uid(), "grid-route-uid-0002");
+        assert_eq!(current_binding.route_revision(), 2);
+    }
+
+    #[test]
+    fn exact_token_binding_rejects_same_name_replacement() {
+        const ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        const SIG_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let client = IpcClient::new("ipc://route_binding_stale_projection");
+        client.route_directory.write().insert_table(
+            "grid".to_string(),
+            MethodTable::from_entries(
+                &[MethodEntry {
+                    name: "ping".to_string(),
+                    index: 0,
+                }],
+                "grid".to_string(),
+                "grid-route-uid-0002".to_string(),
+                2,
+                "test.grid".to_string(),
+                "Grid".to_string(),
+                "0.1.0".to_string(),
+                ABI_HASH.to_string(),
+                SIG_HASH.to_string(),
+                1024,
+            ),
+        );
+        let expected = c2_contract::ExpectedRouteContract {
+            route_name: "grid".to_string(),
+            crm_ns: "test.grid".to_string(),
+            crm_name: "Grid".to_string(),
+            crm_ver: "0.1.0".to_string(),
+            abi_hash: ABI_HASH.to_string(),
+            signature_hash: SIG_HASH.to_string(),
+        };
+
+        let err = client
+            .bind_cached_route_token(&expected, "grid-route-uid-0001", 1)
+            .expect_err("exact token binding must reject replacement route");
+
+        assert!(
+            matches!(
+                &err,
+                IpcError::RouteStale {
+                    route_name,
+                    current_route_uid,
+                    current_route_revision,
+                } if route_name == "grid"
+                    && current_route_uid == "grid-route-uid-0002"
+                    && *current_route_revision == 2
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
     fn client_validates_route_crm_contract_from_handshake_metadata() {
         const ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         const SIG_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
-        let mut client = IpcClient::new("ipc://contract_projection");
+        let client = IpcClient::new("ipc://contract_projection");
         let mut methods = HashMap::new();
         methods.insert("ping".to_string(), 0);
-        client.route_tables.insert(
+        client.route_directory.write().insert_table(
             "grid".to_string(),
             MethodTable {
+                route_name: "grid".to_string(),
+                route_uid: "grid-route-uid-0001".to_string(),
+                route_revision: 1,
                 crm_ns: "test.grid".to_string(),
                 crm_name: "Grid".to_string(),
                 crm_ver: "0.1.0".to_string(),
@@ -1934,12 +2875,15 @@ mod tests {
     async fn client_rejects_request_over_route_payload_limit_before_transport() {
         const ABI_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         const SIG_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
-        let mut client = IpcClient::new("ipc://payload_limit");
+        let client = IpcClient::new("ipc://payload_limit");
         let mut methods = HashMap::new();
         methods.insert("ping".to_string(), 0);
-        client.route_tables.insert(
+        client.route_directory.write().insert_table(
             "grid".to_string(),
             MethodTable {
+                route_name: "grid".to_string(),
+                route_uid: "grid-route-uid-0001".to_string(),
+                route_revision: 1,
                 crm_ns: "test.grid".to_string(),
                 crm_name: "Grid".to_string(),
                 crm_ver: "0.1.0".to_string(),
@@ -1950,10 +2894,21 @@ mod tests {
             },
         );
 
+        let binding = client
+            .bind_cached_route(&c2_contract::ExpectedRouteContract {
+                route_name: "grid".to_string(),
+                crm_ns: "test.grid".to_string(),
+                crm_name: "Grid".to_string(),
+                crm_ver: "0.1.0".to_string(),
+                abi_hash: ABI_HASH.to_string(),
+                signature_hash: SIG_HASH.to_string(),
+            })
+            .expect("cached test route should bind");
+
         let err = client
-            .call("grid", "ping", b"12345")
+            .call_bound(&binding, "ping", b"12345")
             .await
-            .expect_err("oversized direct call should be rejected before writer access");
+            .expect_err("oversized bound call should be rejected before writer access");
         assert!(
             matches!(err, IpcError::Config(_)),
             "unexpected error: {err:?}"
@@ -1966,7 +2921,7 @@ mod tests {
             Ok::<&'static [u8], std::io::Error>(b"12345")
         });
         let err = client
-            .call_sized_stream("grid", "ping", 5, stream)
+            .call_bound_sized_stream(&binding, "ping", 5, stream)
             .await
             .expect_err("oversized streaming call should be rejected before body polling");
         assert!(
@@ -1988,12 +2943,15 @@ mod tests {
                 ..c2_config::BaseIpcConfig::default()
             },
         };
-        let mut client = IpcClient::with_config("ipc://stream_length_mismatch", cfg);
+        let client = IpcClient::with_config("ipc://stream_length_mismatch", cfg);
         let mut methods = HashMap::new();
         methods.insert("ping".to_string(), 0);
-        client.route_tables.insert(
+        client.route_directory.write().insert_table(
             "grid".to_string(),
             MethodTable {
+                route_name: "grid".to_string(),
+                route_uid: "grid-route-uid-0001".to_string(),
+                route_revision: 1,
                 crm_ns: "test.grid".to_string(),
                 crm_name: "Grid".to_string(),
                 crm_ver: "0.1.0".to_string(),
@@ -2004,10 +2962,21 @@ mod tests {
             },
         );
 
+        let binding = client
+            .bind_cached_route(&c2_contract::ExpectedRouteContract {
+                route_name: "grid".to_string(),
+                crm_ns: "test.grid".to_string(),
+                crm_name: "Grid".to_string(),
+                crm_ver: "0.1.0".to_string(),
+                abi_hash: ABI_HASH.to_string(),
+                signature_hash: SIG_HASH.to_string(),
+            })
+            .expect("cached test route should bind");
+
         let short_stream =
             futures_util::stream::iter(vec![Ok::<Vec<u8>, std::io::Error>(vec![1; 100])]);
         let err = client
-            .call_sized_stream("grid", "ping", 200, short_stream)
+            .call_bound_sized_stream(&binding, "ping", 200, short_stream)
             .await
             .expect_err("short stream should fail before sending a frame");
         assert!(err.to_string().contains("expected 200"));
@@ -2020,7 +2989,7 @@ mod tests {
             Ok::<Vec<u8>, std::io::Error>(vec![2; 51]),
         ]);
         let err = client
-            .call_sized_stream("grid", "ping", 200, long_stream)
+            .call_bound_sized_stream(&binding, "ping", 200, long_stream)
             .await
             .expect_err("long stream should fail before sending a frame");
         assert!(err.to_string().contains("exceeded declared content length"));

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use c2_config::RelayConfig;
-use c2_ipc::{ClientIpcConfig, IpcClient};
+use c2_ipc::{ClientIpcConfig, IpcClient, RouteBinding};
 use parking_lot::RwLock;
 use parking_lot::RwLockWriteGuard;
 
@@ -22,10 +22,13 @@ use crate::relay::conn_pool::{
 };
 use crate::relay::route_table::{RouteTable, TombstoneGcEntry};
 use crate::relay::types::*;
+use crate::relay::upstream_control::{self, UpstreamControlTask, UpstreamOwnerKey};
 
 pub struct RelayState {
     route_table: RwLock<RouteTable>,
     conn_pool: ConnectionPool,
+    upstream_controls: RwLock<HashMap<UpstreamOwnerKey, UpstreamControlTask>>,
+    upstream_watch_unavailable: RwLock<HashMap<UpstreamOwnerKey, String>>,
     config: Arc<RelayConfig>,
     disseminator: Arc<dyn crate::relay::disseminator::Disseminator>,
 }
@@ -50,6 +53,7 @@ pub enum UnregisterResult {
     Removed {
         entry: RouteEntry,
         removed_at: f64,
+        removed_revision: u64,
         client: Option<Arc<IpcClient>>,
     },
     AlreadyRemoved,
@@ -59,11 +63,54 @@ pub enum UnregisterResult {
 
 pub enum UpstreamAcquireError {
     NotFound,
+    Stale {
+        route: RouteEntry,
+    },
+    WatchUnavailable {
+        route: RouteEntry,
+        reason: String,
+    },
     Unreachable {
         route: RouteEntry,
         address: String,
         error: c2_ipc::IpcError,
     },
+}
+
+fn expected_contract_for_route(route: &RouteEntry) -> c2_contract::ExpectedRouteContract {
+    c2_contract::ExpectedRouteContract {
+        route_name: route.name.clone(),
+        crm_ns: route.crm_ns.clone(),
+        crm_name: route.crm_name.clone(),
+        crm_ver: route.crm_ver.clone(),
+        abi_hash: route.abi_hash.clone(),
+        signature_hash: route.signature_hash.clone(),
+    }
+}
+
+fn should_treat_as_semantic_route_failure(error: &c2_ipc::IpcError) -> bool {
+    matches!(
+        error,
+        c2_ipc::IpcError::IdentityMismatch { .. }
+            | c2_ipc::IpcError::ContractMismatch(_)
+            | c2_ipc::IpcError::RouteNotFound(_)
+            | c2_ipc::IpcError::RouteRemoved { .. }
+            | c2_ipc::IpcError::RouteClosed { .. }
+    )
+}
+
+async fn verify_route_after_watch_unavailable(
+    lease: &UpstreamLease,
+    expected: &c2_contract::ExpectedRouteContract,
+) -> Result<(), c2_ipc::IpcError> {
+    match lease.client().lookup_route(expected).await {
+        Err(c2_ipc::IpcError::CatalogCompacted { .. })
+        | Err(c2_ipc::IpcError::WatchUnavailable(_)) => {
+            lease.client().rebuild_route_catalog().await?;
+            lease.client().lookup_route(expected).await
+        }
+        other => other,
+    }
 }
 
 impl RelayState {
@@ -75,6 +122,8 @@ impl RelayState {
         Self {
             route_table: RwLock::new(RouteTable::new(config.relay_id.clone())),
             conn_pool: ConnectionPool::with_owner_lease_duration(owner_lease_duration),
+            upstream_controls: RwLock::new(HashMap::new()),
+            upstream_watch_unavailable: RwLock::new(HashMap::new()),
             disseminator,
             config,
         }
@@ -105,6 +154,8 @@ impl RelayState {
         abi_hash: String,
         signature_hash: String,
         max_payload_size: u64,
+        route_uid: String,
+        route_revision: u64,
         replacement: Option<OwnerReplacement>,
     ) -> RegisterCommitResult {
         match RouteAuthority::new(self).execute(RouteCommand::RegisterLocal {
@@ -118,6 +169,8 @@ impl RelayState {
             abi_hash,
             signature_hash,
             max_payload_size,
+            route_uid,
+            route_revision,
             replacement,
         }) {
             Ok(RouteCommandResult::Registered { entry }) => {
@@ -136,7 +189,8 @@ impl RelayState {
             | Err(ControlError::InvalidServerId { reason })
             | Err(ControlError::InvalidServerInstanceId { reason })
             | Err(ControlError::InvalidAddress { reason })
-            | Err(ControlError::ContractMismatch { reason }) => {
+            | Err(ControlError::ContractMismatch { reason })
+            | Err(ControlError::UpstreamUnavailable { reason }) => {
                 RegisterCommitResult::Invalid { reason }
             }
             Ok(
@@ -161,12 +215,17 @@ impl RelayState {
             Ok(RouteCommandResult::Unregistered {
                 entry,
                 removed_at,
+                removed_revision,
                 client,
-            }) => UnregisterResult::Removed {
-                entry,
-                removed_at,
-                client,
-            },
+            }) => {
+                self.stop_upstream_control_if_owner_idle_for_route(&entry);
+                UnregisterResult::Removed {
+                    entry,
+                    removed_at,
+                    removed_revision,
+                    client,
+                }
+            }
             Ok(
                 RouteCommandResult::Registered { .. }
                 | RouteCommandResult::SameOwner { .. }
@@ -181,7 +240,8 @@ impl RelayState {
             | Err(ControlError::InvalidServerId { .. })
             | Err(ControlError::InvalidServerInstanceId { .. })
             | Err(ControlError::InvalidAddress { .. })
-            | Err(ControlError::ContractMismatch { .. }) => UnregisterResult::OwnerMismatch,
+            | Err(ControlError::ContractMismatch { .. })
+            | Err(ControlError::UpstreamUnavailable { .. }) => UnregisterResult::OwnerMismatch,
             Err(ControlError::DuplicateRoute { .. }) => UnregisterResult::OwnerMismatch,
         }
     }
@@ -189,18 +249,24 @@ impl RelayState {
     pub fn remove_unreachable_local_upstream_if_matches(
         &self,
         expected: &RouteEntry,
-    ) -> Option<(RouteEntry, f64, Option<Arc<IpcClient>>)> {
-        let (entry, removed_at, client) = {
+    ) -> Option<(RouteEntry, f64, u64, Option<Arc<IpcClient>>)> {
+        let (entry, removed_at, removed_revision, client) = {
             let mut route_table = self.route_table.write();
-            let (entry, removed_at) = route_table.unregister_local_route_if_matches(expected);
-            let client = if entry.is_some() {
-                self.conn_pool.remove(&expected.name)
-            } else {
-                None
-            };
-            (entry, removed_at, client)
+            let (entry, removed_at, removed_revision) =
+                route_table.unregister_local_route_if_matches(expected);
+            let client = entry
+                .as_ref()
+                .and_then(|entry| UpstreamEndpointKey::from_route(entry))
+                .and_then(|key| {
+                    if route_table.has_local_route_for_endpoint(&key) {
+                        None
+                    } else {
+                        self.conn_pool.remove(&key)
+                    }
+                });
+            (entry, removed_at, removed_revision, client)
         };
-        entry.map(|entry| (entry, removed_at, client))
+        entry.map(|entry| (entry, removed_at, removed_revision, client))
     }
 
     // -- Route-only operations --
@@ -231,6 +297,7 @@ impl RelayState {
 
     // -- Connection-only operations --
 
+    #[cfg(test)]
     pub async fn acquire_upstream(
         &self,
         name: &str,
@@ -240,23 +307,57 @@ impl RelayState {
             .read()
             .local_route(name)
             .ok_or(UpstreamAcquireError::NotFound)?;
-        let route_name = name.to_string();
+        let (lease, route, _binding) = self.acquire_upstream_for_route(&expected).await?;
+        Ok((lease, route))
+    }
+
+    pub async fn acquire_upstream_for_route(
+        &self,
+        expected: &RouteEntry,
+    ) -> Result<(UpstreamLease, RouteEntry, RouteBinding), UpstreamAcquireError> {
+        if !self
+            .route_table
+            .read()
+            .local_route(&expected.name)
+            .is_some_and(|current| local_route_matches(&current, expected))
+        {
+            return Err(UpstreamAcquireError::Stale {
+                route: expected.clone(),
+            });
+        }
+
+        let Some(endpoint_key) = UpstreamEndpointKey::from_route(expected) else {
+            return Err(UpstreamAcquireError::NotFound);
+        };
+        let route_name = expected.name.clone();
         let expected_for_connect = expected.clone();
 
         let lease = match self
             .conn_pool
-            .acquire_with(name, move |address| {
+            .acquire_with(&endpoint_key, move |endpoint| {
                 let expected = expected_for_connect.clone();
                 let route_name = route_name.clone();
                 async move {
-                    if expected.ipc_address.as_deref() != Some(address.as_str()) {
-                        return Err(c2_ipc::IpcError::Handshake(format!(
-                            "relay upstream address mismatch for route {route_name}: expected {:?}, got {address}",
+                    if expected.ipc_address.as_deref() != Some(endpoint.address()) {
+                        return Err(c2_ipc::IpcError::Protocol(format!(
+                            "relay upstream address mismatch for route {route_name}: expected {:?}, got {}",
+                            expected.ipc_address,
+                            endpoint.address()
+                        )));
+                    }
+                    if expected.server_id.as_deref() != Some(endpoint.server_id())
+                        || expected.server_instance_id.as_deref()
+                            != Some(endpoint.server_instance_id())
+                    {
+                        return Err(c2_ipc::IpcError::Protocol(format!(
+                            "relay upstream endpoint mismatch for route {route_name}: expected server_id={:?} server_instance_id={:?} address={:?}, got {endpoint}",
+                            expected.server_id,
+                            expected.server_instance_id,
                             expected.ipc_address
                         )));
                     }
                     let mut client =
-                        IpcClient::with_config(&address, ClientIpcConfig::default());
+                        IpcClient::with_config(endpoint.address(), ClientIpcConfig::default());
                     client.connect().await?;
                     if client.server_id() != expected.server_id.as_deref()
                         || client.server_instance_id() != expected.server_instance_id.as_deref()
@@ -265,27 +366,20 @@ impl RelayState {
                         let got_server_instance_id =
                             client.server_instance_id().unwrap_or("").to_string();
                         client.close().await;
-                        return Err(c2_ipc::IpcError::Handshake(format!(
-                            "relay upstream identity mismatch for route {route_name}: expected {}/{}, got {got_server_id}/{got_server_instance_id}",
-                            expected.server_id.as_deref().unwrap_or(""),
-                            expected.server_instance_id.as_deref().unwrap_or(""),
-                        )));
+                        return Err(c2_ipc::IpcError::IdentityMismatch {
+                            expected_server_id: expected.server_id.clone().unwrap_or_default(),
+                            expected_server_instance_id: expected
+                                .server_instance_id
+                                .clone()
+                                .unwrap_or_default(),
+                            actual_server_id: got_server_id,
+                            actual_server_instance_id: got_server_instance_id,
+                        });
                     }
-                    let expected_contract = c2_contract::ExpectedRouteContract {
-                        route_name: route_name.clone(),
-                        crm_ns: expected.crm_ns.clone(),
-                        crm_name: expected.crm_name.clone(),
-                        crm_ver: expected.crm_ver.clone(),
-                        abi_hash: expected.abi_hash.clone(),
-                        signature_hash: expected.signature_hash.clone(),
-                    };
-                    if let Err(err) = client.validate_route_contract(&expected_contract) {
+                    let expected_contract = expected_contract_for_route(&expected);
+                    if let Err(err) = client.acquire_route(&expected_contract).await {
                         client.close().await;
                         return Err(err);
-                    }
-                    if !client.has_route(&route_name) {
-                        client.close().await;
-                        return Err(c2_ipc::IpcError::RouteNotFound(route_name));
                     }
                     Ok(Arc::new(client))
                 }
@@ -294,102 +388,320 @@ impl RelayState {
         {
             Ok(lease) => lease,
             Err(PoolAcquireError::NotFound) => return Err(UpstreamAcquireError::NotFound),
-            Err(PoolAcquireError::Unreachable { address, error }) => {
+            Err(PoolAcquireError::Unreachable { endpoint, error }) => {
+                if !self
+                    .route_table
+                    .read()
+                    .local_route(&expected.name)
+                    .is_some_and(|current| local_route_matches(&current, expected))
+                {
+                    return Err(UpstreamAcquireError::Stale {
+                        route: expected.clone(),
+                    });
+                }
                 return Err(UpstreamAcquireError::Unreachable {
-                    route: expected,
-                    address,
+                    route: expected.clone(),
+                    address: endpoint.address().to_string(),
                     error,
                 });
             }
         };
 
         let lease_address = lease.address();
+        let expected_contract = expected_contract_for_route(&expected);
+        if let Some(reason) = self.upstream_control_watch_unavailable_for_route(expected) {
+            match verify_route_after_watch_unavailable(&lease, &expected_contract).await {
+                Ok(()) => {}
+                Err(error) if should_treat_as_semantic_route_failure(&error) => {
+                    if let Some(old_client) = lease.evict_current_client() {
+                        old_client.close_shared().await;
+                    }
+                    drop(lease);
+                    return Err(UpstreamAcquireError::Unreachable {
+                        route: expected.clone(),
+                        address: lease_address,
+                        error,
+                    });
+                }
+                Err(error) => {
+                    if let Some(old_client) = lease.evict_current_client() {
+                        old_client.close_shared().await;
+                    }
+                    drop(lease);
+                    return Err(UpstreamAcquireError::WatchUnavailable {
+                        route: expected.clone(),
+                        reason: format!("{reason}; route lookup unavailable: {error}"),
+                    });
+                }
+            }
+        }
+        let binding = match lease
+            .client()
+            .acquire_route_token(
+                &expected_contract,
+                &expected.route_uid,
+                expected.route_revision,
+            )
+            .await
+        {
+            Ok(binding) => binding,
+            Err(error) => {
+                if let Some(old_client) = lease.evict_current_client() {
+                    old_client.close_shared().await;
+                }
+                drop(lease);
+                return match error {
+                    c2_ipc::IpcError::RouteStale { .. } => Err(UpstreamAcquireError::Stale {
+                        route: expected.clone(),
+                    }),
+                    error => Err(UpstreamAcquireError::Unreachable {
+                        route: expected.clone(),
+                        address: lease_address,
+                        error,
+                    }),
+                };
+            }
+        };
+
+        let lease_endpoint = lease.endpoint();
         let route_matches_lease =
-            self.renew_owner_lease_if_current_route(&expected, lease_address.as_str());
+            self.renew_owner_lease_if_current_route(&expected, &lease_endpoint);
 
         if route_matches_lease {
-            Ok((lease, expected))
+            Ok((lease, expected.clone(), binding))
         } else {
             let client = lease.client();
             drop(lease);
             client.close_shared().await;
-            Err(UpstreamAcquireError::NotFound)
+            Err(UpstreamAcquireError::Stale {
+                route: expected.clone(),
+            })
         }
     }
 
     fn renew_owner_lease_if_current_route(
         &self,
         expected: &RouteEntry,
-        lease_address: &str,
+        lease_endpoint: &UpstreamEndpointKey,
     ) -> bool {
         let route_table = self.route_table.read();
         let Some(entry) = route_table.local_route(&expected.name) else {
             return false;
         };
         if !local_route_matches(&entry, expected)
-            || entry.ipc_address.as_deref() != Some(lease_address)
+            || UpstreamEndpointKey::from_route(&entry).as_ref() != Some(lease_endpoint)
         {
             return false;
         }
-        self.conn_pool.renew_current_owner_lease(&expected.name)
+        self.conn_pool.renew_current_owner_lease(lease_endpoint)
     }
 
     #[cfg(test)]
     pub(crate) fn get_address(&self, name: &str) -> Option<String> {
-        self.conn_pool.get_address(name)
+        let key = self
+            .route_table
+            .read()
+            .local_route(name)
+            .and_then(|entry| UpstreamEndpointKey::from_route(&entry))?;
+        self.conn_pool.get_address(&key)
     }
 
     pub(crate) fn owner_token(&self, name: &str) -> Option<OwnerToken> {
-        self.conn_pool.owner_token(name)
+        let key = self
+            .route_table
+            .read()
+            .local_route(name)
+            .and_then(|entry| UpstreamEndpointKey::from_route(&entry))?;
+        self.conn_pool.owner_token(&key)
+    }
+
+    pub(crate) fn owner_token_for_endpoint(&self, key: &UpstreamEndpointKey) -> Option<OwnerToken> {
+        self.conn_pool.owner_token(key)
     }
 
     pub(crate) fn matches_owner_token(&self, name: &str, token: &OwnerToken) -> bool {
-        self.conn_pool.matches_owner_token(name, token)
+        let Some(key) = self
+            .route_table
+            .read()
+            .local_route(name)
+            .and_then(|entry| UpstreamEndpointKey::from_route(&entry))
+        else {
+            return false;
+        };
+        self.conn_pool.matches_owner_token(&key, token)
     }
 
+    #[cfg(test)]
     pub(crate) fn renew_owner_lease(&self, name: &str, token: &OwnerToken) -> bool {
-        self.conn_pool.renew_owner_lease(name, token)
+        let Some(key) = self
+            .route_table
+            .read()
+            .local_route(name)
+            .and_then(|entry| UpstreamEndpointKey::from_route(&entry))
+        else {
+            return false;
+        };
+        self.conn_pool.renew_owner_lease(&key, token)
     }
 
-    pub(crate) fn replace_if_owner_token(
+    pub(crate) fn renew_owner_lease_for_endpoint(
         &self,
-        name: &str,
+        key: &UpstreamEndpointKey,
         token: &OwnerToken,
-        new_address: String,
+    ) -> bool {
+        self.conn_pool.renew_owner_lease(key, token)
+    }
+
+    pub(crate) fn validate_replaceable_owner_token(
+        &self,
+        key: &UpstreamEndpointKey,
+        token: &OwnerToken,
         evidence: OwnerReplacementEvidence,
-    ) -> Result<Option<Arc<IpcClient>>, OwnerReplaceError> {
+    ) -> Result<(), OwnerReplaceError> {
         self.conn_pool
-            .replace_if_owner_token(name, token, new_address, evidence)
+            .validate_replaceable_owner_token(key, token, evidence)
     }
 
     pub(crate) fn connection_lookup(&self, name: &str) -> CachedClient {
-        self.conn_pool.lookup(name)
+        let Some(key) = self
+            .route_table
+            .read()
+            .local_route(name)
+            .and_then(|entry| UpstreamEndpointKey::from_route(&entry))
+        else {
+            return CachedClient::Missing;
+        };
+        self.conn_pool.lookup(&key)
     }
 
-    pub(crate) fn insert_owner_slot(&self, name: String, address: String) {
-        self.conn_pool.insert_owner(name, address);
+    pub(crate) fn insert_owner_slot(&self, entry: &RouteEntry) {
+        if let Some(key) = UpstreamEndpointKey::from_route(entry) {
+            self.conn_pool.insert_owner(key);
+        }
     }
 
-    pub(crate) fn remove_connection(&self, name: &str) -> Option<Arc<IpcClient>> {
-        self.conn_pool.remove(name)
+    pub(crate) fn start_upstream_control(self: &Arc<Self>, entry: &RouteEntry) {
+        let Some(key) = upstream_control::owner_key_for_route(entry) else {
+            return;
+        };
+        {
+            let controls = self.upstream_controls.read();
+            if controls.contains_key(&key) {
+                return;
+            }
+        }
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let task = upstream_control::spawn(Arc::clone(self), key.clone());
+        let old_task = self.upstream_controls.write().insert(key, task);
+        if let Some(old_task) = old_task {
+            old_task.abort();
+        }
+    }
+
+    pub(crate) fn mark_upstream_control_watch_unavailable(
+        &self,
+        key: &UpstreamOwnerKey,
+        reason: impl Into<String>,
+    ) {
+        self.upstream_watch_unavailable
+            .write()
+            .insert(key.clone(), reason.into());
+    }
+
+    pub(crate) fn clear_upstream_control_watch_unavailable(&self, key: &UpstreamOwnerKey) {
+        self.upstream_watch_unavailable.write().remove(key);
+    }
+
+    pub(crate) fn upstream_control_watch_unavailable_for_route(
+        &self,
+        route: &RouteEntry,
+    ) -> Option<String> {
+        let key = upstream_control::owner_key_for_route(route)?;
+        self.upstream_watch_unavailable.read().get(&key).cloned()
+    }
+
+    pub(crate) fn local_routes_for_owner(&self, key: &UpstreamOwnerKey) -> Vec<RouteEntry> {
+        self.route_table
+            .read()
+            .list_routes()
+            .into_iter()
+            .filter(|entry| upstream_control::owner_key_for_route(entry).as_ref() == Some(key))
+            .collect()
+    }
+
+    pub(crate) fn clear_upstream_control_if_matches(
+        &self,
+        key: &UpstreamOwnerKey,
+        token: &Arc<()>,
+    ) {
+        let mut controls = self.upstream_controls.write();
+        if controls
+            .get(key)
+            .is_some_and(|task| task.token_matches(token))
+        {
+            controls.remove(key);
+            drop(controls);
+            self.clear_upstream_control_watch_unavailable(key);
+        }
+    }
+
+    pub(crate) fn stop_upstream_control_if_owner_idle_for_route(&self, entry: &RouteEntry) {
+        let Some(key) = upstream_control::owner_key_for_route(entry) else {
+            return;
+        };
+        if !self.local_routes_for_owner(&key).is_empty() {
+            return;
+        }
+        if let Some(task) = self.upstream_controls.write().remove(&key) {
+            task.abort();
+        }
+        self.clear_upstream_control_watch_unavailable(&key);
+    }
+
+    pub(crate) fn remove_connection_if_endpoint_unused(
+        &self,
+        key: &UpstreamEndpointKey,
+    ) -> Option<Arc<IpcClient>> {
+        if self.route_table.read().has_local_route_for_endpoint(key) {
+            None
+        } else {
+            self.conn_pool.remove(key)
+        }
     }
 
     pub(crate) fn route_table_write(&self) -> RwLockWriteGuard<'_, RouteTable> {
         self.route_table.write()
     }
 
-    pub(crate) fn evict_idle(&self, idle_timeout_ms: u64) -> Vec<(String, Option<Arc<IpcClient>>)> {
+    pub(crate) fn evict_idle(
+        &self,
+        idle_timeout_ms: u64,
+    ) -> Vec<(UpstreamEndpointKey, Option<Arc<IpcClient>>)> {
         self.conn_pool.evict_idle(idle_timeout_ms)
     }
 
     #[cfg(test)]
     pub(crate) fn evict_connection(&self, name: &str) -> Option<Arc<IpcClient>> {
-        self.conn_pool.evict(name)
+        let key = self
+            .route_table
+            .read()
+            .local_route(name)
+            .and_then(|entry| UpstreamEndpointKey::from_route(&entry))?;
+        self.conn_pool.evict(&key)
     }
 
     #[cfg(test)]
     pub(crate) fn reconnect(&self, name: &str, client: Arc<IpcClient>) {
-        self.conn_pool.reconnect(name, client);
+        if let Some(key) = self
+            .route_table
+            .read()
+            .local_route(name)
+            .and_then(|entry| UpstreamEndpointKey::from_route(&entry))
+        {
+            self.conn_pool.reconnect(&key, client);
+        }
     }
 
     // -- Peer management --
@@ -466,6 +778,10 @@ impl RelayState {
 
     pub(crate) fn gc_tombstones(&self, retention: std::time::Duration) -> Vec<TombstoneGcEntry> {
         self.route_table.write().gc_tombstones(retention)
+    }
+
+    pub(crate) fn route_catalog_revisions(&self) -> (u64, u64) {
+        self.with_route_table(|rt| (rt.catalog_revision(), rt.compaction_revision()))
     }
 
     pub(crate) fn with_route_table<F, R>(&self, f: F) -> R
@@ -582,6 +898,8 @@ mod tests {
             abi_hash.to_string(),
             signature_hash.to_string(),
             1024,
+            format!("{name}-{server_id}-uid"),
+            1,
             None,
         ) {
             RegisterCommitResult::Registered { entry }
@@ -678,6 +996,7 @@ mod tests {
                 name: name.to_string(),
                 relay_id: relay_id.to_string(),
                 removed_at: 1001.0,
+                removed_revision: 1,
             })
             .unwrap();
     }
@@ -708,6 +1027,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-server-old-uid".into(),
+            1,
             None,
         );
 
@@ -732,6 +1053,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-server-grid-uid".into(),
+            1,
             None,
         );
 
@@ -770,6 +1093,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-server-grid-uid".into(),
+            1,
             None,
         ) {
             RegisterCommitResult::Registered { .. } => {}
@@ -779,6 +1104,108 @@ mod tests {
         assert!(
             state.evict_idle(0).is_empty(),
             "route registration must not attach a relay data-plane client"
+        );
+        assert_eq!(state.resolve("grid").len(), 1);
+    }
+
+    #[test]
+    fn local_routes_on_same_endpoint_share_one_owner_slot() {
+        let state = RelayState::new(test_config(), null_disseminator());
+        let manager = Arc::new(IpcClient::new("ipc://shared"));
+        manager.force_connected(true);
+        register_local_with_contract(
+            &state,
+            "manager",
+            "server-grid",
+            "server-grid-instance",
+            "ipc://shared",
+            TEST_CRM_NS,
+            TEST_CRM_NAME,
+            TEST_CRM_VER,
+            TEST_ABI_HASH,
+            TEST_SIGNATURE_HASH,
+            manager,
+        );
+        let builder = Arc::new(IpcClient::new("ipc://shared"));
+        builder.force_connected(true);
+        register_local_with_contract(
+            &state,
+            "builder",
+            "server-grid",
+            "server-grid-instance",
+            "ipc://shared",
+            TEST_CRM_NS,
+            TEST_CRM_NAME,
+            TEST_CRM_VER,
+            TEST_ABI_HASH,
+            TEST_SIGNATURE_HASH,
+            builder,
+        );
+
+        assert_eq!(state.local_route_count(), 2);
+        assert_eq!(
+            state.conn_pool.list_connections().len(),
+            1,
+            "multiple local routes on one server instance must share one endpoint slot"
+        );
+        assert!(
+            state.evict_idle(0).is_empty(),
+            "registering multiple routes must not install a data-plane client"
+        );
+    }
+
+    #[test]
+    fn unregister_one_route_keeps_shared_endpoint_for_remaining_routes() {
+        let state = RelayState::new(test_config(), null_disseminator());
+        let manager = Arc::new(IpcClient::new("ipc://shared"));
+        manager.force_connected(true);
+        register_local(&state, "manager", "server-grid", "ipc://shared", manager);
+        let builder = Arc::new(IpcClient::new("ipc://shared"));
+        builder.force_connected(true);
+        register_local(&state, "builder", "server-grid", "ipc://shared", builder);
+
+        assert!(matches!(
+            state.unregister_upstream("manager", "server-grid"),
+            UnregisterResult::Removed { client: None, .. }
+        ));
+
+        assert!(state.resolve("manager").is_empty());
+        assert_eq!(state.resolve("builder").len(), 1);
+        assert_eq!(state.conn_pool.list_connections().len(), 1);
+        assert!(matches!(
+            state.connection_lookup("builder"),
+            CachedClient::OwnerOnly { .. }
+        ));
+
+        assert!(matches!(
+            state.unregister_upstream("builder", "server-grid"),
+            UnregisterResult::Removed { .. }
+        ));
+        assert!(state.conn_pool.list_connections().is_empty());
+    }
+
+    #[test]
+    fn upstream_watch_unavailable_marks_owner_without_withdrawing_route() {
+        let state = RelayState::new(test_config(), null_disseminator());
+        let client = Arc::new(IpcClient::new("ipc://grid"));
+        let entry = register_local(&state, "grid", "server-grid", "ipc://grid", client);
+        let key = upstream_control::owner_key_for_route(&entry).expect("local route owner key");
+
+        state.mark_upstream_control_watch_unavailable(&key, "watch stream closed");
+
+        let reason = state
+            .upstream_control_watch_unavailable_for_route(&entry)
+            .expect("watch-unavailable reason recorded");
+        assert!(reason.contains("watch stream closed"));
+        assert_eq!(state.resolve("grid").len(), 1);
+        assert_eq!(state.with_route_table(|rt| rt.list_tombstones().len()), 0);
+
+        state.clear_upstream_control_watch_unavailable(&key);
+
+        assert!(
+            state
+                .upstream_control_watch_unavailable_for_route(&entry)
+                .is_none()
         );
         assert_eq!(state.resolve("grid").len(), 1);
     }
@@ -836,6 +1263,8 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
+                route_uid: "grid-route-uid-0001".into(),
+                route_revision: 1,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -871,6 +1300,8 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
+                route_uid: "grid-route-uid-0001".into(),
+                route_revision: 1,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -897,6 +1328,7 @@ mod tests {
             name: "grid".into(),
             relay_id: "test-relay".into(),
             removed_at: 1001.0,
+            removed_revision: 1,
         });
         assert!(matches!(result, Err(ControlError::OwnerMismatch)));
 
@@ -935,6 +1367,8 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.to_string(),
                 signature_hash: TEST_SIGNATURE_HASH.to_string(),
                 max_payload_size: 1024,
+                route_uid: "grid-route-uid-0001".into(),
+                route_revision: 1,
                 locality: Locality::Local,
                 registered_at: 1000.0,
             });
@@ -979,6 +1413,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-server-grid-uid".into(),
+            1,
             None,
         );
         assert!(matches!(
@@ -997,6 +1433,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-server-grid-uid".into(),
+            1,
             None,
         );
         assert!(matches!(
@@ -1030,6 +1468,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-test-route-uid".into(),
+            1,
             None,
         );
         assert!(matches!(
@@ -1050,6 +1490,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-test-route-uid".into(),
+            1,
             None,
         );
 
@@ -1098,11 +1540,81 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-test-route-uid".into(),
+            1,
             Some(replacement_proof),
         );
 
         assert!(matches!(result, RegisterCommitResult::Registered { .. }));
         assert_eq!(state.get_address("grid").as_deref(), Some("ipc://new"));
+    }
+
+    #[tokio::test]
+    async fn route_replacement_keeps_old_endpoint_when_other_routes_still_reference_it() {
+        let state = RelayState::new(test_config(), null_disseminator());
+        let manager = Arc::new(IpcClient::new("ipc://old"));
+        manager.force_connected(true);
+        register_local_with_contract(
+            &state,
+            "manager",
+            "server-old",
+            "server-old-instance",
+            "ipc://old",
+            TEST_CRM_NS,
+            TEST_CRM_NAME,
+            TEST_CRM_VER,
+            TEST_ABI_HASH,
+            TEST_SIGNATURE_HASH,
+            manager,
+        );
+        let builder = Arc::new(IpcClient::new("ipc://old"));
+        builder.force_connected(true);
+        register_local_with_contract(
+            &state,
+            "builder",
+            "server-old",
+            "server-old-instance",
+            "ipc://old",
+            TEST_CRM_NS,
+            TEST_CRM_NAME,
+            TEST_CRM_VER,
+            TEST_ABI_HASH,
+            TEST_SIGNATURE_HASH,
+            builder,
+        );
+        let replacement_proof = confirmed_dead_replacement(
+            &state,
+            "manager",
+            "server-new",
+            "server-new-instance",
+            "ipc://new",
+        )
+        .await;
+
+        let result = state.commit_register_upstream(
+            "manager".into(),
+            "server-new".into(),
+            "server-new-instance".into(),
+            "ipc://new".into(),
+            TEST_CRM_NS.to_string(),
+            TEST_CRM_NAME.to_string(),
+            TEST_CRM_VER.to_string(),
+            TEST_ABI_HASH.to_string(),
+            TEST_SIGNATURE_HASH.to_string(),
+            1024,
+            "manager-server-new-uid".into(),
+            1,
+            Some(replacement_proof),
+        );
+
+        assert!(matches!(result, RegisterCommitResult::Registered { .. }));
+        assert_eq!(state.get_address("manager").as_deref(), Some("ipc://new"));
+        assert_eq!(state.get_address("builder").as_deref(), Some("ipc://old"));
+        assert_eq!(
+            state.conn_pool.list_connections().len(),
+            2,
+            "new owner endpoint and still-referenced old endpoint must coexist"
+        );
     }
 
     #[tokio::test]
@@ -1148,6 +1660,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-test-route-uid".into(),
+            1,
             Some(replacement_proof),
         );
 
@@ -1201,6 +1715,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-server-old-uid".into(),
+            1,
             None,
         );
         assert!(matches!(
@@ -1221,58 +1737,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
-            Some(replacement_proof),
-        );
-
-        assert!(matches!(
-            result,
-            RegisterCommitResult::Duplicate {
-                existing_address
-            } if existing_address == "ipc://old"
-        ));
-        assert_eq!(state.get_address("grid").as_deref(), Some("ipc://old"));
-    }
-
-    #[tokio::test]
-    async fn replacement_proof_is_rejected_after_successful_upstream_acquire() {
-        let state = RelayState::new(test_config(), null_disseminator());
-        let old = Arc::new(IpcClient::new("ipc://old"));
-        old.force_connected(true);
-        register_local(&state, "grid", "server-old", "ipc://old", old);
-        state.evict_connection("grid");
-        let replacement_proof = confirmed_dead_replacement(
-            &state,
-            "grid",
-            "server-new",
-            "server-new-instance",
-            "ipc://replacement",
-        )
-        .await;
-        let reconnected = Arc::new(IpcClient::new("ipc://old"));
-        reconnected.force_connected(true);
-        state.reconnect("grid", reconnected);
-
-        let (lease, route) = match state.acquire_upstream("grid").await {
-            Ok(acquired) => acquired,
-            Err(_) => panic!("expected test upstream acquire to succeed"),
-        };
-        assert_eq!(route.name, "grid");
-        drop(lease);
-
-        state.evict_connection("grid");
-        let replacement = Arc::new(IpcClient::new("ipc://replacement"));
-        replacement.force_connected(true);
-        let result = state.commit_register_upstream(
-            "grid".into(),
-            "server-new".into(),
-            "server-new-instance".into(),
-            "ipc://replacement".into(),
-            TEST_CRM_NS.to_string(),
-            TEST_CRM_NAME.to_string(),
-            TEST_CRM_VER.to_string(),
-            TEST_ABI_HASH.to_string(),
-            TEST_SIGNATURE_HASH.to_string(),
-            1024,
+            "grid-test-route-uid".into(),
+            1,
             Some(replacement_proof),
         );
 
@@ -1295,7 +1761,8 @@ mod tests {
         let before_snapshot =
             serde_json::to_value(FullSyncSnapshot::from_internal(state.full_snapshot())).unwrap();
         let before_digest = state.route_digest();
-        assert!(state.conn_pool.renew_current_owner_lease("grid"));
+        let token = state.owner_token("grid").expect("owner token");
+        assert!(state.renew_owner_lease("grid", &token));
 
         assert_eq!(
             serde_json::to_value(FullSyncSnapshot::from_internal(state.full_snapshot())).unwrap(),
@@ -1357,6 +1824,8 @@ mod tests {
             abi_hash: TEST_ABI_HASH.into(),
             signature_hash: TEST_SIGNATURE_HASH.into(),
             max_payload_size: 1024,
+            route_uid: "grid-route-uid-0001".into(),
+            route_revision: 1,
             locality: Locality::Local,
             registered_at: 0.0,
         };
@@ -1407,6 +1876,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-test-route-uid".into(),
+            1,
             Some(replacement_proof),
         );
 
@@ -1453,12 +1924,14 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-server-grid-uid".into(),
+            1,
             None,
         );
 
         assert!(matches!(result, RegisterCommitResult::SameOwner { .. }));
         assert!(matches!(
-            state.conn_pool.lookup("grid"),
+            state.connection_lookup("grid"),
             CachedClient::OwnerOnly { .. }
         ));
     }
@@ -1481,6 +1954,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-server-grid-uid".into(),
+            1,
             None,
         );
 
@@ -1530,6 +2005,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-test-route-uid".into(),
+            1,
             None,
         );
 
@@ -1540,7 +2017,7 @@ mod tests {
             Some("instance-new")
         );
         assert!(matches!(
-            state.conn_pool.lookup("grid"),
+            state.connection_lookup("grid"),
             CachedClient::OwnerOnly { .. }
         ));
     }
@@ -1565,6 +2042,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-test-route-uid".into(),
+            1,
             None,
         );
 
@@ -1628,6 +2107,8 @@ mod tests {
             TEST_ABI_HASH.to_string(),
             TEST_SIGNATURE_HASH.to_string(),
             1024,
+            "grid-server-grid-uid".into(),
+            1,
             None,
         );
 

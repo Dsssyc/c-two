@@ -460,6 +460,59 @@ def test_failed_native_registration_leaves_no_route_or_identity(monkeypatch) -> 
         cc.shutdown()
 
 
+def test_direct_ipc_acquire_waits_for_dynamic_route_publication() -> None:
+    import threading
+    import time
+
+    import c_two as cc
+    from c_two.transport.registry import _ProcessRegistry
+
+    @cc.crm(namespace='cc.test.runtime_session_dynamic_route', version='0.1.0')
+    class DynamicRouteCRM:
+        def ping(self) -> str:
+            ...
+
+    class DynamicRouteImpl:
+        def ping(self) -> str:
+            return 'pong'
+
+    registrar = _ProcessRegistry()
+    resolver = _ProcessRegistry()
+    crm = None
+
+    try:
+        server = registrar._runtime_session.ensure_server_bridge()  # noqa: SLF001
+        server.start()
+        address = registrar.get_server_address()
+        assert address is not None
+
+        def delayed_register() -> None:
+            time.sleep(0.12)
+            registrar.register(
+                DynamicRouteCRM,
+                DynamicRouteImpl(),
+                name='dynamic-route',
+            )
+
+        thread = threading.Thread(target=delayed_register)
+        thread.start()
+        try:
+            crm = resolver.connect(
+                DynamicRouteCRM,
+                name='dynamic-route',
+                address=address,
+            )
+            assert crm.ping() == 'pong'
+        finally:
+            thread.join(timeout=2)
+            assert not thread.is_alive()
+    finally:
+        if crm is not None:
+            resolver.close(crm)
+        resolver.shutdown()
+        registrar.shutdown()
+
+
 def test_native_runtime_session_projects_client_ipc_overrides_copy() -> None:
     from c_two._native import RuntimeSession
 
@@ -734,21 +787,28 @@ def test_relay_ipc_acceptance_does_not_trust_route_name_only() -> None:
         repo_root / 'sdk/python/native/src/runtime_session_ffi.rs'
     ).read_text(encoding='utf-8')
     acquire_body = source.split('fn acquire_relay_ipc_client(', 1)[1].split(
-        'fn acquire_relay_http_client(',
+        'fn expected_route_contract(',
         1,
     )[0]
 
-    assert 'expected_server_id' in acquire_body
-    assert 'expected_server_instance_id' in acquire_body
+    assert 'candidate: &RelayLocalIpcCandidate' in acquire_body
+    assert 'candidate.server_id' in acquire_body
+    assert 'candidate.server_instance_id' in acquire_body
+    assert 'candidate.route_uid' in acquire_body
+    assert 'candidate.route_revision' in acquire_body
     identity_checks = [
         pos for needle in ('server_identity()', 'server_instance_id()')
         if (pos := acquire_body.find(needle)) >= 0
     ]
     assert identity_checks
-    assert min(identity_checks) < acquire_body.find('route_names()')
+    acquire_pos = acquire_body.find('acquire_route_token(&expected')
+    assert acquire_pos >= 0
+    assert min(identity_checks) < acquire_pos
+    assert 'acquire_route(&expected)' not in acquire_body
+    assert 'route_names()' not in acquire_body
 
 
-def test_relay_ipc_identity_mismatch_falls_back_to_http_not_hard_error() -> None:
+def test_relay_ipc_unavailable_does_not_directly_fallback_to_same_http_relay() -> None:
     repo_root = Path(__file__).resolve().parents[4]
     source = (
         repo_root / 'sdk/python/native/src/runtime_session_ffi.rs'
@@ -759,14 +819,15 @@ def test_relay_ipc_identity_mismatch_falls_back_to_http_not_hard_error() -> None
     )[0]
 
     assert 'RelayIpcConnectError::Unavailable' in connect_body
-    assert 'acquire_relay_http_client' in connect_body
-    assert (
-        connect_body.find('RelayIpcConnectError::Unavailable')
-        < connect_body.find('acquire_relay_http_client')
-    )
+    unavailable_branch = connect_body.split(
+        'Err(RelayIpcConnectError::Unavailable(reason)) => {',
+        1,
+    )[1].split('RelayResolvedConnection::Http', 1)[0]
+    assert 'acquire_relay_http_client' not in unavailable_branch
+    assert 'resolve_relay_connection_after_local_ipc_failures' in unavailable_branch
 
 
-def test_relay_ipc_unavailable_reason_is_logged_before_http_fallback() -> None:
+def test_relay_ipc_unavailable_reason_is_reported_before_fallback_denial() -> None:
     repo_root = Path(__file__).resolve().parents[4]
     source = (
         repo_root / 'sdk/python/native/src/runtime_session_ffi.rs'
@@ -776,7 +837,7 @@ def test_relay_ipc_unavailable_reason_is_logged_before_http_fallback() -> None:
         1,
     )[0]
     acquire_body = source.split('fn acquire_relay_ipc_client(', 1)[1].split(
-        'fn acquire_relay_http_client(',
+        'fn expected_route_contract(',
         1,
     )[0]
 
@@ -785,13 +846,42 @@ def test_relay_ipc_unavailable_reason_is_logged_before_http_fallback() -> None:
     assert 'RelayIpcUnavailableReason::RouteMissing' in source
     assert 'Err(RelayIpcConnectError::Unavailable(reason))' in connect_body
     assert 'eprintln!' in connect_body
-    assert (
-        connect_body.find('eprintln!')
-        < connect_body.find('acquire_relay_http_client')
-    )
+    assert 'falling back to HTTP relay' not in connect_body
+    assert 'fallback denied' in connect_body.lower()
+    assert 'direct_ipc_failure' in source
+    assert 'direct_ipc_failure_kind' in source
+    assert 'route_uid' in source
+    assert 'route_revision' in source
     assert 'RelayIpcUnavailable::pool_acquire' in acquire_body
     assert 'RelayIpcUnavailable::identity_mismatch' in acquire_body
     assert 'RelayIpcUnavailable::route_missing' in acquire_body
+
+
+def test_registry_restores_native_error_bytes_before_wrapping() -> None:
+    from c_two.error import CCError, FallbackDenied
+    from c_two.transport.registry import _cc_error_from_native_exception
+
+    native_exc = RuntimeError('native failure')
+    native_exc.error_bytes = CCError.serialize(FallbackDenied(
+        'same local relay HTTP fallback denied',
+        details={'route': 'grid'},
+    ))
+
+    restored = _cc_error_from_native_exception(native_exc)
+
+    assert isinstance(restored, FallbackDenied)
+    assert restored.details == {'route': 'grid'}
+
+
+def test_relay_ipc_contract_mismatch_uses_cc_error_envelope() -> None:
+    repo_root = Path(__file__).resolve().parents[4]
+    source = (
+        repo_root / 'sdk/python/native/src/runtime_session_ffi.rs'
+    ).read_text(encoding='utf-8')
+
+    assert 'RelayIpcConnectError::ContractMismatch' in source
+    assert 'relay_ipc_contract_mismatch_to_py' in source
+    assert 'ErrorCode::ContractMismatch' in source
 
 
 def test_relay_ipc_identity_boundary_is_native_owned() -> None:
@@ -804,5 +894,5 @@ def test_relay_ipc_identity_boundary_is_native_owned() -> None:
     ).read_text(encoding='utf-8')
 
     assert 'server_instance_id' not in registry_source
-    assert 'expected_server_instance_id' in native_source
-    assert 'route_names()' in native_source
+    assert 'candidate.server_instance_id' in native_source
+    assert 'acquire_route(&expected)' in native_source

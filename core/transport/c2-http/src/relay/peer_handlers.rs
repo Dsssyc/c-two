@@ -86,6 +86,8 @@ pub async fn handle_peer_announce(
             abi_hash,
             signature_hash,
             max_payload_size,
+            route_uid,
+            route_revision,
             registered_at,
         } => {
             // Peer wire data never carries owner-private fields; keep peer
@@ -105,6 +107,8 @@ pub async fn handle_peer_announce(
                     abi_hash,
                     signature_hash,
                     max_payload_size,
+                    route_uid,
+                    route_revision,
                     locality: Locality::Peer,
                     registered_at,
                 },
@@ -114,12 +118,14 @@ pub async fn handle_peer_announce(
             name,
             relay_id,
             removed_at,
+            removed_revision,
         } => {
             let _ = RouteAuthority::new(&state).execute(RouteCommand::WithdrawPeer {
                 sender_relay_id,
                 name,
                 relay_id,
                 removed_at,
+                removed_revision,
             });
         }
         _ => {
@@ -316,6 +322,7 @@ pub async fn handle_peer_digest(
                                 name: tombstone.name,
                                 relay_id: tombstone.relay_id,
                                 removed_at: tombstone.removed_at,
+                                removed_revision: tombstone.removed_revision,
                                 hash,
                             });
                         }
@@ -349,12 +356,14 @@ pub async fn handle_peer_digest(
                             name,
                             relay_id,
                             removed_at,
+                            removed_revision,
                         } = deleted;
                         let _ = RouteAuthority::new(&state).execute(RouteCommand::WithdrawPeer {
                             sender_relay_id: sender_relay_id.clone(),
                             name,
                             relay_id,
                             removed_at,
+                            removed_revision,
                         });
                     }
                 }
@@ -437,6 +446,8 @@ mod tests {
             abi_hash: TEST_ABI_HASH.into(),
             signature_hash: TEST_SIGNATURE_HASH.into(),
             max_payload_size: 1024,
+            route_uid: "grid-route-uid-0001".into(),
+            route_revision: 1,
             registered_at: 1000.0,
             hash: String::new(),
         };
@@ -456,6 +467,7 @@ mod tests {
             name: name.into(),
             relay_id: relay_id.into(),
             removed_at,
+            removed_revision: 1,
             hash: String::new(),
         };
         let hash = crate::relay::peer::route_digest_hash_for_diff_entry(&entry).unwrap();
@@ -490,6 +502,8 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
+                route_uid: "grid-route-uid-0001".into(),
+                route_revision: 1,
                 registered_at: 1000.0,
             },
         );
@@ -518,6 +532,8 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
+                route_uid: "grid-route-uid-0001".into(),
+                route_revision: 1,
                 registered_at: 1000.0,
             },
         );
@@ -547,6 +563,8 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
+                route_uid: "grid-route-uid-0001".into(),
+                route_revision: 1,
                 registered_at: 1000.0,
             },
         );
@@ -588,6 +606,8 @@ mod tests {
                     abi_hash: TEST_ABI_HASH.into(),
                     signature_hash: TEST_SIGNATURE_HASH.into(),
                     max_payload_size: 1024,
+                    route_uid: "grid-route-uid-0001".into(),
+                    route_revision: 1,
                     registered_at: 1000.0,
                 },
             );
@@ -620,6 +640,8 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
+                route_uid: "grid-route-uid-0001".into(),
+                route_revision: 1,
                 registered_at: 1000.0,
             },
         );
@@ -650,6 +672,8 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
+                route_uid: "grid-route-uid-0001".into(),
+                route_revision: 1,
                 registered_at: 1000.0,
             },
         );
@@ -710,6 +734,8 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
+                route_uid: "grid-route-uid-0001".into(),
+                route_revision: 1,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -806,6 +832,8 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
+                route_uid: "grid-route-uid-0001".into(),
+                route_revision: 1,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -846,6 +874,8 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
+                route_uid: "grid-route-uid-0001".into(),
+                route_revision: 1,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -856,6 +886,7 @@ mod tests {
                 name: "grid".into(),
                 relay_id: "relay-b".into(),
                 removed_at: 1001.0,
+                removed_revision: 1,
             },
         );
         envelope.protocol_version = crate::relay::peer::ROUTE_HASH_PEER_VERSION - 1;
@@ -913,6 +944,8 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
+                route_uid: "grid-route-uid-0001".into(),
+                route_revision: 1,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -952,6 +985,8 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
+                route_uid: "grid-route-uid-0001".into(),
+                route_revision: 1,
                 locality: Locality::Local,
                 registered_at: 1000.0,
             });
@@ -962,6 +997,7 @@ mod tests {
                 name: "grid".into(),
                 relay_id: "relay-a".into(),
                 removed_at: 1001.0,
+                removed_revision: 1,
             },
         );
 
@@ -1067,6 +1103,8 @@ mod tests {
                     abi_hash: TEST_ABI_HASH.into(),
                     signature_hash: TEST_SIGNATURE_HASH.into(),
                     max_payload_size: 1024,
+                    route_uid: "grid-route-uid-0001".into(),
+                    route_revision: 1,
                     registered_at: 1000.0,
                     hash: test_hash(),
                 }],
@@ -1151,6 +1189,8 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
+                route_uid: "grid-route-uid-0001".into(),
+                route_revision: 1,
                 locality: Locality::Local,
                 registered_at: 1000.0,
             });
@@ -1170,6 +1210,8 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
+                route_uid: "grid-route-uid-0001".into(),
+                route_revision: 1,
                 locality: Locality::Peer,
                 registered_at: 1001.0,
             },
@@ -1279,6 +1321,8 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
+                route_uid: "grid-route-uid-0001".into(),
+                route_revision: 1,
                 locality: Locality::Peer,
                 registered_at: 1000.0,
             },
@@ -1316,6 +1360,8 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
+                route_uid: "grid-route-uid-0001".into(),
+                route_revision: 1,
                 locality: Locality::Local,
                 registered_at: 1000.0,
             });
@@ -1350,6 +1396,8 @@ mod tests {
                 abi_hash: TEST_ABI_HASH.into(),
                 signature_hash: TEST_SIGNATURE_HASH.into(),
                 max_payload_size: 1024,
+                route_uid: "grid-route-uid-0001".into(),
+                route_revision: 1,
                 locality: Locality::Local,
                 registered_at: 1000.0,
             });
