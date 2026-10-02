@@ -2,7 +2,7 @@ name: Windows Native
 
 on:
   push:
-    branches: [socu/windows-native-ipc, main]
+    branches: [socu/windows-native-ipc, main, socu/memory-audit-validation-20261002]
   pull_request:
     paths:
       - "core/**"
