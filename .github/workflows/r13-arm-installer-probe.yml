@@ -1,0 +1,34 @@
+name: R13 ARM installer diagnosis
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: windows-11-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 3
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12'
+          architecture: arm64
+      - uses: astral-sh/setup-uv@v6
+      - name: Prepare isolated test dependencies
+        shell: pwsh
+        run: |
+          $path = Join-Path $env:RUNNER_TEMP 'r13-probe-python'
+          uv venv --python (Get-Command python).Source $path
+          $python = Join-Path $path 'Scripts\python.exe'
+          uv pip install --python $python pytest==9.0.3 pytest-timeout==2.4.0
+          "PROBE_PYTHON=$python" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Collect unchanged baseline and candidate evidence
+        run: python tools/ci/r13_arm_installer_probe.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: r13-arm-installer-diagnostic
+          path: artifacts/arm-installer-probe
+          if-no-files-found: error
