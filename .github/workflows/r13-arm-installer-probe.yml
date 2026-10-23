@@ -1,5 +1,7 @@
 name: R13 ARM installer diagnosis
 on:
+  push:
+    branches: [socu/r13-arm-probe-6msr2d9q]
   workflow_dispatch:
 permissions:
   contents: read
@@ -10,7 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          fetch-depth: 3
+          fetch-depth: 4
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: '3.12'
