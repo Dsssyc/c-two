@@ -1,0 +1,97 @@
+name: Identity Error Delta Validation
+
+# Disposable CI wrapper. Compile the fixed implementation commit below.
+on:
+  push:
+    branches: [socu/windows-user-scope-ci]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMPLEMENTATION_SHA: b9efb2d9706a7563ddaacfe2db2dc2d953c8b86e
+  CARGO_BUILD_JOBS: "2"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_TERM_COLOR: never
+  C2_ENV_FILE: ""
+  C2_RELAY_ANCHOR_ADDRESS: ""
+
+jobs:
+  classification:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    defaults:
+      run:
+        working-directory: c-two
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: c-two
+          ref: ${{ env.IMPLEMENTATION_SHA }}
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.12"
+          architecture: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: "22"
+          architecture: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ runner.os == 'Windows' && 'stable-aarch64-pc-windows-msvc' || 'stable' }}
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+        with:
+          arch: arm64
+      - name: Prepare the existing FastDB SDK prerequisite
+        run: python .github/scripts/prepare_fastdb_sdk.py --output "${{ runner.temp }}/fastdb-core-sdk" --emit-github
+      - name: Run affected error-contract checks
+        shell: python
+        run: |
+          import hashlib, json, os, pathlib, platform, shutil, subprocess
+          root = pathlib.Path.cwd()
+          output = root / "artifacts" / "identity-error-delta"
+          output.mkdir(parents=True)
+          sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          assert sha == os.environ["IMPLEMENTATION_SHA"]
+          if os.name == "nt":
+              assert subprocess.check_output(["node", "-p", "process.arch"], text=True).strip() == "arm64"
+              assert "host: aarch64-pc-windows-msvc" in subprocess.check_output(["rustc", "-vV"], text=True)
+          pkg = root / "core/foundation/c2-mem-ffi/bindings/typescript"
+          cargo = ["cargo", "test", "--locked", "--manifest-path", "core/Cargo.toml"]
+          commands = [
+              ("owner", cargo + ["-p", "c2-core", "--lib", "local_connect_identity_refusal_survives_inspect_and_not_sent"], root, False),
+              ("ffi", cargo + ["-p", "c2-mem-ffi", "--lib", "connect_status_distinguishes_identity_from_os_access_failure"], root, False),
+              ("header", cargo + ["-p", "c2-mem-ffi", "--lib", "public_c_header_compiles_and_matches_block_layout"], root, False),
+              ("npm", ["npm.cmd" if os.name == "nt" else "npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"], pkg, os.name == "nt"),
+              ("node-build", ["node", "scripts/build-runtime.mjs"], pkg, False),
+              ("node", ["node", "--test", "--test-name-pattern", "native connect preserves identity refusal separately from OS access failure", "tests/c2-mem-ffi-node-loader.test.mjs"], pkg, False),
+          ]
+          receipt = {"source": sha, "os": platform.platform(), "machine": platform.machine(), "steps": []}
+          try:
+              for name, command, cwd, shell in commands:
+                  with (output / (name + ".log")).open("w", encoding="utf-8") as log:
+                      result = subprocess.run(command, cwd=cwd, stdout=log, stderr=subprocess.STDOUT, shell=shell)
+                  receipt["steps"].append({"name": name, "exit_code": result.returncode})
+                  if result.returncode:
+                      print((output / (name + ".log")).read_text(encoding="utf-8", errors="replace")[-6000:])
+                      raise SystemExit(result.returncode)
+              receipt["artifacts"] = [{"path": str(p.relative_to(root)), "sha256": hashlib.sha256(p.read_bytes()).hexdigest()}
+                                      for p in (pkg / "dist").rglob("*") if p.is_file()]
+              receipt["passed"] = True
+          finally:
+              (output / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: identity-error-${{ matrix.os }}-${{ env.IMPLEMENTATION_SHA }}
+          path: c-two/artifacts/identity-error-delta/
+          if-no-files-found: error
