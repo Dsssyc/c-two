@@ -215,24 +215,6 @@ impl RelayAwareHttpClient {
             .block_on(self.call_async(method_name, data))
     }
 
-    /// Call through the selected relay path while retaining the dispatch
-    /// phase of any failure.
-    pub fn call_phased(&self, method_name: &str, data: &[u8]) -> Result<Vec<u8>, HttpCallError> {
-        super::http_client::runtime()
-            .handle()
-            .block_on(self.call_phased_async(method_name, data))
-    }
-
-    pub async fn call_phased_async(
-        &self,
-        method_name: &str,
-        data: &[u8],
-    ) -> Result<Vec<u8>, HttpCallError> {
-        self.call_async(method_name, data)
-            .await
-            .map_err(|source| HttpCallError::new(http_call_error_phase(&source), source))
-    }
-
     /// Call with the owner's original scope guards and one shared, read-only
     /// input owner, including any caller-owned retention permit. Bodies retain
     /// that complete owner until their last slice is dropped; an attempt's
@@ -250,44 +232,10 @@ impl RelayAwareHttpClient {
             .map_err(|source| HttpCallError::new(http_call_error_phase(&source), source))
     }
 
-    /// Synchronous facade for [`Self::call_controlled_async`]. An owned caller
-    /// must drive this operation to completion after business dispatch.
-    pub fn call_controlled(
-        &self,
-        method_name: &str,
-        data: HttpInputOwner,
-        control: &HttpCallControl,
-    ) -> Result<Vec<u8>, HttpCallError> {
-        super::http_client::runtime()
-            .handle()
-            .block_on(self.call_controlled_async(method_name, data, control))
-    }
-
     pub fn connect(&self) -> Result<(), HttpError> {
         super::http_client::runtime()
             .handle()
             .block_on(self.connect_async())
-    }
-
-    pub fn resolve_target(&self) -> Result<RelayResolvedTarget, HttpError> {
-        super::http_client::runtime()
-            .handle()
-            .block_on(self.resolve_target_async())
-    }
-
-    pub fn resolve_http_target(&self) -> Result<RelayResolvedTarget, HttpError> {
-        super::http_client::runtime()
-            .handle()
-            .block_on(self.resolve_http_target_async())
-    }
-
-    pub fn resolve_target_after_local_ipc_failures(
-        &self,
-        failed_candidates: &[RelayLocalIpcCandidate],
-    ) -> Result<RelayResolvedTarget, HttpError> {
-        super::http_client::runtime()
-            .handle()
-            .block_on(self.resolve_target_after_local_ipc_failures_async(failed_candidates))
     }
 
     /// Resolve/probe using the caller's single connection budget.
@@ -298,7 +246,7 @@ impl RelayAwareHttpClient {
         super::connect_deadline::check(deadline, "relay_resolve")?;
         super::http_client::runtime_with_deadline(deadline)?
             .handle()
-            .block_on(self.resolve_target_with_deadline_async(deadline))
+            .block_on(self.select_target_with_local_exclusions_async(true, &[], false, deadline))
     }
 
     pub fn resolve_http_target_with_deadline(
@@ -308,7 +256,7 @@ impl RelayAwareHttpClient {
         super::connect_deadline::check(deadline, "relay_resolve")?;
         super::http_client::runtime_with_deadline(deadline)?
             .handle()
-            .block_on(self.resolve_http_target_with_deadline_async(deadline))
+            .block_on(self.select_target_with_local_exclusions_async(false, &[], false, deadline))
     }
 
     pub fn resolve_target_after_local_ipc_failures_with_deadline(
@@ -323,40 +271,8 @@ impl RelayAwareHttpClient {
                 true,
                 failed_candidates,
                 true,
-                None,
                 deadline,
             ))
-    }
-
-    pub async fn resolve_target_after_local_ipc_failures_with_deadline_async(
-        &self,
-        failed_candidates: &[RelayLocalIpcCandidate],
-        deadline: c2_config::ConnectDeadline,
-    ) -> Result<RelayResolvedTarget, HttpError> {
-        self.select_target_with_local_exclusions_async(
-            true,
-            failed_candidates,
-            true,
-            None,
-            deadline,
-        )
-        .await
-    }
-
-    pub async fn resolve_target_with_deadline_async(
-        &self,
-        deadline: c2_config::ConnectDeadline,
-    ) -> Result<RelayResolvedTarget, HttpError> {
-        self.select_target_with_local_exclusions_async(true, &[], false, None, deadline)
-            .await
-    }
-
-    pub async fn resolve_http_target_with_deadline_async(
-        &self,
-        deadline: c2_config::ConnectDeadline,
-    ) -> Result<RelayResolvedTarget, HttpError> {
-        self.select_target_with_local_exclusions_async(false, &[], false, None, deadline)
-            .await
     }
 
     async fn connect_async(&self) -> Result<(), HttpError> {
@@ -364,45 +280,6 @@ impl RelayAwareHttpClient {
             RelayResolvedTarget::Http { .. } => Ok(()),
             RelayResolvedTarget::Ipc { .. } => unreachable!("HTTP selection cannot return IPC"),
         }
-    }
-
-    pub async fn resolve_target_async(&self) -> Result<RelayResolvedTarget, HttpError> {
-        self.select_target_async(true).await
-    }
-
-    pub async fn resolve_http_target_async(&self) -> Result<RelayResolvedTarget, HttpError> {
-        self.select_target_async(false).await
-    }
-
-    /// Resolve/probe under the same logical call's active check. Control-plane
-    /// safety timeouts remain independent and never restart its deadline.
-    /// Neither resolve nor probe invokes the business dispatch guard.
-    pub async fn resolve_http_target_controlled_async(
-        &self,
-        control: &HttpCallControl,
-    ) -> Result<RelayResolvedTarget, HttpError> {
-        self.select_target_with_local_exclusions_async(
-            false,
-            &[],
-            false,
-            Some(control),
-            c2_config::ConnectDeadline::default(),
-        )
-        .await
-    }
-
-    pub async fn resolve_target_after_local_ipc_failures_async(
-        &self,
-        failed_candidates: &[RelayLocalIpcCandidate],
-    ) -> Result<RelayResolvedTarget, HttpError> {
-        self.select_target_with_local_exclusions_async(
-            true,
-            failed_candidates,
-            true,
-            None,
-            c2_config::ConnectDeadline::default(),
-        )
-        .await
     }
 
     async fn select_target_async(
@@ -413,7 +290,6 @@ impl RelayAwareHttpClient {
             prefer_local_ipc,
             &[],
             false,
-            None,
             c2_config::ConnectDeadline::default(),
         )
         .await
@@ -424,7 +300,6 @@ impl RelayAwareHttpClient {
         prefer_local_ipc: bool,
         excluded_local_ipc_candidates: &[RelayLocalIpcCandidate],
         fallback_denied_when_only_excluded: bool,
-        control: Option<&HttpCallControl>,
         deadline: c2_config::ConnectDeadline,
     ) -> Result<RelayResolvedTarget, HttpError> {
         let attempts = self.config.max_attempts.max(1);
@@ -437,7 +312,7 @@ impl RelayAwareHttpClient {
                 .resolve_routes_async(
                     attempt > 0 || fallback_denied_when_only_excluded,
                     prefer_local_ipc,
-                    control,
+                    None,
                     deadline,
                 )
                 .await
@@ -491,7 +366,7 @@ impl RelayAwareHttpClient {
             for route in ordered {
                 let relay_url = route.relay_url.trim_end_matches('/').to_string();
                 let client =
-                    match self.acquire_route_client_with_deadline(&relay_url, control, deadline) {
+                    match self.acquire_route_client_with_deadline(&relay_url, None, deadline) {
                         Ok(client) => client,
                         Err(err @ HttpError::LocalCallRejected(_)) => return Err(err),
                         Err(err) => {
@@ -500,7 +375,6 @@ impl RelayAwareHttpClient {
                         }
                     };
 
-                check_active(control)?;
                 let probe = super::connect_deadline::run(
                     deadline,
                     "relay_probe",
@@ -511,7 +385,6 @@ impl RelayAwareHttpClient {
                     ),
                 )
                 .await;
-                check_active(control)?;
                 match probe {
                     Ok(()) => {
                         *super::connect_deadline::lock(&self.current, deadline, "relay_select")? =
@@ -538,13 +411,11 @@ impl RelayAwareHttpClient {
             }
 
             if attempt + 1 < attempts {
-                check_active(control)?;
                 super::connect_deadline::run(deadline, "relay_retry", async {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     Ok(())
                 })
                 .await?;
-                check_active(control)?;
             }
         }
 
@@ -1092,7 +963,7 @@ mod tests {
         .with_http_only();
         let start = std::time::Instant::now();
         let error = client
-            .resolve_target_with_deadline_async(connect_budget(50))
+            .select_target_with_local_exclusions_async(true, &[], false, connect_budget(50))
             .await
             .unwrap_err();
         assert!(start.elapsed() < Duration::from_millis(500));
@@ -1100,7 +971,7 @@ mod tests {
         responsive.store(true, Ordering::SeqCst);
         assert_eq!(
             client
-                .resolve_http_target_with_deadline_async(connect_budget(1000))
+                .select_target_with_local_exclusions_async(false, &[], false, connect_budget(1000))
                 .await
                 .unwrap()
                 .as_url(),
@@ -1171,7 +1042,7 @@ mod tests {
         .with_http_only();
         assert_connect_expired(
             client
-                .resolve_http_target_with_deadline_async(connect_budget(200))
+                .select_target_with_local_exclusions_async(false, &[], false, connect_budget(200))
                 .await
                 .unwrap_err(),
             "relay_probe",
@@ -1180,7 +1051,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         stall_probe.store(false, Ordering::SeqCst);
         client
-            .resolve_http_target_with_deadline_async(connect_budget(1000))
+            .select_target_with_local_exclusions_async(false, &[], false, connect_budget(1000))
             .await
             .unwrap();
         assert_eq!(probes.load(Ordering::SeqCst), 2);
@@ -1219,7 +1090,7 @@ mod tests {
         let start = std::time::Instant::now();
         assert_connect_expired(
             client
-                .resolve_http_target_with_deadline_async(connect_budget(150))
+                .select_target_with_local_exclusions_async(false, &[], false, connect_budget(150))
                 .await
                 .unwrap_err(),
             "relay_resolve",
@@ -1737,7 +1608,7 @@ mod tests {
         )
         .unwrap()
         .with_local_endpoint_context(context);
-        let result = client.resolve_target_async().await;
+        let result = client.select_target_async(true).await;
         match expected {
             Ok(expect_ipc) => {
                 let target = result.unwrap();
@@ -1839,7 +1710,7 @@ mod tests {
         )
         .unwrap();
 
-        let target = client.resolve_target_async().await.unwrap();
+        let target = client.select_target_async(true).await.unwrap();
         assert_eq!(target.as_url(), "ipc://local-grid");
         assert_eq!(
             resolve_count.load(Ordering::SeqCst),
@@ -1887,7 +1758,12 @@ mod tests {
         };
 
         let target = client
-            .resolve_target_after_local_ipc_failures_async(std::slice::from_ref(&failed))
+            .select_target_with_local_exclusions_async(
+                true,
+                std::slice::from_ref(&failed),
+                true,
+                c2_config::ConnectDeadline::default(),
+            )
             .await
             .unwrap();
 
@@ -1941,7 +1817,12 @@ mod tests {
         };
 
         let err = client
-            .resolve_target_after_local_ipc_failures_async(std::slice::from_ref(&failed))
+            .select_target_with_local_exclusions_async(
+                true,
+                std::slice::from_ref(&failed),
+                true,
+                c2_config::ConnectDeadline::default(),
+            )
             .await
             .unwrap_err();
 
@@ -2452,7 +2333,11 @@ mod tests {
         .unwrap();
 
         let error = client
-            .call_phased_async("step", b"payload")
+            .call_controlled_async(
+                "step",
+                Arc::new(b"payload".to_vec()),
+                &HttpCallControl::new(|| Ok(()), |_| Ok(())),
+            )
             .await
             .expect_err("dispatch-uncertain relay failure");
         assert_eq!(error.phase(), HttpCallPhase::DispatchUncertain);

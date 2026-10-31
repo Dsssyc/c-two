@@ -222,7 +222,7 @@ List known mesh peers:
 c3 registry peers --relay http://127.0.0.1:8080
 ```
 
-Registry requests use a five-second HTTP timeout. By default, the CLI bypasses system proxy settings for relay inspection unless the relay layer is configured to use proxies.
+Registry requests use a five-second HTTP timeout. Malformed route or peer responses fail the command with a JSON error. By default, the CLI bypasses system proxy settings for relay inspection unless the relay layer is configured to use proxies.
 
 ## Development
 

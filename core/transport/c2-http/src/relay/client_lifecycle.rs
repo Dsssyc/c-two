@@ -1,4 +1,4 @@
-//! Bounded Relay ownership of native clients, including unconfirmed cleanup.
+//! Relay ownership of native clients, including unconfirmed cleanup.
 //!
 //! A slot is reserved before connecting. Unique-client cancellation hands the
 //! client to this domain; published clients remain owned until confirmed close.
@@ -10,8 +10,6 @@ use std::time::Duration;
 use c2_ipc::{IpcClient, IpcError};
 use parking_lot::Mutex;
 use tokio::sync::Notify;
-
-const MAX_CLIENT_OWNERS: usize = 1024;
 
 struct Entry {
     client: Option<Arc<IpcClient>>,
@@ -85,13 +83,9 @@ impl ClientLifecycle {
         }
         let slot = if let Some(slot) = inner.entries.iter().position(Option::is_none) {
             slot
-        } else if inner.entries.len() < MAX_CLIENT_OWNERS {
+        } else {
             inner.entries.push(None);
             inner.entries.len() - 1
-        } else {
-            return Err(IpcError::Protocol(
-                "relay native client owner capacity exhausted".into(),
-            ));
         };
         inner.entries[slot] = Some(Entry {
             client: None,
@@ -213,7 +207,6 @@ impl ClientLifecycle {
         if let Some(slot) = inner.entries.iter().position(Option::is_none) {
             inner.entries[slot] = entry;
         } else {
-            assert!(inner.entries.len() < MAX_CLIENT_OWNERS);
             inner.entries.push(entry);
         }
     }
@@ -229,31 +222,22 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn native_owner_capacity_includes_unpublished_and_closing_clients() {
+    async fn native_owner_tracking_accepts_more_than_1024_clients() {
+        const CLIENT_COUNT: usize = 1025;
         let domain = ClientLifecycle::new();
         let mut reserved = Vec::new();
-        for _ in 0..MAX_CLIENT_OWNERS {
+        for _ in 0..CLIENT_COUNT {
             reserved.push(
                 domain
                     .manage(|| IpcClient::new("ipc://not-connected"))
                     .unwrap(),
             );
         }
-        assert!(
-            domain
-                .manage(|| IpcClient::new("ipc://not-connected"))
-                .is_err()
-        );
-        assert!(
-            domain
-                .manage(|| panic!("exhausted ownership must reject before client allocation"))
-                .is_err()
-        );
-        assert_eq!(domain.outstanding(), MAX_CLIENT_OWNERS);
+        assert_eq!(domain.outstanding(), CLIENT_COUNT);
         // Unique candidates (including failed acquisition) cannot lose their
         // cleanup observer on future cancellation; dropping transfers ownership.
         drop(reserved);
-        assert_eq!(domain.outstanding(), MAX_CLIENT_OWNERS);
+        assert_eq!(domain.outstanding(), CLIENT_COUNT);
         let observer = {
             let domain = domain.clone();
             tokio::spawn(async move { domain.run().await })

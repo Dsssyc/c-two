@@ -2345,22 +2345,8 @@ function decodeIpcCatalogReply(payload: Uint8Array, responseTag: number): C2IpcC
     ipcCatalogInteger(item.rejected_revision, "rejected_revision");
     const error = ipcCatalogObject(item.error);
     const code = ipcCatalogInteger(error.code, "error code");
-    const name = ipcCatalogText(error.name, "error name");
-    // NACK is a structured C2 error envelope, not a business reply payload.
-    // Names mirror the canonical c2-error registry for wire validation only.
-    const names = [
-      "Unknown", "ResourceInputDeserializing", "ResourceOutputSerializing",
-      "ResourceFunctionExecuting", "ResourceInputFromBuffer", "ClientInputSerializing",
-      "ClientOutputDeserializing", "ClientCallingResource", "ClientOutputFromBuffer",
-    ];
-    const routeNames = [
-      "ResourceNotFound", "ResourceUnavailable", "ResourceAlreadyRegistered", "RouteStale",
-      "RegistryUnavailable", "WriteConflict", "ResourceClosed", "ResourceRemoved",
-      "ContractMismatch", "IdentityMismatch", "RouteCatalogCompacted", "RouteWatchUnavailable",
-      "ProtocolViolation", "FallbackDenied", "CallDeadlineExceeded", "UnsupportedCallMode", "CallCapacityExceeded",
-    ];
-    if (error.version !== 1 || name !== (code < names.length ? names[code] : routeNames[code - 701]) ||
-      typeof error.message !== "string") {
+    ipcCatalogText(error.name, "error name");
+    if (error.version !== 1 || typeof error.message !== "string") {
       throw new C2IpcTransportError("C-Two IPC route catalog invalid NACK error envelope.");
     }
     const details = ipcCatalogObject(error.details);

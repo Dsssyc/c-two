@@ -1099,6 +1099,35 @@ test('compacted catalog uses contract-scoped list then lookup with the pinned to
   await t.close();
 });
 
+test('a future semantic NACK code and name remain a valid error envelope', async () => {
+  const s = server(), t = transport(s);
+  s.nextControl = {tag: 0x15, body: {nonce: 0, rejected_revision: 1, error: {
+    version: 1, code: 799, name: 'FutureRouteCondition', message: 'future condition', details: {},
+  }}};
+  try {
+    await assert.rejects(() => call(t), (error) => {
+      assert.ok(error instanceof C2IpcTransportError);
+      assert.match(error.message, /NACK 799: future condition/);
+      return true;
+    });
+    assert.equal(s.calls.length, 0);
+  } finally { await t.close(); }
+});
+
+test('NACK decoding still rejects malformed error fields', async () => {
+  for (const [error, expected] of [
+    [{version: 1, code: 799, name: 42, message: 'bad name', details: {}}, /missing error name/],
+    [{version: 1, code: 799, name: 'FutureRouteCondition', message: 'bad details', details: {stage: 42}}, /invalid NACK error details/],
+  ]) {
+    const s = server(), t = transport(s);
+    s.nextControl = {tag: 0x15, body: {nonce: 0, rejected_revision: 1, error}};
+    try {
+      await assert.rejects(() => call(t), expected);
+      assert.equal(s.calls.length, 0);
+    } finally { await t.close(); }
+  }
+});
+
 test('corrupt control replies discard the stream without business dispatch', async () => {
   for (const corrupt of [
     (id) => frame(id + 1n, 18, Buffer.from([0x11, 123, 125])),

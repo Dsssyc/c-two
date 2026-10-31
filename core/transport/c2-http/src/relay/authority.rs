@@ -23,10 +23,16 @@ pub(crate) enum ControlError {
     InvalidServerInstanceId { reason: String },
     InvalidAddress { reason: String },
     ContractMismatch { reason: String },
-    UpstreamUnavailable { reason: String },
     AddressMismatch { existing_address: String },
     DuplicateRoute { existing_address: String },
     OwnerMismatch,
+    NotFound,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RouteAttestationError {
+    ContractMismatch { reason: String },
+    UpstreamUnavailable { reason: String },
     NotFound,
 }
 
@@ -92,18 +98,15 @@ fn existing_contract_mismatch_reason(
     None
 }
 
-fn control_error_from_ipc_attestation_error(
-    route_name: &str,
-    err: c2_ipc::IpcError,
-) -> ControlError {
+fn attestation_error_from_ipc(route_name: &str, err: c2_ipc::IpcError) -> RouteAttestationError {
     match err {
         c2_ipc::IpcError::RouteNotFound(_)
         | c2_ipc::IpcError::RouteRemoved { .. }
-        | c2_ipc::IpcError::RouteClosed { .. } => ControlError::NotFound,
+        | c2_ipc::IpcError::RouteClosed { .. } => RouteAttestationError::NotFound,
         c2_ipc::IpcError::ContractMismatch(reason) | c2_ipc::IpcError::Protocol(reason) => {
-            ControlError::ContractMismatch { reason }
+            RouteAttestationError::ContractMismatch { reason }
         }
-        err => ControlError::UpstreamUnavailable {
+        err => RouteAttestationError::UpstreamUnavailable {
             reason: format!("IPC upstream route '{route_name}' acquisition failed: {err}"),
         },
     }
@@ -112,24 +115,24 @@ fn control_error_from_ipc_attestation_error(
 pub(crate) async fn read_ipc_route_contract(
     client: &IpcClient,
     route_name: &str,
-) -> Result<AttestedRouteContract, ControlError> {
+) -> Result<AttestedRouteContract, RouteAttestationError> {
     let Some(contract) = client.route_contract(route_name) else {
-        return Err(ControlError::NotFound);
+        return Err(RouteAttestationError::NotFound);
     };
     if contract.crm_ns.is_empty() || contract.crm_name.is_empty() || contract.crm_ver.is_empty() {
-        return Err(ControlError::ContractMismatch {
+        return Err(RouteAttestationError::ContractMismatch {
             reason: format!("IPC upstream route '{route_name}' did not advertise a CRM contract"),
         });
     }
     if c2_contract::validate_expected_route_contract(&contract).is_err() {
-        return Err(ControlError::ContractMismatch {
+        return Err(RouteAttestationError::ContractMismatch {
             reason: format!("IPC upstream route '{route_name}' advertised an invalid CRM contract"),
         });
     }
     let binding = client
         .attest_route_for_registration(&contract)
         .await
-        .map_err(|err| control_error_from_ipc_attestation_error(route_name, err))?;
+        .map_err(|err| attestation_error_from_ipc(route_name, err))?;
     Ok(AttestedRouteContract {
         route_uid: binding.route_uid().to_string(),
         route_revision: binding.route_revision(),
@@ -145,10 +148,10 @@ pub(crate) async fn read_ipc_route_contract(
 pub(crate) async fn attest_ipc_route_contract(
     client: &IpcClient,
     claimed: ClaimedRouteContract<'_>,
-) -> Result<AttestedRouteContract, ControlError> {
+) -> Result<AttestedRouteContract, RouteAttestationError> {
     let route_name = claimed.expected.route_name.as_str();
     if c2_contract::validate_expected_route_contract(claimed.expected).is_err() {
-        return Err(ControlError::ContractMismatch {
+        return Err(RouteAttestationError::ContractMismatch {
             reason: format!(
                 "IPC upstream route '{route_name}' registration did not claim a complete CRM contract"
             ),
@@ -157,10 +160,10 @@ pub(crate) async fn attest_ipc_route_contract(
     let binding = client
         .attest_route_for_registration(claimed.expected)
         .await
-        .map_err(|err| control_error_from_ipc_attestation_error(route_name, err))?;
+        .map_err(|err| attestation_error_from_ipc(route_name, err))?;
     let max_payload_size = binding.max_payload_size();
     if claimed.max_payload_size != max_payload_size {
-        return Err(ControlError::ContractMismatch {
+        return Err(RouteAttestationError::ContractMismatch {
             reason: format!(
                 "IPC upstream route '{route_name}' max_payload_size mismatch: claimed {}, got {max_payload_size}",
                 claimed.max_payload_size
@@ -183,28 +186,28 @@ pub(crate) async fn attest_ipc_pending_route_contract(
     client: &mut IpcClient,
     registration_token: &str,
     claimed: ClaimedRouteContract<'_>,
-) -> Result<AttestedRouteContract, ControlError> {
+) -> Result<AttestedRouteContract, RouteAttestationError> {
     let route_name = claimed.expected.route_name.as_str();
     let (contract, binding) = match client
         .acquire_pending_route_attestation(route_name, registration_token)
         .await
     {
         Ok(attested) => attested,
-        Err(c2_ipc::IpcError::RouteNotFound(_)) => return Err(ControlError::NotFound),
+        Err(c2_ipc::IpcError::RouteNotFound(_)) => return Err(RouteAttestationError::NotFound),
         Err(err) => {
-            return Err(control_error_from_ipc_attestation_error(route_name, err));
+            return Err(attestation_error_from_ipc(route_name, err));
         }
     };
     let max_payload_size = binding.max_payload_size();
     if c2_contract::validate_expected_route_contract(claimed.expected).is_err() {
-        return Err(ControlError::ContractMismatch {
+        return Err(RouteAttestationError::ContractMismatch {
             reason: format!(
                 "IPC upstream route '{route_name}' registration did not claim a complete CRM contract"
             ),
         });
     }
     if claimed.expected != &contract {
-        return Err(ControlError::ContractMismatch {
+        return Err(RouteAttestationError::ContractMismatch {
             reason: format!(
                 "IPC upstream pending route '{route_name}' CRM contract mismatch: claimed {}/{}/{} hashes={}/{}, got {}/{}/{} hashes={}/{}",
                 claimed.expected.crm_ns,
@@ -221,7 +224,7 @@ pub(crate) async fn attest_ipc_pending_route_contract(
         });
     }
     if claimed.max_payload_size != max_payload_size {
-        return Err(ControlError::ContractMismatch {
+        return Err(RouteAttestationError::ContractMismatch {
             reason: format!(
                 "IPC upstream pending route '{route_name}' max_payload_size mismatch: claimed {}, got {max_payload_size}",
                 claimed.max_payload_size
@@ -475,13 +478,7 @@ impl<'a> RouteAuthority<'a> {
                 return Err(ControlError::AddressMismatch { existing_address });
             }
 
-            let replacement = match self.different_owner_replacement(&existing) {
-                Ok(replacement) => replacement,
-                Err(ControlError::DuplicateRoute { existing_address }) => {
-                    return Err(ControlError::DuplicateRoute { existing_address });
-                }
-                Err(err) => return Err(err),
-            };
+            let replacement = self.different_owner_replacement(&existing)?;
 
             match self.probe_captured_owner(&replacement).await {
                 OwnerProbe::Alive => {

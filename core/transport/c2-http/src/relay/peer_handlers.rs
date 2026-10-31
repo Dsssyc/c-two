@@ -36,7 +36,7 @@ fn current_full_sync_envelope(state: &RelayState) -> FullSyncEnvelope {
 }
 
 fn check_protocol_version(envelope: &PeerEnvelope) -> bool {
-    if envelope.protocol_version > PROTOCOL_VERSION {
+    if envelope.protocol_version != PROTOCOL_VERSION {
         eprintln!(
             "[relay] Ignoring message from {} with protocol_version {}",
             envelope.sender_relay_id, envelope.protocol_version
@@ -657,6 +657,29 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert!(state.list_routes().is_empty());
         assert!(state.list_routes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn join_requires_the_current_protocol_version() {
+        for protocol_version in [PROTOCOL_VERSION - 1, PROTOCOL_VERSION + 1] {
+            let state = test_state();
+            let mut envelope = PeerEnvelope::new(
+                "relay-b",
+                PeerMessage::RelayJoin {
+                    relay_id: "relay-b".into(),
+                    url: "http://relay-b:8080".into(),
+                },
+            );
+            envelope.protocol_version = protocol_version;
+            let response = handle_peer_join(State(state.clone()), Json(envelope))
+                .await
+                .into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                state.list_peers().is_empty(),
+                "accepted version {protocol_version}"
+            );
+        }
     }
 
     #[tokio::test]

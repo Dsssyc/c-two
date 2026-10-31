@@ -99,8 +99,6 @@ pub struct RouteTombstone {
     pub removed_at: f64,
     /// Delete-event revision assigned by the owner relay.
     pub removed_revision: u64,
-    /// Local route-table revision assigned when this relay applies the tombstone.
-    pub local_catalog_revision: u64,
     pub server_id: Option<String>,
     pub observed_at: Instant,
 }
@@ -343,7 +341,6 @@ impl FullSyncTombstone {
             relay_id: self.relay_id.clone(),
             removed_at: self.removed_at,
             removed_revision: self.removed_revision,
-            local_catalog_revision: 0,
             server_id: None,
             observed_at: observed_now(),
         }

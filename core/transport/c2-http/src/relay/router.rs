@@ -5,7 +5,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::{
     Json, Router,
@@ -21,16 +21,17 @@ use futures::StreamExt;
 use crate::client::{LOCAL_ENDPOINT_NAMESPACE_HEADER, validate_local_endpoint_namespace};
 use crate::relay::authority::{
     ClaimedRouteContract, ControlError, LocalRegistration, LocalRouteOwner, RegisterPreparation,
-    RegistrationWithdrawal, RouteAuthority, attest_ipc_pending_route_contract,
-    attest_ipc_route_contract, read_ipc_route_contract,
+    RegistrationWithdrawal, RouteAttestationError, RouteAuthority,
+    attest_ipc_pending_route_contract, attest_ipc_route_contract, read_ipc_route_contract,
 };
 use crate::relay::conn_pool::UpstreamLease;
 use crate::relay::gossip::{broadcast_route_announce, broadcast_route_withdraw};
 use crate::relay::peer_handlers;
 use crate::relay::route_table::valid_route_name;
+use crate::relay::server::connect_register_attestation_client;
 use crate::relay::state::{RegisterCommitResult, RelayState, UpstreamAcquireError};
 use crate::relay::types::{RouteEntry, UpstreamEndpointKey};
-use c2_ipc::{ClientIpcConfig, IpcClient};
+use c2_ipc::IpcClient;
 
 const CONTROL_BODY_LIMIT_BYTES: usize = 64 * 1024;
 const EXPECTED_CRM_NS_HEADER: &str = "x-c2-expected-crm-ns";
@@ -560,33 +561,6 @@ fn with_local_namespace_response(state: &RelayState, mut response: Response) -> 
     response
 }
 
-async fn connect_ipc_for_register(
-    address: &str,
-    context: &c2_config::LocalEndpointContext,
-    clients: &Arc<crate::relay::client_lifecycle::ClientLifecycle>,
-) -> Result<crate::relay::client_lifecycle::ManagedClient, String> {
-    let started = Instant::now();
-    let timeout = Duration::from_millis(500);
-    loop {
-        let endpoint = context
-            .endpoint(address)
-            .map_err(|error| error.to_string())?;
-        let mut client = clients
-            .manage(|| IpcClient::with_endpoint(endpoint, ClientIpcConfig::default()))
-            .map_err(|error| error.to_string())?;
-        match client.connect().await {
-            Ok(()) => return Ok(client),
-            Err(err) => {
-                let message = err.to_string();
-                if started.elapsed() >= timeout {
-                    return Err(message);
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        }
-    }
-}
-
 fn register_body_string_field<'a>(
     body: &'a serde_json::Value,
     field: &'static str,
@@ -815,8 +789,7 @@ async fn handle_register(
         | Err(ControlError::InvalidServerId { reason })
         | Err(ControlError::InvalidServerInstanceId { reason })
         | Err(ControlError::InvalidAddress { reason })
-        | Err(ControlError::ContractMismatch { reason })
-        | Err(ControlError::UpstreamUnavailable { reason }) => {
+        | Err(ControlError::ContractMismatch { reason }) => {
             eprintln!(
                 "[relay] Register rejected: name={name} server_id={server_id} address={address} reason={reason}"
             );
@@ -832,7 +805,7 @@ async fn handle_register(
 
     // Connect IPC client and attest the registered route contract.
     let (client, contract) = {
-        let mut c = match connect_ipc_for_register(
+        let mut c = match connect_register_attestation_client(
             &address,
             state.endpoint_context(),
             &state.clients,
@@ -877,7 +850,7 @@ async fn handle_register(
             .await
             {
                 Ok(contract) => contract,
-                Err(ControlError::ContractMismatch { reason }) => {
+                Err(RouteAttestationError::ContractMismatch { reason }) => {
                     close_client(c);
                     eprintln!(
                         "[relay] Register rejected: name={name} server_id={server_id} address={address} reason={reason}"
@@ -888,7 +861,7 @@ async fn handle_register(
                     )
                         .into_response();
                 }
-                Err(ControlError::NotFound) => {
+                Err(RouteAttestationError::NotFound) => {
                     if !prepare_only {
                         close_client(c);
                         eprintln!(
@@ -928,7 +901,7 @@ async fn handle_register(
                     .await
                     {
                         Ok(contract) => contract,
-                        Err(ControlError::ContractMismatch { reason }) => {
+                        Err(RouteAttestationError::ContractMismatch { reason }) => {
                             close_client(c);
                             eprintln!(
                                 "[relay] Register rejected: name={name} server_id={server_id} address={address} reason={reason}"
@@ -939,7 +912,7 @@ async fn handle_register(
                             )
                                 .into_response();
                         }
-                        Err(ControlError::NotFound) => {
+                        Err(RouteAttestationError::NotFound) => {
                             close_client(c);
                             eprintln!(
                                 "[relay] Register rejected: name={name} server_id={server_id} address={address} reason=pending_route_not_attested"
@@ -952,7 +925,7 @@ async fn handle_register(
                                 )
                                     .into_response();
                         }
-                        Err(ControlError::UpstreamUnavailable { reason }) => {
+                        Err(RouteAttestationError::UpstreamUnavailable { reason }) => {
                             close_client(c);
                             eprintln!(
                                 "[relay] Register rejected: name={name} server_id={server_id} address={address} reason={reason}"
@@ -963,12 +936,9 @@ async fn handle_register(
                             )
                                 .into_response();
                         }
-                        Err(_) => unreachable!(
-                            "pending route contract attestation returns only contract errors"
-                        ),
                     }
                 }
-                Err(ControlError::UpstreamUnavailable { reason }) => {
+                Err(RouteAttestationError::UpstreamUnavailable { reason }) => {
                     close_client(c);
                     eprintln!(
                         "[relay] Register rejected: name={name} server_id={server_id} address={address} reason={reason}"
@@ -979,12 +949,11 @@ async fn handle_register(
                     )
                         .into_response();
                 }
-                Err(_) => unreachable!("route contract attestation returns only contract errors"),
             },
             None => match c.rebuild_route_catalog().await {
                 Ok(()) => match read_ipc_route_contract(&c, &name).await {
                     Ok(contract) => contract,
-                    Err(ControlError::NotFound) => {
+                    Err(RouteAttestationError::NotFound) => {
                         close_client(c);
                         eprintln!(
                             "[relay] Register rejected: name={name} server_id={server_id} address={address} reason=route_not_exported"
@@ -997,7 +966,7 @@ async fn handle_register(
                         )
                             .into_response();
                     }
-                    Err(ControlError::ContractMismatch { reason }) => {
+                    Err(RouteAttestationError::ContractMismatch { reason }) => {
                         close_client(c);
                         eprintln!(
                             "[relay] Register rejected: name={name} server_id={server_id} address={address} reason={reason}"
@@ -1008,7 +977,7 @@ async fn handle_register(
                         )
                             .into_response();
                     }
-                    Err(ControlError::UpstreamUnavailable { reason }) => {
+                    Err(RouteAttestationError::UpstreamUnavailable { reason }) => {
                         close_client(c);
                         eprintln!(
                             "[relay] Register rejected: name={name} server_id={server_id} address={address} reason={reason}"
@@ -1019,7 +988,6 @@ async fn handle_register(
                         )
                             .into_response();
                     }
-                    Err(_) => unreachable!("route contract read returns only contract errors"),
                 },
                 Err(c2_ipc::IpcError::RouteNotFound(_)) => {
                     close_client(c);
@@ -1121,8 +1089,7 @@ async fn handle_register(
         | Err(ControlError::InvalidServerId { reason })
         | Err(ControlError::InvalidServerInstanceId { reason })
         | Err(ControlError::InvalidAddress { reason })
-        | Err(ControlError::ContractMismatch { reason })
-        | Err(ControlError::UpstreamUnavailable { reason }) => {
+        | Err(ControlError::ContractMismatch { reason }) => {
             close_arc_client(&state, client);
             eprintln!(
                 "[relay] Register rejected: name={name} server_id={server_id} address={address} reason={reason}"
@@ -2254,6 +2221,98 @@ mod tests {
     const TEST_SIGNATURE_HASH: &str =
         "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn register_connect_does_not_retry_protocol_version_mismatch() {
+        use std::os::unix::fs::DirBuilderExt;
+        use tokio::io::AsyncReadExt;
+
+        struct TestRoot(std::path::PathBuf);
+        impl Drop for TestRoot {
+            fn drop(&mut self) {
+                std::fs::remove_dir_all(&self.0).unwrap();
+            }
+        }
+
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = TestRoot(std::path::PathBuf::from(format!(
+            "/tmp/c2-m4-{}-{suffix:x}",
+            std::process::id(),
+        )));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root.0)
+            .unwrap();
+        let context = c2_config::LocalEndpointContext::with_unix_root(&root.0).unwrap();
+        let address = "ipc://version-mismatch";
+        let mut listener =
+            c2_local::LocalListener::bind(&context.endpoint(address).unwrap()).unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            tokio::pin!(stopped);
+            let mut accepted = 0;
+            loop {
+                tokio::select! {
+                    _ = &mut stopped => break,
+                    stream = listener.accept() => {
+                        let mut stream = stream.unwrap();
+                        accepted += 1;
+                        let mut hello = [0; 25];
+                        stream.read_exact(&mut hello).await.unwrap();
+                        let mut response = c2_wire::handshake::encode_version_preamble(
+                            c2_wire::handshake::VersionPreambleKind::VersionMismatch,
+                        );
+                        response[21..].copy_from_slice(
+                            &(c2_wire::handshake::HANDSHAKE_VERSION - 1).to_le_bytes(),
+                        );
+                        stream.write_all(&response).await.unwrap();
+                    }
+                }
+            }
+            listener.close();
+            accepted
+        });
+        let state = namespace_test_state(context.clone());
+        let clients = state.clients.clone();
+        let observer = {
+            let clients = clients.clone();
+            tokio::spawn(async move { clients.run().await })
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            LOCAL_ENDPOINT_NAMESPACE_HEADER,
+            context.namespace_id().parse().unwrap(),
+        );
+        let response = handle_register(
+            State(state),
+            headers,
+            Json(serde_json::json!({
+                "name": "grid",
+                "server_id": "version-server",
+                "server_instance_id": "version-instance",
+                "address": address,
+                "max_payload_size": 1024,
+            })),
+        )
+        .await;
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 4096).await.unwrap();
+        stop.send(()).unwrap();
+        let accepted = peer.await.unwrap();
+        clients.shutdown().await;
+        observer.await.unwrap();
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(
+            std::str::from_utf8(&body)
+                .unwrap()
+                .contains("protocol version mismatch")
+        );
+        assert_eq!(accepted, 1, "version mismatch must terminate registration");
+    }
+
     #[test]
     fn semantic_withdrawal_reason_separates_authority_from_transport() {
         assert_eq!(
@@ -2890,7 +2949,7 @@ mod tests {
         );
         assert!(
             source.find("local_namespace_from_headers").unwrap()
-                < source.find("connect_ipc_for_register(").unwrap()
+                < source.find("connect_register_attestation_client(").unwrap()
         );
     }
 
@@ -3047,9 +3106,12 @@ mod tests {
             )
             .unwrap()
             .with_local_endpoint_context(&contexts[index]);
-            let RelayResolvedTarget::Ipc { candidate } =
-                client.resolve_target_async().await.unwrap()
-            else {
+            let RelayResolvedTarget::Ipc { candidate } = tokio::task::spawn_blocking(move || {
+                client.resolve_target_with_deadline(c2_config::ConnectDeadline::default())
+            })
+            .await
+            .unwrap()
+            .unwrap() else {
                 panic!("matching namespace must propose direct IPC")
             };
             let mut ipc = IpcClient::with_endpoint(
@@ -3084,10 +3146,14 @@ mod tests {
             )
             .unwrap()
             .with_local_endpoint_context(&contexts[1 - index]);
-            assert!(matches!(
-                wrong_client.resolve_target_async().await.unwrap(),
-                RelayResolvedTarget::Http { .. }
-            ));
+            let (wrong_client, target) = tokio::task::spawn_blocking(move || {
+                let target = wrong_client
+                    .resolve_target_with_deadline(c2_config::ConnectDeadline::default());
+                (wrong_client, target.unwrap())
+            })
+            .await
+            .unwrap();
+            assert!(matches!(target, RelayResolvedTarget::Http { .. }));
             assert_eq!(
                 wrong_client.call_async("ping", b"").await.unwrap(),
                 if index == 0 {
@@ -3105,7 +3171,12 @@ mod tests {
             )
             .unwrap();
             assert!(matches!(
-                legacy.resolve_target_async().await.unwrap(),
+                tokio::task::spawn_blocking(move || {
+                    legacy.resolve_target_with_deadline(c2_config::ConnectDeadline::default())
+                })
+                .await
+                .unwrap()
+                .unwrap(),
                 RelayResolvedTarget::Http { .. }
             ));
             let route_before = relay_states[index].local_route("grid").unwrap();

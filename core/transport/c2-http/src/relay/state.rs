@@ -266,8 +266,7 @@ impl RelayState {
             | Err(ControlError::InvalidServerId { reason })
             | Err(ControlError::InvalidServerInstanceId { reason })
             | Err(ControlError::InvalidAddress { reason })
-            | Err(ControlError::ContractMismatch { reason })
-            | Err(ControlError::UpstreamUnavailable { reason }) => {
+            | Err(ControlError::ContractMismatch { reason }) => {
                 RegisterCommitResult::Invalid { reason }
             }
             Err(ControlError::OwnerMismatch) | Err(ControlError::NotFound) => {
@@ -303,8 +302,7 @@ impl RelayState {
             | Err(ControlError::InvalidServerId { .. })
             | Err(ControlError::InvalidServerInstanceId { .. })
             | Err(ControlError::InvalidAddress { .. })
-            | Err(ControlError::ContractMismatch { .. })
-            | Err(ControlError::UpstreamUnavailable { .. }) => UnregisterResult::OwnerMismatch,
+            | Err(ControlError::ContractMismatch { .. }) => UnregisterResult::OwnerMismatch,
             Err(ControlError::DuplicateRoute { .. }) => UnregisterResult::OwnerMismatch,
         }
     }
@@ -977,10 +975,6 @@ impl RelayState {
 
     pub(crate) fn gc_tombstones(&self, retention: std::time::Duration) -> Vec<TombstoneGcEntry> {
         self.route_table.write().gc_tombstones(retention)
-    }
-
-    pub(crate) fn route_catalog_revisions(&self) -> (u64, u64) {
-        self.with_route_table(|rt| (rt.catalog_revision(), rt.compaction_revision()))
     }
 
     pub(crate) fn with_route_table<F, R>(&self, f: F) -> R

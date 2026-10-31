@@ -1,11 +1,9 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use c2_contract::{ExpectedRouteContract, MAX_WIRE_TEXT_BYTES};
 
 use crate::relay::types::*;
-
-const DEFAULT_EVENT_RETENTION: usize = 1024;
 
 /// Route table — owns all route entries and peer info.
 ///
@@ -29,58 +27,12 @@ pub struct RouteTable {
     next_timestamp: f64,
     /// Local monotonic revision for this relay's applied route catalog changes.
     catalog_revision: u64,
-    /// Highest local tombstone catalog revision that has been compacted.
-    compaction_revision: u64,
-    /// Oldest local route event revision that can still be incrementally
-    /// watched. Watchers behind this boundary must relist.
-    min_watch_revision: u64,
-    /// Maximum number of local route authority events to retain.
-    event_retention: usize,
-    /// Revision-ordered local route authority events.
-    events: VecDeque<RouteAuthorityWatchEvent>,
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-#[derive(Debug, Clone)]
-pub(crate) enum RouteAuthorityWatchBatch {
-    Events {
-        current_revision: u64,
-        events: Vec<RouteAuthorityWatchEvent>,
-    },
-    Compacted {
-        compacted_revision: u64,
-        current_revision: u64,
-    },
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-#[derive(Debug, Clone)]
-pub(crate) enum RouteAuthorityWatchEvent {
-    Upserted {
-        entry: Box<RouteEntry>,
-        catalog_revision: u64,
-    },
-    Removed {
-        name: String,
-        relay_id: String,
-        route_uid: Option<String>,
-        catalog_revision: u64,
-        removed_revision: Option<u64>,
-        reason: RouteAuthorityStateReason,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RouteAuthorityStateReason {
-    RemovedByTombstone,
-    PeerLeft,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct TombstoneGcEntry {
     pub tombstone: RouteTombstone,
     pub reason: TombstoneGcReason,
-    pub compaction_revision: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,10 +52,6 @@ impl TombstoneGcReason {
 
 impl RouteTable {
     pub fn new(relay_id: String) -> Self {
-        Self::with_event_retention(relay_id, DEFAULT_EVENT_RETENTION)
-    }
-
-    pub(crate) fn with_event_retention(relay_id: String, event_retention: usize) -> Self {
         Self {
             routes: HashMap::new(),
             tombstones: HashMap::new(),
@@ -112,28 +60,11 @@ impl RouteTable {
             relay_id,
             next_timestamp: current_epoch_millis().saturating_sub(1) as f64,
             catalog_revision: 0,
-            compaction_revision: 0,
-            min_watch_revision: 1,
-            event_retention,
-            events: VecDeque::new(),
         }
     }
 
     pub fn relay_id(&self) -> &str {
         &self.relay_id
-    }
-
-    pub fn catalog_revision(&self) -> u64 {
-        self.catalog_revision
-    }
-
-    pub fn compaction_revision(&self) -> u64 {
-        self.compaction_revision
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn min_watch_revision(&self) -> u64 {
-        self.min_watch_revision
     }
 
     fn next_catalog_revision(&self) -> u64 {
@@ -210,12 +141,8 @@ impl RouteTable {
         let key = (entry.name.clone(), entry.relay_id.clone());
         self.tombstones.remove(&key);
         self.withdrawn_registrations.remove(&key);
-        let catalog_revision = self.advance_catalog_revision();
-        self.routes.insert(key, entry.clone());
-        self.push_event(RouteAuthorityWatchEvent::Upserted {
-            entry: Box::new(entry),
-            catalog_revision,
-        });
+        self.advance_catalog_revision();
+        self.routes.insert(key, entry);
     }
 
     /// Register or update a route (upsert semantics).
@@ -239,7 +166,6 @@ impl RouteTable {
             relay_id: relay_id.to_string(),
             removed_at,
             removed_revision,
-            local_catalog_revision: 0,
             server_id: None,
             observed_at: Instant::now(),
         };
@@ -274,7 +200,6 @@ impl RouteTable {
             relay_id: relay_id.clone(),
             removed_at,
             removed_revision,
-            local_catalog_revision: 0,
             server_id: Some(server_id.to_string()),
             observed_at: Instant::now(),
         };
@@ -324,7 +249,6 @@ impl RouteTable {
             relay_id,
             removed_at,
             removed_revision,
-            local_catalog_revision: 0,
             server_id,
             observed_at: Instant::now(),
         };
@@ -396,20 +320,10 @@ impl RouteTable {
                 tombstone.server_id = existing.server_id.clone();
             }
         }
-        let removed_route_uid = self.routes.get(&key).map(|entry| entry.route_uid.clone());
-        let local_catalog_revision = self.advance_catalog_revision();
+        self.advance_catalog_revision();
         tombstone.observed_at = Instant::now();
-        tombstone.local_catalog_revision = local_catalog_revision;
         self.routes.remove(&key);
-        self.tombstones.insert(key, tombstone.clone());
-        self.push_event(RouteAuthorityWatchEvent::Removed {
-            name: tombstone.name,
-            relay_id: tombstone.relay_id,
-            route_uid: removed_route_uid,
-            catalog_revision: local_catalog_revision,
-            removed_revision: Some(tombstone.removed_revision),
-            reason: RouteAuthorityStateReason::RemovedByTombstone,
-        });
+        self.tombstones.insert(key, tombstone);
         true
     }
 
@@ -503,15 +417,7 @@ impl RouteTable {
             let Some(entry) = self.routes.remove(&key) else {
                 continue;
             };
-            let catalog_revision = self.advance_catalog_revision();
-            self.push_event(RouteAuthorityWatchEvent::Removed {
-                name: entry.name.clone(),
-                relay_id: entry.relay_id.clone(),
-                route_uid: Some(entry.route_uid.clone()),
-                catalog_revision,
-                removed_revision: None,
-                reason: RouteAuthorityStateReason::PeerLeft,
-            });
+            self.advance_catalog_revision();
             removed.push(entry);
         }
         removed
@@ -534,78 +440,14 @@ impl RouteTable {
             })
             .collect();
 
-        let compaction_revision = expired
-            .iter()
-            .filter_map(|(key, _)| self.tombstones.get(key))
-            .map(|tombstone| tombstone.local_catalog_revision)
-            .max()
-            .unwrap_or(self.compaction_revision);
-        if compaction_revision > self.compaction_revision {
-            self.compaction_revision = compaction_revision;
-            self.compact_event_history_through(compaction_revision);
-        }
-
         let mut removed = Vec::with_capacity(expired.len());
         for (key, reason) in expired {
             if let Some(tombstone) = self.tombstones.remove(&key) {
                 self.withdrawn_registrations.remove(&key);
-                removed.push(TombstoneGcEntry {
-                    tombstone,
-                    reason,
-                    compaction_revision,
-                });
+                removed.push(TombstoneGcEntry { tombstone, reason });
             }
         }
         removed
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn watch_from(&self, from_revision: u64) -> RouteAuthorityWatchBatch {
-        if from_revision.saturating_add(1) < self.min_watch_revision {
-            return RouteAuthorityWatchBatch::Compacted {
-                compacted_revision: self.min_watch_revision.saturating_sub(1),
-                current_revision: self.catalog_revision,
-            };
-        }
-        let events = self
-            .events
-            .iter()
-            .filter(|event| route_authority_event_revision(event) > from_revision)
-            .cloned()
-            .collect();
-        RouteAuthorityWatchBatch::Events {
-            current_revision: self.catalog_revision,
-            events,
-        }
-    }
-
-    fn push_event(&mut self, event: RouteAuthorityWatchEvent) {
-        self.events.push_back(event);
-        while self.events.len() > self.event_retention {
-            self.events.pop_front();
-        }
-        self.refresh_min_watch_revision();
-    }
-
-    fn compact_event_history_through(&mut self, compaction_revision: u64) {
-        while self
-            .events
-            .front()
-            .is_some_and(|event| route_authority_event_revision(event) <= compaction_revision)
-        {
-            self.events.pop_front();
-        }
-        self.refresh_min_watch_revision();
-    }
-
-    fn refresh_min_watch_revision(&mut self) {
-        let event_min_revision = self
-            .events
-            .front()
-            .map(route_authority_event_revision)
-            .unwrap_or_else(|| self.catalog_revision.saturating_add(1));
-        self.min_watch_revision =
-            event_min_revision.max(self.compaction_revision.saturating_add(1));
     }
 
     // -- Peer operations --
@@ -892,7 +734,6 @@ impl RouteTable {
             relay_id: relay_id.to_string(),
             removed_at,
             removed_revision: self.next_catalog_revision(),
-            local_catalog_revision: 0,
             server_id: None,
             observed_at: Instant::now(),
         };
@@ -967,17 +808,6 @@ pub(crate) fn valid_relay_url(url: &str) -> bool {
                 && parsed.password().is_none()
         }
         Err(_) => false,
-    }
-}
-
-fn route_authority_event_revision(event: &RouteAuthorityWatchEvent) -> u64 {
-    match event {
-        RouteAuthorityWatchEvent::Upserted {
-            catalog_revision, ..
-        }
-        | RouteAuthorityWatchEvent::Removed {
-            catalog_revision, ..
-        } => *catalog_revision,
     }
 }
 
@@ -1173,7 +1003,6 @@ mod tests {
             relay_id: "relay-a".into(),
             removed_at: 1001.0,
             removed_revision: 1,
-            local_catalog_revision: 0,
             server_id: None,
             observed_at: Instant::now(),
         }));
@@ -1370,7 +1199,6 @@ mod tests {
             relay_id: "relay-a".into(),
             removed_at: newer_removed_at,
             removed_revision: 1,
-            local_catalog_revision: 0,
             server_id: None,
             observed_at: Instant::now(),
         }));
@@ -1547,7 +1375,6 @@ mod tests {
             relay_id: "relay-a".into(),
             removed_at: 2000.0,
             removed_revision: 1,
-            local_catalog_revision: 0,
             server_id: None,
             observed_at: Instant::now(),
         });
@@ -1633,7 +1460,6 @@ mod tests {
             relay_id: "relay-a".into(),
             removed_at: f64::NAN,
             removed_revision: 1,
-            local_catalog_revision: 0,
             server_id: None,
             observed_at: Instant::now(),
         }));
@@ -1653,7 +1479,6 @@ mod tests {
             relay_id: "relay-a".into(),
             removed_at: 2000.0,
             removed_revision: 1,
-            local_catalog_revision: 0,
             server_id: None,
             observed_at: Instant::now(),
         }));
@@ -1663,7 +1488,6 @@ mod tests {
             relay_id: " ".into(),
             removed_at: 2000.0,
             removed_revision: 1,
-            local_catalog_revision: 0,
             server_id: None,
             observed_at: Instant::now(),
         }));
@@ -1673,7 +1497,6 @@ mod tests {
             relay_id: "relay-a".into(),
             removed_at: 2000.0,
             removed_revision: 1,
-            local_catalog_revision: 0,
             server_id: Some("bad/server".into()),
             observed_at: Instant::now(),
         }));
@@ -1693,7 +1516,6 @@ mod tests {
             relay_id: "bad/relay".into(),
             removed_at: 2000.0,
             removed_revision: 1,
-            local_catalog_revision: 0,
             server_id: None,
             observed_at: Instant::now(),
         }));
@@ -1761,7 +1583,6 @@ mod tests {
             relay_id: "relay-a".into(),
             removed_at: 2000.0,
             removed_revision: 1,
-            local_catalog_revision: 0,
             server_id: None,
             observed_at: Instant::now(),
         });
@@ -1782,7 +1603,6 @@ mod tests {
             relay_id: "relay-a".into(),
             removed_at: 2000.0,
             removed_revision: 1,
-            local_catalog_revision: 0,
             server_id: None,
             observed_at: Instant::now(),
         }));
@@ -1883,7 +1703,6 @@ mod tests {
             relay_id: "relay-a".into(),
             removed_at: 10.0,
             removed_revision: 1,
-            local_catalog_revision: 0,
             server_id: None,
             observed_at: Instant::now(),
         }));
@@ -1915,7 +1734,6 @@ mod tests {
                     relay_id: "relay-a".into(),
                     removed_at: 2000.0,
                     removed_revision: 1,
-                    local_catalog_revision: 0,
                     server_id: None,
                     observed_at: Instant::now(),
                 }],
@@ -1946,7 +1764,6 @@ mod tests {
                     relay_id: "relay-a".into(),
                     removed_at: 2000.0,
                     removed_revision: 1,
-                    local_catalog_revision: 0,
                     server_id: None,
                     observed_at: Instant::now(),
                 }],
@@ -2092,7 +1909,6 @@ mod tests {
                     relay_id: "relay-a".into(),
                     removed_at: 3000.0,
                     removed_revision: 1,
-                    local_catalog_revision: 0,
                     server_id: None,
                     observed_at: Instant::now(),
                 }],
@@ -2122,7 +1938,6 @@ mod tests {
             relay_id: "relay-a".into(),
             removed_at: 2000.0,
             removed_revision: 1,
-            local_catalog_revision: 0,
             server_id: None,
             observed_at: Instant::now(),
         });
@@ -2137,182 +1952,14 @@ mod tests {
     }
 
     #[test]
-    fn catalog_revision_advances_for_route_events_and_gc_compacts_removed_revision() {
+    fn local_tombstone_removed_revision_follows_catalog_changes() {
         let mut rt = RouteTable::new("relay-a".into());
-        assert_eq!(rt.catalog_revision(), 0);
-        assert_eq!(rt.compaction_revision(), 0);
-
         assert!(rt.register_route(local_entry("grid", "relay-a")));
-        assert_eq!(rt.catalog_revision(), 1);
 
-        let (removed, _, _) = rt.unregister_local_route_with_tombstone("grid", "server-grid");
+        let (removed, _, removed_revision) =
+            rt.unregister_local_route_with_tombstone("grid", "server-grid");
         assert!(removed.is_some());
-        assert_eq!(rt.catalog_revision(), 2);
-
-        let tombstone = rt.list_tombstones().pop().expect("tombstone recorded");
-        assert_eq!(tombstone.removed_revision, 2);
-        assert_eq!(tombstone.local_catalog_revision, 2);
-        assert_eq!(rt.compaction_revision(), 0);
-
-        let removed = rt.gc_tombstones(Duration::from_secs(0));
-        assert_eq!(removed.len(), 1);
-        assert_eq!(removed[0].tombstone.removed_revision, 2);
-        assert_eq!(removed[0].tombstone.local_catalog_revision, 2);
-        assert_eq!(removed[0].compaction_revision, 2);
-        assert_eq!(rt.compaction_revision(), 2);
-    }
-
-    #[test]
-    fn relay_watch_retains_removed_event_until_tombstone_compaction() {
-        let mut rt = RouteTable::new("relay-a".into());
-
-        assert!(rt.register_route(local_entry("grid", "relay-a")));
-        let (removed, _, _) = rt.unregister_local_route_with_tombstone("grid", "server-grid");
-        assert!(removed.is_some());
-
-        let RouteAuthorityWatchBatch::Events {
-            current_revision,
-            events,
-        } = rt.watch_from(0)
-        else {
-            panic!("watch from 0 should have retained add/remove history");
-        };
-        assert_eq!(current_revision, 2);
-        assert_eq!(events.len(), 2);
-        match &events[0] {
-            RouteAuthorityWatchEvent::Upserted {
-                entry,
-                catalog_revision,
-            } => {
-                assert_eq!(entry.name, "grid");
-                assert_eq!(*catalog_revision, 1);
-            }
-            other => panic!("expected upserted watch event, got {other:?}"),
-        }
-        match &events[1] {
-            RouteAuthorityWatchEvent::Removed {
-                name,
-                relay_id,
-                route_uid,
-                catalog_revision,
-                removed_revision,
-                reason,
-            } => {
-                assert_eq!(name, "grid");
-                assert_eq!(relay_id, "relay-a");
-                assert_eq!(route_uid.as_deref(), Some("grid-relay-a-uid"));
-                assert_eq!(*catalog_revision, 2);
-                assert_eq!(*removed_revision, Some(2));
-                assert_eq!(*reason, RouteAuthorityStateReason::RemovedByTombstone);
-            }
-            other => panic!("expected removed watch event, got {other:?}"),
-        }
-
-        let retained = rt.gc_tombstones(Duration::from_secs(3600));
-        assert!(retained.is_empty());
-        assert!(matches!(
-            rt.watch_from(0),
-            RouteAuthorityWatchBatch::Events { .. }
-        ));
-
-        let removed = rt.gc_tombstones(Duration::from_secs(0));
-        assert_eq!(removed.len(), 1);
-        assert_eq!(rt.min_watch_revision(), 3);
-
-        match rt.watch_from(0) {
-            RouteAuthorityWatchBatch::Compacted {
-                compacted_revision,
-                current_revision,
-            } => {
-                assert_eq!(compacted_revision, 2);
-                assert_eq!(current_revision, 2);
-            }
-            other => panic!("watch from compacted history should force relist: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn relay_watch_history_overflow_compacts_without_dropping_routes() {
-        let mut rt = RouteTable::with_event_retention("relay-a".into(), 2);
-
-        assert!(rt.register_route(local_entry("grid-a", "relay-a")));
-        assert!(rt.register_route(local_entry("grid-b", "relay-a")));
-        assert!(rt.register_route(local_entry("grid-c", "relay-a")));
-
-        match rt.watch_from(0) {
-            RouteAuthorityWatchBatch::Compacted {
-                compacted_revision,
-                current_revision,
-            } => {
-                assert_eq!(compacted_revision, 1);
-                assert_eq!(current_revision, 3);
-            }
-            other => panic!("watch from overflowed history should compact: {other:?}"),
-        }
-        assert_eq!(rt.list_routes().len(), 3);
-    }
-
-    #[test]
-    fn peer_leave_removal_advances_catalog_and_emits_remove_events() {
-        let mut rt = RouteTable::new("relay-a".into());
-        register_alive_peer(&mut rt, "relay-b");
-        assert!(rt.register_route(peer_entry("grid", "relay-b", 1000.0)));
-        assert_eq!(rt.catalog_revision(), 1);
-
-        let removed = rt.remove_routes_by_relay("relay-b");
-
-        assert_eq!(removed.len(), 1);
-        assert_eq!(rt.catalog_revision(), 2);
-        assert!(rt.list_routes().is_empty());
-        let RouteAuthorityWatchBatch::Events { events, .. } = rt.watch_from(1) else {
-            panic!("watch after peer route registration should retain remove event");
-        };
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            RouteAuthorityWatchEvent::Removed {
-                name,
-                relay_id,
-                route_uid,
-                catalog_revision,
-                removed_revision,
-                reason,
-            } => {
-                assert_eq!(name, "grid");
-                assert_eq!(relay_id, "relay-b");
-                assert_eq!(route_uid.as_deref(), Some("grid-relay-b-uid"));
-                assert_eq!(*catalog_revision, 2);
-                assert_eq!(*removed_revision, None);
-                assert_eq!(*reason, RouteAuthorityStateReason::PeerLeft);
-            }
-            other => panic!("expected peer-left remove event, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn peer_tombstone_gc_compacts_local_revision_not_owner_removed_revision() {
-        let mut rt = RouteTable::new("relay-b".into());
-        register_alive_peer(&mut rt, "relay-a");
-
-        assert!(rt.apply_tombstone(RouteTombstone {
-            name: "grid".into(),
-            relay_id: "relay-a".into(),
-            removed_at: 2000.0,
-            removed_revision: 77,
-            local_catalog_revision: 0,
-            server_id: None,
-            observed_at: Instant::now(),
-        }));
-        assert_eq!(rt.catalog_revision(), 1);
-
-        let tombstone = rt.list_tombstones().pop().expect("tombstone recorded");
-        assert_eq!(tombstone.removed_revision, 77);
-        assert_eq!(tombstone.local_catalog_revision, 1);
-
-        let removed = rt.gc_tombstones(Duration::from_secs(0));
-        assert_eq!(removed.len(), 1);
-        assert_eq!(removed[0].tombstone.removed_revision, 77);
-        assert_eq!(removed[0].tombstone.local_catalog_revision, 1);
-        assert_eq!(removed[0].compaction_revision, 1);
-        assert_eq!(rt.compaction_revision(), 1);
+        assert_eq!(removed_revision, 2);
+        assert_eq!(rt.list_tombstones()[0].removed_revision, 2);
     }
 }

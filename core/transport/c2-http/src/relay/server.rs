@@ -16,13 +16,14 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::relay::authority::{ControlError, LocalRegistration, LocalRouteOwner, RouteAuthority};
+use crate::relay::authority::{
+    ControlError, LocalRegistration, LocalRouteOwner, RouteAttestationError, RouteAuthority,
+};
 use crate::relay::background::spawn_background_tasks;
 use crate::relay::gossip::{broadcast_route_announce, broadcast_route_withdraw};
 use crate::relay::peer::{PeerEnvelope, PeerMessage};
 use crate::relay::router;
 use crate::relay::state::{RegisterCommitResult, RelayState, UnregisterResult};
-use crate::relay::url::peer_endpoint_url;
 use c2_config::{
     CallExecutionLimitsOverrides, ConfigResolver, ConfigSources, LocalEndpointContext,
     LocalEndpointOptions, RelayConfig,
@@ -117,8 +118,7 @@ fn control_error_to_relay_error(err: ControlError) -> RelayControlError {
         | ControlError::InvalidServerId { reason }
         | ControlError::InvalidServerInstanceId { reason }
         | ControlError::InvalidAddress { reason }
-        | ControlError::ContractMismatch { reason }
-        | ControlError::UpstreamUnavailable { reason } => RelayControlError::Other(reason),
+        | ControlError::ContractMismatch { reason } => RelayControlError::Other(reason),
         ControlError::AddressMismatch { .. }
         | ControlError::DuplicateRoute { .. }
         | ControlError::OwnerMismatch
@@ -148,7 +148,7 @@ fn should_retry_register_attestation_connect(error: &c2_ipc::IpcError) -> bool {
     )
 }
 
-async fn connect_register_attestation_client(
+pub(super) async fn connect_register_attestation_client(
     address: &str,
     context: &LocalEndpointContext,
     clients: &Arc<crate::relay::client_lifecycle::ClientLifecycle>,
@@ -409,48 +409,6 @@ impl RelayServer {
         // Spawn background tasks (heartbeat, failure detection, anti-entropy, etc.)
         let bg_handles = spawn_background_tasks(state.clone(), cancel.clone());
 
-        // Seed bootstrap (one-shot, non-blocking)
-        if !state.config().seeds.is_empty() {
-            let s = state.clone();
-            tokio::spawn(async move {
-                let client = crate::relay_client_builder_with_proxy(s.config().use_proxy)
-                    .timeout(std::time::Duration::from_secs(5))
-                    .build()
-                    .expect("c-two: failed to build reqwest Client for relay traffic");
-                for seed_url in &s.config().seeds {
-                    let join_url = peer_endpoint_url(seed_url, "/_peer/join");
-                    let envelope = PeerEnvelope::new(
-                        s.relay_id(),
-                        PeerMessage::RelayJoin {
-                            relay_id: s.relay_id().to_string(),
-                            url: s.config().effective_advertise_url(),
-                        },
-                    );
-                    if let Ok(resp) = client.post(&join_url).json(&envelope).send().await
-                        && let Ok(envelope) =
-                            resp.json::<crate::relay::types::FullSyncEnvelope>().await
-                    {
-                        let Ok(snapshot) =
-                            crate::relay::types::ValidatedFullSync::try_from(envelope)
-                        else {
-                            continue;
-                        };
-                        s.merge_snapshot(snapshot);
-                        let peers = s.list_peers();
-                        let announce = PeerEnvelope::new(
-                            s.relay_id(),
-                            PeerMessage::RelayJoin {
-                                relay_id: s.relay_id().to_string(),
-                                url: s.config().effective_advertise_url(),
-                            },
-                        );
-                        s.disseminator().broadcast(announce, &peers);
-                        break;
-                    }
-                }
-            });
-        }
-
         let server = axum::serve(
             listener,
             app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -561,8 +519,7 @@ impl RelayServer {
                         | Err(ControlError::InvalidServerId { reason })
                         | Err(ControlError::InvalidServerInstanceId { reason })
                         | Err(ControlError::InvalidAddress { reason })
-                        | Err(ControlError::ContractMismatch { reason })
-                        | Err(ControlError::UpstreamUnavailable { reason }) => {
+                        | Err(ControlError::ContractMismatch { reason }) => {
                             eprintln!(
                                 "[relay] Register command rejected: name={name} server_id={server_id} address={address} reason={reason}"
                             );
@@ -646,7 +603,7 @@ impl RelayServer {
                                     .await
                                     {
                                         Ok(contract) => contract,
-                                        Err(ControlError::ContractMismatch { reason }) => {
+                                        Err(RouteAttestationError::ContractMismatch { reason }) => {
                                             close_client(client);
                                             eprintln!(
                                                 "[relay] Register command rejected: name={name} server_id={server_id} address={address} reason={reason}"
@@ -655,7 +612,7 @@ impl RelayServer {
                                                 reply.send(Err(RelayControlError::Other(reason)));
                                             continue;
                                         }
-                                        Err(ControlError::NotFound) => {
+                                        Err(RouteAttestationError::NotFound) => {
                                             close_client(client);
                                             eprintln!(
                                                 "[relay] Register command rejected: name={name} server_id={server_id} address={address} reason=route_not_exported"
@@ -667,7 +624,9 @@ impl RelayServer {
                                             )));
                                             continue;
                                         }
-                                        Err(ControlError::UpstreamUnavailable { reason }) => {
+                                        Err(RouteAttestationError::UpstreamUnavailable {
+                                            reason,
+                                        }) => {
                                             close_client(client);
                                             eprintln!(
                                                 "[relay] Register command rejected: name={name} server_id={server_id} address={address} reason={reason}"
@@ -676,9 +635,6 @@ impl RelayServer {
                                                 reply.send(Err(RelayControlError::Other(reason)));
                                             continue;
                                         }
-                                        Err(_) => unreachable!(
-                                            "route contract attestation returns only contract errors"
-                                        ),
                                     };
                                 let client = client.into_shared();
                                 let replacement = match RouteAuthority::new(&state)
@@ -702,8 +658,7 @@ impl RelayServer {
                                     | Err(ControlError::InvalidServerId { reason })
                                     | Err(ControlError::InvalidServerInstanceId { reason })
                                     | Err(ControlError::InvalidAddress { reason })
-                                    | Err(ControlError::ContractMismatch { reason })
-                                    | Err(ControlError::UpstreamUnavailable { reason }) => {
+                                    | Err(ControlError::ContractMismatch { reason }) => {
                                         state.clients.close(&client);
                                         eprintln!(
                                             "[relay] Register command rejected: name={name} server_id={server_id} address={address} reason={reason}"

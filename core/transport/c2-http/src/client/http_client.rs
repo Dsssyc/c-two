@@ -80,9 +80,8 @@ fn runtime_cell_with_deadline<'a>(
         HttpError::Transport(format!("failed to create c2-http runtime: {error}"))
     })?;
     // The coordinator is the sole publication authority for this cell.
-    if let Err(unpublished) = cell.set(runtime) {
-        unpublished.shutdown_background();
-    }
+    cell.set(runtime)
+        .expect("runtime initializer holds the coordinator");
     Ok(cell
         .get()
         .expect("runtime initializer must publish before returning"))
