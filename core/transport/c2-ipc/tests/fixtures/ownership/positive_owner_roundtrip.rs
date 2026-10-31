@@ -4,7 +4,7 @@
 use c2_mem::{MemPool, PoolConfig};
 
 fn main() {
-    let mut pool = MemPool::new(PoolConfig::default());
+    let mut pool = MemPool::new(PoolConfig::default()).unwrap();
     let mut handle = pool.alloc_handle(8192).expect("real allocation");
     pool.handle_slice_mut(&mut handle)[0] = 0xAB;
     assert_eq!(pool.handle_slice(&handle)[0], 0xAB);

@@ -472,9 +472,7 @@ def test_failed_native_replacement_retry_carries_own_holds_through_the_registry(
         assert replacement.memory_stats()['holds']['total_held_bytes'] == 64
     finally:
         settings.shm_threshold = None
-        registry._runtime_session.shutdown(  # noqa: SLF001
-            route_names=[], relay_anchor_address=None,
-        )
+        registry._runtime_session.shutdown()  # noqa: SLF001
         lease.release()
         _reset_default_runtime()
 

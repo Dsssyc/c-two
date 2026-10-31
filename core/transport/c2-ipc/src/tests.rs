@@ -32,7 +32,7 @@ pub(crate) async fn close_listener(listener: c2_local::LocalListener) {
 #[cfg(test)]
 mod client_tests {
     use c2_wire::buddy::{BUDDY_PAYLOAD_SIZE, decode_buddy_payload};
-    use c2_wire::chunk::{CHUNK_HEADER_SIZE, decode_chunk_header};
+    use c2_wire::chunk::header::{CHUNK_HEADER_SIZE, decode_chunk_header};
     use c2_wire::control::*;
     use c2_wire::flags;
     use c2_wire::frame;
@@ -237,7 +237,7 @@ mod client_tests {
 
     #[test]
     fn test_chunked_frame_encoding() {
-        use c2_wire::chunk::encode_chunk_header;
+        use c2_wire::chunk::header::encode_chunk_header;
 
         let ctrl = encode_call_control(&call_identity("grid"), 2).unwrap();
         let data = [0xABu8; 128];
@@ -330,33 +330,6 @@ mod client_tests {
     }
 
     #[test]
-    fn call_full_is_not_a_public_production_api() {
-        let client_source = include_str!("client.rs");
-        let client_production = client_source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("client.rs must contain a production section");
-        assert!(
-            !client_production.contains("pub async fn call_full("),
-            "IpcClient must expose one canonical semantic call API"
-        );
-        assert!(
-            !client_production.contains("refresh_route_contract"),
-            "IpcClient must not reintroduce name-only route contract refresh"
-        );
-
-        let sync_source = include_str!("sync_client.rs");
-        let sync_production = sync_source
-            .split("#[cfg(test)]")
-            .next()
-            .expect("sync_client.rs must contain a production section");
-        assert!(
-            !sync_production.contains(".call_full("),
-            "SyncClient must delegate to canonical route-bound IPC calls"
-        );
-    }
-
-    #[test]
     fn with_config_owns_request_pool_when_pool_enabled() {
         let cfg = ClientIpcConfig {
             shm_threshold: 100,
@@ -368,7 +341,7 @@ mod client_tests {
             },
             ..ClientIpcConfig::default()
         };
-        let client = IpcClient::with_config("ipc://configured", cfg.clone());
+        let client = IpcClient::with_config("ipc://configured", cfg.clone()).unwrap();
         assert!(client.has_request_pool());
         assert_eq!(client.config.shm_threshold, cfg.shm_threshold);
 
@@ -376,14 +349,13 @@ mod client_tests {
         // requests and the wire prefix alive, only the buddy tiers are off.
         let mut disabled = cfg;
         disabled.base.pool_enabled = false;
-        let client = IpcClient::with_config("ipc://configured-no-pool", disabled);
+        let client = IpcClient::with_config("ipc://configured-no-pool", disabled).unwrap();
         let pool = client
             .request_pool()
             .expect("policy-disabled pool stays live");
-        let mut pool = pool.lock();
+        let pool = pool.lock();
         assert!(!pool.config().buddy_enabled);
         assert_eq!(pool.segment_count(), 0);
-        assert!(pool.ensure_ready().is_ok());
         assert_eq!(pool.segment_count(), 0);
     }
 
@@ -395,30 +367,6 @@ mod client_tests {
         let rt1 = crate::sync_client::tests::runtime_ptr();
         let rt2 = crate::sync_client::tests::runtime_ptr();
         assert_eq!(rt1, rt2, "global runtime should be the same instance");
-    }
-
-    #[test]
-    fn test_ipc_config_propagation() {
-        // Verify custom config flows through to IpcClient via with_pool.
-        // We can't actually connect (no server), but construction must succeed
-        // and the config should influence transport path selection.
-        let cfg = ClientIpcConfig {
-            shm_threshold: 512,
-            base: c2_config::BaseIpcConfig {
-                chunk_size: 2048,
-                ..c2_config::BaseIpcConfig::default()
-            },
-            ..ClientIpcConfig::default()
-        };
-
-        // IpcClient::new uses default config.
-        let c1 = crate::client::IpcClient::new("ipc://test_prop_1");
-        assert!(!c1.is_connected());
-
-        // IpcClient::with_pool uses custom config.
-        let pool = c2_mem::MemPool::new(c2_mem::PoolConfig::default());
-        let c2 = crate::client::IpcClient::with_pool("ipc://test_prop_2", pool, cfg);
-        assert!(!c2.is_connected());
     }
 
     #[test]
@@ -481,10 +429,9 @@ mod response_lease_tests {
     }
 
     fn empty_reassembly_pool(label: char) -> Arc<RwLock<MemPool>> {
-        Arc::new(RwLock::new(MemPool::new_with_prefix(
-            pool_config(),
-            unique_prefix(label),
-        )))
+        Arc::new(RwLock::new(
+            MemPool::new_with_prefix(pool_config(), unique_prefix(label)).unwrap(),
+        ))
     }
 
     #[test]
@@ -532,10 +479,9 @@ mod response_lease_tests {
         for logical_len in [payload.len(), 1, 0] {
             let mut config = pool_config();
             config.spill_threshold = 0.0;
-            let pool = Arc::new(RwLock::new(MemPool::new_with_prefix(
-                config,
-                unique_prefix('f'),
-            )));
+            let pool = Arc::new(RwLock::new(
+                MemPool::new_with_prefix(config, unique_prefix('f')).unwrap(),
+            ));
             let mut backing =
                 ReassemblyBacking::admit(Arc::clone(&pool), 1, payload.len()).unwrap();
             assert!(backing.is_file_spill());
@@ -559,7 +505,7 @@ mod response_lease_tests {
     #[test]
     fn invalid_shm_span_fails_copy_and_drop_without_freeing_an_allocation() {
         let prefix = unique_prefix('x');
-        let mut producer = MemPool::new_with_prefix(pool_config(), prefix.clone());
+        let mut producer = MemPool::new_with_prefix(pool_config(), prefix.clone()).unwrap();
         let allocation = producer.alloc(4096).unwrap();
         let budget = producer.budget().unwrap().clone();
         let charged = budget.snapshot().shm.used_bytes;
@@ -568,10 +514,8 @@ mod response_lease_tests {
             .unwrap()
             .allocator()
             .data_size();
-        let reader = MemPool::open_peer(pool_config(), producer.prefix().to_string());
-        let server_pool = Arc::new(Mutex::new(Some(ServerPoolState::from_pool_for_test(
-            reader,
-        ))));
+        let reader = MemPool::open_peer(pool_config(), producer.prefix().to_string()).unwrap();
+        let server_pool = Arc::new(Mutex::new(ServerPoolState::from_pool_for_test(reader)));
         let mut carrier = ServerShmResponse::admit(
             server_pool,
             u16::try_from(allocation.seg_idx).unwrap(),
@@ -609,7 +553,7 @@ mod response_lease_tests {
         handle.write_at(0, b"combined failure").unwrap();
         let budget = pool.read().budget().unwrap().clone();
         let lease = ResponseLease::new(ResponseData::Handle(handle));
-        *pool.write() = MemPool::new_with_prefix(pool_config(), unique_prefix('z'));
+        *pool.write() = MemPool::new_with_prefix(pool_config(), unique_prefix('z')).unwrap();
 
         let error = lease.into_owned_bytes().unwrap_err();
         assert!(error.contains("response handle copy failed"), "{error}");
@@ -628,11 +572,14 @@ mod response_lease_tests {
         // contention must keep the backing so the retry after unlock frees
         // storage, refunds the charge, and re-admits the same capacity.
         let capacity = 4096usize;
-        let pool = Arc::new(RwLock::new(MemPool::new_with_prefix_and_budget(
-            pool_config(),
-            unique_prefix('k'),
-            MemoryBudget::new(8 * 1024 * 1024, 16 * 1024 * 1024, capacity as u64),
-        )));
+        let pool = Arc::new(RwLock::new(
+            MemPool::new_with_prefix_and_budget(
+                pool_config(),
+                unique_prefix('k'),
+                MemoryBudget::new(8 * 1024 * 1024, 16 * 1024 * 1024, capacity as u64),
+            )
+            .unwrap(),
+        ));
         let backing = ReassemblyBacking::admit(Arc::clone(&pool), 1, capacity).unwrap();
         let mut lease = ResponseLease::new(ResponseData::Handle(backing));
 
@@ -664,7 +611,7 @@ mod response_lease_tests {
 
     fn assert_shm_response(payload: Vec<u8>, expected_dedicated: bool, label: char) {
         let prefix = unique_prefix(label);
-        let mut producer = MemPool::new_with_prefix(pool_config(), prefix.clone());
+        let mut producer = MemPool::new_with_prefix(pool_config(), prefix.clone()).unwrap();
         let mut handle = producer.try_alloc_shm(payload.len()).unwrap();
         assert_eq!(handle.is_dedicated(), expected_dedicated);
         producer
@@ -672,10 +619,8 @@ mod response_lease_tests {
             .copy_from_slice(&payload);
         let allocation = handle.shm_allocation().unwrap();
 
-        let reader = MemPool::open_peer(pool_config(), producer.prefix().to_string());
-        let server_pool = Arc::new(Mutex::new(Some(ServerPoolState::from_pool_for_test(
-            reader,
-        ))));
+        let reader = MemPool::open_peer(pool_config(), producer.prefix().to_string()).unwrap();
+        let server_pool = Arc::new(Mutex::new(ServerPoolState::from_pool_for_test(reader)));
         let mut lease = ResponseLease::new(ResponseData::Shm(ServerShmResponse::admit(
             Arc::clone(&server_pool),
             u16::try_from(allocation.seg_idx).unwrap(),
@@ -700,7 +645,7 @@ mod response_lease_tests {
 
     #[test]
     fn response_release_rejects_stale_id_after_same_slot_reuse() {
-        let mut owner = MemPool::new_with_prefix(pool_config(), unique_prefix('i'));
+        let mut owner = MemPool::new_with_prefix(pool_config(), unique_prefix('i')).unwrap();
         let old = owner.alloc(4096).unwrap();
         // SAFETY: test holds sole release authority for its own allocation.
         unsafe { owner.free(&old) }.unwrap();
@@ -711,7 +656,7 @@ mod response_lease_tests {
         );
         assert_ne!(current.allocation_id, old.allocation_id);
 
-        let peer = MemPool::open_peer(pool_config(), owner.prefix().to_string());
+        let peer = MemPool::open_peer(pool_config(), owner.prefix().to_string()).unwrap();
         let mut state = ServerPoolState::from_pool_for_test(peer);
         assert!(
             state
@@ -1031,7 +976,8 @@ mod lazy_policy_roundtrip_tests {
             .wait_until_ready(Duration::from_secs(5))
             .await
             .unwrap();
-        let mut client = IpcClient::with_endpoint(endpoint.clone(), client_config(base, 1024));
+        let mut client =
+            IpcClient::with_endpoint(endpoint.clone(), client_config(base, 1024)).unwrap();
         client.connect().await.unwrap();
         let payload = vec![0xA7; 8192];
         let response = echo_roundtrip(&client, label, &payload).await;
@@ -1148,8 +1094,11 @@ mod lazy_policy_roundtrip_tests {
         let (base, threshold, expected_kind) = controlled_config(kind);
         let (callback, seen) = echo_callback();
         let server = start_echo_server(label, server_config(base.clone(), 1024), callback).await;
-        let mut client =
-            IpcClient::with_config(server.ipc_address(), client_config(base, threshold));
+        let mut client = IpcClient::with_config(
+            server.local_endpoint().address(),
+            client_config(base, threshold),
+        )
+        .unwrap();
         client.connect().await.unwrap();
         let binding = client
             .acquire_route(&expected_contract(label))
@@ -1310,7 +1259,7 @@ mod lazy_policy_roundtrip_tests {
             crate::client::dedicated_retire_test_control::retention_jobs_for_pool(&pool),
             0
         );
-        assert!(crate::ping(server.ipc_address(), Duration::from_secs(5)).unwrap());
+        assert!(crate::ping(server.local_endpoint().address(), Duration::from_secs(5)).unwrap());
         client.close_shared().await;
         drop(preparation_rejection);
         drop(pool);
@@ -1436,8 +1385,11 @@ mod lazy_policy_roundtrip_tests {
             callback,
         )
         .await;
-        let mut client =
-            IpcClient::with_config(server.ipc_address(), client_config(base, threshold));
+        let mut client = IpcClient::with_config(
+            server.local_endpoint().address(),
+            client_config(base, threshold),
+        )
+        .unwrap();
         client.connect().await.unwrap();
         let binding = client
             .acquire_route(&expected_contract(label))
@@ -1605,7 +1557,7 @@ mod lazy_policy_roundtrip_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn controlled_async_sync_client_delegates_without_nested_block_on() {
-        use crate::{IpcCallControl, SyncClient, TransportPhase};
+        use crate::{ClientPool, IpcCallControl, TransportPhase};
         let (callback, seen) = echo_callback();
         let base = small_base(64 * 1024, 2);
         let server = start_echo_server(
@@ -1616,9 +1568,11 @@ mod lazy_policy_roundtrip_tests {
         .await;
         // Only connection acquisition is blocking. The call below is awaited
         // directly from a distinct current-thread runtime.
-        let address = server.ipc_address().to_string();
+        let address = server.local_endpoint().address().to_string();
         let (client, binding) = tokio::task::spawn_blocking(move || {
-            let client = SyncClient::connect(&address, None, client_config(base, 1024)).unwrap();
+            let client = ClientPool::new(Duration::from_secs(30))
+                .acquire(&address, Some(&client_config(base, 1024)))
+                .unwrap();
             let binding = client
                 .acquire_route(&expected_contract("control_sync_async"))
                 .unwrap();
@@ -1666,8 +1620,11 @@ mod lazy_policy_roundtrip_tests {
         let base = small_base(64 * 1024, 2);
         let server =
             start_echo_server("control_close", server_config(base.clone(), 1024), callback).await;
-        let mut client =
-            IpcClient::with_config(server.ipc_address(), client_config(base, u64::MAX));
+        let mut client = IpcClient::with_config(
+            server.local_endpoint().address(),
+            client_config(base, u64::MAX),
+        )
+        .unwrap();
         client.connect().await.unwrap();
         let binding = client
             .acquire_route(&expected_contract("control_close"))
@@ -1753,9 +1710,10 @@ mod lazy_policy_roundtrip_tests {
         .await;
 
         let mut client = IpcClient::with_config(
-            server.ipc_address(),
+            server.local_endpoint().address(),
             client_config(small_base(64 * 1024, 2), 4096),
-        );
+        )
+        .unwrap();
         client.connect().await.unwrap();
 
         // Default policy (prewarm 0): the handshake announced zero buddy
@@ -1799,7 +1757,7 @@ mod lazy_policy_roundtrip_tests {
         .await;
 
         let mut client = IpcClient::with_config(
-            server.ipc_address(),
+            server.local_endpoint().address(),
             client_config(
                 BaseIpcConfig {
                     pool_enabled: false,
@@ -1808,7 +1766,8 @@ mod lazy_policy_roundtrip_tests {
                 },
                 1024,
             ),
-        );
+        )
+        .unwrap();
         client.connect().await.unwrap();
 
         let payload: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
@@ -1867,7 +1826,7 @@ mod lazy_policy_roundtrip_tests {
         .await;
 
         let mut client = IpcClient::with_config(
-            server.ipc_address(),
+            server.local_endpoint().address(),
             client_config(
                 BaseIpcConfig {
                     pool_enabled: false,
@@ -1876,7 +1835,8 @@ mod lazy_policy_roundtrip_tests {
                 },
                 1 << 20,
             ),
-        );
+        )
+        .unwrap();
         client.connect().await.unwrap();
 
         let payload: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 241) as u8).collect();
@@ -1927,7 +1887,7 @@ mod lazy_policy_roundtrip_tests {
         .await;
 
         let mut client = IpcClient::with_config(
-            server.ipc_address(),
+            server.local_endpoint().address(),
             client_config(
                 BaseIpcConfig {
                     pool_enabled: false,
@@ -1938,7 +1898,8 @@ mod lazy_policy_roundtrip_tests {
                 // so the client sends the request as chunks.
                 1 << 20,
             ),
-        );
+        )
+        .unwrap();
         client.connect().await.unwrap();
 
         let payload: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 239) as u8).collect();
@@ -1969,9 +1930,10 @@ mod lazy_policy_roundtrip_tests {
         // Deliberately different client/server segment geometry; neither side
         // may substitute its local default for the peer's real geometry.
         let mut client = IpcClient::with_config(
-            server.ipc_address(),
+            server.local_endpoint().address(),
             client_config(small_base(256 * 1024, 2), 1024),
-        );
+        )
+        .unwrap();
         client.connect().await.unwrap();
 
         assert_eq!(own_pool_segment_count(&client), 0);
@@ -2136,15 +2098,18 @@ mod lazy_policy_roundtrip_tests {
             ..PoolConfig::default()
         };
         let budget = MemoryBudget::new(1 << 20, 1 << 20, 1 << 20);
-        let pool = Arc::new(Mutex::new(MemPool::new_with_prefix_and_budget(
-            config.clone(),
-            format!(
-                "/cc3handoff{:08x}{:08x}",
-                std::process::id(),
-                ADDR_COUNTER.fetch_add(1, Ordering::Relaxed)
-            ),
-            budget.clone(),
-        )));
+        let pool = Arc::new(Mutex::new(
+            MemPool::new_with_prefix_and_budget(
+                config.clone(),
+                format!(
+                    "/cc3handoff{:08x}{:08x}",
+                    std::process::id(),
+                    ADDR_COUNTER.fetch_add(1, Ordering::Relaxed)
+                ),
+                budget.clone(),
+            )
+            .unwrap(),
+        ));
         let handle = pool
             .lock()
             .try_alloc_shm(4096)
@@ -2158,7 +2123,7 @@ mod lazy_policy_roundtrip_tests {
             .dedicated_name(seg_idx)
             .expect("dedicated backing name")
             .to_string();
-        let mut peer = MemPool::open_peer(config, prefix);
+        let mut peer = MemPool::open_peer(config, prefix).unwrap();
         unsafe { peer.open_dedicated_at(seg_idx, &name, 4096) }
             .expect("peer opens the request backing");
         let charged = budget.snapshot().shm.used_bytes;
@@ -2260,15 +2225,18 @@ mod lazy_policy_roundtrip_tests {
             ..PoolConfig::default()
         };
         let budget = MemoryBudget::new(1 << 20, 1 << 20, 1 << 20);
-        let pool = Arc::new(Mutex::new(MemPool::new_with_prefix_and_budget(
-            config.clone(),
-            format!(
-                "/cc3inflight{:08x}{:08x}",
-                std::process::id(),
-                ADDR_COUNTER.fetch_add(1, Ordering::Relaxed)
-            ),
-            budget.clone(),
-        )));
+        let pool = Arc::new(Mutex::new(
+            MemPool::new_with_prefix_and_budget(
+                config.clone(),
+                format!(
+                    "/cc3inflight{:08x}{:08x}",
+                    std::process::id(),
+                    ADDR_COUNTER.fetch_add(1, Ordering::Relaxed)
+                ),
+                budget.clone(),
+            )
+            .unwrap(),
+        ));
         let alloc = pool.lock().alloc(4096).expect("real dedicated allocation");
         assert!(alloc.is_dedicated);
         let prefix = pool.lock().prefix().to_string();
@@ -2277,7 +2245,7 @@ mod lazy_policy_roundtrip_tests {
             .dedicated_name(alloc.seg_idx)
             .expect("dedicated backing name")
             .to_string();
-        let mut peer = MemPool::open_peer(config, prefix);
+        let mut peer = MemPool::open_peer(config, prefix).unwrap();
         unsafe { peer.open_dedicated_at(alloc.seg_idx, &name, 4096) }
             .expect("peer opens the request backing");
         let charged = budget.snapshot().shm.used_bytes;
@@ -2424,114 +2392,6 @@ mod lazy_policy_roundtrip_tests {
 
     // ── Injected pools cannot bypass the configured buddy policy ─────────
 
-    #[tokio::test]
-    async fn injected_buddy_enabled_pool_cannot_bypass_disabled_policy() {
-        // No server is listening: the policy gate must reject before any
-        // connection I/O, so the error is the policy error, not an I/O error.
-        let mut client = IpcClient::with_pool(
-            &unique_address("policy_mismatch"),
-            MemPool::new(c2_mem::PoolConfig::default()),
-            client_config(
-                BaseIpcConfig {
-                    pool_enabled: false,
-                    ..small_base(64 * 1024, 2)
-                },
-                1024,
-            ),
-        );
-        match client.connect().await {
-            Err(IpcError::Pool(msg)) => {
-                assert!(msg.contains("pool_enabled"), "unexpected error: {msg}");
-                assert!(msg.contains("buddy enabled"), "unexpected error: {msg}");
-            }
-            other => panic!("expected Pool policy rejection before I/O, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn injected_pool_with_prewarm_config_is_rejected_before_io() {
-        let mut client = IpcClient::with_pool(
-            &unique_address("prewarm_injected"),
-            MemPool::new(c2_mem::PoolConfig::default()),
-            client_config(
-                BaseIpcConfig {
-                    pool_prewarm_segments: 1,
-                    ..small_base(64 * 1024, 2)
-                },
-                1024,
-            ),
-        );
-        match client.connect().await {
-            Err(IpcError::Pool(msg)) => {
-                assert!(
-                    msg.contains("pool_prewarm_segments"),
-                    "unexpected error: {msg}"
-                );
-                assert!(msg.contains("injected"), "unexpected error: {msg}");
-            }
-            other => panic!("expected Pool policy rejection before I/O, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn disabled_injected_pool_still_sends_dedicated_data() {
-        let _retire_guard = crate::client::dedicated_retire_test_control::production_guard();
-        let (callback, seen_kinds) = echo_callback();
-        let server = start_echo_server(
-            "disabled_injected",
-            server_config(
-                BaseIpcConfig {
-                    pool_enabled: false,
-                    chunk_size: 1 << 20,
-                    ..small_base(64 * 1024, 2)
-                },
-                1024,
-            ),
-            callback,
-        )
-        .await;
-
-        let config = client_config(
-            BaseIpcConfig {
-                pool_enabled: false,
-                chunk_size: 1 << 20,
-                ..small_base(64 * 1024, 2)
-            },
-            1024,
-        );
-        // A policy-matching injected pool: buddy-disabled, built from
-        // the same centralized projection the transport itself uses.
-        let injected = MemPool::new(config.base.primary_pool_config(&config.pool_tuning()));
-        let mut client = IpcClient::with_pool(server.ipc_address(), injected, config);
-        let injected = client.request_pool().unwrap();
-        client.connect().await.unwrap();
-
-        let payload: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
-        let response = echo_roundtrip(&client, "disabled_injected", &payload).await;
-
-        assert_eq!(*seen_kinds.lock(), vec!["shm_dedicated"]);
-        let ResponseData::Shm(carrier) = &response else {
-            panic!("expected SHM response, got {response:?}");
-        };
-        assert!(
-            carrier.is_dedicated(),
-            "disabled injected pool must serve dedicated SHM"
-        );
-        assert_eq!(response_bytes(&client, response), payload);
-
-        // read_done permits retirement, but receiver settlement is deliberately
-        // nonblocking when the shared retire executor is busy. Observe the
-        // existing close barrier before asserting that owner cleanup finished.
-        assert!(client.close_shared_bounded(Duration::from_secs(2)).await);
-        {
-            let pool = injected.lock();
-            assert!(!pool.config().buddy_enabled);
-            assert_eq!(pool.segment_count(), 0);
-            assert_eq!(pool.stats().dedicated_segments, 0);
-        }
-        stop_server(&server).await;
-    }
-
     // ── Client maintenance: idle retirement, stale sweeps, liveness ──────
 
     #[tokio::test]
@@ -2554,8 +2414,11 @@ mod lazy_policy_roundtrip_tests {
         let server =
             start_echo_server("client_gc", server_config(base.clone(), 1024), callback).await;
 
-        let mut client =
-            IpcClient::with_config(server.ipc_address(), fast_client_config(base, 1024));
+        let mut client = IpcClient::with_config(
+            server.local_endpoint().address(),
+            fast_client_config(base, 1024),
+        )
+        .unwrap();
         client.connect().await.unwrap();
         assert!(
             client.maintenance.lock().is_some(),
@@ -2642,8 +2505,11 @@ mod lazy_policy_roundtrip_tests {
             start_echo_server("gc_lifecycle", server_config(base.clone(), 4096), callback).await;
 
         // Explicit close: the task is stopped and removed from the state.
-        let mut client =
-            IpcClient::with_config(server.ipc_address(), fast_client_config(base.clone(), 4096));
+        let mut client = IpcClient::with_config(
+            server.local_endpoint().address(),
+            fast_client_config(base.clone(), 4096),
+        )
+        .unwrap();
         client.connect().await.unwrap();
         let ticks = Arc::clone(&client.maintenance_ticks);
         wait_until(5, || ticks.load(Ordering::Relaxed) >= 2).await;
@@ -2661,7 +2527,11 @@ mod lazy_policy_roundtrip_tests {
         // Plain drop (no close): the weak liveness probe must terminate the
         // task on its next tick even though the recv loop keeps the registry
         // alive until the peer hangs up.
-        let client_b = IpcClient::with_config(server.ipc_address(), fast_client_config(base, 4096));
+        let client_b = IpcClient::with_config(
+            server.local_endpoint().address(),
+            fast_client_config(base, 4096),
+        )
+        .unwrap();
         let mut client_b = client_b;
         client_b.connect().await.unwrap();
         let ticks_b = Arc::clone(&client_b.maintenance_ticks);
@@ -2694,8 +2564,11 @@ mod lazy_policy_roundtrip_tests {
         let server =
             start_echo_server("dedicated_gc", server_config(base.clone(), 1024), callback).await;
 
-        let mut client =
-            IpcClient::with_config(server.ipc_address(), fast_client_config(base, 1024));
+        let mut client = IpcClient::with_config(
+            server.local_endpoint().address(),
+            fast_client_config(base, 1024),
+        )
+        .unwrap();
         client.connect().await.unwrap();
 
         // One round trip: dedicated SHM request and dedicated SHM reply.
@@ -2757,9 +2630,10 @@ mod lazy_policy_roundtrip_tests {
 
         // Requests stay inline; only the reply path grows the server pool.
         let mut client = IpcClient::with_config(
-            server.ipc_address(),
+            server.local_endpoint().address(),
             client_config(small_base(64 * 1024, 20), 1 << 20),
-        );
+        )
+        .unwrap();
         client.connect().await.unwrap();
 
         // Held replies keep their full receive carrier: the read/release
@@ -2790,12 +2664,7 @@ mod lazy_policy_roundtrip_tests {
         assert_eq!(max_seg_idx, 16, "34 held replies must reach buddy index 16");
         assert_eq!(server.response_pool_arc().read().segment_count(), 17);
         assert_eq!(
-            client
-                .server_pool_arc()
-                .lock()
-                .as_ref()
-                .unwrap()
-                .segment_count(),
+            client.server_pool_arc().lock().segment_count(),
             17,
             "client peer cache must hold all lazily opened server segments"
         );
@@ -2834,9 +2703,10 @@ mod lazy_policy_roundtrip_tests {
         .await;
 
         let mut client = IpcClient::with_config(
-            server.ipc_address(),
+            server.local_endpoint().address(),
             client_config(small_base(64 * 1024, 20), 1024),
-        );
+        )
+        .unwrap();
         client.connect().await.unwrap();
         let binding = client
             .acquire_route(&expected_contract("request_idx16"))
@@ -2912,7 +2782,8 @@ mod lazy_policy_roundtrip_tests {
             cfg.base.primary_pool_config(&cfg.pool_tuning()),
             prefix,
             probed.clone(),
-        );
+        )
+        .unwrap();
         pool.ensure_buddy_segments(1).expect("probe segment");
         let charge = probed.snapshot().shm.used_bytes;
         assert!(charge > 0, "a mapped buddy segment must be charged");
@@ -2953,7 +2824,9 @@ mod lazy_policy_roundtrip_tests {
         server_cfg.base.chunk_size = 8 * 1024;
         let server = start_echo_server("budget_share_standalone", server_cfg, callback).await;
 
-        let mut client = IpcClient::with_config(server.ipc_address(), client_config(base, 1024));
+        let mut client =
+            IpcClient::with_config(server.local_endpoint().address(), client_config(base, 1024))
+                .unwrap();
         client.connect().await.unwrap();
         let request_pool = client.request_pool().unwrap();
         let reassembly_pool = Arc::clone(client.require_chunk_registry().pool());
@@ -3011,8 +2884,12 @@ mod lazy_policy_roundtrip_tests {
         cfg.base.file_backing_budget_bytes = 0;
 
         let cache = Arc::new(ClientPool::new(Duration::from_secs(30)));
-        let client_a = cache.acquire(server_a.ipc_address(), Some(&cfg)).unwrap();
-        let client_b = cache.acquire(server_b.ipc_address(), Some(&cfg)).unwrap();
+        let client_a = cache
+            .acquire(server_a.local_endpoint().address(), Some(&cfg))
+            .unwrap();
+        let client_b = cache
+            .acquire(server_b.local_endpoint().address(), Some(&cfg))
+            .unwrap();
         let pool_a = client_a.request_pool().unwrap();
         let pool_b = client_b.request_pool().unwrap();
         assert_eq!(
@@ -3069,55 +2946,6 @@ mod lazy_policy_roundtrip_tests {
         server_rt.block_on(stop_server(&server_b));
     }
 
-    /// An injected owner pool whose budget limits diverge from the config is
-    /// rejected before any connection I/O, and the pool is not mutated.
-    #[tokio::test]
-    async fn injected_pool_with_divergent_budget_is_rejected_before_io() {
-        let cfg = client_config(small_base(64 * 1024, 4), 1024);
-        let injected_budget = c2_mem::MemoryBudget::new(1, 2, 3);
-        let pool = MemPool::new_with_prefix_and_budget(
-            cfg.base.primary_pool_config(&cfg.pool_tuning()),
-            "/cc3i00000000000001".to_string(),
-            injected_budget.clone(),
-        );
-        let mut client = IpcClient::with_pool("ipc://budget_mismatch_never_connects", pool, cfg);
-        let error = client
-            .connect()
-            .await
-            .expect_err("divergent budget limits must reject before I/O");
-        assert!(matches!(error, IpcError::Pool(_)), "unexpected: {error:?}");
-        assert!(error.to_string().contains("do not match"), "{error}");
-        assert_eq!(
-            injected_budget.snapshot().shm.limit_bytes,
-            1,
-            "rejection must not mutate the injected budget"
-        );
-    }
-
-    /// An injected peer pool carries no owner-creation budget: it is rejected
-    /// instead of silently pairing the client with a freshly invented context.
-    #[tokio::test]
-    async fn injected_peer_pool_without_budget_is_rejected_before_io() {
-        let cfg = client_config(small_base(64 * 1024, 4), 1024);
-        let peer = MemPool::open_peer(
-            c2_mem::config::PoolConfig::default(),
-            "/cc3peer00000000001".to_string(),
-        );
-        let mut client =
-            IpcClient::with_pool("ipc://peer_pool_without_budget_never_connects", peer, cfg);
-        let error = client
-            .connect()
-            .await
-            .expect_err("a peer pool without an owner budget must reject");
-        assert!(matches!(error, IpcError::Pool(_)), "unexpected: {error:?}");
-        assert!(
-            error
-                .to_string()
-                .contains("no owner-creation memory budget"),
-            "{error}"
-        );
-    }
-
     /// Zero SHM budget still serves inline replies, and chunk/file reassembly
     /// remains available when the file cell admits it.
     #[tokio::test]
@@ -3133,7 +2961,7 @@ mod lazy_policy_roundtrip_tests {
         let mut cfg = client_config(base, 1024);
         cfg.base.shm_backing_budget_bytes = 0;
         cfg.base.file_backing_budget_bytes = 2 * 1024 * 1024 * 1024;
-        let mut client = IpcClient::with_config(server.ipc_address(), cfg);
+        let mut client = IpcClient::with_config(server.local_endpoint().address(), cfg).unwrap();
         client.connect().await.unwrap();
         let client = Arc::new(client);
 
@@ -3201,7 +3029,7 @@ mod lazy_policy_roundtrip_tests {
         cfg.base.pool_enabled = false;
         cfg.base.shm_backing_budget_bytes = 0;
         cfg.base.file_backing_budget_bytes = 0;
-        let mut client = IpcClient::with_config(server.ipc_address(), cfg);
+        let mut client = IpcClient::with_config(server.local_endpoint().address(), cfg).unwrap();
         client.connect().await.unwrap();
         let binding = client
             .acquire_route(&expected_contract("budget_exhausted"))
@@ -3226,7 +3054,7 @@ mod lazy_policy_roundtrip_tests {
         // runs on a blocking worker: a `#[tokio::test]` runtime is
         // single-threaded, so blocking its only worker would starve the
         // server's accept loop this probe needs.
-        let address = server.ipc_address().to_string();
+        let address = server.local_endpoint().address().to_string();
         let ping_ok =
             tokio::task::spawn_blocking(move || crate::ping(&address, Duration::from_secs(5)))
                 .await
@@ -3268,10 +3096,10 @@ mod lazy_policy_roundtrip_tests {
         let cache_a = Arc::new(ClientPool::new(Duration::from_secs(30)));
         let cache_b = Arc::new(ClientPool::new(Duration::from_secs(30)));
         let client_a = cache_a
-            .acquire(server_a.ipc_address(), Some(&cfg_a))
+            .acquire(server_a.local_endpoint().address(), Some(&cfg_a))
             .unwrap();
         let client_b = cache_b
-            .acquire(server_b.ipc_address(), Some(&cfg_b))
+            .acquire(server_b.local_endpoint().address(), Some(&cfg_b))
             .unwrap();
         assert_eq!(
             cache_a
@@ -3348,7 +3176,9 @@ mod lazy_policy_roundtrip_tests {
 
         let cfg = client_config(base, 1024);
         let cache = Arc::new(ClientPool::new(Duration::from_secs(30)));
-        let client = cache.acquire(server.ipc_address(), Some(&cfg)).unwrap();
+        let client = cache
+            .acquire(server.local_endpoint().address(), Some(&cfg))
+            .unwrap();
         let binding = client
             .acquire_route(&expected_contract("budget_held_charge"))
             .unwrap();
@@ -3425,74 +3255,6 @@ mod lazy_policy_roundtrip_tests {
         server_rt.block_on(stop_server(&server));
     }
 
-    #[test]
-    fn prealloc_rejects_another_clients_block_before_publication() {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let (callback, seen) = echo_callback();
-        let base = small_base(64 * 1024, 2);
-        let server = runtime.block_on(start_echo_server(
-            "prealloc_owner",
-            server_config(base.clone(), 1024),
-            callback,
-        ));
-        let config = client_config(base, 1024);
-        let mut a = crate::SyncClient::connect(server.ipc_address(), None, config.clone()).unwrap();
-        let mut b = crate::SyncClient::connect(server.ipc_address(), None, config).unwrap();
-        let binding_a = a
-            .acquire_route(&expected_contract("prealloc_owner"))
-            .unwrap();
-        let binding_b = b
-            .acquire_route(&expected_contract("prealloc_owner"))
-            .unwrap();
-        let block_a = a.pool_alloc_and_write(&[1; 4096]).unwrap();
-        let block_b = b.pool_alloc_and_write(&[2; 4096]).unwrap();
-        let coords = |block: &crate::RequestBlock| {
-            let allocation = block.allocation();
-            (
-                allocation.seg_idx,
-                allocation.generation,
-                allocation.offset,
-                allocation.allocation_id,
-            )
-        };
-        assert_eq!(coords(&block_a), coords(&block_b));
-        let result = b.call_bound_prealloc(&binding_b, "echo", &block_a);
-        let rejected =
-            matches!(&result, Err(IpcError::Pool(message)) if message.contains("request pool"));
-        let received =
-            result.map(|response| b.lease_response(response).into_owned_bytes().unwrap());
-        let calls_after_rejection = seen.lock().len();
-        let allocations = (
-            a.request_pool().unwrap().lock().stats().alloc_count,
-            b.request_pool().unwrap().lock().stats().alloc_count,
-        );
-        if rejected {
-            let response = b.call_bound_prealloc(&binding_b, "echo", &block_b).unwrap();
-            assert_eq!(
-                b.lease_response(response).into_owned_bytes().unwrap(),
-                [2; 4096]
-            );
-            let fresh = a.pool_alloc_and_write(&[3; 4096]).unwrap();
-            let response = a.call_bound_prealloc(&binding_a, "echo", &fresh).unwrap();
-            assert_eq!(
-                a.lease_response(response).into_owned_bytes().unwrap(),
-                [3; 4096]
-            );
-        }
-        drop(block_a);
-        drop(block_b);
-        a.close();
-        b.close();
-        runtime.block_on(stop_server(&server));
-        assert!(rejected, "foreign block reached the server: {received:?}");
-        assert_eq!(calls_after_rejection, 0);
-        assert_eq!(
-            allocations,
-            (0, 1),
-            "failure must release only the original owner"
-        );
-    }
-
     /// A confirmed close detaches idle owner pools so a closed-but-retained
     /// client stops pinning unused mappings and their charge; a reconnect
     /// rebuilds fresh incarnations on the same frozen budget.
@@ -3509,7 +3271,9 @@ mod lazy_policy_roundtrip_tests {
 
         let cfg = client_config(base, 1024);
         let budget = c2_mem::MemoryBudget::from_limits(&cfg.memory_budget_limits());
-        let mut client = IpcClient::with_shared_budget(server.ipc_address(), cfg, budget.clone());
+        let mut client =
+            IpcClient::with_shared_budget(server.local_endpoint().address(), cfg, budget.clone())
+                .unwrap();
         client.connect().await.unwrap();
         let first_prefix = client
             .request_pool()
@@ -3523,7 +3287,7 @@ mod lazy_policy_roundtrip_tests {
 
         let payload: Vec<u8> = (0..32 * 1024u32).map(|i| (i % 229) as u8).collect();
         let response = echo_roundtrip(&client, "budget_detach_reconnect", &payload).await;
-        let first_response_pool = Arc::clone(client.server_pool_arc());
+        let first_response_pool = client.server_pool_arc();
         let mut held = ResponseLease::new(response);
         assert_eq!(held.copy_bytes().unwrap(), payload);
         assert!(
@@ -3552,7 +3316,7 @@ mod lazy_policy_roundtrip_tests {
         // Reconnect rebuilds fresh pool incarnations on the same budget.
         client.connect().await.unwrap();
         assert!(
-            !Arc::ptr_eq(client.server_pool_arc(), &first_response_pool),
+            !Arc::ptr_eq(&client.server_pool_arc(), &first_response_pool),
             "a reconnect must not replace a retained reply's pool state"
         );
         assert_eq!(held.copy_bytes().unwrap(), payload);
@@ -3652,7 +3416,9 @@ mod lazy_policy_roundtrip_tests {
             callback,
         )
         .await;
-        let mut client = IpcClient::with_config(server.ipc_address(), client_config(base, 1024));
+        let mut client =
+            IpcClient::with_config(server.local_endpoint().address(), client_config(base, 1024))
+                .unwrap();
         client.connect().await.unwrap();
         let binding = client
             .acquire_route(&expected_contract("buddy_fill_source_error"))
@@ -3766,9 +3532,10 @@ mod lazy_policy_roundtrip_tests {
         )
         .await;
         let mut client = IpcClient::with_config(
-            server.ipc_address(),
+            server.local_endpoint().address(),
             client_config(small_base(64 * 1024, 2), 1024),
-        );
+        )
+        .unwrap();
         client.connect().await.unwrap();
         let old_pool = client.request_pool().expect("transport-owned request pool");
         let binding = client
@@ -3820,7 +3587,8 @@ mod lazy_policy_roundtrip_tests {
                     ADDR_COUNTER.fetch_add(1, Ordering::Relaxed)
                 ),
                 fresh_budget,
-            ),
+            )
+            .unwrap(),
         ));
         client.replace_request_pool_for_test(Some(Arc::clone(&fresh_pool)));
         let _canary = fresh_pool.lock().alloc(64).expect("fresh-pool canary");
@@ -3876,7 +3644,9 @@ mod lazy_policy_roundtrip_tests {
             callback,
         )
         .await;
-        let mut client = IpcClient::with_config(server.ipc_address(), client_config(base, 1024));
+        let mut client =
+            IpcClient::with_config(server.local_endpoint().address(), client_config(base, 1024))
+                .unwrap();
         client.connect().await.unwrap();
         let pool = client
             .request_pool()
@@ -3961,7 +3731,9 @@ mod lazy_policy_roundtrip_tests {
             callback,
         )
         .await;
-        let mut client = IpcClient::with_config(server.ipc_address(), client_config(base, 1024));
+        let mut client =
+            IpcClient::with_config(server.local_endpoint().address(), client_config(base, 1024))
+                .unwrap();
         client.connect().await.unwrap();
         let pool = client
             .request_pool()
@@ -4076,7 +3848,8 @@ mod lazy_policy_roundtrip_tests {
                 crate::tests::close_listener(listener).await;
                 exchange
             });
-            let mut client = IpcClient::with_endpoint(endpoint, ClientIpcConfig::default());
+            let mut client =
+                IpcClient::with_endpoint(endpoint, ClientIpcConfig::default()).unwrap();
             let connected = timeout(Duration::from_secs(5), client.connect()).await;
             client.close().await;
             let (hello, trailing) = handler.await.expect("peer joined").unwrap().unwrap();
@@ -4148,7 +3921,8 @@ mod lazy_policy_roundtrip_tests {
                 crate::tests::close_listener(listener).await;
                 exchange
             });
-            let mut client = IpcClient::with_endpoint(endpoint, ClientIpcConfig::default());
+            let mut client =
+                IpcClient::with_endpoint(endpoint, ClientIpcConfig::default()).unwrap();
             let connected = timeout(Duration::from_secs(2), client.connect()).await;
             client.close().await;
             let trailing = handler.await.unwrap().unwrap().unwrap();
@@ -4274,7 +4048,8 @@ mod lazy_policy_roundtrip_tests {
                 },
                 8192, // force chunking for this 8192-byte request
             ),
-        );
+        )
+        .unwrap();
         client.connect().await.unwrap();
         let binding = client
             .bind_cached_route(&expected_contract("grid"))
@@ -4309,7 +4084,7 @@ mod lazy_policy_roundtrip_tests {
         assert!(c2_wire::flags::is_chunked(header.flags));
         assert!(!c2_wire::flags::is_chunk_last(header.flags));
         let (chunk_idx, total_chunks, offset) =
-            c2_wire::chunk::decode_chunk_header(payload, 0).unwrap();
+            c2_wire::chunk::header::decode_chunk_header(payload, 0).unwrap();
         assert_eq!(chunk_idx, 0);
         assert_eq!(total_chunks, 128);
         let (_, consumed) = c2_wire::control::decode_call_control(payload, offset).unwrap();
@@ -4363,9 +4138,10 @@ mod lazy_policy_roundtrip_tests {
         )
         .await;
         let mut client = IpcClient::with_config(
-            server.ipc_address(),
+            server.local_endpoint().address(),
             client_config(small_base(64 * 1024, 2), 1024),
-        );
+        )
+        .unwrap();
         client.connect().await.unwrap();
         let pool = client.request_pool().expect("transport-owned request pool");
         let binding = client
@@ -4385,7 +4161,7 @@ mod lazy_policy_roundtrip_tests {
         let _canary = pool.lock().alloc(64).expect("pool canary");
         assert_eq!(pool.lock().stats().alloc_count, 2);
 
-        // The public release path (SyncClient::pool_free equivalent): the
+        // The request owner release path: the
         // armed block is freed through its exact owner.
         let _ = block.release();
         assert_eq!(
@@ -4433,9 +4209,10 @@ mod lazy_policy_roundtrip_tests {
         )
         .await;
         let mut client = IpcClient::with_config(
-            server.ipc_address(),
+            server.local_endpoint().address(),
             client_config(small_base(64 * 1024, 2), 1024),
-        );
+        )
+        .unwrap();
         client.connect().await.unwrap();
         let binding = client
             .acquire_route(&expected_contract("double_dispatch"))
@@ -4503,7 +4280,8 @@ mod lazy_policy_roundtrip_tests {
     async fn release_racing_dispatch_never_sends_freed_coordinates() {
         let (address, peer_rx) = raw_handshake_peer("release_race_dispatch").await;
         let mut client =
-            IpcClient::with_config(&address, client_config(small_base(64 * 1024, 2), 1024));
+            IpcClient::with_config(&address, client_config(small_base(64 * 1024, 2), 1024))
+                .unwrap();
         client.connect().await.expect("connect");
         let mut peer = peer_rx.await.expect("peer stream");
         let pool = client.request_pool().expect("transport-owned request pool");
@@ -4592,7 +4370,9 @@ mod lazy_policy_roundtrip_tests {
             callback,
         )
         .await;
-        let mut client = IpcClient::with_config(server.ipc_address(), client_config(base, 1024));
+        let mut client =
+            IpcClient::with_config(server.local_endpoint().address(), client_config(base, 1024))
+                .unwrap();
         client.connect().await.unwrap();
         // Keep only the domain budget (an accounting handle, not backing
         // retention); the pool Arc is dropped immediately.
@@ -4670,24 +4450,25 @@ mod lazy_policy_roundtrip_tests {
             callback,
         )
         .await;
-        // Build the client around a short-crash-timeout, buddy-disabled
-        // injected pool exactly as a deployment would configure it, and drop
-        // the test's pool reference right away: only production ownership
-        // may keep the backing alive from here on.
         let cfg = client_config(base, 1024);
         let budget = c2_mem::MemoryBudget::from_limits(&cfg.memory_budget_limits());
+        let endpoint = server.local_endpoint().clone();
         let mut pool_config = cfg.base.primary_pool_config(&cfg.pool_tuning());
         pool_config.dedicated_crash_timeout_secs = 0.25;
-        let pool = MemPool::new_with_prefix_and_budget(
-            pool_config,
-            format!(
-                "/cc3crash{:08x}{:08x}",
-                std::process::id(),
-                ADDR_COUNTER.fetch_add(1, Ordering::Relaxed)
-            ),
-            budget.clone(),
-        );
-        let mut client = IpcClient::with_pool(server.ipc_address(), pool, cfg);
+        let pool = Arc::new(Mutex::new(
+            MemPool::new_with_prefix_and_budget(
+                pool_config,
+                format!(
+                    "/cc3crash{:08x}{:08x}",
+                    std::process::id(),
+                    ADDR_COUNTER.fetch_add(1, Ordering::Relaxed)
+                ),
+                budget.clone(),
+            )
+            .unwrap(),
+        ));
+        let mut client =
+            IpcClient::with_transport_pool(endpoint, pool, cfg, budget.clone()).unwrap();
         client.connect().await.unwrap();
 
         let binding = client
@@ -4753,7 +4534,9 @@ mod lazy_policy_roundtrip_tests {
             callback,
         )
         .await;
-        let mut client = IpcClient::with_config(server.ipc_address(), client_config(base, 1024));
+        let mut client =
+            IpcClient::with_config(server.local_endpoint().address(), client_config(base, 1024))
+                .unwrap();
         client.connect().await.unwrap();
         let pool = client
             .request_pool()
@@ -4839,7 +4622,7 @@ mod lazy_policy_roundtrip_tests {
             cfg.base.chunk_gc_interval_secs = 60.0;
             cfg.pool_decay_seconds = 60.0;
         }
-        let mut client = IpcClient::with_config(&address, cfg.clone());
+        let mut client = IpcClient::with_config(&address, cfg.clone()).unwrap();
         let drain_probe = if contended_drain {
             let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
             let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
@@ -4989,7 +4772,8 @@ mod lazy_policy_roundtrip_tests {
         )
         .await;
         let mut reacquired =
-            IpcClient::with_shared_budget(server.ipc_address(), cfg, budget.clone());
+            IpcClient::with_shared_budget(server.local_endpoint().address(), cfg, budget.clone())
+                .unwrap();
         reacquired.connect().await.expect("same-budget reconnect");
         assert_ne!(
             reacquired.request_pool().unwrap().lock().prefix(),
@@ -5133,7 +4917,8 @@ mod lazy_policy_roundtrip_tests {
             assert!(pointer.is_dedicated, "must publish real dedicated SHM");
             let (control, _) = decode_call_control(payload, consumed).unwrap();
             assert_eq!(control.identity.route_uid, "terminal-grid-1");
-            let mut memory = MemPool::open_peer(c2_mem::PoolConfig::default(), prefix.clone());
+            let mut memory =
+                MemPool::open_peer(c2_mem::PoolConfig::default(), prefix.clone()).unwrap();
             unsafe {
                 memory.open_dedicated_at(
                     u32::from(pointer.seg_idx),
@@ -5229,8 +5014,17 @@ mod lazy_policy_roundtrip_tests {
             .budget
             .shm
             .used_bytes;
-        let block = Arc::new(old.pool_alloc_and_write(&vec![7; 160 * 1024]).unwrap());
-        assert!(block.is_dedicated());
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        let caller = {
+            let old = Arc::clone(&old);
+            std::thread::spawn(move || {
+                let err = old
+                    .call_bound(&binding, "echo", &vec![7; 160 * 1024])
+                    .expect_err("the live request must receive Closed");
+                closed_tx.send((err, old.is_connected())).unwrap();
+            })
+        };
+        peer_rt.block_on(published_rx).unwrap();
         let retained = cache
             .memory_budget_snapshot()
             .unwrap()
@@ -5241,18 +5035,6 @@ mod lazy_policy_roundtrip_tests {
             cfg.base.shm_backing_budget_bytes - retained < prewarm_bytes,
             "a fresh prewarm cannot fit while the old real backing is retained"
         );
-        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
-        let caller = {
-            let old = Arc::clone(&old);
-            let block = Arc::clone(&block);
-            std::thread::spawn(move || {
-                let err = old
-                    .call_bound_prealloc(&binding, "echo", &block)
-                    .expect_err("the live request must receive Closed");
-                closed_tx.send((err, old.is_connected())).unwrap();
-            })
-        };
-        peer_rt.block_on(published_rx).unwrap();
         let busy = owner.lock();
         assert_eq!(busy.stats().dedicated_active_count, 1);
         terminate_tx.send(()).unwrap();
@@ -5315,7 +5097,6 @@ mod lazy_policy_roundtrip_tests {
             "close retry must finish settlement"
         );
         assert!(old.request_pool().is_none());
-        drop(block);
         drop(owner);
         assert_eq!(
             cache
@@ -5365,7 +5146,9 @@ mod lazy_policy_roundtrip_tests {
             callback,
         )
         .await;
-        let mut client = IpcClient::with_config(server.ipc_address(), client_config(base, 1024));
+        let mut client =
+            IpcClient::with_config(server.local_endpoint().address(), client_config(base, 1024))
+                .unwrap();
         client.connect().await.unwrap();
         let observation = client.connection_observation().unwrap();
         let binding = client
@@ -5477,7 +5260,9 @@ mod lazy_policy_roundtrip_tests {
             callback,
         )
         .await;
-        let mut client = IpcClient::with_config(server.ipc_address(), client_config(base, 1024));
+        let mut client =
+            IpcClient::with_config(server.local_endpoint().address(), client_config(base, 1024))
+                .unwrap();
         client.connect().await.unwrap();
         let observation = client.connection_observation().unwrap();
         let budget = client
@@ -5586,19 +5371,26 @@ mod lazy_policy_roundtrip_tests {
         let expected = expected_contract("sender_cancel");
 
         let mut inline_client = IpcClient::with_config(
-            server.ipc_address(),
+            server.local_endpoint().address(),
             client_config(chunked_base.clone(), 1 << 20),
-        );
+        )
+        .unwrap();
         inline_client.connect().await.unwrap();
         let inline_binding = inline_client.acquire_route(&expected).await.unwrap();
         let inline_client = Arc::new(inline_client);
-        let mut chunked_client =
-            IpcClient::with_config(server.ipc_address(), client_config(chunked_base, 1 << 20));
+        let mut chunked_client = IpcClient::with_config(
+            server.local_endpoint().address(),
+            client_config(chunked_base, 1 << 20),
+        )
+        .unwrap();
         chunked_client.connect().await.unwrap();
         let chunked_binding = chunked_client.acquire_route(&expected).await.unwrap();
         let chunked_client = Arc::new(chunked_client);
-        let mut dedicated_client =
-            IpcClient::with_config(server.ipc_address(), client_config(dedicated_base, 8));
+        let mut dedicated_client = IpcClient::with_config(
+            server.local_endpoint().address(),
+            client_config(dedicated_base, 8),
+        )
+        .unwrap();
         dedicated_client.connect().await.unwrap();
         let dedicated_binding = dedicated_client.acquire_route(&expected).await.unwrap();
         let dedicated_client = Arc::new(dedicated_client);
@@ -5681,7 +5473,9 @@ mod lazy_policy_roundtrip_tests {
             callback,
         )
         .await;
-        let mut client = IpcClient::with_config(server.ipc_address(), client_config(base, 8));
+        let mut client =
+            IpcClient::with_config(server.local_endpoint().address(), client_config(base, 8))
+                .unwrap();
         client.connect().await.unwrap();
         let pool = client
             .request_pool()
@@ -5772,7 +5566,9 @@ mod lazy_policy_roundtrip_tests {
         };
         let server =
             start_echo_server("retire_capacity", server_config(base.clone(), 64), callback).await;
-        let mut client = IpcClient::with_config(server.ipc_address(), client_config(base, 8));
+        let mut client =
+            IpcClient::with_config(server.local_endpoint().address(), client_config(base, 8))
+                .unwrap();
         client.connect().await.unwrap();
         let budget = client
             .request_pool()
@@ -5915,7 +5711,9 @@ mod lazy_policy_roundtrip_tests {
             callback,
         )
         .await;
-        let mut client = IpcClient::with_config(server.ipc_address(), client_config(base, 8));
+        let mut client =
+            IpcClient::with_config(server.local_endpoint().address(), client_config(base, 8))
+                .unwrap();
         client.connect().await.unwrap();
         let budget = client
             .request_pool()
@@ -6099,7 +5897,9 @@ mod lazy_policy_roundtrip_tests {
             callback,
         )
         .await;
-        let mut client = IpcClient::with_config(server.ipc_address(), client_config(base, 8));
+        let mut client =
+            IpcClient::with_config(server.local_endpoint().address(), client_config(base, 8))
+                .unwrap();
         client.connect().await.unwrap();
         let client_pool = client
             .request_pool()
@@ -6378,7 +6178,9 @@ mod lazy_policy_roundtrip_tests {
             callback,
         )
         .await;
-        let mut client = IpcClient::with_config(server.ipc_address(), client_config(base, 1024));
+        let mut client =
+            IpcClient::with_config(server.local_endpoint().address(), client_config(base, 1024))
+                .unwrap();
         client.connect().await.unwrap();
         assert!(
             client.shm_request_available(),
@@ -6417,7 +6219,7 @@ mod lazy_policy_roundtrip_tests {
         let (endpoint, done, mut header_rx) =
             capped_ack_peer("negotiation_drop", false, false).await;
         let base = small_base(64 * 1024, 2);
-        let mut client = IpcClient::with_endpoint(endpoint, client_config(base, 1024));
+        let mut client = IpcClient::with_endpoint(endpoint, client_config(base, 1024)).unwrap();
         client.connect().await.unwrap();
         assert!(!client.shm_request_available());
         assert!(
@@ -6511,9 +6313,9 @@ mod lazy_policy_roundtrip_tests {
         });
 
         let base = small_base(64 * 1024, 2);
-        let mut client = IpcClient::with_endpoint(endpoint, client_config(base, 1024));
+        let mut client = IpcClient::with_endpoint(endpoint, client_config(base, 1024)).unwrap();
         client.connect().await.unwrap();
-        let server_pool_probe = Arc::clone(client.server_pool_arc());
+        let server_pool_probe = client.server_pool_arc();
         let result = client.call_inline(&raw_peer_identity(), 0, b"probe").await;
         match result {
             Err(IpcError::Protocol(message)) => assert!(
@@ -6522,160 +6324,13 @@ mod lazy_policy_roundtrip_tests {
             ),
             other => panic!("un-negotiated buddy reply must be rejected: {other:?}"),
         }
-        let mapped_segments = server_pool_probe
-            .lock()
-            .as_ref()
-            .map(|state| state.segment_count())
-            .unwrap_or(0);
+        let mapped_segments = server_pool_probe.lock().segment_count();
         assert_eq!(
             mapped_segments, 0,
             "no server segment may be lazy-opened for an un-negotiated buddy reply"
         );
         client.close_shared().await;
         peer_task.await.unwrap();
-    }
-
-    /// Current-pool preallocated block on an un-negotiated connection: the
-    /// direction gate copy-consumes the armed snapshot at its requested
-    /// length, frees it through the exact owning pool, and sends the owned
-    /// bytes through the inline/chunked policy — the peer never receives
-    /// coordinates it did not ACK.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn unnegotiated_direction_copy_consumes_current_pool_prealloc_block() {
-        let (endpoint, done, mut header_rx) =
-            capped_ack_peer("prealloc_direction_copy", false, false).await;
-        let base = small_base(64 * 1024, 2);
-        let mut client = IpcClient::with_endpoint(endpoint, client_config(base, 1024));
-        client.connect().await.unwrap();
-        assert!(!client.shm_request_available());
-        assert!(
-            client.has_request_pool(),
-            "the pool stays; only the direction is off"
-        );
-
-        let payload = vec![7u8; 8192];
-        let block = client
-            .try_alloc_request_block(payload.len())
-            .unwrap()
-            .expect("current pool allocates a request block");
-        block.write_at(0, &payload).unwrap();
-        let owner_pool = client.request_pool().expect("current request pool");
-
-        let identity = raw_peer_identity();
-        let response = client
-            .call_with_prealloc(&identity, 0, &block)
-            .await
-            .expect("copy-consumed block must still deliver its bytes");
-        assert!(matches!(response, ResponseData::Inline(_)));
-        let observed = header_rx
-            .recv()
-            .await
-            .expect("peer must observe the call frame");
-        assert!(observed.is_call_v2());
-        assert!(
-            !observed.is_buddy(),
-            "an un-negotiated direction must never publish SHM coordinates"
-        );
-        assert_eq!(
-            owner_pool.lock().stats().alloc_count,
-            0,
-            "copy-consumption must free through the exact owning pool once"
-        );
-        // The armed state machine is spent: a second publication attempt is a
-        // clean rejection, not a second frame or release.
-        let err = client.call_with_prealloc(&identity, 0, &block).await;
-        assert!(
-            matches!(err, Err(IpcError::Pool(ref message)) if message.contains("released")),
-            "a consumed block must never carry a second frame: {err:?}"
-        );
-
-        drop(block);
-        client.close_shared().await;
-        done.await.unwrap();
-    }
-
-    /// A block from a retired pool incarnation (after a confirmed close plus
-    /// reconnect) keeps the original writer-seam pool-identity rejection: it
-    /// is released through its original owner and never published, exactly
-    /// like a foreign pool's block. Copy-consumption exists only for the
-    /// current pool's blocks on un-negotiated connections.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn retired_incarnation_prealloc_block_keeps_original_rejection() {
-        let (callback, seen_kinds) = echo_callback();
-        let base = small_base(64 * 1024, 2);
-        let server = start_echo_server(
-            "prealloc_retired_reject",
-            server_config(base.clone(), 1024),
-            callback,
-        )
-        .await;
-        let mut client = IpcClient::with_config(server.ipc_address(), client_config(base, 1024));
-        client.connect().await.unwrap();
-        let binding = client
-            .acquire_route(&expected_contract("prealloc_retired_reject"))
-            .await
-            .unwrap();
-        let (method_idx, identity, _max_payload) = binding
-            .call_target_for("echo")
-            .expect("route target resolves");
-
-        let payload = vec![5u8; 4096];
-        let block = client
-            .try_alloc_request_block(payload.len())
-            .unwrap()
-            .expect("live session allocates a request block");
-        block.write_at(0, &payload).unwrap();
-        let retired_pool = client.request_pool().expect("live request pool");
-
-        // Retire the session: a confirmed close detaches the transport-owned
-        // pool, and reconnect installs a fresh incarnation.
-        assert!(
-            client.close_shared_bounded(Duration::from_secs(5)).await,
-            "close barrier must confirm before reconnect"
-        );
-        client.connect().await.unwrap();
-        let fresh_pool = client.request_pool().expect("reconnected request pool");
-        assert!(
-            !Arc::ptr_eq(&retired_pool, &fresh_pool),
-            "reconnect must install a fresh pool incarnation"
-        );
-
-        // The retired-incarnation block is rejected at the original
-        // writer-seam identity check, in its original error shape, and the
-        // failure releases the armed block through its original owner.
-        let err = client
-            .call_with_prealloc(&identity, method_idx, &block)
-            .await;
-        assert!(
-            matches!(err, Err(IpcError::Pool(ref message)) if message.contains("request pool")),
-            "a retired-incarnation block must keep the original rejection: {err:?}"
-        );
-        assert_eq!(
-            seen_kinds.lock().len(),
-            0,
-            "a rejected block must never reach the resource"
-        );
-        assert_eq!(
-            retired_pool.lock().stats().alloc_count,
-            0,
-            "rejection must release only the original owner's block"
-        );
-        // The fresh session keeps serving normal calls through SHM.
-        let response = client.call_bound(&binding, "echo", &payload).await.unwrap();
-        assert_eq!(response_bytes(&client, response), payload);
-        {
-            let kinds = seen_kinds.lock();
-            assert!(
-                kinds
-                    .iter()
-                    .any(|kind| matches!(*kind, "shm_buddy" | "shm_dedicated")),
-                "the fresh session must still use negotiated SHM: {kinds:?}"
-            );
-        }
-
-        drop(block);
-        client.close_shared().await;
-        stop_server(&server).await;
     }
 }
 
@@ -6692,7 +6347,8 @@ mod chunk_reply_admission_tests {
 
     use c2_local::LocalStream;
     use c2_mem::{MemPool, MemoryBudget, PoolConfig};
-    use c2_wire::chunk::{ChunkConfig, ChunkRegistry, encode_reply_chunk_meta};
+    use c2_wire::chunk::header::encode_reply_chunk_meta;
+    use c2_wire::chunk::{ChunkConfig, ChunkRegistry};
     use c2_wire::flags;
     use c2_wire::frame;
     use tokio::io::AsyncReadExt as _;
@@ -6738,7 +6394,8 @@ mod chunk_reply_admission_tests {
                 pool_config(),
                 unique_prefix(label),
                 budget.clone(),
-            ),
+            )
+            .unwrap(),
         ));
         (
             Arc::new(ChunkRegistry::new(pool, ChunkConfig::default())),
@@ -6786,7 +6443,12 @@ mod chunk_reply_admission_tests {
             recv_loop(
                 client_read,
                 loop_pending,
-                Arc::new(parking_lot::Mutex::new(None::<crate::ServerPoolState>)),
+                Arc::new(parking_lot::Mutex::new(
+                    crate::ServerPoolState::from_pool_for_test(
+                        c2_mem::MemPool::open_peer(PoolConfig::default(), "/reply-test".into())
+                            .unwrap(),
+                    ),
+                )),
                 Arc::new(tokio::sync::Mutex::new(Some(client_write))),
                 registry,
                 7,
@@ -7318,9 +6980,12 @@ mod endpoint_context_tests {
     fn platform_default_and_explicit_constructors_keep_the_same_snapshot() {
         let context = LocalEndpointContext::default_for_platform().unwrap();
         let endpoint = context.endpoint("ipc://context_api").unwrap();
-        let client = IpcClient::new(endpoint.address());
-        let configured = IpcClient::with_config(endpoint.address(), ClientIpcConfig::default());
-        let explicit = IpcClient::with_endpoint(endpoint.clone(), ClientIpcConfig::default());
+        let client =
+            IpcClient::with_config(endpoint.address(), ClientIpcConfig::default()).unwrap();
+        let configured =
+            IpcClient::with_config(endpoint.address(), ClientIpcConfig::default()).unwrap();
+        let explicit =
+            IpcClient::with_endpoint(endpoint.clone(), ClientIpcConfig::default()).unwrap();
         assert_eq!(client.local_endpoint().unwrap(), &endpoint);
         assert_eq!(configured.local_endpoint().unwrap(), &endpoint);
         assert_eq!(explicit.local_endpoint().unwrap(), &endpoint);
@@ -7367,7 +7032,7 @@ mod endpoint_context_tests {
         let config = ClientIpcConfig::default();
         let budget = c2_mem::MemoryBudget::from_limits(&config.memory_budget_limits());
         let mut client =
-            IpcClient::with_endpoint_and_shared_budget(endpoint.clone(), config, budget);
+            IpcClient::with_endpoint_and_shared_budget(endpoint.clone(), config, budget).unwrap();
         tokio::runtime::Runtime::new()
             .unwrap()
             .block_on(client.close());
@@ -7400,8 +7065,8 @@ mod endpoint_context_tests {
 #[cfg(all(test, unix))]
 mod endpoint_context_transport_tests {
     use crate::{
-        ClientIpcConfig, ClientPool, SyncClient, ping_with_context, ping_with_endpoint,
-        shutdown_with_context, shutdown_with_endpoint,
+        ClientPool, SyncClient, ping_with_context, ping_with_endpoint, shutdown_with_context,
+        shutdown_with_endpoint,
     };
     use c2_config::LocalEndpointContext;
     use c2_server::{
@@ -7536,12 +7201,12 @@ mod endpoint_context_transport_tests {
             server_b.wait_until_ready(WAIT).await.unwrap();
             runs
         });
-        let mut direct_a =
-            SyncClient::connect_with_endpoint(endpoint_a.clone(), None, ClientIpcConfig::default())
-                .unwrap();
-        let mut direct_b =
-            SyncClient::connect_with_endpoint(endpoint_b.clone(), None, ClientIpcConfig::default())
-                .unwrap();
+        let direct_a = ClientPool::with_endpoint_context(WAIT, endpoint_a.context().clone())
+            .acquire(endpoint_a.address(), None)
+            .unwrap();
+        let direct_b = ClientPool::with_endpoint_context(WAIT, endpoint_b.context().clone())
+            .acquire(endpoint_b.address(), None)
+            .unwrap();
         assert_eq!(direct_a.server_identity(), Some(server_a.identity()));
         assert_eq!(direct_b.server_identity(), Some(server_b.identity()));
         check_tag(&direct_a, b'A');
@@ -7577,8 +7242,8 @@ mod endpoint_context_transport_tests {
         check_tag(&reopened_a, b'A');
         check_tag(&cached_b, b'B');
 
-        direct_a.close();
-        direct_b.close();
+        assert!(direct_a.close_shared(WAIT));
+        assert!(direct_b.close_shared(WAIT));
         let report = pool_a.close_all(WAIT);
         assert!(
             report.error.is_none() && report.unconfirmed.is_empty(),
@@ -7603,15 +7268,16 @@ mod endpoint_context_transport_tests {
             server_a.wait_until_ready(WAIT).await.unwrap();
             runner
         });
-        let mut restarted_client =
-            SyncClient::connect_with_endpoint(endpoint_a.clone(), None, ClientIpcConfig::default())
+        let restarted_client =
+            ClientPool::with_endpoint_context(WAIT, endpoint_a.context().clone())
+                .acquire(endpoint_a.address(), None)
                 .unwrap();
         assert_eq!(
             restarted_client.server_identity(),
             Some(server_a.identity())
         );
         assert_eq!(restarted_client.local_endpoint(), &endpoint_a);
-        restarted_client.close();
+        assert!(restarted_client.close_shared(WAIT));
         check_tag(&cached_b, b'B');
         let ack_a = shutdown_with_endpoint(&endpoint_a, WAIT).unwrap();
         assert!(ack_a.acknowledged && ack_a.shutdown_started);

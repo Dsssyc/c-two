@@ -540,7 +540,7 @@ impl fmt::Debug for Host {
         formatter
             .debug_struct("Host")
             .field("server_id", &self.inner.server.server_id())
-            .field("ipc_address", &self.inner.server.ipc_address())
+            .field("ipc_address", &self.inner.server.local_endpoint().address())
             .finish_non_exhaustive()
     }
 }

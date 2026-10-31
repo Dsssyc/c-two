@@ -9,7 +9,7 @@ use c2_server::{PeerShmRequest, RequestData, RequestLease};
 
 fn main() {
     let pool = Arc::new(parking_lot::RwLock::new(
-        MemPool::new(PoolConfig::default()),
+        MemPool::new(PoolConfig::default()).unwrap(),
     ));
     let mut lease = RequestLease::new(RequestData::Shm(PeerShmRequest::admit(
         pool,

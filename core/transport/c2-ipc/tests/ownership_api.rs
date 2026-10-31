@@ -81,18 +81,6 @@ const CASES: &[(&str, Probe)] = &[
         Probe::Fails(&["E0133"]),
     ),
     (
-        "vuln_injected_pool_destroy_during_fill",
-        Probe::Fails(&["E0308"]),
-    ),
-    (
-        "vuln_prealloc_published_span_expansion",
-        Probe::Fails(&["E0061"]),
-    ),
-    (
-        "vuln_async_injected_pool_replacement",
-        Probe::Fails(&["E0308"]),
-    ),
-    (
         "vuln_server_response_pool_replacement",
         Probe::Fails(&["E0133"]),
     ),

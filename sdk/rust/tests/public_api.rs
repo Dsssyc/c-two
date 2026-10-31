@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use c_two::contract::{ContractLimits, ContractReleaseRef};
+use c_two::contract::ContractReleaseRef;
 use c_two::generated::{
     C2Error, EncodedClient, EncodedService, ErrorCode, MethodAccess, MethodDefinition,
     ServiceDefinition, fastdb_cause_details,
@@ -150,9 +150,7 @@ fn test_context() -> &'static c_two::endpoint::LocalEndpointContext {
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
-            let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("target/test-ipc")
-                .join(unique_name("public-api"));
+            let root = Path::new("/tmp").join(unique_name("c2-sdk"));
             std::fs::DirBuilder::new()
                 .recursive(true)
                 .mode(0o700)
@@ -177,11 +175,7 @@ fn test_runtime(options: RuntimeOptions) -> Result<Runtime, c_two::LifecycleErro
 }
 
 fn release() -> ContractRelease {
-    ContractRelease::from_descriptor_json_with_limits(
-        DESCRIPTOR.as_bytes(),
-        ContractLimits::default(),
-    )
-    .expect("valid release")
+    ContractRelease::from_descriptor_json(DESCRIPTOR.as_bytes()).expect("valid release")
 }
 
 fn definition(route_name: &str) -> ServiceDefinition {
@@ -467,7 +461,7 @@ fn low_level_transports_are_not_importable_and_encoded_client_is_sealed() {
     assert_external_crate_rejected(
         "moved-root-surface",
         r#"
-use c_two::{ContractLimits, EndpointCredential, OwnerControl, ConnectionObservation};
+use c_two::{EndpointCredential, OwnerControl, ConnectionObservation};
 fn main() {}
 "#,
         "unresolved imports",

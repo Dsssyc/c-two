@@ -201,11 +201,10 @@ fn connect_with_transient_retry(
         crate::client::connect_check(deadline, "pool_connect")?;
         let counter = CLIENT_POOL_GEN.fetch_add(1, Ordering::Relaxed) as u32;
         let prefix = format!("/cc3c{:08x}{:08x}", std::process::id(), counter);
-        let pool = Arc::new(Mutex::new(MemPool::new_with_prefix_and_budget(
-            pool_config.clone(),
-            prefix,
-            budget.clone(),
-        )));
+        let pool = Arc::new(Mutex::new(
+            MemPool::new_with_prefix_and_budget(pool_config.clone(), prefix, budget.clone())
+                .map_err(IpcError::Config)?,
+        ));
         // Explicit prewarm only: without it the pool stays unmapped until the
         // first allocation (config validation rejects prewarm with buddy
         // disabled).
@@ -222,7 +221,7 @@ fn connect_with_transient_retry(
             budget.clone(),
             deadline,
             owner.connection_event_source.as_ref(),
-        );
+        )?;
         let client = Arc::new(client);
         fresh.attach(client.clone());
         match result {
@@ -2145,11 +2144,14 @@ mod tests {
         pool.state.lock().domain_memory = Some(domain);
         pool.set_default_config(cfg.clone()).unwrap();
         let initial_epoch = pool.state.lock().epoch;
-        let mem = Arc::new(Mutex::new(MemPool::new_with_prefix_and_budget(
-            pool_config_from_client_config(&cfg),
-            format!("/timeout_accounting_{}", std::process::id()),
-            budget.clone(),
-        )));
+        let mem = Arc::new(Mutex::new(
+            MemPool::new_with_prefix_and_budget(
+                pool_config_from_client_config(&cfg),
+                format!("/timeout_accounting_{}", std::process::id()),
+                budget.clone(),
+            )
+            .unwrap(),
+        ));
         mem.lock().ensure_buddy_segments(1).unwrap();
         let charged = budget.snapshot().shm.used_bytes;
         assert!(charged > 1024 * 1024);
@@ -2163,7 +2165,8 @@ mod tests {
             budget.clone(),
             connect_budget(0),
             None,
-        );
+        )
+        .unwrap();
         assert!(matches!(result, Err(IpcError::LocalCallRejected(_))));
         let client = Arc::new(client);
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -2220,7 +2223,8 @@ mod tests {
             pool_config_from_client_config(&cfg),
             format!("/timeout_accounting_recovered_{}", std::process::id()),
             budget.clone(),
-        );
+        )
+        .unwrap();
         recovered.ensure_buddy_segments(1).unwrap();
         assert_eq!(budget.snapshot().shm.used_bytes, charged);
         assert_eq!(budget.snapshot().shm.rejected_allocations, 0);
@@ -3105,14 +3109,9 @@ mod tests {
         fn seal_seed_retains_abnormal_completion_before_driver_merge_once() {
             let peer = NoAckPeer::start();
             let pool = test_pool(Duration::from_secs(60));
-            let client = Arc::new(
-                SyncClient::connect_with_endpoint(
-                    test_endpoint(&peer.address),
-                    None,
-                    ClientIpcConfig::default(),
-                )
-                .unwrap(),
-            );
+            let client = test_pool(Duration::from_secs(60))
+                .acquire(&peer.address, None)
+                .unwrap();
             let weak = Arc::downgrade(&client);
             let work =
                 pool.retire_under_coordinator(&mut pool.close_txn.0.lock(), &peer.address, client);
@@ -3141,14 +3140,9 @@ mod tests {
         fn late_seed_merge_does_not_replay_a_consumed_close_ticket() {
             let peer = NoAckPeer::start();
             let pool = test_pool(Duration::from_secs(60));
-            let client = Arc::new(
-                SyncClient::connect_with_endpoint(
-                    test_endpoint(&peer.address),
-                    None,
-                    ClientIpcConfig::default(),
-                )
-                .unwrap(),
-            );
+            let client = test_pool(Duration::from_secs(60))
+                .acquire(&peer.address, None)
+                .unwrap();
             let work =
                 pool.retire_under_coordinator(&mut pool.close_txn.0.lock(), &peer.address, client);
             let mut observation = pool.observe_closes();
@@ -3228,14 +3222,9 @@ mod tests {
         fn abnormal_close_between_shutdown_retries_is_reported_once() {
             let peer = NoAckPeer::start();
             let pool = test_pool(Duration::from_secs(60));
-            let client = Arc::new(
-                SyncClient::connect_with_endpoint(
-                    test_endpoint(&peer.address),
-                    None,
-                    ClientIpcConfig::default(),
-                )
-                .unwrap(),
-            );
+            let client = test_pool(Duration::from_secs(60))
+                .acquire(&peer.address, None)
+                .unwrap();
             let weak = Arc::downgrade(&client);
             let work =
                 pool.retire_under_coordinator(&mut pool.close_txn.0.lock(), &peer.address, client);
@@ -3305,14 +3294,9 @@ mod tests {
 
             // A confirmed record can also remain registered when prune's
             // nonblocking coordinator acquisition loses to another caller.
-            let client = Arc::new(
-                SyncClient::connect_with_endpoint(
-                    test_endpoint(&peer.address),
-                    None,
-                    ClientIpcConfig::default(),
-                )
-                .unwrap(),
-            );
+            let client = test_pool(Duration::from_secs(60))
+                .acquire(&peer.address, None)
+                .unwrap();
             let work =
                 pool.retire_under_coordinator(&mut pool.close_txn.0.lock(), &peer.address, client);
             let coordinator = pool.close_txn.0.lock();
@@ -3333,14 +3317,9 @@ mod tests {
         fn pre_wait_timeout_keeps_already_confirmed_abnormal_detail() {
             let peer = NoAckPeer::start();
             let pool = Arc::new(test_pool(Duration::from_secs(60)));
-            let client = Arc::new(
-                SyncClient::connect_with_endpoint(
-                    test_endpoint(&peer.address),
-                    None,
-                    ClientIpcConfig::default(),
-                )
-                .unwrap(),
-            );
+            let client = test_pool(Duration::from_secs(60))
+                .acquire(&peer.address, None)
+                .unwrap();
             let weak = Arc::downgrade(&client);
             let completed =
                 pool.retire_under_coordinator(&mut pool.close_txn.0.lock(), &peer.address, client);
@@ -3377,14 +3356,9 @@ mod tests {
         fn final_wait_timeout_keeps_late_observed_abnormal_detail() {
             let peer = NoAckPeer::start();
             let pool = Arc::new(test_pool(Duration::from_secs(60)));
-            let client = Arc::new(
-                SyncClient::connect_with_endpoint(
-                    test_endpoint(&peer.address),
-                    None,
-                    ClientIpcConfig::default(),
-                )
-                .unwrap(),
-            );
+            let client = test_pool(Duration::from_secs(60))
+                .acquire(&peer.address, None)
+                .unwrap();
             let pending = pool.register_close_work(
                 &mut pool.close_txn.0.lock(),
                 "ipc://late-closing",
@@ -3431,14 +3405,9 @@ mod tests {
         fn preparing_close_between_observation_and_drain_is_reported() {
             let peer = NoAckPeer::start();
             let pool = Arc::new(test_pool(Duration::from_secs(60)));
-            let client = Arc::new(
-                SyncClient::connect_with_endpoint(
-                    test_endpoint(&peer.address),
-                    None,
-                    ClientIpcConfig::default(),
-                )
-                .unwrap(),
-            );
+            let client = test_pool(Duration::from_secs(60))
+                .acquire(&peer.address, None)
+                .unwrap();
             let weak = Arc::downgrade(&client);
             let work = pool.register_close_work(
                 &mut pool.close_txn.0.lock(),
@@ -3483,14 +3452,9 @@ mod tests {
             let peer = NoAckPeer::start();
             let pool = test_pool(Duration::from_secs(60));
             let active = pool.acquire(&peer.address, None).unwrap();
-            let client = Arc::new(
-                SyncClient::connect_with_endpoint(
-                    test_endpoint(&peer.address),
-                    None,
-                    ClientIpcConfig::default(),
-                )
-                .unwrap(),
-            );
+            let client = test_pool(Duration::from_secs(60))
+                .acquire(&peer.address, None)
+                .unwrap();
             let weak = Arc::downgrade(&client);
             let retry = pool.register_close_work(
                 &mut pool.close_txn.0.lock(),
@@ -3748,7 +3712,7 @@ mod tests {
         fn start() -> Self {
             // MemPool's lazy identity includes a fresh UUID; no new Cargo
             // dependency, process-global environment or endpoint cleanup.
-            let identity = MemPool::new(PoolConfig::default());
+            let identity = MemPool::new(PoolConfig::default()).unwrap();
             let address = format!(
                 "ipc://pool_peer_{}",
                 identity.prefix().trim_start_matches('/')
@@ -4220,14 +4184,13 @@ mod tests {
             // All SyncClient operations below block on the shared global
             // client runtime and must run on a plain thread, not on this
             // runtime's worker.
-            let client = Arc::new(
+            let client =
                 tokio::task::spawn_blocking(move || {
-                    SyncClient::connect(&address, None, ClientIpcConfig::default())
+                    ClientPool::new(Duration::from_secs(60)).acquire(&address, None)
                 })
                 .await
                 .expect("connect task")
-                .expect("connect"),
-            );
+                .expect("connect");
             assert!(client.is_connected());
 
             let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel::<()>();
@@ -4930,7 +4893,7 @@ mod tests {
                 let connect_address = address.clone();
                 let client =
                     tokio::task::spawn_blocking(move || {
-                        SyncClient::connect(&connect_address, None, ClientIpcConfig::default())
+                        ClientPool::new(Duration::from_secs(60)).acquire(&connect_address, None)
                     })
                     .await
                     .expect("connect task")
@@ -4940,7 +4903,7 @@ mod tests {
                 client.hold_writer_slot_for_test(acquired_tx, release_rx);
                 acquired_rx.await.expect("writer slot hold readiness");
                 release_guards.push(release_tx);
-                entries.push((format!("ipc://aggregate-{index}"), Arc::new(client)));
+                entries.push((format!("ipc://aggregate-{index}"), client));
             }
             {
                 let mut state = pool.state.lock();
@@ -5078,7 +5041,7 @@ mod tests {
                 .await
                 .expect("server should be responsive");
 
-            let mut client = IpcClient::with_config(&address, ClientIpcConfig::default());
+            let mut client = IpcClient::with_config(&address, ClientIpcConfig::default()).unwrap();
             client.connect().await.expect("client connects");
             assert!(
                 matches!(
@@ -5410,9 +5373,9 @@ mod tests {
         let p2 = format!("/cc3c{:08x}{:08x}", std::process::id(), c2);
         assert_ne!(p1, p2, "consecutive prefixes must differ");
         // Verify the pools can be created with these prefixes.
-        let pool1 = MemPool::new_with_prefix(pc.clone(), p1.clone());
-        let pool2 = MemPool::new_with_prefix(pc.clone(), p2.clone());
-        let repeated_label = MemPool::new_with_prefix(pc, p1.clone());
+        let pool1 = MemPool::new_with_prefix(pc.clone(), p1.clone()).unwrap();
+        let pool2 = MemPool::new_with_prefix(pc.clone(), p2.clone()).unwrap();
+        let repeated_label = MemPool::new_with_prefix(pc, p1.clone()).unwrap();
         assert!(pool1.prefix().starts_with(&format!("{p1}_")));
         assert!(pool2.prefix().starts_with(&format!("{p2}_")));
         assert_ne!(pool1.prefix(), repeated_label.prefix());

@@ -639,7 +639,8 @@ fn invalid(path: impl Into<String>, message: impl Into<String>) -> ContractError
     }
 }
 
-pub(crate) fn canonical_json(value: &Value) -> String {
+/// Serialize JSON with sorted object keys for stable contract identity.
+pub fn canonical_json(value: &Value) -> String {
     match value {
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => value.to_string(),
         Value::Array(values) => {
@@ -673,7 +674,8 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     lower_hex(&digest)
 }
 
-fn lower_hex(bytes: &[u8]) -> String {
+/// Encode bytes as lowercase hexadecimal text.
+pub fn lower_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {

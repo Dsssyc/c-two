@@ -1631,7 +1631,8 @@ mod tests {
             let mut attestor = IpcClient::with_endpoint(
                 endpoint_context.endpoint(&address).unwrap(),
                 ClientIpcConfig::default(),
-            );
+            )
+            .unwrap();
             attestor.connect().await.unwrap();
             let manager_contract = attestor.route_contract("manager").unwrap();
             let manager_binding = attestor.acquire_route(&manager_contract).await.unwrap();

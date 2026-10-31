@@ -411,25 +411,11 @@ pub fn normalize_ipc_error(error: IpcError, phase: TransportPhase) -> Error {
                 ]),
             ),
         ),
-        IpcError::CatalogCompacted {
-            compacted_revision,
-            current_revision,
-        } => semantic_route_error(
-            ErrorCode::RouteCatalogCompacted,
-            "route catalog history was compacted".to_string(),
-            [
-                ("compacted_revision", compacted_revision.to_string()),
-                ("current_revision", current_revision.to_string()),
-            ],
-        ),
-        IpcError::WatchUnavailable(message) => Error::Semantic(
-            C2Error::new(ErrorCode::RouteWatchUnavailable, message).with_details(BTreeMap::from([
-                ("transport".to_string(), "ipc".to_string()),
-            ])),
-        ),
-        IpcError::Protocol(message) | IpcError::Handshake(message) => Error::Semantic(
-            protocol_violation("IPC protocol validation failed", "ipc", &message),
-        ),
+        IpcError::Protocol(message) => Error::Semantic(protocol_violation(
+            "IPC protocol validation failed",
+            "ipc",
+            &message,
+        )),
         IpcError::MethodNotFound {
             route_name,
             method_name,
@@ -606,7 +592,9 @@ mod native_boundary_tests {
     use super::*;
     use c2_mem::{MemPool, MemoryBudget, PoolConfig};
     use c2_wire::chunk::{
-        ChunkConfig, ChunkRegistry, decode_reply_chunk_meta, encode_reply_chunk_meta,
+        config::ChunkConfig,
+        header::{decode_reply_chunk_meta, encode_reply_chunk_meta},
+        registry::ChunkRegistry,
     };
     use parking_lot::RwLock;
     use std::sync::Arc;
@@ -619,15 +607,18 @@ mod native_boundary_tests {
         live_limit: u64,
     ) -> (IpcError, MemoryBudget) {
         let budget = MemoryBudget::new(0, file_limit, live_limit);
-        let pool = Arc::new(RwLock::new(MemPool::new_with_prefix_and_budget(
-            PoolConfig {
-                buddy_enabled: false,
-                spill_threshold: 0.0,
-                ..PoolConfig::default()
-            },
-            "error-boundary-pure".to_string(),
-            budget.clone(),
-        )));
+        let pool = Arc::new(RwLock::new(
+            MemPool::new_with_prefix_and_budget(
+                PoolConfig {
+                    buddy_enabled: false,
+                    spill_threshold: 0.0,
+                    ..PoolConfig::default()
+                },
+                "error-boundary-pure".to_string(),
+                budget.clone(),
+            )
+            .expect("test pool"),
+        ));
         let registry = ChunkRegistry::new(pool, ChunkConfig::default());
         let mut bytes = encode_reply_chunk_meta(total_size, chunks, 0).to_vec();
         bytes.resize(bytes.len() + data_len, 0x42);

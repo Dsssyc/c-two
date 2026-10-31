@@ -30,7 +30,7 @@ pub enum ResponseData {
 /// coordinates: copying and releasing through this carrier are the safe
 /// surface, and a [`ResponseLease`] owns the carrier.
 pub struct ServerShmResponse {
-    server_pool: Arc<Mutex<Option<ServerPoolState>>>,
+    server_pool: Arc<Mutex<ServerPoolState>>,
     seg_idx: u16,
     generation: u32,
     offset: u32,
@@ -61,7 +61,7 @@ impl ServerShmResponse {
     /// Admit one received SHM response block. Crate-private: only the reply
     /// decode path that actually received the frame may call this.
     pub(crate) fn admit(
-        server_pool: Arc<Mutex<Option<ServerPoolState>>>,
+        server_pool: Arc<Mutex<ServerPoolState>>,
         seg_idx: u16,
         generation: u32,
         offset: u32,
@@ -125,12 +125,9 @@ impl ServerShmResponse {
 
     fn release_with_guard(
         &self,
-        mut server_pool: MutexGuard<'_, Option<ServerPoolState>>,
+        mut server_pool: MutexGuard<'_, ServerPoolState>,
     ) -> Result<(), String> {
-        let state = server_pool
-            .as_mut()
-            .ok_or_else(|| "server pool not initialised".to_string())?;
-        state.release_response(
+        server_pool.release_response(
             self.seg_idx,
             self.generation,
             self.offset,
@@ -207,10 +204,7 @@ impl ResponseLease {
             ResponseData::Inline(bytes) => Ok(bytes.clone()),
             ResponseData::Shm(carrier) => {
                 let mut server_pool = carrier.server_pool.lock();
-                let state = server_pool
-                    .as_mut()
-                    .ok_or_else(|| "server pool not initialised".to_string())?;
-                state.copy_response(
+                server_pool.copy_response(
                     carrier.seg_idx,
                     carrier.generation,
                     carrier.offset,

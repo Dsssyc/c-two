@@ -299,7 +299,7 @@ mod tests {
         let mut ipc_config = c2_config::ClientIpcConfig::default();
         ipc_config.base.pool_enabled = false;
         ipc_config.base.pool_prewarm_segments = 0;
-        let mut client = IpcClient::with_endpoint(endpoint, ipc_config);
+        let mut client = IpcClient::with_endpoint(endpoint, ipc_config).unwrap();
 
         // Cleanup runs after every assertion failure or bounded step timeout.
         let result = std::panic::AssertUnwindSafe(tokio::time::timeout(STEP, async {
@@ -411,7 +411,8 @@ mod tests {
     #[tokio::test]
     async fn watch_transport_failure_does_not_withdraw_route() {
         let address = "ipc://relay_watch_unconnected";
-        let client = IpcClient::new(address);
+        let client =
+            IpcClient::with_config(address, c2_config::ClientIpcConfig::default()).unwrap();
         let route = route_entry("unconnected", address, "unconnected-route".into(), 1);
         assert!(matches!(
             client

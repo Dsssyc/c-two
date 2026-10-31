@@ -141,20 +141,6 @@ fn should_treat_as_semantic_route_failure(error: &c2_ipc::IpcError) -> bool {
         || matches!(error, c2_ipc::IpcError::IdentityMismatch { .. })
 }
 
-async fn verify_route_after_watch_unavailable(
-    lease: &UpstreamLease,
-    expected: &c2_contract::ExpectedRouteContract,
-) -> Result<(), c2_ipc::IpcError> {
-    match lease.client().lookup_route(expected).await {
-        Err(c2_ipc::IpcError::CatalogCompacted { .. })
-        | Err(c2_ipc::IpcError::WatchUnavailable(_)) => {
-            lease.client().rebuild_route_catalog().await?;
-            lease.client().lookup_route(expected).await
-        }
-        other => other,
-    }
-}
-
 impl RelayState {
     #[cfg(test)]
     pub fn new(
@@ -481,7 +467,7 @@ impl RelayState {
         let lease_address = lease.address();
         let expected_contract = expected_contract_for_route(expected);
         if let Some(reason) = self.upstream_control_watch_unavailable_for_route(expected) {
-            match verify_route_after_watch_unavailable(&lease, &expected_contract).await {
+            match lease.client().lookup_route(&expected_contract).await {
                 Ok(()) => {}
                 Err(error) if should_treat_as_semantic_route_failure(&error) => {
                     if !is_route_local_acquire_failure(&error)
@@ -1066,7 +1052,6 @@ mod tests {
         server_task: tokio::task::JoinHandle<Result<(), c2_server::ServerError>>,
         state: Arc<RelayState>,
         observer: tokio::task::JoinHandle<()>,
-        endpoint_context: LocalEndpointContext,
         #[cfg(unix)]
         endpoint_root: std::path::PathBuf,
         probes: [Arc<AcquireProbe>; 2],
@@ -1161,7 +1146,6 @@ mod tests {
                 server_task,
                 state,
                 observer,
-                endpoint_context,
                 #[cfg(unix)]
                 endpoint_root,
                 probes,
@@ -1211,11 +1195,10 @@ mod tests {
 
         fn client(&self) -> IpcClient {
             IpcClient::with_endpoint(
-                self.endpoint_context
-                    .endpoint(self.server.ipc_address())
-                    .unwrap(),
+                self.server.local_endpoint().clone(),
                 ClientIpcConfig::default(),
             )
+            .unwrap()
         }
 
         fn release(&mut self, index: usize) {
@@ -1671,7 +1654,8 @@ mod tests {
 
         // Registration attestation is a private lazy default client. It must
         // remain usable even when the data-plane budget is zero.
-        let mut probe = IpcClient::new(&address);
+        let mut probe =
+            IpcClient::with_config(&address, c2_config::ClientIpcConfig::default()).unwrap();
         probe.connect().await.unwrap();
         let contract = probe.route_contract("grid").unwrap();
         let attestation = probe
@@ -2060,7 +2044,9 @@ mod tests {
     #[test]
     fn register_and_resolve_upstream() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let client = Arc::new(IpcClient::new("ipc://grid"));
+        let client = Arc::new(
+            IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         let registered = register_local(&state, "grid", "server-grid", "ipc://grid", client);
         let routes = state.resolve_matching(&expected_contract_for_route(&registered));
         assert_eq!(routes.len(), 1);
@@ -2105,7 +2091,9 @@ mod tests {
     #[test]
     fn local_routes_on_same_endpoint_share_one_owner_slot() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let manager = Arc::new(IpcClient::new("ipc://shared"));
+        let manager = Arc::new(
+            IpcClient::with_config("ipc://shared", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         manager.force_connected(true);
         register_local_with_contract(
             &state,
@@ -2116,7 +2104,9 @@ mod tests {
             TEST_ROUTE_CONTRACT,
             manager,
         );
-        let builder = Arc::new(IpcClient::new("ipc://shared"));
+        let builder = Arc::new(
+            IpcClient::with_config("ipc://shared", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         builder.force_connected(true);
         register_local_with_contract(
             &state,
@@ -2143,10 +2133,14 @@ mod tests {
     #[test]
     fn unregister_one_route_keeps_shared_endpoint_for_remaining_routes() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let manager = Arc::new(IpcClient::new("ipc://shared"));
+        let manager = Arc::new(
+            IpcClient::with_config("ipc://shared", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         manager.force_connected(true);
         register_local(&state, "manager", "server-grid", "ipc://shared", manager);
-        let builder = Arc::new(IpcClient::new("ipc://shared"));
+        let builder = Arc::new(
+            IpcClient::with_config("ipc://shared", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         builder.force_connected(true);
         register_local(&state, "builder", "server-grid", "ipc://shared", builder);
 
@@ -2177,7 +2171,10 @@ mod tests {
             "grid",
             "server-grid",
             "ipc://grid",
-            Arc::new(IpcClient::new("ipc://grid")),
+            Arc::new(
+                IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default())
+                    .unwrap(),
+            ),
         );
         let key = upstream_control::owner_key_for_route(&entry).unwrap();
         state.mark_upstream_control_watch_unavailable(&key, "watch stream closed");
@@ -2274,7 +2271,9 @@ mod tests {
     #[test]
     fn unregister_upstream() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let client = Arc::new(IpcClient::new("ipc://grid"));
+        let client = Arc::new(
+            IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         register_local(&state, "grid", "server-grid", "ipc://grid", client);
         assert!(matches!(
             state.unregister_upstream("grid", "server-grid"),
@@ -2286,7 +2285,9 @@ mod tests {
     #[test]
     fn unregister_upstream_rejects_wrong_server_id() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let client = Arc::new(IpcClient::new("ipc://grid"));
+        let client = Arc::new(
+            IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         client.force_connected(true);
         register_local(&state, "grid", "server-grid", "ipc://grid", client);
 
@@ -2341,7 +2342,9 @@ mod tests {
         // would silently demote a Local route (with ipc_address) to a Peer
         // route (without ipc_address) and break local IPC dispatch.
         let state = RelayState::new(test_config(), null_disseminator());
-        let client = Arc::new(IpcClient::new("ipc://grid"));
+        let client = Arc::new(
+            IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         register_local(&state, "grid", "server-grid", "ipc://grid", client);
 
         // Echo of our own route arriving via DigestDiff with our relay_id.
@@ -2379,7 +2382,9 @@ mod tests {
     #[test]
     fn unregister_peer_route_does_not_remove_local_route() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let client = Arc::new(IpcClient::new("ipc://grid"));
+        let client = Arc::new(
+            IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         register_local(&state, "grid", "server-grid", "ipc://grid", client);
 
         let result = RouteAuthority::new(&state).withdraw_peer(
@@ -2398,7 +2403,9 @@ mod tests {
     #[test]
     fn remove_routes_by_relay_does_not_remove_local_routes() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let client = Arc::new(IpcClient::new("ipc://grid"));
+        let client = Arc::new(
+            IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         register_local(&state, "grid", "server-grid", "ipc://grid", client);
 
         remove_peer_routes(&state, "test-relay");
@@ -2454,9 +2461,13 @@ mod tests {
     #[test]
     fn register_commit_rechecks_owner_after_preflight_no_owner() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let first = Arc::new(IpcClient::new("ipc://first"));
+        let first = Arc::new(
+            IpcClient::with_config("ipc://first", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         first.force_connected(true);
-        let second = Arc::new(IpcClient::new("ipc://second"));
+        let second = Arc::new(
+            IpcClient::with_config("ipc://second", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         second.force_connected(true);
 
         let first_result = test_commit_registration!(
@@ -2514,7 +2525,9 @@ mod tests {
             .unwrap();
         assert!(replacement.is_none());
 
-        let racer = Arc::new(IpcClient::new("ipc://racer"));
+        let racer = Arc::new(
+            IpcClient::with_config("ipc://racer", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         racer.force_connected(true);
         let racer_result = test_commit_registration!(
             &state,
@@ -2537,7 +2550,10 @@ mod tests {
             RegisterCommitResult::Registered { .. }
         ));
 
-        let candidate = Arc::new(IpcClient::new("ipc://candidate"));
+        let candidate = Arc::new(
+            IpcClient::with_config("ipc://candidate", c2_config::ClientIpcConfig::default())
+                .unwrap(),
+        );
         candidate.force_connected(true);
         let candidate_result = test_commit_registration!(
             &state,
@@ -2568,7 +2584,9 @@ mod tests {
     #[tokio::test]
     async fn replacement_proof_can_replace_same_slot_only_while_still_evicted() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let old = Arc::new(IpcClient::new("ipc://old"));
+        let old = Arc::new(
+            IpcClient::with_config("ipc://old", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         old.force_connected(true);
         register_local_with_contract(
             &state,
@@ -2584,7 +2602,9 @@ mod tests {
             confirmed_dead_replacement(&state, "grid", "server-new", "instance-new", "ipc://new")
                 .await;
 
-        let replacement = Arc::new(IpcClient::new("ipc://new"));
+        let replacement = Arc::new(
+            IpcClient::with_config("ipc://new", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         replacement.force_connected(true);
         let result = test_commit_registration!(
             &state,
@@ -2610,7 +2630,9 @@ mod tests {
     #[tokio::test]
     async fn route_replacement_keeps_old_endpoint_when_other_routes_still_reference_it() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let manager = Arc::new(IpcClient::new("ipc://old"));
+        let manager = Arc::new(
+            IpcClient::with_config("ipc://old", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         manager.force_connected(true);
         register_local_with_contract(
             &state,
@@ -2621,7 +2643,9 @@ mod tests {
             TEST_ROUTE_CONTRACT,
             manager,
         );
-        let builder = Arc::new(IpcClient::new("ipc://old"));
+        let builder = Arc::new(
+            IpcClient::with_config("ipc://old", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         builder.force_connected(true);
         register_local_with_contract(
             &state,
@@ -2671,7 +2695,9 @@ mod tests {
     #[tokio::test]
     async fn replacement_proof_does_not_match_re_registered_same_address_owner() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let old = Arc::new(IpcClient::new("ipc://same"));
+        let old = Arc::new(
+            IpcClient::with_config("ipc://same", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         old.force_connected(true);
         register_local(&state, "grid", "server-old", "ipc://same", old);
         state.evict_connection("grid");
@@ -2688,7 +2714,9 @@ mod tests {
             UnregisterResult::Removed { .. }
         ));
 
-        let new_same_address = Arc::new(IpcClient::new("ipc://same"));
+        let new_same_address = Arc::new(
+            IpcClient::with_config("ipc://same", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         new_same_address.force_connected(true);
         register_local(
             &state,
@@ -2698,7 +2726,10 @@ mod tests {
             new_same_address,
         );
 
-        let stale_replacement = Arc::new(IpcClient::new("ipc://replacement"));
+        let stale_replacement = Arc::new(
+            IpcClient::with_config("ipc://replacement", c2_config::ClientIpcConfig::default())
+                .unwrap(),
+        );
         stale_replacement.force_connected(true);
         let result = test_commit_registration!(
             &state,
@@ -2729,7 +2760,9 @@ mod tests {
     #[tokio::test]
     async fn replacement_proof_is_rejected_after_same_owner_lease_renewal() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let old = Arc::new(IpcClient::new("ipc://old"));
+        let old = Arc::new(
+            IpcClient::with_config("ipc://old", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         old.force_connected(true);
         register_local_with_contract(
             &state,
@@ -2750,7 +2783,9 @@ mod tests {
         )
         .await;
 
-        let same_owner = Arc::new(IpcClient::new("ipc://old"));
+        let same_owner = Arc::new(
+            IpcClient::with_config("ipc://old", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         same_owner.force_connected(true);
         let same_owner_result = test_commit_registration!(
             &state,
@@ -2773,7 +2808,10 @@ mod tests {
             RegisterCommitResult::SameOwner { .. }
         ));
 
-        let replacement = Arc::new(IpcClient::new("ipc://replacement"));
+        let replacement = Arc::new(
+            IpcClient::with_config("ipc://replacement", c2_config::ClientIpcConfig::default())
+                .unwrap(),
+        );
         replacement.force_connected(true);
         let result = test_commit_registration!(
             &state,
@@ -2804,7 +2842,9 @@ mod tests {
     #[test]
     fn owner_lease_renewal_is_not_peer_visible_route_state() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let old = Arc::new(IpcClient::new("ipc://old"));
+        let old = Arc::new(
+            IpcClient::with_config("ipc://old", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         old.force_connected(true);
         register_local(&state, "grid", "server-old", "ipc://old", old);
 
@@ -2824,7 +2864,9 @@ mod tests {
     #[test]
     fn stale_unreachable_removal_does_not_delete_new_same_address_owner_with_different_tag() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let old = Arc::new(IpcClient::new("ipc://same"));
+        let old = Arc::new(
+            IpcClient::with_config("ipc://same", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         old.force_connected(true);
         register_local_with_contract(
             &state,
@@ -2847,7 +2889,9 @@ mod tests {
             UnregisterResult::Removed { .. }
         ));
 
-        let new_same_address = Arc::new(IpcClient::new("ipc://same"));
+        let new_same_address = Arc::new(
+            IpcClient::with_config("ipc://same", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         new_same_address.force_connected(true);
         register_local_with_contract(
             &state,
@@ -2897,7 +2941,10 @@ mod tests {
     #[test]
     fn replacement_proof_cannot_replace_reconnected_owner_slot() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let old = Arc::new(IpcClient::new("ipc://same-slot"));
+        let old = Arc::new(
+            IpcClient::with_config("ipc://same-slot", c2_config::ClientIpcConfig::default())
+                .unwrap(),
+        );
         old.force_connected(true);
         register_local(&state, "grid", "server-old", "ipc://same-slot", old);
         state.evict_connection("grid");
@@ -2913,11 +2960,17 @@ mod tests {
                 "ipc://replacement",
             ));
 
-        let reconnected_old = Arc::new(IpcClient::new("ipc://same-slot"));
+        let reconnected_old = Arc::new(
+            IpcClient::with_config("ipc://same-slot", c2_config::ClientIpcConfig::default())
+                .unwrap(),
+        );
         reconnected_old.force_connected(true);
         state.reconnect("grid", reconnected_old);
 
-        let replacement = Arc::new(IpcClient::new("ipc://replacement"));
+        let replacement = Arc::new(
+            IpcClient::with_config("ipc://replacement", c2_config::ClientIpcConfig::default())
+                .unwrap(),
+        );
         replacement.force_connected(true);
         let result = test_commit_registration!(
             &state,
@@ -2951,7 +3004,9 @@ mod tests {
     #[test]
     fn same_server_registration_is_idempotent_without_repairing_evicted_client() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let original = Arc::new(IpcClient::new("ipc://grid"));
+        let original = Arc::new(
+            IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         original.force_connected(true);
         register_local_with_contract(
             &state,
@@ -2991,7 +3046,9 @@ mod tests {
     #[test]
     fn same_owner_registration_rejects_contract_change_without_new_instance() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let original = Arc::new(IpcClient::new("ipc://grid"));
+        let original = Arc::new(
+            IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         original.force_connected(true);
         register_local(&state, "grid", "server-grid", "ipc://grid", original);
 
@@ -3025,7 +3082,9 @@ mod tests {
     #[test]
     fn same_server_new_instance_refreshes_local_route_owner_slot() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let original = Arc::new(IpcClient::new("ipc://grid"));
+        let original = Arc::new(
+            IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         original.force_connected(true);
         register_local_with_instance(
             &state,
@@ -3075,11 +3134,15 @@ mod tests {
     #[test]
     fn same_server_registration_with_different_address_conflicts() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let original = Arc::new(IpcClient::new("ipc://old"));
+        let original = Arc::new(
+            IpcClient::with_config("ipc://old", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         original.force_connected(true);
         register_local(&state, "grid", "server-grid", "ipc://old", original);
 
-        let moved = Arc::new(IpcClient::new("ipc://new"));
+        let moved = Arc::new(
+            IpcClient::with_config("ipc://new", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         moved.force_connected(true);
         let result = test_commit_registration!(
             &state,
@@ -3110,7 +3173,9 @@ mod tests {
     #[tokio::test]
     async fn acquire_after_unregister_reports_not_found() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let client = Arc::new(IpcClient::new("ipc://grid"));
+        let client = Arc::new(
+            IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         client.force_connected(true);
         register_local(&state, "grid", "server-grid", "ipc://grid", client);
 
@@ -3128,7 +3193,9 @@ mod tests {
     #[tokio::test]
     async fn same_server_register_does_not_repair_evicted_slot() {
         let state = RelayState::new(test_config(), null_disseminator());
-        let original = Arc::new(IpcClient::new("ipc://grid"));
+        let original = Arc::new(
+            IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         original.force_connected(true);
         register_local_with_contract(
             &state,
@@ -3141,7 +3208,9 @@ mod tests {
         );
         state.evict_connection("grid");
 
-        let replacement = Arc::new(IpcClient::new("ipc://grid"));
+        let replacement = Arc::new(
+            IpcClient::with_config("ipc://grid", c2_config::ClientIpcConfig::default()).unwrap(),
+        );
         replacement.force_connected(true);
         let result = test_commit_registration!(
             &state,

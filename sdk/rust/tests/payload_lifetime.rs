@@ -3,7 +3,7 @@ use c_two::generated::{
 };
 use c2_ipc::{ResponseData, ResponseLease};
 use c2_mem::{MemPool, PoolConfig};
-use c2_wire::chunk::ReassemblyBacking;
+use c2_wire::chunk::backing::ReassemblyBacking;
 use fastdb::{BuildPolicy, Builder, CompiledSpec, Payload};
 use parking_lot::RwLock;
 use std::process::Command;
@@ -141,14 +141,17 @@ fn held_open_failure_keeps_payload_error_and_abandons_failed_cleanup_once() {
     let spec = CompiledSpec::compile(VALUE_SPEC).expect("compile value spec");
     let invalid_bytes = [0xa5; 512];
     let expected = open_owned(&spec, &invalid_bytes).expect_err("invalid payload");
-    let pool = Arc::new(RwLock::new(MemPool::new(PoolConfig::default())));
+    let pool = Arc::new(RwLock::new(MemPool::new(PoolConfig::default()).unwrap()));
     let budget = pool.read().budget().unwrap().clone();
     let mut backing = ReassemblyBacking::admit(Arc::clone(&pool), 1, invalid_bytes.len()).unwrap();
     backing.write_at(0, &invalid_bytes).unwrap();
     let response =
         HeldResponse::from_response_lease(ResponseLease::new(ResponseData::Handle(backing)))
             .unwrap();
-    let original = std::mem::replace(&mut *pool.write(), MemPool::new(PoolConfig::default()));
+    let original = std::mem::replace(
+        &mut *pool.write(),
+        MemPool::new(PoolConfig::default()).unwrap(),
+    );
 
     let error = open_held(&spec, response).err().expect("invalid payload");
     assert_eq!(error.symbol(), expected.symbol());
@@ -190,7 +193,7 @@ fn generated_decode_cleanup_reports_failure_and_preserves_drop_retry() {
     };
     let (spec, source) = value_payload(19);
     let bytes = source.binary_bytes().unwrap();
-    let pool = Arc::new(RwLock::new(MemPool::new(PoolConfig::default())));
+    let pool = Arc::new(RwLock::new(MemPool::new(PoolConfig::default()).unwrap()));
     let budget = pool.read().budget().unwrap().clone();
     let mut backing = ReassemblyBacking::admit(Arc::clone(&pool), 1, bytes.len()).unwrap();
     backing.write_at(0, &bytes).unwrap();
@@ -200,8 +203,12 @@ fn generated_decode_cleanup_reports_failure_and_preserves_drop_retry() {
     let mut held = open_held(&spec, response).unwrap();
     let clone = held.value().unwrap().clone();
     let view = clone.entry_view(0).unwrap().at(0).unwrap();
-    let original = (mode == "failed")
-        .then(|| std::mem::replace(&mut *pool.write(), MemPool::new(PoolConfig::default())));
+    let original = (mode == "failed").then(|| {
+        std::mem::replace(
+            &mut *pool.write(),
+            MemPool::new(PoolConfig::default()).unwrap(),
+        )
+    });
 
     release_held_after_error(&mut held);
 

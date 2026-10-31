@@ -4695,7 +4695,7 @@ mod tests {
         let rt = Runtime::server_runtime().expect("runtime");
         rt.block_on(server.wait_until_ready(Duration::from_secs(2)))
             .expect("server ready");
-        let ack = c2_ipc::shutdown(server.ipc_address(), Duration::from_secs(2))
+        let ack = c2_ipc::shutdown(server.local_endpoint().address(), Duration::from_secs(2))
             .expect("direct IPC shutdown should be acknowledged");
         assert!(ack.acknowledged);
         assert!(ack.shutdown_started);

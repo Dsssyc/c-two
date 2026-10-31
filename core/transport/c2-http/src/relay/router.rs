@@ -1878,9 +1878,6 @@ async fn acquire_request_client_for_route(
                 | c2_ipc::IpcError::IdentityMismatch { .. }
                 | c2_ipc::IpcError::Protocol(_)
                 | c2_ipc::IpcError::ProtocolVersionMismatch { .. }
-                | c2_ipc::IpcError::Handshake(_)
-                | c2_ipc::IpcError::CatalogCompacted { .. }
-                | c2_ipc::IpcError::WatchUnavailable(_)
                 | c2_ipc::IpcError::MethodNotFound { .. }) => RequestClient::RouteError(error),
                 _ => RequestClient::Unreachable,
             }
@@ -2003,33 +2000,6 @@ fn ipc_route_error_response(route_name: &str, error: &c2_ipc::IpcError) -> Respo
                 ]),
             ),
         ),
-        c2_ipc::IpcError::CatalogCompacted {
-            compacted_revision,
-            current_revision,
-        } => semantic_error_response(
-            StatusCode::CONFLICT,
-            C2Error::new(
-                ErrorCode::RouteCatalogCompacted,
-                "route catalog history was compacted",
-            )
-            .with_details(BTreeMap::from([
-                (
-                    "compacted_revision".to_string(),
-                    compacted_revision.to_string(),
-                ),
-                ("current_revision".to_string(), current_revision.to_string()),
-                ("route".to_string(), route_name.to_string()),
-            ])),
-        ),
-        c2_ipc::IpcError::WatchUnavailable(message) => semantic_error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            C2Error::new(ErrorCode::RouteWatchUnavailable, message.clone()).with_details(
-                BTreeMap::from([
-                    ("route".to_string(), route_name.to_string()),
-                    ("transport".to_string(), "ipc".to_string()),
-                ]),
-            ),
-        ),
         c2_ipc::IpcError::MethodNotFound {
             route_name,
             method_name,
@@ -2055,20 +2025,18 @@ fn ipc_route_error_response(route_name: &str, error: &c2_ipc::IpcError) -> Respo
                 ]),
             ),
         ),
-        c2_ipc::IpcError::Protocol(message) | c2_ipc::IpcError::Handshake(message) => {
-            semantic_error_response(
-                StatusCode::BAD_GATEWAY,
-                C2Error::new(
-                    ErrorCode::ProtocolViolation,
-                    "IPC protocol validation failed",
-                )
-                .with_details(BTreeMap::from([
-                    ("reason".to_string(), message.clone()),
-                    ("route".to_string(), route_name.to_string()),
-                    ("transport".to_string(), "ipc".to_string()),
-                ])),
+        c2_ipc::IpcError::Protocol(message) => semantic_error_response(
+            StatusCode::BAD_GATEWAY,
+            C2Error::new(
+                ErrorCode::ProtocolViolation,
+                "IPC protocol validation failed",
             )
-        }
+            .with_details(BTreeMap::from([
+                ("reason".to_string(), message.clone()),
+                ("route".to_string(), route_name.to_string()),
+                ("transport".to_string(), "ipc".to_string()),
+            ])),
+        ),
         error => resource_unavailable_response(
             route_name,
             format!("relay upstream unavailable before dispatch: {error}"),
@@ -2081,7 +2049,6 @@ fn upstream_acquire_error_kind(error: &c2_ipc::IpcError) -> &'static str {
         c2_ipc::IpcError::Io(_) | c2_ipc::IpcError::Connect(_) => "io",
         c2_ipc::IpcError::Config(_) => "config",
         c2_ipc::IpcError::Decode(_) => "decode",
-        c2_ipc::IpcError::Handshake(_) => "handshake",
         c2_ipc::IpcError::Protocol(_) => "protocol",
         c2_ipc::IpcError::ProtocolVersionMismatch { .. } => "protocol-version-mismatch",
         c2_ipc::IpcError::IdentityMismatch { .. } => "identity-mismatch",
@@ -2090,8 +2057,6 @@ fn upstream_acquire_error_kind(error: &c2_ipc::IpcError) -> &'static str {
         c2_ipc::IpcError::RouteRemoved { .. } => "route-removed",
         c2_ipc::IpcError::RouteClosed { .. } => "route-closed",
         c2_ipc::IpcError::RouteStale { .. } => "route-stale",
-        c2_ipc::IpcError::CatalogCompacted { .. } => "catalog-compacted",
-        c2_ipc::IpcError::WatchUnavailable(_) => "watch-unavailable",
         c2_ipc::IpcError::MethodNotFound { .. } => "method-missing",
         c2_ipc::IpcError::Shm(_) => "shm",
         c2_ipc::IpcError::Chunk(_) => "chunk",
@@ -2370,12 +2335,6 @@ mod tests {
             }),
             None
         );
-        assert_eq!(
-            semantic_withdrawal_reason(&c2_ipc::IpcError::WatchUnavailable(
-                "watch disconnected".into()
-            )),
-            None
-        );
     }
 
     #[tokio::test]
@@ -2428,19 +2387,6 @@ mod tests {
                 },
                 StatusCode::CONFLICT,
                 ErrorCode::IdentityMismatch,
-            ),
-            (
-                c2_ipc::IpcError::CatalogCompacted {
-                    compacted_revision: 4,
-                    current_revision: 8,
-                },
-                StatusCode::CONFLICT,
-                ErrorCode::RouteCatalogCompacted,
-            ),
-            (
-                c2_ipc::IpcError::WatchUnavailable("watch disconnected".into()),
-                StatusCode::SERVICE_UNAVAILABLE,
-                ErrorCode::RouteWatchUnavailable,
             ),
             (
                 c2_ipc::IpcError::MethodNotFound {
@@ -3117,7 +3063,8 @@ mod tests {
             let mut ipc = IpcClient::with_endpoint(
                 contexts[index].endpoint(&candidate.address).unwrap(),
                 ClientIpcConfig::default(),
-            );
+            )
+            .unwrap();
             ipc.connect().await.unwrap();
             assert_eq!(ipc.server_id(), Some(candidate.server_id.as_str()));
             assert_eq!(
@@ -3745,38 +3692,6 @@ mod tests {
         let status = response.status();
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         (status, body.to_vec())
-    }
-
-    async fn get_probe_with_expected_crm_tag(
-        state: Arc<RelayState>,
-        name: &str,
-        crm_ns: &str,
-        crm_name: &str,
-        crm_ver: &str,
-    ) -> StatusCode {
-        let route = state.local_route(name);
-        let app = build_router(state);
-        let response = app
-            .oneshot(
-                add_route_token_headers(
-                    add_expected_crm_tag_headers(
-                        Request::builder()
-                            .method("GET")
-                            .uri(format!("/_probe/{name}")),
-                        crm_ns,
-                        crm_name,
-                        crm_ver,
-                    ),
-                    route.as_ref(),
-                )
-                .body(Body::empty())
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-        let status = response.status();
-        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        status
     }
 
     async fn get_resolve_without_query(state: Arc<RelayState>, name: &str) -> StatusCode {
@@ -5813,7 +5728,7 @@ mod tests {
         // tombstone keeps this uid, so the withdrawal response can be pinned
         // to the exact removed incarnation.
         let mut attested =
-            c2_ipc::IpcClient::with_config(&owner_address, ClientIpcConfig::default());
+            c2_ipc::IpcClient::with_config(&owner_address, ClientIpcConfig::default()).unwrap();
         attested
             .connect()
             .await
@@ -5967,7 +5882,7 @@ mod tests {
         let owner_server = start_live_server(&owner_address, "server-grid").await;
 
         let mut attested =
-            c2_ipc::IpcClient::with_config(&owner_address, ClientIpcConfig::default());
+            c2_ipc::IpcClient::with_config(&owner_address, ClientIpcConfig::default()).unwrap();
         attested
             .connect()
             .await
@@ -6313,7 +6228,8 @@ mod tests {
         let server = start_live_server(&address, "server-grid").await;
 
         let mut attested =
-            c2_ipc::IpcClient::with_config(&address, c2_config::ClientIpcConfig::default());
+            c2_ipc::IpcClient::with_config(&address, c2_config::ClientIpcConfig::default())
+                .unwrap();
         attested
             .connect()
             .await

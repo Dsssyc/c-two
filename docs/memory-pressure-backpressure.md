@@ -21,7 +21,7 @@ The runtime protects memory use at three points:
 | --- | --- |
 | Config resolution | Rust validates sizes, counts, finite durations, and derived values before runtime use. |
 | Backing allocation | Rust atomically reserves finite SHM/file budgets before creating backing, alongside segment size/count and OS-pressure checks. |
-| Chunk reassembly | Chunk registries cap segment counts, total chunks, stale assembly time and message size, and reserve full capacity against the shared live-reassembly budget. |
+| Chunk reassembly | Chunk registries cap segment counts, chunks in flight across requests, stale assembly time and message size, and reserve full capacity against the shared live-reassembly budget. |
 
 `max_pool_memory` is not a user setting. It is derived from:
 

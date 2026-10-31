@@ -73,7 +73,7 @@ impl ClientLifecycle {
 
     pub(crate) fn manage(
         self: &Arc<Self>,
-        construct: impl FnOnce() -> IpcClient,
+        construct: impl FnOnce() -> Result<IpcClient, IpcError>,
     ) -> Result<ManagedClient, IpcError> {
         let mut inner = self.inner.lock();
         if inner.closed {
@@ -92,8 +92,16 @@ impl ClientLifecycle {
             closing: false,
         });
         drop(inner);
+        let client = match construct() {
+            Ok(client) => client,
+            Err(error) => {
+                self.inner.lock().entries[slot] = None;
+                self.drained.notify_waiters();
+                return Err(error);
+            }
+        };
         Ok(ManagedClient {
-            client: Some(construct()),
+            client: Some(client),
             domain: self.clone(),
             slot,
         })
@@ -221,6 +229,14 @@ impl ClientLifecycle {
 mod tests {
     use super::*;
 
+    #[test]
+    fn failed_client_construction_releases_reserved_slot() {
+        let domain = ClientLifecycle::new();
+        let result = domain.manage(|| Err(IpcError::Config("invalid pool".into())));
+        assert!(matches!(result, Err(IpcError::Config(_))));
+        assert_eq!(domain.outstanding(), 0);
+    }
+
     #[tokio::test]
     async fn native_owner_tracking_accepts_more_than_1024_clients() {
         const CLIENT_COUNT: usize = 1025;
@@ -229,7 +245,12 @@ mod tests {
         for _ in 0..CLIENT_COUNT {
             reserved.push(
                 domain
-                    .manage(|| IpcClient::new("ipc://not-connected"))
+                    .manage(|| {
+                        IpcClient::with_config(
+                            "ipc://not-connected",
+                            c2_config::ClientIpcConfig::default(),
+                        )
+                    })
                     .unwrap(),
             );
         }
@@ -249,7 +270,10 @@ mod tests {
         assert_eq!(domain.outstanding(), 0);
         assert!(
             domain
-                .manage(|| IpcClient::new("ipc://not-connected"))
+                .manage(|| IpcClient::with_config(
+                    "ipc://not-connected",
+                    c2_config::ClientIpcConfig::default()
+                ))
                 .is_err()
         );
     }
@@ -258,7 +282,9 @@ mod tests {
     async fn shutdown_observes_reserved_candidate_until_ownership_is_published() {
         let domain = ClientLifecycle::new();
         let candidate = domain
-            .manage(|| IpcClient::new("ipc://not-connected"))
+            .manage(|| {
+                IpcClient::with_config("ipc://not-connected", c2_config::ClientIpcConfig::default())
+            })
             .unwrap();
         let observer = {
             let domain = domain.clone();

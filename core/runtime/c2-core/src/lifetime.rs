@@ -129,7 +129,7 @@ impl Drop for HeldResponse {
 mod tests {
     use super::*;
     use c2_mem::{MemPool, PoolConfig};
-    use c2_wire::chunk::ReassemblyBacking;
+    use c2_wire::chunk::backing::ReassemblyBacking;
     use parking_lot::RwLock;
     use std::{cell::Cell, sync::Arc};
 
@@ -144,6 +144,7 @@ mod tests {
             },
             format!("/c2r07-{}", uuid::Uuid::new_v4().simple()),
         )
+        .expect("test pool")
     }
 
     #[test]

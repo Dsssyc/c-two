@@ -165,8 +165,8 @@ c3 relay --bind 127.0.0.1:8080 --idle-timeout 10 \
 Idle eviction disconnects the relay's cached IPC connection, not the resource
 server. Reconnect preserves full contract and server/instance identity
 validation; it does not replay ambiguous data-plane failures.
-`C2_RELAY_ROUTE_MAX_ATTEMPTS` belongs to relay-aware **clients**, not the relay
-server resolver (default 3, range 1..=32, zero treated as one).
+Relay-aware clients make one route observation and at most one refresh when
+the observed target becomes unavailable.
 See the [memory policy](../docs/memory-policy.en.md) for lazy allocation,
 fallback and retained-owner accounting.
 

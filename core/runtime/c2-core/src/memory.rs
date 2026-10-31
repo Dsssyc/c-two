@@ -441,9 +441,7 @@ impl RetirementHandoff {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use c2_mem::{
-        BudgetKind, BufferLeaseMeta, BufferStorage, LeaseDirection, LeaseRetention, MemoryBudget,
-    };
+    use c2_mem::{BudgetKind, BufferLeaseMeta, BufferStorage, LeaseDirection, MemoryBudget};
 
     fn limits() -> MemoryBudgetLimits {
         MemoryBudgetLimits {
@@ -458,7 +456,6 @@ mod tests {
             route_name: "grid".to_string(),
             method_name: "echo".to_string(),
             direction: LeaseDirection::ClientResponse,
-            retention: LeaseRetention::Retained,
             storage: BufferStorage::Shm,
             bytes,
         }
@@ -469,7 +466,7 @@ mod tests {
         let limits = limits();
         let budget = MemoryBudget::from_limits(&limits);
         let reservation = budget.reserve(BudgetKind::Shm, 1024).expect("reserve");
-        let tracker = Arc::new(BufferLeaseTracker::new(false));
+        let tracker = Arc::new(BufferLeaseTracker::new());
         let hold = tracker.track(retained_meta(64));
 
         let observation = RetiredMemoryObservation::new();
@@ -516,7 +513,7 @@ mod tests {
         // zero record must stay observable.
         let limits = limits();
         let budget = MemoryBudget::from_limits(&limits);
-        let tracker = Arc::new(BufferLeaseTracker::new(false));
+        let tracker = Arc::new(BufferLeaseTracker::new());
 
         let observation = RetiredMemoryObservation::new();
         observation.push_scope(
@@ -546,7 +543,7 @@ mod tests {
         // observable through the same record.
         let limits = limits();
         let budget = MemoryBudget::from_limits(&limits);
-        let session_tracker = Arc::new(BufferLeaseTracker::new(false));
+        let session_tracker = Arc::new(BufferLeaseTracker::new());
         let producer_handle = session_tracker.clone();
 
         let observation = RetiredMemoryObservation::new();
@@ -569,7 +566,7 @@ mod tests {
 
     #[test]
     fn sweep_snapshots_are_composed_without_exposing_trackers() {
-        let tracker = Arc::new(BufferLeaseTracker::new(false));
+        let tracker = Arc::new(BufferLeaseTracker::new());
         let _hold = tracker.track(retained_meta(16));
 
         let observation = RetiredMemoryObservation::new();
@@ -600,7 +597,7 @@ mod tests {
         let limits = limits();
         let charged = MemoryBudget::from_limits(&limits);
         let reservation = charged.reserve(BudgetKind::Shm, 2048).expect("reserve");
-        let held_tracker = Arc::new(BufferLeaseTracker::new(false));
+        let held_tracker = Arc::new(BufferLeaseTracker::new());
         let hold = held_tracker.track(retained_meta(96));
 
         let mut current: Vec<Arc<RetiredMemoryObservation>> = Vec::new();
@@ -617,7 +614,7 @@ mod tests {
                 // Later sessions are empty: fresh tracker, no scopes. Their
                 // session handles drop with the swap, so their records
                 // detach.
-                pending.push_tracker(Arc::new(BufferLeaseTracker::new(false)));
+                pending.push_tracker(Arc::new(BufferLeaseTracker::new()));
             }
             let handoff = RetirementHandoff::new(pending, current.clone());
             let mut replacement = Vec::new();
@@ -660,7 +657,7 @@ mod tests {
         // same tracker/domain observed through two adopted bundles.
         let limits = limits();
         let budget = MemoryBudget::from_limits(&limits);
-        let tracker = Arc::new(BufferLeaseTracker::new(false));
+        let tracker = Arc::new(BufferLeaseTracker::new());
         let hold = tracker.track(retained_meta(64));
 
         // First retirement succeeded earlier and was adopted.

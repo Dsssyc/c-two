@@ -37,7 +37,7 @@ The crate root contains the Runtime, Host, client, registration and call types, 
 | `c_two::endpoint` | Supervisors and maintenance tools: endpoint contexts, credentials, inspection, reaping, sweeps, direct IPC ping/shutdown and local I/O causes. |
 | `c_two::owner` | Trusted launchers: owner/bootstrap capabilities, recovery tickets, takeover and lifecycle policy. |
 | `c_two::observe` | Monitoring and diagnostics: connection events, call admission and concurrency snapshots, memory statistics, host lifecycle, paths and routes. |
-| `c_two::contract` | Contract tooling: validation errors and limits, release references and expected route contracts. |
+| `c_two::contract` | Contract tooling: validation errors, release references and expected route contracts. |
 
 `c_two::endpoint::{direct_ipc_endpoint, ping_direct_ipc, shutdown_direct_ipc}` take the logical address followed by `Option<&LocalEndpointContext>`; ping and shutdown also take a `Duration`. Pass `Some(&context)` to use a captured local domain. `None` resolves the existing process configuration once, using platform defaults when no override is present.
 
@@ -66,7 +66,6 @@ Portable payloads keep their owner-qualified name:
 
 ```rust
 use c_two::{Connect, ContractRelease, Runtime};
-use c_two::contract::{ContractLimits};
 use fastdb::Payload;
 ```
 

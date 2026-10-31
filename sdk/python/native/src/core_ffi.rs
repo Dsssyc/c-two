@@ -847,16 +847,13 @@ mod payload_tests {
     }
 
     fn tracker() -> PyBufferLeaseTracker {
-        PyBufferLeaseTracker::from_arc(Arc::new(c2_mem::BufferLeaseTracker::new(false)))
+        PyBufferLeaseTracker::from_arc(Arc::new(c2_mem::BufferLeaseTracker::new()))
     }
 
     fn assert_counts(tracker: &PyBufferLeaseTracker, holds: usize, bytes: usize) {
         let stats = tracker.inner.stats();
-        assert_eq!((stats.active_leases, stats.active_holds), (holds, holds));
-        assert_eq!(
-            (stats.total_leased_bytes, stats.total_held_bytes),
-            (bytes, bytes)
-        );
+        assert_eq!(stats.active_holds, holds);
+        assert_eq!(stats.total_held_bytes, bytes);
     }
 
     fn assert_buffer_error(py: Python<'_>, result: PyResult<()>, message: &str) {
@@ -1029,12 +1026,13 @@ def cleanup():
                     max_segments: 1,
                     ..Default::default()
                 };
-                let pool = Arc::new(parking_lot::RwLock::new(c2_mem::MemPool::new(
-                    config.clone(),
-                )));
+                let pool = Arc::new(parking_lot::RwLock::new(
+                    c2_mem::MemPool::new(config.clone()).unwrap(),
+                ));
                 let budget = pool.read().budget().unwrap().clone();
                 let backing =
-                    c2_wire::chunk::ReassemblyBacking::admit(pool.clone(), 1, 512).unwrap();
+                    c2_wire::chunk::backing::ReassemblyBacking::admit(pool.clone(), 1, 512)
+                        .unwrap();
                 let held = HeldResponse::from_response_lease(c2_ipc::ResponseLease::new(
                     c2_ipc::ResponseData::Handle(backing),
                 ))
@@ -1045,7 +1043,8 @@ def cleanup():
                 owner
                     .track_retained(&tracker, "retry", "release", "client_response")
                     .unwrap();
-                let original = std::mem::replace(&mut *pool.write(), c2_mem::MemPool::new(config));
+                let original =
+                    std::mem::replace(&mut *pool.write(), c2_mem::MemPool::new(config).unwrap());
                 let globals = pyo3::types::PyDict::new(py);
                 py.run(
                     c"def invalidator(value):
@@ -1247,7 +1246,7 @@ def dispatch(route, method, request):
                 let owner = view.getattr("obj").unwrap();
                 let owner = owner.cast::<PyCoreRequestBuffer>().unwrap().borrow();
                 let tracker = PyBufferLeaseTracker::from_arc(std::sync::Arc::new(
-                    c2_mem::BufferLeaseTracker::new(false),
+                    c2_mem::BufferLeaseTracker::new(),
                 ));
                 owner
                     .track_retained(&tracker, "request-owner", "dispatch", "resource_input")

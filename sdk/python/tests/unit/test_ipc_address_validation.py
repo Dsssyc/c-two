@@ -41,7 +41,12 @@ def test_client_util_accepts_plain_ipc_region():
         assert endpoint.startswith('\\\\.\\pipe\\c_two-')
     else:
         import re
-        assert re.fullmatch(r'/tmp/c2-v3-[0-9a-f]+/[0-9a-f]{32}', endpoint)
+        from pathlib import Path
+        from c_two.transport.registry import _get_default_runtime
+
+        context = _get_default_runtime()._runtime_session.local_endpoint_context()
+        assert Path(endpoint).parent == Path(context.root)
+        assert re.fullmatch(r'[0-9a-f]{32}', Path(endpoint).name)
 
 
 def test_client_util_uses_native_endpoint_name(monkeypatch):

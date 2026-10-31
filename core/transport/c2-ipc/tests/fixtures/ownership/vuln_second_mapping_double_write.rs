@@ -11,12 +11,12 @@ fn copy_of(source: &MemHandle) -> MemHandle {
 }
 
 fn main() {
-    let mut owner = MemPool::new(PoolConfig::default());
+    let mut owner = MemPool::new(PoolConfig::default()).unwrap();
     let mut owner_handle = owner.alloc_handle(8192).expect("real allocation");
     let mut peer_handle = copy_of(&owner_handle);
     let allocation = owner_handle.shm_allocation().unwrap();
     let (seg_idx, generation) = (allocation.seg_idx, allocation.generation);
-    let mut peer = MemPool::open_peer(PoolConfig::default(), owner.prefix().to_string());
+    let mut peer = MemPool::open_peer(PoolConfig::default(), owner.prefix().to_string()).unwrap();
     peer.ensure_peer_segment(seg_idx, generation, 8192)
         .expect("second mapping");
     let owner_writer = owner.handle_slice_mut(&mut owner_handle);

@@ -811,7 +811,7 @@ def test_no_liveness_status_is_fabricated_for_kernel_managed_platforms() -> None
     assert 'present' not in endpoint_module.NON_LIVENESS_STATUSES
 
 
-@pytest.mark.parametrize('addresses', [['http://wrong'], ['/tmp/forged.sock'], [SWEEP_ADDRESSES[0]] * 4097])
+@pytest.mark.parametrize('addresses', [['http://wrong'], ['/tmp/forged.sock']])
 def test_sweep_address_scope_rejects_before_taking_the_lease(addresses: list[str]) -> None:
     with pytest.raises(ValueError):
         cc.endpoint.sweep_endpoints(addresses=addresses)

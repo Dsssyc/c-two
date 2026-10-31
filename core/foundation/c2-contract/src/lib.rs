@@ -13,8 +13,9 @@ pub use admission::{
 };
 pub use descriptor::{
     BindingDirection, ContractFingerprints, MethodAccess, NestedFastDbSpec,
-    ValidatedContractDescriptor, ValidatedMethodDescriptor, contract_descriptor_sha256_hex,
-    derive_contract_fingerprints_json, validate_portable_contract_descriptor_json,
+    ValidatedContractDescriptor, ValidatedMethodDescriptor, canonical_json,
+    contract_descriptor_sha256_hex, derive_contract_fingerprints_json, lower_hex,
+    validate_portable_contract_descriptor_json,
 };
 pub use release::{
     CONTRACT_RELEASE_REF_SCHEMA, ContractDescriptorDigest, ContractRelease, ContractReleaseRef,

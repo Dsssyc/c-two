@@ -16,7 +16,7 @@ Both server and client IPC overrides accept these independent byte budgets:
 | `file_backing_budget_bytes` | 16 GiB | Locally created file backing length |
 | `live_reassembly_budget_bytes` | 8 GiB | Reassembly capacity retained by incomplete, queued, executing or held payloads |
 
-Zero rejects every positive reservation. The entire `u64` range is valid; zero does not mean unlimited. Per-message, reassembly, chunk-count and segment-count limits also apply independently. Budgets cover C-Two-owned IPC backing and assembly, without bounding Python/FastDB heaps, HTTP buffers, receiver-opened peer mappings or total process RSS.
+Zero rejects every positive reservation. The entire `u64` range is valid; zero does not mean unlimited. Per-message payload and reassembly limits apply independently; the chunk-count limit applies to chunks in flight across requests, and the segment-count limit applies to pool segments. Budgets cover C-Two-owned IPC backing and assembly, without bounding Python/FastDB heaps, HTTP buffers, receiver-opened peer mappings or total process RSS.
 
 Server response pools, reassembly and prewarming share one server-direction budget. Cached request and reassembly pools in one Runtime's outgoing client domain share another. Directions and separate Runtimes are independent. Reservation occurs atomically before backing creation: refusal creates no mapping or file. Reusing free blocks in charged backing does not charge it again. Dedicated storage remains charged while waiting for peer `read_done` or owner GC.
 
@@ -32,7 +32,7 @@ New buddy or dedicated backing also passes an OS memory-pressure heuristic. The 
 
 ## Allocation and transport fallback
 
-Client requests choose inline or checked chunk transfer when request-pool SHM is not selected. SHM selection depends on `shm_threshold` (4 KiB by default) and wire representation limits. SHM requests write into the local request pool and transmit the 23-byte `BuddyPayload` coordinates, generation and allocation id; the peer lazily opens the exact prefix, index and generation. If SHM is unavailable because of budget, pressure or representation limits, small requests fall back to inline and larger requests use checked chunks. The default chunk size is 128 KiB, bounded by chunk-count and reassembly limits.
+Client requests choose inline or checked chunk transfer when request-pool SHM is not selected. SHM selection depends on `shm_threshold` (4 KiB by default) and wire representation limits. SHM requests write into the local request pool and transmit the 23-byte `BuddyPayload` coordinates, generation and allocation id; the peer lazily opens the exact prefix, index and generation. If SHM is unavailable because of budget, pressure or representation limits, small requests fall back to inline and larger requests use checked chunks. The default chunk size is 128 KiB. Payload and reassembly sizes bound each request; the chunk-count limit bounds chunks in flight across requests.
 
 Server responses up to `shm_threshold` use inline frames. Larger responses try buddy reuse, buddy expansion and dedicated SHM before checked chunk fallback. Payloads that cannot fit buddy wire metadata also use the checked fallback.
 
@@ -42,7 +42,7 @@ Receiver assembly reserves full capacity, `total_chunks × chunk_size`, before a
 
 Low-level explicit Rust release retains authority on failure. `MemPool::release_handle` returns `ReleaseHandleError` containing the original `handle` and `reason`; `RequestLease::release` and `ResponseLease::release` clear their carrier only after success. A caller may retry after contention ends; retry does not repair poison, stale identity or a wrong pool. Reassembly reservations are refunded only after storage release; cached mapping charges still follow the existing GC policy.
 
-`SyncClient::pool_alloc_and_write/fill` returns `RequestPreparationError`: `source_error()` exposes the preparation failure, `release_error()` the initial cleanup failure, `has_pending_release()` the pending ownership, and `release()` attempts cleanup without replaying the fill callback. The incomplete block cannot be recovered or published. `pool_free` returns the existing release result. Consuming calls, Core/SDK Held and final Drop remain separate ownership work; this change does not guarantee their failed-owner retention or add background retries.
+The ownership rules for consuming calls, Core/SDK Held and final Drop after an unconfirmed release are described below. These paths do not replay a business call.
 
 FastDB content remains opaque at this layer. C-Two transports bytes or SHM coordinates and delegates nested payload specifications to FastDB Core.
 

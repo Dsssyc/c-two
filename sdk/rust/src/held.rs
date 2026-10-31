@@ -97,7 +97,7 @@ mod tests {
     use super::*;
     use c2_ipc::{ResponseData, ResponseLease};
     use c2_mem::{MemPool, PoolConfig};
-    use c2_wire::chunk::ReassemblyBacking;
+    use c2_wire::chunk::backing::ReassemblyBacking;
     use parking_lot::RwLock;
     use std::cell::Cell;
     use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -118,7 +118,7 @@ mod tests {
 
     #[test]
     fn invalidator_unwind_releases_response_before_value_drop() {
-        let pool = Arc::new(RwLock::new(MemPool::new(PoolConfig::default())));
+        let pool = Arc::new(RwLock::new(MemPool::new(PoolConfig::default()).unwrap()));
         let mut backing = ReassemblyBacking::admit(Arc::clone(&pool), 1, 512).unwrap();
         backing.write_at(0, &[7; 512]).unwrap();
         let response =
@@ -142,7 +142,7 @@ mod tests {
 
     #[test]
     fn failed_native_release_retains_response_and_never_reinvalidates() {
-        let pool = Arc::new(RwLock::new(MemPool::new(PoolConfig::default())));
+        let pool = Arc::new(RwLock::new(MemPool::new(PoolConfig::default()).unwrap()));
         let budget = pool.read().budget().unwrap().clone();
         let mut backing = ReassemblyBacking::admit(Arc::clone(&pool), 1, 512).unwrap();
         backing.write_at(0, &[7; 512]).unwrap();
@@ -154,7 +154,10 @@ mod tests {
             calls.set(calls.get() + 1);
             Ok(())
         });
-        let original = std::mem::replace(&mut *pool.write(), MemPool::new(PoolConfig::default()));
+        let original = std::mem::replace(
+            &mut *pool.write(),
+            MemPool::new(PoolConfig::default()).unwrap(),
+        );
 
         let first = held
             .release()

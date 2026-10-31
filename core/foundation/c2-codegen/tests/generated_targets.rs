@@ -263,7 +263,7 @@ use c_two_generated_contract_check::contract;
 use c_two::generated::{AdapterFailurePhase, HeldResponse, fastdb_adapter_error};
 use c2_ipc::{ResponseData, ResponseLease};
 use c2_mem::{MemPool, PoolConfig};
-use c2_wire::chunk::ReassemblyBacking;
+use c2_wire::chunk::backing::ReassemblyBacking;
 use fastdb::{BuildPolicy, Builder, CompiledSpec};
 use parking_lot::RwLock;
 
@@ -281,12 +281,12 @@ fn main() {
         payload.require_spec_sha256(&[0; 32]).unwrap_err(),
     );
     let bytes = payload.binary_bytes().unwrap();
-    let pool = Arc::new(RwLock::new(MemPool::new(PoolConfig::default())));
+    let pool = Arc::new(RwLock::new(MemPool::new(PoolConfig::default()).unwrap()));
     let budget = pool.read().budget().unwrap().clone();
     let mut backing = ReassemblyBacking::admit(Arc::clone(&pool), 1, bytes.len()).unwrap();
     backing.write_at(0, &bytes).unwrap();
     let response = HeldResponse::from_response_lease(ResponseLease::new(ResponseData::Handle(backing))).unwrap();
-    let original = std::mem::replace(&mut *pool.write(), MemPool::new(PoolConfig::default()));
+    let original = std::mem::replace(&mut *pool.write(), MemPool::new(PoolConfig::default()).unwrap());
     let error = contract::decode_method_1_echo_output_held(response).unwrap_err();
     match error {
         c_two::Error::Semantic(error) => assert_eq!(error, expected),

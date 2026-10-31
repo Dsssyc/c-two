@@ -18,7 +18,7 @@ C-Two 对自有 IPC 后备与在途组装维护三个有限的字节预算。三
 
 零值语义：`0` 表示该单元拒绝一切正数预留，它不是"无限制"。全部 `u64` 范围都是合法配置。
 
-预算边界：只覆盖 C-Two 自有的 IPC 数据后备与在途组装，不约束 Python/FastDB 堆、HTTP 缓冲、接收端代开的对端映射，也不等于进程 RSS。既有的单消息限制（`max_payload_size`、`max_reassembly_bytes`、`max_total_chunks`、`max_pool_segments` 等）继续独立生效，预算不替代它们。另有独立的调用延续预算（`C2_CALL_MAX_OUTSTANDING`、`C2_CALL_RETAINED_INPUT_BUDGET_BYTES`）：它只约束有限期限调用为保留请求输入而取得的准入名额与字节预留，不属于这三个 IPC 预算单元，也不约束无限调用。
+预算边界：只覆盖 C-Two 自有的 IPC 数据后备与在途组装，不约束 Python/FastDB 堆、HTTP 缓冲、接收端代开的对端映射，也不等于进程 RSS。单消息仍受 `max_payload_size` 与 `max_reassembly_bytes` 限制；`max_total_chunks` 限制全局在途分片数，`max_pool_segments` 限制池段数。预算不替代这些限制。另有独立的调用延续预算（`C2_CALL_MAX_OUTSTANDING`、`C2_CALL_RETAINED_INPUT_BUDGET_BYTES`）：它只约束有限期限调用为保留请求输入而取得的准入名额与字节预留，不属于这三个 IPC 预算单元，也不约束无限调用。
 
 预算方向：服务端方向（响应池、组装池、响应预热）共享一个预算；Runtime 出站客户端域内所有缓存连接的请求池与组装池共享另一个预算。两个方向相互独立，独立的 Runtime 互不共享。创建 backing 前先原子预留预算：预留失败不会产生任何映射或文件；复用已计费段中的空闲块不二次计费；dedicated 段等待对端 `read_done`/GC 期间保持计费。
 
@@ -36,7 +36,7 @@ C-Two 对自有 IPC 后备与在途组装维护三个有限的字节预算。三
 
 1. 未选择请求池 SHM 且负载不大于 `chunk_size` 时走 inline 帧；更大的负载走分块。是否选择 SHM 还取决于 `shm_threshold`（默认 4096 字节）和线格式上限。
 2. 负载大于 `shm_threshold` 且不超过 buddy 线格式上限时，走 SHM 指针传输：数据写入本进程请求池，线上携带 23 字节 `BuddyPayload` 位置、generation 与 allocation_id 元数据，接收端按前缀/索引/代惰性打开。
-3. SHM 不可用（预算拒绝、压力拒绝或超线格式上限）时，回退到检查过的分块传输（`chunk_size` 默认 128 KiB，受 `max_total_chunks`/`max_reassembly_bytes` 约束）；小负载回退 inline。不引入第三种传输栈。
+3. SHM 不可用（预算拒绝、压力拒绝或超线格式上限）时，回退到检查过的分块传输（`chunk_size` 默认 128 KiB；单请求受 `max_payload_size` 与 `max_reassembly_bytes` 约束，全局在途分片受 `max_total_chunks` 约束）；小负载回退 inline。不引入第三种传输栈。
 
 服务端响应对称：不大于 `shm_threshold` 走 inline；否则先尝试 buddy 复用，再尝试 buddy 池扩展，再尝试 dedicated SHM；都不可用或负载无法被 buddy 元数据表示时走分块回退。
 
@@ -46,7 +46,7 @@ SHM 头部版本 3 在同一分配器锁下维护每次 buddy 分配的层级与
 
 低层 Rust 的显式释放失败会保留原释放权：`MemPool::release_handle` 返回的 `ReleaseHandleError` 包含原 `handle` 与 `reason`；`RequestLease::release` / `ResponseLease::release` 只有成功后才清空 carrier。竞争解除后可由调用者再次释放，poison、过期身份或错误 pool 不因重试恢复有效。重组 reservation 仍在存储释放成功后归还；空闲映射的 SHM charge 继续遵循原 GC 策略。
 
-`SyncClient::pool_alloc_and_write/fill` 返回 `RequestPreparationError`：`source_error()` 查询准备错误，`release_error()` 查询首次清理错误，`has_pending_release()` 表示是否仍持有待清理块，`release()` 只尝试清理且不重放填充回调。失败块不能取出或发布，`pool_free` 也返回原释放结果。消费式调用、Core/SDK Held 和最终 Drop 的失败接管仍是独立范围；本变化不保证它们能保留失败 owner，也不新增后台重试。
+消费式调用、Core/SDK Held 和最终 Drop 在未确认释放时保留或放弃原 owner 的规则见下文；这些路径不会重放业务调用。
 
 FastDB 载荷内容对该层不透明：C-Two 只搬运字节或共享内存指针，嵌套规格作为不透明 JSON 委托 FastDB Core，这是保持中立的边界。
 

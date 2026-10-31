@@ -236,7 +236,8 @@ impl Upstream {
             .await
             .unwrap();
         // Attestation uses its own real, lazy control-plane connection.
-        let mut attestor = IpcClient::new(&address);
+        let mut attestor =
+            IpcClient::with_config(&address, c2_config::ClientIpcConfig::default()).unwrap();
         bounded(attestor.connect()).await.unwrap();
         let contract = attestor.route_contract(name).unwrap();
         let attestation = bounded(attestor.attest_route_for_registration(&contract))

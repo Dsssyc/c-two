@@ -206,7 +206,7 @@ fn held_release_attempts_invalidation_and_transport_cleanup_and_retains_both_fai
 #[test]
 fn held_response_copy_failure_attempts_cleanup_and_retains_both_causes() {
     let pool = Arc::new(RwLock::new(replacement_pool("copy_source")));
-    let mut handle = c2_wire::chunk::ReassemblyBacking::admit(Arc::clone(&pool), 1, 16)
+    let mut handle = c2_wire::chunk::backing::ReassemblyBacking::admit(Arc::clone(&pool), 1, 16)
         .expect("handle admission");
     handle
         .write_at(0, b"copy and release")
@@ -240,7 +240,7 @@ fn inline_response_lease(bytes: &[u8]) -> ResponseLease {
 fn breakable_handle_response(bytes: &[u8]) -> (HeldResponse, Arc<RwLock<MemPool>>) {
     let pool = Arc::new(RwLock::new(replacement_pool("handle")));
     let mut handle =
-        c2_wire::chunk::ReassemblyBacking::admit(Arc::clone(&pool), 1, bytes.len().max(1))
+        c2_wire::chunk::backing::ReassemblyBacking::admit(Arc::clone(&pool), 1, bytes.len().max(1))
             .expect("handle admission");
     handle.write_at(0, bytes).expect("handle write");
     let lease = ResponseLease::new(ResponseData::Handle(handle));
@@ -271,6 +271,7 @@ fn replacement_pool(label: &str) -> MemPool {
         .take(24)
         .collect(),
     )
+    .expect("replacement test pool")
 }
 
 fn assert_held_release_error(

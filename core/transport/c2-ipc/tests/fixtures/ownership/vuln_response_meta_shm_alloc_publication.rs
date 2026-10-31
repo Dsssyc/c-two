@@ -17,7 +17,7 @@ impl CrmCallback for ForgedPublisher {
         _request: RequestData,
         _response_pool: Arc<c2_server::ResponsePool>,
     ) -> Result<ResponseMeta, CrmError> {
-        let mut other_pool = MemPool::new(PoolConfig::default());
+        let mut other_pool = MemPool::new(PoolConfig::default()).unwrap();
         let handle = other_pool.alloc_shm_handle(4096).unwrap();
         Ok(ResponseMeta::ShmAlloc(PreparedShmResponse::new(
             Arc::new(parking_lot::RwLock::new(other_pool)),
