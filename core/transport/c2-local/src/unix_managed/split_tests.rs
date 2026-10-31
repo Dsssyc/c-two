@@ -179,9 +179,14 @@ async fn split_gate_pin_and_directory_replacements_fail_closed() {
     let endpoint = fixture.endpoint(&fixture.sockets, "pin-gate");
     let listener = crate::LocalListener::bind(&endpoint).unwrap();
     let gate = fixture.records.join(GATE_NAME);
-    let original = fstat(listener.0._gate_pin.as_raw_fd()).unwrap();
+    let original = fstat(listener.0._gate_pin.as_ref().unwrap().as_raw_fd()).unwrap();
     fs::remove_file(&gate).unwrap();
-    assert_eq!(fstat(listener.0._gate_pin.as_raw_fd()).unwrap().st_nlink, 0);
+    assert_eq!(
+        fstat(listener.0._gate_pin.as_ref().unwrap().as_raw_fd())
+            .unwrap()
+            .st_nlink,
+        0
+    );
     let replacement = OpenOptions::new()
         .write(true)
         .create_new(true)

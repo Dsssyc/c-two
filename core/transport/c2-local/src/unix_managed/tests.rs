@@ -1091,9 +1091,9 @@ async fn managed_listener_pins_original_gate_until_lease_ownership_ends() {
     let endpoint = managed_endpoint_at(&root, "gate-pin");
     let listener = bind_managed_at(&endpoint, root).unwrap();
     let gate = root.join(GATE_NAME);
-    let original = fstat(listener._gate_pin.as_raw_fd()).unwrap();
+    let original = fstat(listener._gate_pin.as_ref().unwrap().as_raw_fd()).unwrap();
     std::fs::remove_file(&gate).unwrap();
-    let unlinked = fstat(listener._gate_pin.as_raw_fd()).unwrap();
+    let unlinked = fstat(listener._gate_pin.as_ref().unwrap().as_raw_fd()).unwrap();
     assert!(same_file(&original, &unlinked));
     assert_eq!(
         unlinked.st_nlink, 0,
@@ -1453,8 +1453,103 @@ async fn managed_failed_initialization_withdraws_its_socket_and_rebinds() {
     assert!(!lease_path_at(root, &endpoint).exists());
 }
 
-/// A Drop that cannot take the gate stays bounded, releases its handles in
-/// order, and leaves complete metadata for the reaper.
+#[tokio::test]
+async fn managed_drop_retires_after_transient_gate_contention() {
+    let namespace = TestNamespace::new();
+    let root = namespace.path();
+    let endpoint = managed_endpoint_at(root, "drop-transient-gate");
+    let listener = bind_managed_at(&endpoint, root).unwrap();
+    let duplicate = listener.duplicate_lease_fd_for_test();
+    let lease_probe = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lease_path_at(root, &endpoint))
+        .unwrap();
+    let gate_pin_fd = listener._gate_pin.as_ref().unwrap().as_raw_fd();
+    let original_gate = fstat(gate_pin_fd).unwrap();
+    let gate = ManagedNamespace::open_root(root, false, true).unwrap();
+
+    let started = Instant::now();
+    drop(listener);
+    let drop_elapsed = started.elapsed();
+    assert!(socket_path_at(root, &endpoint).exists());
+    assert!(lease_path_at(root, &endpoint).exists());
+    assert!(
+        same_file(&original_gate, &fstat(gate_pin_fd).unwrap()),
+        "the background owner must keep the original gate inode pinned"
+    );
+    drop(gate);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while (socket_path_at(root, &endpoint).exists() || lease_path_at(root, &endpoint).exists())
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        !socket_path_at(root, &endpoint).exists() && !lease_path_at(root, &endpoint).exists(),
+        "Drop must retire its socket and lease after transient gate contention"
+    );
+    assert!(
+        drop_elapsed < Duration::from_millis(80),
+        "Drop blocked its caller for {drop_elapsed:?}"
+    );
+    assert!(
+        try_lock_lease(&lease_probe).is_ok(),
+        "a live duplicate must not extend the retired lease flock"
+    );
+    drop(Lease(Some(lease_probe)));
+    drop(duplicate);
+}
+
+#[tokio::test]
+async fn managed_drop_gate_replacement_keeps_record_and_releases_lease() {
+    let namespace = TestNamespace::new();
+    let root = namespace.path();
+    let endpoint = managed_endpoint_at(root, "drop-replaced-gate");
+    let listener = bind_managed_at(&endpoint, root).unwrap();
+    let gate_pin_fd = listener._gate_pin.as_ref().unwrap().as_raw_fd();
+    let original_gate = fstat(gate_pin_fd).unwrap();
+    let lease_path = lease_path_at(root, &endpoint);
+    let lease_probe = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lease_path)
+        .unwrap();
+    let held_gate = ManagedNamespace::open_root(root, false, true).unwrap();
+
+    drop(listener);
+    assert!(same_file(&original_gate, &fstat(gate_pin_fd).unwrap()));
+    let gate_path = root.join(GATE_NAME);
+    std::fs::remove_file(&gate_path).unwrap();
+    let replacement = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&gate_path)
+        .unwrap();
+    drop(held_gate);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match try_lock_lease(&lease_probe) {
+            Ok(()) => break,
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("background owner retained the lease: {error}"),
+        }
+    }
+    assert!(socket_path_at(root, &endpoint).exists());
+    assert!(lease_path.exists());
+    assert_eq!(replacement.metadata().unwrap().len(), 0);
+    drop(Lease(Some(lease_probe)));
+}
+
+/// A gate held beyond the bounded retry leaves complete metadata for the
+/// reaper after the background retirement attempt releases its lease.
 #[tokio::test]
 async fn managed_drop_without_gate_leaves_metadata_for_the_reaper() {
     let namespace = TestNamespace::new();
@@ -2249,7 +2344,7 @@ async fn managed_duplicate_lease_cannot_extend_ownership_across_retirement() {
     assert!(matches!(replacement.close(), EndpointReapResult::Reaped));
     drop(duplicate);
 
-    // --- Part 2: a Drop that never takes the gate. ---
+    // --- Part 2: a Drop whose caller cannot take the gate. ---
     // This is the case where the duplicate would otherwise keep the *same*
     // lease inode locked forever: the entry is not unlinked, so the reaper must
     // observe a released flock on the surviving inode even though the duplicate
@@ -2257,8 +2352,8 @@ async fn managed_duplicate_lease_cannot_extend_ownership_across_retirement() {
     let listener = bind_managed_at(&endpoint, root).unwrap();
     let duplicate = listener.duplicate_lease_fd_for_test();
 
-    // Hold the coordinator so the Drop cannot retire and is forced onto the
-    // bounded "leave metadata for the reaper" path.
+    // Hold the coordinator so the Drop caller cannot retire; its background
+    // retry must either retire or release ownership for a reaper.
     let held_root = root.to_owned();
     let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let holder = {
@@ -2295,15 +2390,18 @@ async fn managed_duplicate_lease_cannot_extend_ownership_across_retirement() {
     release.store(true, std::sync::atomic::Ordering::SeqCst);
     holder.join().unwrap();
 
-    // The duplicate is STILL OPEN. The reaper must not be blocked by it: the
-    // listener already issued `LOCK_UN` on the shared description during Drop.
-    assert!(
-        matches!(
-            reap_managed_at(&endpoint, &credential, root),
-            EndpointReapResult::Reaped
-        ),
-        "a live duplicate must not keep the retired lease locked"
-    );
+    // The duplicate is STILL OPEN. Whether the short retry or this reaper
+    // retires the slot, its shared lease description must become unlocked.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match reap_managed_at(&endpoint, &credential, root) {
+            EndpointReapResult::Reaped | EndpointReapResult::AlreadyAbsent => break,
+            EndpointReapResult::Busy if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            other => panic!("a live duplicate kept the retired lease locked: {other:?}"),
+        }
+    }
     assert!(!socket_path_at(root, &endpoint).exists());
     assert!(!lease_path_at(root, &endpoint).exists());
     // The retired lease entry never comes back, so the duplicate cannot
@@ -2315,10 +2413,10 @@ async fn managed_duplicate_lease_cannot_extend_ownership_across_retirement() {
     drop(duplicate);
 }
 
-/// A first-initialization scan is bounded: a namespace that exceeds the entry
-/// cap fails closed instead of traversing an unbounded directory.
-#[test]
-fn managed_first_initialization_scan_is_bounded_and_fails_closed() {
+/// Unrelated files beyond the old scan cap must not block first use of a
+/// private namespace.
+#[tokio::test]
+async fn managed_first_initialization_scans_past_unrelated_entries() {
     let parent = tempfile::Builder::new()
         .prefix("c2s-")
         .tempdir_in("/tmp")
@@ -2332,19 +2430,21 @@ fn managed_first_initialization_scan_is_bounded_and_fails_closed() {
     )
     .unwrap();
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
-    for index in 0..(INIT_SCAN_LIMIT + 4) {
+    for index in 0..68 {
         std::fs::write(root.join(format!("noise-{index:03}")), b"x").unwrap();
     }
 
-    let error = ManagedNamespace::open_root(&root, true, true).map(|_| ());
-    assert!(matches!(
-        error,
-        Err(NamespaceError::Io(_)) | Err(NamespaceError::Unverified(_))
-    ));
-    assert!(
-        !root.join(MARKER_NAME).exists(),
-        "an over-budget namespace must never be adopted"
-    );
+    let endpoint = managed_endpoint_at(&root, "scan-past-noise");
+    let listener =
+        bind_managed_at(&endpoint, &root).expect("unrelated files must not prevent first bind");
+    assert!(root.join(MARKER_NAME).exists());
+    assert!(matches!(listener.close(), EndpointReapResult::Reaped));
+    for index in 0..68 {
+        assert_eq!(
+            std::fs::read(root.join(format!("noise-{index:03}"))).unwrap(),
+            b"x"
+        );
+    }
 }
 
 /// The descriptor-anchored bind never touches the *calling* thread's working

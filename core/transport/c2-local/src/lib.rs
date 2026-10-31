@@ -333,7 +333,7 @@ pub struct SweepBatch {
 /// always starts at the beginning and does not inherit completion state.
 pub struct EndpointSweep(platform::EndpointSweep);
 
-/// A bounded set of logical addresses in one canonical protocol namespace.
+/// Caller-selected logical addresses in one canonical protocol namespace.
 /// Constructing a scope performs no filesystem access and takes no sweep lease.
 #[derive(Clone)]
 pub struct EndpointSweepScope {
@@ -342,15 +342,7 @@ pub struct EndpointSweepScope {
 }
 
 impl EndpointSweepScope {
-    pub const MAX_ADDRESSES: usize = 4096;
-
     pub fn from_addresses(endpoint: &LocalEndpoint, addresses: &[String]) -> io::Result<Self> {
-        if addresses.len() > Self::MAX_ADDRESSES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "too many endpoint sweep addresses",
-            ));
-        }
         let mut targets = Vec::with_capacity(addresses.len());
         for address in addresses {
             let target = endpoint.context().endpoint(address)?;

@@ -713,28 +713,14 @@ fn gate_entry_is_current(directory: &EndpointDirectory, gate: &File) -> bool {
         .is_some_and(|current| same_file(&opened, &current))
 }
 
-/// Bound on the first-initialization scan. A namespace with no identity marker
-/// is only adoptable when it is provably empty of endpoint objects, so the scan
-/// stops at the first endpoint entry; the cap keeps a hostile or accidental
-/// directory from turning initialization into an unbounded traversal.
-const INIT_SCAN_LIMIT: usize = 64;
-
 /// Whether a namespace already holds endpoint objects.
 ///
-/// Bounded to [`INIT_SCAN_LIMIT`] entries. Exceeding the cap fails closed: an
-/// unenumerated directory cannot prove "no endpoint objects", and adopting it
-/// would risk writing a first marker into a namespace whose real identity is
-/// simply too large to inspect.
+/// A namespace without an identity marker can only be adopted after the scan
+/// reaches EOF without finding an endpoint object.
 fn has_endpoint_entries(
     entries: impl Iterator<Item = io::Result<fs::DirEntry>>,
 ) -> io::Result<bool> {
-    for (index, entry) in entries.enumerate() {
-        if index >= INIT_SCAN_LIMIT {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "managed namespace first-initialization scan exceeded its bound",
-            ));
-        }
+    for entry in entries {
         let name = entry?.file_name();
         let bytes = name.as_bytes();
         if is_endpoint_stem(bytes)
@@ -778,7 +764,7 @@ fn gate_nonce(gate: &File) -> Result<[u8; 16], NamespaceError> {
 }
 
 fn write_marker(directory: &EndpointDirectory, gate: &File) -> Result<(), NamespaceError> {
-    // Only first initialization, under the gate and after the bounded scan,
+    // Only first initialization, under the gate and after a complete scan,
     // may assign an identity. A marker-bearing empty/replaced gate is rejected
     // by validate_marker and never reaches this path.
     if gate.metadata().map_err(NamespaceError::Io)?.len() == 0 {
@@ -1182,6 +1168,21 @@ fn retire_owned(
     EndpointReapResult::Reaped
 }
 
+fn retire_listener_with_namespace(
+    namespace: &ManagedNamespace,
+    directories_pin: Option<&NamespaceDirectories>,
+    endpoint: &LocalEndpoint,
+    lease: &Lease,
+    record: &OwnerRecord,
+) -> EndpointReapResult {
+    if directories_pin
+        .is_some_and(|directories| !directories.same_as(&namespace.directories).unwrap_or(false))
+    {
+        return EndpointReapResult::Unverified(EndpointUnverifiedReason::UnsafeDirectory);
+    }
+    retire_owned(namespace, endpoint, lease.file(), record)
+}
+
 /// The per-endpoint lease a listener holds for life.
 ///
 /// `flock` locks are attached to the *open file description*, not the
@@ -1220,6 +1221,31 @@ impl Drop for Lease {
         // A lease that is dropped without an explicit retire still must not
         // outlive its listener through a shared OFD.
         self.release();
+    }
+}
+
+/// The Drop worker owns the listener's lease and original gate pin until its
+/// bounded retirement attempt ends. Field order releases the lease first.
+struct DropRetirement {
+    lease: Lease,
+    _gate_pin: File,
+    directories_pin: Option<NamespaceDirectories>,
+    root: PathBuf,
+    endpoint: LocalEndpoint,
+    record: OwnerRecord,
+}
+
+impl DropRetirement {
+    fn run(self) {
+        if let Ok(namespace) = open_root_bounded(&self.root, false) {
+            let _ = retire_listener_with_namespace(
+                &namespace,
+                self.directories_pin.as_ref(),
+                &self.endpoint,
+                &self.lease,
+                &self.record,
+            );
+        }
     }
 }
 
@@ -1274,7 +1300,7 @@ pub(crate) struct ManagedListener {
     // including a close/drop that cannot reacquire its named gate. Namespace
     // Drop releases the shared OFD flock; this descriptor holds only the inode.
     // Field order releases the lease before this last listener pin closes.
-    _gate_pin: File,
+    _gate_pin: Option<File>,
     directories_pin: Option<NamespaceDirectories>,
     context_binding: Option<ContextBinding>,
     #[cfg(test)]
@@ -1340,40 +1366,57 @@ impl ManagedListener {
                 return namespace_reap_error(error);
             }
         };
-        if self.directories_pin.as_ref().is_some_and(|directories| {
-            !directories.same_as(&namespace.directories).unwrap_or(false)
-        }) {
-            self.lease.take();
-            return EndpointReapResult::Unverified(EndpointUnverifiedReason::UnsafeDirectory);
-        }
         match self.lease.as_ref() {
-            Some(lease) => retire_owned(&namespace, &self.endpoint, lease.file(), &self.record),
+            Some(lease) => retire_listener_with_namespace(
+                &namespace,
+                self.directories_pin.as_ref(),
+                &self.endpoint,
+                lease,
+                &self.record,
+            ),
             None => EndpointReapResult::Unverified(EndpointUnverifiedReason::InvalidOwnership),
         }
     }
 
-    /// Bounded Drop path: close the listening descriptor in order, then retry
-    /// the gate without waiting. A missed gate leaves the lease record for the
-    /// reaper instead of starting unbounded background work. Either way the
-    /// lease flock is released and this listener's descriptor closed, so a
-    /// duplicate of it can never keep ownership alive.
+    /// Close the listening descriptor, then try immediate retirement. Gate
+    /// contention moves the lease to a short-lived thread that uses the same
+    /// bounded wait as explicit close, without waiting on the Drop caller.
+    /// A failed wait leaves the complete record for the reaper and releases
+    /// the lease flock even when another descriptor shares its description.
     fn drop_bounded(&mut self) {
         if self.cleaned {
             return;
         }
         self.cleaned = true;
-        let namespace = ManagedNamespace::open_root(&self.root, false, false);
         self.inner.take();
-        if let (Ok(namespace), Some(lease)) = (namespace, self.lease.as_ref()) {
-            if self.directories_pin.as_ref().is_none_or(|directories| {
-                directories.same_as(&namespace.directories).unwrap_or(false)
-            }) {
-                let _ = retire_owned(&namespace, &self.endpoint, lease.file(), &self.record);
+        let Some(lease) = self.lease.take() else {
+            return;
+        };
+        match ManagedNamespace::open_root(&self.root, false, false) {
+            Ok(namespace) => {
+                let _ = retire_listener_with_namespace(
+                    &namespace,
+                    self.directories_pin.as_ref(),
+                    &self.endpoint,
+                    &lease,
+                    &self.record,
+                );
             }
+            Err(NamespaceError::Busy) => {
+                let retirement = DropRetirement {
+                    lease,
+                    _gate_pin: self._gate_pin.take().expect("bound listener pins its gate"),
+                    directories_pin: self.directories_pin.take(),
+                    root: self.root.clone(),
+                    endpoint: self.endpoint.clone(),
+                    record: self.record.clone(),
+                };
+                let _ = std::thread::Builder::new()
+                    .name("c2-local-drop-retire".into())
+                    .spawn(move || retirement.run());
+            }
+            Err(_) => {}
         }
-        // Retire (or a missed gate) leaves the record for the reaper; in both
-        // cases the lease flock must not survive this listener.
-        self.lease.take();
     }
     /// Test-only: simulate a process exit without destructors, leaving the
     /// socket and its complete record behind while releasing the lease flock.
@@ -1597,7 +1640,7 @@ fn bind_at(
         record,
         root: root.to_owned(),
         lease: Some(lease),
-        _gate_pin: gate_pin,
+        _gate_pin: Some(gate_pin),
         directories_pin: namespace
             .directories
             .split()

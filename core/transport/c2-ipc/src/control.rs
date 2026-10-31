@@ -337,7 +337,7 @@ pub fn shutdown_with_endpoint(
                     if flags & FLAG_SIGNAL == 0 || flags & FLAG_RESPONSE == 0 {
                         return Ok(unacknowledged());
                     }
-                    return Ok(decode_shutdown_ack(&payload).unwrap_or_else(|_| unacknowledged()));
+                    return decode_shutdown_ack(&payload).map_err(IpcError::Protocol);
                 }
                 Exchange::DispatchUncertain => return Ok(unacknowledged()),
                 Exchange::NotSent => {
@@ -635,6 +635,45 @@ mod tests {
             assert!(result.acknowledged && result.shutdown_started && !result.server_stopped);
             assert!(result.route_outcomes.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn malformed_shutdown_ack_is_protocol_error() {
+        #[cfg(unix)]
+        let root = tempfile::Builder::new()
+            .prefix("c2m2")
+            .tempdir_in("/tmp")
+            .unwrap();
+        #[cfg(unix)]
+        let context = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            LocalEndpointContext::with_unix_root(root.path()).unwrap()
+        };
+        #[cfg(windows)]
+        let context = LocalEndpointContext::default_for_platform().unwrap();
+        let endpoint = context.endpoint(&address("malformed-ack")).unwrap();
+        let mut listener = LocalListener::bind(&endpoint).unwrap();
+        let shutdown =
+            tokio::task::spawn_blocking(move || shutdown_with_endpoint(&endpoint, PROBE_BUDGET));
+        let mut stream = listener.accept().await.unwrap();
+        let (_, request) = read_reply(&mut stream).await.unwrap();
+        assert_eq!(request, encode_shutdown_initiate());
+        stream
+            .write_all(&frame::encode_frame(
+                0,
+                FLAG_SIGNAL | FLAG_RESPONSE,
+                b"malformed shutdown acknowledgement",
+            ))
+            .await
+            .unwrap();
+        drop(stream);
+        let result = shutdown.await.unwrap();
+        crate::tests::close_listener(listener).await;
+        assert!(
+            matches!(result, Err(IpcError::Protocol(_))),
+            "malformed shutdown ACK must fail parsing: {result:?}"
+        );
     }
 
     #[test]
