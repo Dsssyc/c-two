@@ -260,15 +260,17 @@ def test_generated_node_early_chunk_rejection_stops_upload_and_reconnects_once(
             rejected = node.request("large")
             _reject(rejected)
             assert rejected["error"]["name"] == "C2CrmMethodError", rejected
-            # Either native limit may win the first-reply race. Neither a
-            # client-side preflight refusal nor close-induced I/O is acceptable.
+            # The first-chunk size check and the global chunk-processing
+            # permit check can race to reply. Both are native capacity
+            # refusals; client preflight and close-induced I/O cannot replace them.
             wire_error = rejected["error"]["payload"]
             assert wire_error.startswith("C2E1"), rejected
             native_error = json.loads(wire_error[4:])
             assert native_error["version"] == 1 and native_error["details"] == {}
             assert (native_error["code"], native_error["name"], native_error["message"]) in (
-                (713, "ProtocolViolation",
-                 "chunked call reassembly admission failed: total_chunks 16384 exceeds limit 2"),
+                (702, "ResourceUnavailable",
+                 "chunked call reassembly admission failed: "
+                 "reassembly size 67108864 exceeds limit 65536"),
                 (702, "ResourceUnavailable",
                  "server chunk processing capacity exceeded: max_total_chunks=2"),
             ), rejected
