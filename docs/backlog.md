@@ -58,6 +58,18 @@
 
 [账本](plans/2026-10-13-local-slimming-batches.md)里还有尚未单独验收的 R09、R10、R19、R21、R35，以及暂缓表中的各项。与复审重叠的，按复审第七节的修正处理，例如 R19 就是 H10，R26 与 R34 的保留结论已被修正；其余仍按账本写明的暂缓条件。
 
+## 盘点中发现的未完成事项
+
+2026-10-31 文档盘点从历史文档里找出、此前没有登记的事项。出处见[执行计划](plans/2026-10-31-docs-and-agents-restructure.md)第八节涉及的原文档。
+
+- **协议批一并处理：** 客户端的请求 id 计数器是 `AtomicU32`，线上格式是 u64，要核实传输时是否截断（`c2-ipc/src/client.rs`）；SHM 释放坐标无法认证，要在单一属主释放的详细设计里点名。
+- **relay：** relay-aware 调用没有每次调用的路由回执，`observed_route` 仍是连接时的值；relay 的 HTTP 响应仍整体物化，没有流式，与流式 RPC 一并考虑；HTTP 载荷的内存预算与消费生命周期只有设计提案，没有实施（`plans/2026-10-06-http-memory-budget.md`）。
+- **TypeScript：** 公共错误类不暴露 `pre_dispatch` 与 `dispatch_uncertain` 的区分；resolve 返回的 `route_revision` 应以十进制字符串保全 u64，现在只到 2^53−1，这是协议改动；无法解码不透明的响应 allocator。
+- **内存：** buddy 中间空洞的复用；探针退出后客户端 backing 仍能打开，这一现象待核实；逐处复制字节的归因测量（`plans/2026-09-26-memory-policy.md` 的遗留项）。
+- **发版敏捷性方案 B：** B1 候选重整、B2 删除约 8 千行（`tools/local_rc` 与 `local-endpoint-validation.yml` 仍在）、B3 FastDB 版本只写一处、B5 精简各条线的 gate、B6 修 `PROBE_BUDGET` 的偶发失败；决定 3、7 待定（`plans/2026-10-30-release-agility-review.md` 第三、四节）。
+- **瘦身账本条目边界表里的余项：** R17 的 gate/context 与目录 pin 的错误分类；R06 回调重入导致自锁的风险；R13 写锁前取消时保留未发布的分配；R16 完整的 Node→Core 投影迁移；R29、R32、R33 的剩余，含孤立的 `wrap_error`；两份控制会话重构；C04；R14 与 C03 的剩余；R07：`abandoned_releases` 出现非零时重新评估。与复审重叠的部分按复审第七节处理。
+- **要核实的保证：** 旧 Python 服务端用写屏障保证同一连接内先写后读的顺序，当时的规格说 Rust 有等价机制，但现行文档没写，`c2-server` 里也没找到。查清楚之后，要么写进文档，要么确认已经不再保证。
+
 ## 将来
 
 - **流式 RPC**（[路线图](roadmap.zh-CN.md)第 7 项）：用户确认这是必备能力。排在协议批之后；设计要回答单一属主评估"与流式 RPC 的关系"一节列出的八个问题。
@@ -65,7 +77,8 @@
 ## 待用户决定
 
 - 配置项的逐项表。
-- 文档重组第二步：盘点之后的清退清单；`CONTEXT.md` 的词条。
+- 文档重组第二步：盘点之后的清退清单（[执行计划](plans/2026-10-31-docs-and-agents-restructure.md)第八节）；`CONTEXT.md` 的词条。
+- 704 `StaleResource` 与 706 `WriteConflict`：错误码已登记，但生产代码从不产生。它们原本属于 relay mesh 的第二、三阶段（副本写协调、读到过期副本时的策略、数据刷新），这两个阶段从没实现，路线图里也没有。是写进路线图，还是删掉这两个码。
 - 所有者子系统是否删除。
 - relay 轮询的间隔。
 - `/_admin/unregister` 有没有人手动使用（F7）。

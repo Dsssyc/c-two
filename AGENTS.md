@@ -73,8 +73,8 @@ C2_RELAY_ANCHOR_ADDRESS= uv run pytest sdk/python/tests/ -q --timeout=30
 uv run python examples/python/local.py
 
 # IPC example, two terminals
-uv run python examples/python/crm_process.py
-uv run python examples/python/client.py <address>
+uv run python examples/python/ipc_resource.py
+uv run python examples/python/ipc_client.py <address>
 
 # Relay mesh example, three terminals
 python tools/dev/c3_tool.py --build --link
