@@ -1,5 +1,7 @@
 # CI and release qualification
 
+This reference owns source validation, release candidate qualification, and artifact promotion.
+
 Daily validation, release qualification and publication are separate stages. A normal pull request or main-branch push does not build the 35-wheel release matrix and cannot publish anything. Publishing promotes verified bytes; it does not compile them again.
 
 | Stage | Trigger | Required evidence | Can publish? |

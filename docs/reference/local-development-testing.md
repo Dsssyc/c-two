@@ -1,5 +1,7 @@
 # Local development test sidecar
 
+This guide owns shared macOS/Unix and Windows development test preparation, execution, and retained evidence.
+
 `tools/dev/test_local.py` shares the local Python executor with macOS/Unix and Windows. It is an explicit development entry, separate from `tools/ci/source_validation.py` and the release workflows. Local reports are development evidence; they do not certify publication, standard-user release installation, or hosted CI success.
 
 ## Tools and platform preparation
@@ -52,7 +54,7 @@ Windows children also set `MSBUILDDISABLENODEREUSE=1` so completed CMake/MSBuild
 
 The initial implementation is verified on a Windows development machine. macOS command compatibility and the Unix backend have regression coverage, but actual macOS execution must be recorded separately; Windows results do not prove a macOS run.
 
-The initial Windows per-suite results and retained failure investigations are recorded in [the verification report](reports/2026-10-10-local-test-sidecar-windows.md).
+The initial Windows per-suite results and retained failure investigations are recorded in [the verification report](../reports/2026-10-10-local-test-sidecar-windows.md).
 
 
 ## Review fixes: source identity and preparation failures
@@ -62,3 +64,7 @@ The sidecar records `source_identity_before` before preflight and retains that s
 Every accepted new output directory gets `run.json`, including validation, preflight, planning and cancellation failures. The report includes `phase`, error and completion time. Existing evidence directories are never overwritten. Commands launched by the sidecar resolve against the child tool PATH to absolute executables; reports record the actual selected executable.
 
 `prepare --suite core` and `all` install locked npm dependencies with scripts disabled in the actual sibling `../fastdb/ts/fastdb4ts` consumed by the Rust Core TypeScript contract tests. This requires Node/npm and the sibling package manifest and lockfile. `--fastdb-source` continues to select the separate source for staged WASM preparation; it does not change the Core tests' sibling path. Core check/prepare/run require this actual sibling to be a clean Git checkout at the pinned FastDB commit, with the payload source entrypoint present. Linked Git worktrees are supported; index flags `assume-unchanged` and `skip-worktree` are rejected because they can hide source edits. Preflight records the checkout path, HEAD, tracked diff/content hashes, worktree status, index flags and payload entrypoint hash; final validation records and compares the source identity again. Core run preflight also verifies TypeScript 5.9.3 and fingerprints the compiler package. Sibling leases protect capture, preparation and Core execution; source identity and compiler inputs are checked before/after Core consumption so a change after preflight cannot produce passing evidence.
+
+## Endpoint namespace isolation
+
+`C2_IPC_ROOT` is configuration, not an isolation boundary for the complete Rust relay suite: some fixtures explicitly derive the platform-default namespace while others resolve the environment. Do not override it globally to isolate those fixtures. When the host's historical namespace must remain untouched, run that suite in a clean runner; local targeted fixtures must explicitly use the same task-owned context on both ends. `LocalStream::pair()` also derives the platform default through `LocalEndpoint::from_address()` and ignores `C2_IPC_ROOT`; an isolated probe must explicitly pass its task-owned `LocalEndpointContext` into both endpoints rather than treating that environment variable as sufficient.

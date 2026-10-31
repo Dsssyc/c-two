@@ -4,7 +4,7 @@
 
 这是 C-Two 0.x 的当前维护路线图，以 C-Two 0.10.1 / c3 0.6.0 为源码基线。FastDB 固定 0.2.4。Rust SDK/Core/TypeScript 保持独立的 0.1.0 版本，无 C-Two crates.io/npm 发布。当前 API 边界和发行范围见[0.10.0 更新与迁移说明](releases/0.10.0.md)。
 
-当前用法见[生命周期接入](local-endpoint-lifecycle.md)与[内存策略](memory-policy.md)。正式候选矩阵为 35 wheel、1 sdist 和 6 CLI target，包含原生 Windows ARM64。[CI 与发行流程](ci-cd.md)区分源码验证、包验证与发布；各次发行保留确切源码与产物收据。
+当前用法见[生命周期接入](reference/local-endpoint-lifecycle.md)与[内存策略](reference/memory-policy.md)。正式候选矩阵为 35 wheel、1 sdist 和 6 CLI target，包含原生 Windows ARM64。[CI 与发行流程](reference/ci-cd.md)区分源码验证、包验证与发布；各次发行保留确切源码与产物收据。
 
 Portable-payload 架构与历史本地候选参考为：
 

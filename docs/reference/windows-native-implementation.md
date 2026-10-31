@@ -1,10 +1,12 @@
 # Windows native implementation
 
+This reference owns the Windows native transport, memory, endpoint identity, and implementation validation boundaries.
+
 Windows development machines can use the [shared local test sidecar](local-development-testing.md), which reuses the macOS/Unix Python executor with native Windows process and file-lock adapters. Its development reports are separate from the historical hosted and formal release evidence below.
 
 ## C-Two 0.10.1 release (2026-10-30)
 
-C-Two 0.10.1 writes the `cc.serve()` banner and shutdown messages as ASCII with stdout's own encoding, so a server whose output goes to a pipe or file under the ANSI code page (for example cp1252 or GBK) no longer exits with `UnicodeEncodeError`. Its regression test runs a subprocess `cc.serve()` without UTF-8 mode, including the Windows default code page. The CRM template generator and the contract export that `c3 contract` runs now read and write UTF-8 regardless of the code page; see the [patch notes](releases/0.10.1.md). Protocols and formats are unchanged from 0.10.0.
+C-Two 0.10.1 writes the `cc.serve()` banner and shutdown messages as ASCII with stdout's own encoding, so a server whose output goes to a pipe or file under the ANSI code page (for example cp1252 or GBK) no longer exits with `UnicodeEncodeError`. Its regression test runs a subprocess `cc.serve()` without UTF-8 mode, including the Windows default code page. The CRM template generator and the contract export that `c3 contract` runs now read and write UTF-8 regardless of the code page; see the [patch notes](../releases/0.10.1.md). Protocols and formats are unchanged from 0.10.0.
 
 ## C-Two 0.10.0 release (2026-10-30)
 
@@ -14,52 +16,27 @@ Windows endpoint naming is fixed and does not vary with the protocol or package 
 
 ## C-Two 0.9.0 release (2026-10-25)
 
-C-Two 0.9.0 introduced TokenUser scope across logons, verifies connected pipe ownership and a server of at least Medium integrity before sending, and uses existing owned/inline/chunked transfer across sessions that cannot share Local mappings. IPC 13 and C/FFI ABI 6 require coordinated upgrades; SHM 3 and owner control 1 retain their formats. The [release notes](releases/0.9.0.md) describe the API changes and the [acceptance record](reports/2026-10-25-090-windows-release-acceptance.md) binds the actual Windows developer-host, second-account, cross-session, hosted ARM64 and publication evidence.
+C-Two 0.9.0 introduced TokenUser scope across logons, verifies connected pipe ownership and a server of at least Medium integrity before sending, and uses existing owned/inline/chunked transfer across sessions that cannot share Local mappings. IPC 13 and C/FFI ABI 6 require coordinated upgrades; SHM 3 and owner control 1 retain their formats. The [release notes](../releases/0.9.0.md) describe the API changes and the [acceptance record](../reports/2026-10-25-090-windows-release-acceptance.md) binds the actual Windows developer-host, second-account, cross-session, hosted ARM64 and publication evidence.
 
 The stages and chronological evidence below retain the claims and open items of their original revisions. They do not define a second supported logon-scoped mode.
 
 ## C-Two 0.8.0 source (2026-10-22)
 
-The active dependency pins now select FastDB 0.2.4, source
-`f82fa13adeae2b87a295bf984821c85c44b55a3d`, for Python, Rust, native source builds
-and the official CoreSDK. The existing SDK preparation helper also recognizes
-its `aarch64-pc-windows-msvc` bundle and requires the same verified
-`lib/fastdb.dll` and `lib/fastdb.lib` pair as Windows x64. C-Two's release gates
-now include native Windows 11 ARM64 source validation, five Python ABI rows
-from 3.11 through 3.14t, an ARM64 c3 executable and standard-user consumers.
-The gates check native Python, Rust and Node architecture before execution;
-FastDB availability alone is not accepted as runtime evidence.
-Published 0.7.6 keeps its historical `fastdb4py==0.2.2` extra; the
-source/run records below retain their actual FastDB inputs.
+The active dependency pins now select FastDB 0.2.4, source `f82fa13adeae2b87a295bf984821c85c44b55a3d`, for Python, Rust, native source builds and the official CoreSDK. The existing SDK preparation helper also recognizes its `aarch64-pc-windows-msvc` bundle and requires the same verified `lib/fastdb.dll` and `lib/fastdb.lib` pair as Windows x64. C-Two's release gates now include native Windows 11 ARM64 source validation, five Python ABI rows from 3.11 through 3.14t, an ARM64 c3 executable and standard-user consumers. The gates check native Python, Rust and Node architecture before execution; FastDB availability alone is not accepted as runtime evidence. Published 0.7.6 keeps its historical `fastdb4py==0.2.2` extra; the source/run records below retain their actual FastDB inputs.
 
 ## Historical validation status (2026-10-07)
 
-Python c-two 0.7.0 and c3 0.3.0 are the coordinated runtime baseline,
-with FastDB 0.2.1 as the official dependency. The release notes describe the
-formal package gates and source manifest. The retained development
-[canonical validation](reports/canonical-local-endpoint-validation.md) binds
-C-Two `e49652e85a384f1dd3489f393c13f4d9fff27f9f` and FastDB
-`4f99f86a662b0e950a0dd29800c25a1c9fca4def`:
-[Windows run 37559074657](https://github.com/Dsssyc/c-two/actions/runs/37559074657)
-passes four jobs, 23/23 full gates per OS, strict 18 Rust/Python and 12 TypeScript
-rows, ordinary/non-administrator wheel consumption and account/process/temp
-cleanup. Those wheels still identify as 0.6.0; this is source-development
-acceptance, not 0.7 formal package evidence.
+Python c-two 0.7.0 and c3 0.3.0 are the coordinated runtime baseline, with FastDB 0.2.1 as the official dependency. The release notes describe the formal package gates and source manifest. The retained development [canonical validation](../reports/canonical-local-endpoint-validation.md) binds C-Two `e49652e85a384f1dd3489f393c13f4d9fff27f9f` and FastDB `4f99f86a662b0e950a0dd29800c25a1c9fca4def`: [Windows run 37559074657](https://github.com/Dsssyc/c-two/actions/runs/37559074657) passes four jobs, 23/23 full gates per OS, strict 18 Rust/Python and 12 TypeScript rows, ordinary/non-administrator wheel consumption and account/process/temp cleanup. Those wheels still identify as 0.6.0; this is source-development acceptance, not 0.7 formal package evidence.
 
-The current source uses one TokenUser-scoped Named Pipe backend with a non-inheritable Global listener lease. Connections verify the actual pipe owner and server process before sending; the server must be at least Medium integrity. Cross-session payloads use negotiated owned/inline/chunked paths instead of Local mappings. See the [0.9.0 migration](releases/0.9.0.md) and [design boundary](plans/2026-10-24-windows-user-scope-ipc.md). Rust owns endpoint derivation,
-Persistent/OwnerBound lifecycle, drain and maintenance; credential protocol
-values are format metadata. See [usage](windows-native-usage.md),
-[lifecycle](local-endpoint-lifecycle.md) and [0.7 release notes](releases/0.7.0.md).
-Formal release-package validation is separate from this development evidence.
+The current source uses one TokenUser-scoped Named Pipe backend with a non-inheritable Global listener lease. Connections verify the actual pipe owner and server process before sending; the server must be at least Medium integrity. Cross-session payloads use negotiated owned/inline/chunked paths instead of Local mappings. See the [0.9.0 migration](../releases/0.9.0.md) and [design boundary](../plans/2026-10-24-windows-user-scope-ipc.md). Rust owns endpoint derivation, Persistent/OwnerBound lifecycle, drain and maintenance; credential protocol values are format metadata. See [usage](windows-native-usage.md), [lifecycle](local-endpoint-lifecycle.md) and [0.7 release notes](../releases/0.7.0.md). Formal release-package validation is separate from this development evidence.
 
 ## Historical implementation record
 
-The sequence and evidence log below preserve the earlier source/run status.
-Their pending statements are historical and are not current publication claims.
+The sequence and evidence log below preserve the earlier source/run status. Their pending statements are historical and are not current publication claims.
 
-Status: the development implementation and hosted Windows x64 acceptance completed on 2026-09-25. [Final validation](reports/windows-native-final-validation.md) records four successful jobs on Windows Server 2022/2025, strict cross-language receipts, installed-wheel consumers under runner and non-administrator accounts, and downloaded artifact hashes. The tested source is C-Two `5cf96eafc4674f7961beb15b7a976cfee7f238d0` on `socu/windows-native-ipc`, paired with FastDB `6f03b1c9a0ffc8d9c205f9dcebb54ce698b9dff4` from [FastDB PR #37](https://github.com/world-in-progress/fastdb/pull/37). Later documentation commits are not artifact source commits. This is development-build acceptance; formal publication and the additional environments below remain separate work.
+Status: the development implementation and hosted Windows x64 acceptance completed on 2026-09-25. [Final validation](../reports/windows-native-final-validation.md) records four successful jobs on Windows Server 2022/2025, strict cross-language receipts, installed-wheel consumers under runner and non-administrator accounts, and downloaded artifact hashes. The tested source is C-Two `5cf96eafc4674f7961beb15b7a976cfee7f238d0` on `socu/windows-native-ipc`, paired with FastDB `6f03b1c9a0ffc8d9c205f9dcebb54ce698b9dff4` from [FastDB PR #37](https://github.com/world-in-progress/fastdb/pull/37). Later documentation commits are not artifact source commits. This is development-build acceptance; formal publication and the additional environments below remain separate work.
 
-The target architecture and evidence boundaries are recorded in [the analysis](reports/2026-09-24-windows-native-ipc-analysis.zh-CN.md). Work resumed on 2026-09-24 after FastDB 0.2.0 publication and the OIDC migration. The first baseline used the official release source `ceebed2edbef580ba0a42dcd28dadf9628894523`; the validated MSVC repair is an unreleased source input, not a replacement for that immutable release.
+The target architecture and evidence boundaries are recorded in [the analysis](../reports/2026-09-24-windows-native-ipc-analysis.zh-CN.md). Work resumed on 2026-09-24 after FastDB 0.2.0 publication and the OIDC migration. The first baseline used the official release source `ceebed2edbef580ba0a42dcd28dadf9628894523`; the validated MSVC repair is an unreleased source input, not a replacement for that immutable release.
 
 ## Sequence and acceptance
 
@@ -80,7 +57,7 @@ The wire transport carries a `u32` buddy backing generation with every SHM coord
 
 Peer caches identify a concrete slot/generation and reject older generations. They may replace a cached backing only when its allocator is unlocked, unpoisoned and has zero allocations. Releasing the last valid block also releases an idle peer cache mapping, while an outstanding held/borrowed lease keeps its allocation live. This provides the retirement boundary through the existing allocation ownership rather than an unbounded wait for a new ACK. Connection loss does not revoke a still-live local held owner. A stale generation never reinitializes or frees a newer backing.
 
-Shared allocator header version 3 stores the full process identifier in a 64-bit lock word with a separate panic-poison flag and records each live buddy allocation's level and instance id. IPC 12 and C/FFI ABI 5 introduced that id in request/response release and block descriptors; the current source IPC 14 / ABI 6 retain the same allocation-id contract. An old id cannot release a new allocation at the same offset. A dead holder leaves the backing locked: observers refuse access without writing that PID-only word, avoiding a race with PID reuse. A panicking holder poisons its own backing. No process steals the lock and resumes potentially partial allocator mutations. Retirement tries to acquire the same lock once before checking the allocation count; busy or poisoned counters cannot authorize it. See [allocator crash safety](reports/windows-allocator-crash-safety.md) for the retained lock policy and its original version-2 evidence.
+Shared allocator header version 3 stores the full process identifier in a 64-bit lock word with a separate panic-poison flag and records each live buddy allocation's level and instance id. IPC 12 and C/FFI ABI 5 introduced that id in request/response release and block descriptors; the current source IPC 14 / ABI 6 retain the same allocation-id contract. An old id cannot release a new allocation at the same offset. A dead holder leaves the backing locked: observers refuse access without writing that PID-only word, avoiding a race with PID reuse. A panicking holder poisons its own backing. No process steals the lock and resumes potentially partial allocator mutations. Retirement tries to acquire the same lock once before checking the allocation count; busy or poisoned counters cannot authorize it. See [allocator crash safety](../reports/windows-allocator-crash-safety.md) for the retained lock policy and its original version-2 evidence.
 
 This contract must be proven by a test retaining an old peer mapping while the producer reclaims and regrows the same slot, plus tests holding an active block across attempted retirement. If these invariants cannot be maintained through every receive/release path, the implementation must add an explicit retirement protocol before claiming this stage complete.
 
@@ -106,8 +83,8 @@ This contract must be proven by a test retaining an old peer mapping while the p
 - Final local regression after the listener/test corrections: Core workspace 960 tests and Rust SDK 10 tests pass. The locked generated Rust consumers additionally pass their 4-test suite and one cross-target generation test without a network fallback.
 
 - Run [36017573157](https://github.com/Dsssyc/c-two/actions/runs/36017573157), on `b39bc20f12e8603ec38fa594ce7109343f072761`, passed both local-platform gates (513 tests per OS). Console evidence records 21/22 full gates passing per OS, with `core-test` the sole failed gate: a proxy-environment test race on Windows 2022 and two route-withdrawal fixture status mismatches on Windows 2025. These are not a complete Core pass because Cargo stopped at each failing binary.
-- The next correction shares the existing process-environment lock between test readers and writers, and gives never-found/known-removed relay fixtures deterministic 404/410 paths. No production behavior or failure assertion is weakened. Host checks pass all 13 client-mode tests and the three affected relay tests; see [environment isolation](reports/windows-proxy-test-isolation.md) and [route withdrawal](reports/windows-route-removal-tests.md). Native Windows confirmation is pending the next run.
-- Final run [36034972057](https://github.com/Dsssyc/c-two/actions/runs/36034972057), on C-Two `5cf96eafc4674f7961beb15b7a976cfee7f238d0` and the same FastDB repair source, passes all four jobs. Each OS passes 22/22 full gates, 513 local-platform tests, 954 Core tests, 829 Python tests, strict 18-row Rust/Python and 12-row TypeScript receipts, and both installed-wheel consumers. Lifecycle and account/process/workspace cleanup pass. Downloaded ZIP digests, all recorded internal hashes and the retained executable's equality with every matrix/wheel receipt were verified. See [final validation](reports/windows-native-final-validation.md) for the exact evidence and release boundaries.
+- The next correction shares the existing process-environment lock between test readers and writers, and gives never-found/known-removed relay fixtures deterministic 404/410 paths. No production behavior or failure assertion is weakened. Host checks pass all 13 client-mode tests and the three affected relay tests; see [environment isolation](../reports/windows-proxy-test-isolation.md) and [route withdrawal](../reports/windows-route-removal-tests.md). Native Windows confirmation is pending the next run.
+- Final run [36034972057](https://github.com/Dsssyc/c-two/actions/runs/36034972057), on C-Two `5cf96eafc4674f7961beb15b7a976cfee7f238d0` and the same FastDB repair source, passes all four jobs. Each OS passes 22/22 full gates, 513 local-platform tests, 954 Core tests, 829 Python tests, strict 18-row Rust/Python and 12-row TypeScript receipts, and both installed-wheel consumers. Lifecycle and account/process/workspace cleanup pass. Downloaded ZIP digests, all recorded internal hashes and the retained executable's equality with every matrix/wheel receipt were verified. See [final validation](../reports/windows-native-final-validation.md) for the exact evidence and release boundaries.
 
 ## Historical coverage boundary (0.7 baseline)
 

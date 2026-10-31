@@ -1,6 +1,6 @@
 # IPC Memory Pressure And Backpressure
 
-This guide describes C-Two 0.10.1 / c3 0.6.0. See the [release notes](releases/0.10.0.md) for upgrades and release scope, and [memory policy](memory-policy.en.md) for configuration and retained-owner accounting.
+This guide describes C-Two 0.10.1 / c3 0.6.0. See the [release notes](releases/0.10.0.md) for upgrades and release scope, and [memory policy](reference/memory-policy.md) for configuration and retained-owner accounting.
 
 ## Current Model
 
@@ -29,24 +29,11 @@ The runtime protects memory use at three points:
 pool_segment_size * max_pool_segments
 ```
 
-Python resolved configuration dictionaries retain this derived output. Rust
-`BaseIpcConfig` stores only the two inputs; callers no longer initialize or
-update a separate `max_pool_memory` field. Resolver overflow errors retain
-their original order, before final configuration validation.
+Python resolved configuration dictionaries retain this derived output. Rust `BaseIpcConfig` stores only the two inputs; callers no longer initialize or update a separate `max_pool_memory` field. Resolver overflow errors retain their original order, before final configuration validation.
 
-The three finite budgets are `shm_backing_budget_bytes`,
-`file_backing_budget_bytes` and `live_reassembly_budget_bytes`; zero refuses
-positive reservations. Backing and reassembly are separate accounting units,
-not additive RSS measurements. Budget charges survive queueing, execution and
-hold until the actual storage is released, including retained owners after
-runtime shutdown.
+The three finite budgets are `shm_backing_budget_bytes`, `file_backing_budget_bytes` and `live_reassembly_budget_bytes`; zero refuses positive reservations. Backing and reassembly are separate accounting units, not additive RSS measurements. Budget charges survive queueing, execution and hold until the actual storage is released, including retained owners after runtime shutdown.
 
-Buddy reuse/expansion, dedicated SHM and checked chunked IPC remain the transport
-fallback model, with file spill where receiving-side storage supports it.
-Default buddy allocation is lazy; `pool_enabled=False` skips buddy while
-keeping dedicated mappings and the other fallback paths. File spill is not a
-guarantee for every resource or call path. Chunking completes a request before
-resource invocation; it does not expose streaming business methods.
+Buddy reuse/expansion, dedicated SHM and checked chunked IPC remain the transport fallback model, with file spill where receiving-side storage supports it. Default buddy allocation is lazy; `pool_enabled=False` skips buddy while keeping dedicated mappings and the other fallback paths. File spill is not a guarantee for every resource or call path. Chunking completes a request before resource invocation; it does not expose streaming business methods.
 
 ## Failure Semantics
 

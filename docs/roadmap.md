@@ -4,7 +4,7 @@ Status refreshed: 2026-10-29; product ordering retains the July design prioritie
 
 This is the maintained roadmap for C-Two's 0.x line, using C-Two 0.10.1 / c3 0.6.0 as the source baseline. FastDB is pinned to 0.2.4. Rust SDK/Core/TypeScript retain independent 0.1.0 versions with no C-Two crates.io/npm publication. See the [0.10.0 release and migration notes](releases/0.10.0.md) for the current API boundaries and release scope.
 
-Current usage is documented in [lifecycle integration](local-endpoint-lifecycle.en.md) and [memory policy](memory-policy.en.md). The release qualification matrix contains 35 wheels, one sdist and six CLI targets, including native Windows ARM64. [CI and release qualification](ci-cd.md) distinguishes source validation, package validation and publication; each release retains its exact source and artifact receipts. Portable-payload architecture and historical local-candidate references are:
+Current usage is documented in [lifecycle integration](reference/local-endpoint-lifecycle.md) and [memory policy](reference/memory-policy.md). The release qualification matrix contains 35 wheels, one sdist and six CLI targets, including native Windows ARM64. [CI and release qualification](reference/ci-cd.md) distinguishes source validation, package validation and publication; each release retains its exact source and artifact receipts. Portable-payload architecture and historical local-candidate references are:
 
 1. [`2026-07-24 portable-payload contract composition design`](./superpowers/specs/2026-07-24-portable-payload-contract-composition-design.md)
 2. [`2026-07-24 Rust SDK and local-candidate design`](./superpowers/specs/2026-07-24-rust-sdk-portable-payload-local-release-candidate-design.md)

@@ -1,0 +1,71 @@
+# Runtime lifecycle
+
+This reference owns native Runtime sessions, Python binding projections, registration, startup, connection deadlines, shutdown, and connection observations.
+
+## Runtime authority and Python bindings
+
+Runtime configuration is owned by Rust Core and projected into SDKs through the native session. Rust `c2-core::Runtime` owns its instance server identity, canonical `ipc://` address derivation, server IPC override storage/projection, direct IPC client acquire/release, client IPC config projection/freeze, route registration transactions, unregister/shutdown transaction outcomes, relay projection, relay-backed name resolution, explicit HTTP relay contract validation, and low-level HTTP client pool projection. Python exposes that authority through its native `RuntimeSession` projection and may expose typed override facades, but must not keep separate `_server_ipc_overrides`, `_client_config`, `_client_ipc_overrides`, `_pool_config_applied`, server-id, server-address, direct `RustClientPool` or `RustHttpClientPool` authority, `_http_pool`, `_rollback_registration`, relay control-client caches, or independent route unregister/shutdown ordering authority in `registry.py`. Python still owns Python CRM local bindings and invokes `@on_shutdown` callbacks exactly once from native structured outcomes.
+
+Path: `sdk/python/src/c_two/transport/`
+
+The Python transport layer is a thin orchestration shell around a Rust-native core. Python handles CRM registration, Python callback dispatch, serialization orchestration, and same-process direct-call glue. Rust handles IPC, wire framing, SHM, response allocation/transport selection, route concurrency enforcement, runtime session state, HTTP relay transport, and relay-aware route fallback. Response allocation must enforce native IPC payload limits before allocating owned fallback buffers, skip buddy SHM when buddy wire metadata cannot represent the payload, and use checked chunked fallback rather than truncating frame or chunk metadata.
+
+| File | Purpose |
+| --- | --- |
+| `registry.py` | Public `cc.Runtime()` owns independent Python bindings over one native session; module-level registration, connection, shutdown and setters use the default Runtime. `cc.close(proxy)` follows the proxy's owner. |
+| `wire.py` | `MethodTable` for Python resource method dispatch |
+| `server/native.py` | `NativeServerBridge` exported as `Server` |
+| `server/scheduler.py` | `ConcurrencyConfig` facade plus thin native route-concurrency adapter for same-process direct calls |
+| `server/reply.py` | `unpack_icrm_result` and `wrap_error` |
+| `client/proxy.py` | `CRMProxy` for thread-local, IPC, and HTTP modes |
+| `client/util.py` | Thin native-backed `ping()` and `shutdown()` probes for direct IPC |
+
+`registry.py` asks native `RuntimeSession.ensure_server_bridge()` for the server bridge, `RuntimeSession.acquire_ipc_client()` for direct IPC clients, `RuntimeSession.connect_explicit_relay_http()` for explicit HTTP relay clients, and `RuntimeSession.connect_via_relay()` for relay name resolution. It consumes native unregister/shutdown outcomes before mutating Python local bindings. Do not reintroduce `_relay_control_client`, `_relay_control_address`, `_relay_control_client_for()`, `_http_pool`, direct `RustHttpClientPool.instance()`, or direct construction of `RustRelayAwareHttpClient` in `registry.py`.
+
+An explicit Python `Runtime` owns its code overrides and native session; it does not inherit the default Runtime's code overrides. Process environment and `.env` remain common resolver inputs. Instance `start()` uses the existing native readiness/PONG path, including for an empty Host. `cc.serve()` alone manages process signals for the default Runtime; explicit instances are shut down by their callers. A completed shutdown replaces that instance's native session under the existing handoff rules; old event subscriptions stay with their old source. Custom endpoint directories remain application-owned. Do not add a Runtime context manager, `Runtime.serve()`, a global instance registry, or automatic directory deletion.
+
+Failed Host startup cleanup is observed through the concrete attempt's existing `ShutdownTransaction` receipt. NativeSession retains it under its original Host ownership lock, preferring it over an empty hostless result or an older Host outcome; pending and terminal-with-error are distinct. Release the Host lock before reattaching the Python GIL. Do not add a Python pending/closed state, a second cleanup transaction, or a scan that merges historical outcomes.
+
+## Transport projections
+
+Transport modes:
+
+- Thread-local: same-process `cc.connect()` returns a zero-serialization proxy. It passes Python objects directly and may use the native route-concurrency handle through a thin Python adapter; do not route this path through Rust bytes dispatch for symmetry.
+- IPC (`ipc://`): Rust `c2-local` owns local streams (Unix UDS or Windows byte-mode Named Pipes), while `c2-mem` owns POSIX SHM or Windows named mappings. `c2-config::LocalEndpoint` derives the OS endpoint from the logical address; SDKs must use that authority. Remote IPC concurrency semantics and route capacity limits belong to Rust `c2-server`; Python only projects the native handle for same-process calls. The RPC IPC handshake is version 14 and opens with the permanent fixed 25-byte version preamble (see `docs/reference/ipc-handshake.md`): native identity checks precede the preamble, un-negotiated CALL/ordinary-CTRL frames are fenced until the final metadata ACK, a complete `VersionMismatch` is a typed terminal error with no route/HTTP fallback and no retry, and handshake-13-or-older peers (0.9.x and older wheels) are incompatible with no compatibility path.
+- HTTP (`http://`): relay-based cross-machine transport through Rust.
+
+## Connection deadlines
+
+Optional connection deadlines belong to Core. `cc.connect(..., timeout=...)` creates one native `ConnectAttempt` before SDK binding locks; the same absolute deadline covers singleton/registry/local-slot/relay override waits, pools, OS connection, handshake and live route/relay acquisition. SDKs project the attempt and never restart its budget, implement their own timer or leave a waiting thread after returning. Omitted/None retains existing phase guards; zero expires before transport. Connect expiry uses `CallDeadlineExceeded` with `operation=connect`, `transport_phase=pre_dispatch` and `stage`; it cannot execute or replay a business method. Preserve healthy shared clients on waiter expiry and isolate partial control writes.
+
+## Startup and readiness
+
+Startup wait configuration also belongs to Core: Python `cc.set_server(startup_timeout=...)` and native `RuntimeSession` project seconds into `RuntimeOptions.server_startup_timeout`; explicit Rust `HostOptions.with_startup_timeout` wins, then the Runtime value, then the finite five-second default. Server options freeze atomically on the first Host start attempt, including failure, and pre-use session replacement must preserve the timeout. `ServerStartupTimeout` survives the lifecycle watch and projects as `CoreError.lifecycle_kind='startup_timeout'`, with stage and configured seconds; deadline failures have no OS cause. Native shutdown cleanup retains its own budget after startup expiry. Do not reintroduce a Python timer, readiness polling, or the `config error` label on a `ServerError::Failed`.
+
+Server lifecycle/readiness belongs to Rust. Python `NativeServerBridge` may expose `start()`, `is_started()`, and shutdown facades, but must delegate readiness to native `RustServer.start_and_wait()` and native state projection. Do not reintroduce Python socket-file polling, `os.path.exists(socket_path)` readiness checks, or Python-owned `_started` authority. Each native start attempt must be fenced in Rust before readiness waiters run: reset stale `Stopped` / `Failed` lifecycle state and the one-shot shutdown signal, then observe readiness for that attempt. A Rust `Server` may only unlink its IPC socket path after that concrete instance successfully bound the socket; failed duplicate startups must not remove another server's active socket path. Bridge shutdown must still drive the idempotent native runtime barrier through `RuntimeSession.shutdown()` so the PyO3 runtime handle drains even when native lifecycle state is already stopped by an external direct IPC shutdown signal. That native runtime barrier is a lifecycle fence: after it returns, runtime-owned server work must be terminal (`Initialized`, `Stopped`, or `Failed`) so a following start attempt does not observe stale `Stopping` state.
+
+`NativeServerBridge` (exported as Python `Server`) is bound to one `RuntimeSession` at construction. Identity, IPC overrides and relay settings belong to that session; bridge operations cannot replace it or select a per-operation relay anchor. Keep configuration preflight at bridge construction without retaining a Python config snapshot. `start()` has no timeout argument; the actual `shutdown(timeout=...)` budget and structured completion handling remain. Independent low-level hosts must configure their session explicitly; the process registry obtains its bridge through `RuntimeSession.ensure_server_bridge()`.
+
+## Shutdown authority
+
+Direct IPC `shutdown("ipc://...")` under `c_two.transport.client.util` is an admin/control-plane helper for high-privilege same-host supervisors of `Persistent` hosts. `OwnerBound` hosts reject ordinary admin shutdown with the existing negative ACK, including pre-handshake and duplicate initiate requests; their current owner uses `OwnerControl.request_shutdown()`. Trusted in-process `Runtime.shutdown()` / `cc.shutdown()` retains its authority. An accepted shutdown ACK proves initiation only, without proving that active callbacks have drained or shutdown hooks are safe to run. Completion and route close outcomes must be observed through `RuntimeSession.shutdown()` / bridge barriers or a future explicit wait helper. Future name-based or HTTP/relay-propagated shutdown must be designed as an explicit authenticated admin control plane with clear route-level vs server-level scope, not as a hidden normal RPC side effect.
+
+## Session retirement
+
+- For the Python SDK, explicit `Runtime.shutdown()` / `cc.shutdown()` starts the Core Runtime's single permanent retirement scope, sealing its client pool and refusing new register/start/remote-connect work; pending retains the old session and slots until a later SDK shutdown consumes the completed receipt and hands off a replacement. The zero/short caller budget does not cancel its driver. Expiry before handoff is `shutdown_wait_timeout` with stage and timeout details, not pending. Python instance-lock wait remains outside the deadline; after acquisition, Native Host, Core and pool waits share one absolute deadline. The connect publication check uses the original connect deadline and never retries; normal successful client reuse is unchanged. Low-level Rust/Native Host shutdown remains restartable. Core exposes `RuntimeShutdownTarget` borrowing `Host`, `FailedStartShutdownReceipt` or `ClientsOnly`, `RuntimeShutdownReceipt`, and `begin_session_retirement(..., deadline) -> Result<_, LifecycleError>`; `retirement_receipt(deadline)` observes the same scope. Keep the `FailedStartShutdownReceipt`'s concrete cleanup role, and use `Host.shutdown_outcome_until(deadline)` for bounded observation of its existing journal. Listener closure, work drain and retained payload leases are distinct; HTTP-only retirement creates no IPC pool and promises no physical closure of every HTTP keepalive socket. Shutdown error projection and hooks run outside the binding lock; hooks run after replacement, and failed replacement retains original slots/journal. These Runtime retirement semantics do not alter IPC 14, SHM 3 or C/FFI ABI 6; R07 final Drop remains separate.
+
+- An SDK shutdown returning `completed=False` retains the old bridge and routes as well as the session and shutdown slots until a later SDK shutdown consumes the completed receipt and replaces the session.
+
+- `RuntimeShutdownReceipt` exposes `observe_until(deadline)` and `terminal_outcome()` after `Runtime::retirement_receipt(deadline)` retrieves the existing scope.
+
+- The `runtime_retired` lifecycle error has no I/O cause, and Python numeric strings are no longer accepted as shutdown timeout inputs.
+
+- Retirement refusal and shutdown-begin exception projection run outside the Python binding lock; shutdown hooks run outside it only after replacement.
+
+- A failed-start result and later retirement outcome must be retained separately. Incomplete or failed cleanup must not be hidden by the startup exception; NativeSession observes the original transaction for that concrete Server, including terminal errors.
+
+- The historical [public Runtime acceptance record](../reports/2026-10-28-public-runtime-acceptance.md) covers its original acceptance scope and does not itself validate the later Runtime retirement scope.
+
+## Connection observations
+
+Connection observations share the existing native terminal publisher. `Runtime.connection_events()` / `c_two.observe.connection_events()` includes managed outgoing and accepted IPC connections with a client/server side; it creates no host or configuration authority. Python waits only through `ConnectionEvents.recv()`, releases the GIL, and may close that subscription from another thread. Do not restore Python `wait_closed()` or its Core blocking bridge, or add per-connection observation workers. Snapshots and the existing Rust async close barrier retain their terminal metadata and no payload/transport ownership.

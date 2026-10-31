@@ -1,6 +1,10 @@
 # Python SDK usage
 
-This guide describes the Python APIs of C-Two 0.10.1 / c3 0.6.0; the [0.10.0 release notes](releases/0.10.0.md) describe the migration from 0.9.x, including `cc.Runtime()`, `cc.endpoint.server_credential()`, Unix schema 4 and the additional binding reason. CRM contracts expose stateful resources over same-process calls, local IPC and HTTP relay; portable Python payloads use the optional FastDB 0.2.4 extra. For installation and a runnable introduction, see the [quickstart](../README.md#quickstart).
+This guide describes C-Two 0.10.1 / c3 0.6.0 Python SDK usage, including CRM authoring, calls, portable FastDB 0.2.4 payloads, and Runtime ownership.
+
+English · [简体中文](python-usage.zh-CN.md)
+
+The [0.10.0 release notes](../releases/0.10.0.md) describe migration from 0.9.x, including `cc.Runtime()`, `cc.endpoint.server_credential()`, Unix schema 4 and the additional binding reason. CRM contracts expose stateful resources over same-process calls, local IPC and HTTP relay; portable Python payloads use the optional FastDB 0.2.4 extra. For installation and a runnable introduction, see the [quickstart](../../README.md#quickstart).
 
 ## Portable payloads (FastDB)
 
@@ -65,7 +69,7 @@ A portable method carries zero or one `Payload` envelope in each direction; C-Tw
 
 `cc.hold(echo.echo)(source)` retains a response as `HeldResult`. Explicit `release()` first attempts FastDB invalidation once, then releases native storage. When native cleanup fails, the original response stays with the result for another `release()` call; invalidation does not replay and the value stays inaccessible. Release an additional exported memoryview before retrying an export rejection, which occurs before invalidation. Manually constructed `HeldResult(release_cb=...)` callbacks still run once. Use `with cc.hold(...) as held` for normal scopes and materialize values that must outlive them.
 
-`cc.observe.memory_stats()` includes `abandoned_releases` in each native memory scope. Final consuming cleanup failures retain unreturned charges and count one abandoned obligation, with the error returned or logged by its native carrier. No background recovery runs. The counter includes uncertain published SHM outcomes that a peer may later release. An abnormal same-user SHM peer can assert invalid, replayed or stale allocation coordinates; unreleaseable asserted references also count and can make this counter exceed actual unreleased allocations. See [memory policy](memory-policy.en.md#statistics-and-payload-lifetime) for its accounting limits.
+`cc.observe.memory_stats()` includes `abandoned_releases` in each native memory scope. Final consuming cleanup failures retain unreturned charges and count one abandoned obligation, with the error returned or logged by its native carrier. No background recovery runs. The counter includes uncertain published SHM outcomes that a peer may later release. An abnormal same-user SHM peer can assert invalid, replayed or stale allocation coordinates; unreleaseable asserted references also count and can make this counter exceed actual unreleased allocations. See [memory policy](memory-policy.md#statistics-and-payload-lifetime) for its accounting limits.
 
 ## Remote connections and deadlines
 
@@ -84,9 +88,9 @@ finally:
 
 Connection `timeout` is one budget in seconds across pool waiting, OS connection, handshake, current route lookup and relay acquisition. Omission or `None` adds no caller deadline; zero expires immediately. Negative and non-finite values are rejected. Expiration raises `CallDeadlineExceeded` with `operation=connect`, `transport_phase=pre_dispatch` and the failed `stage`; no resource method has run.
 
-Business-call waiting is independent. `cc.with_call_options` returns a view of an existing connection; its timeout does not become a resource method argument. A call deadline can end caller waiting after dispatch while native work still holds the input until completion. It does not cancel a running resource method or authorize replay. Direct IPC waits indefinitely by default; HTTP uses the configured logical-call budget. Same-process synchronous calls accept inherited or unlimited waiting. See [configuration](configuration.en.md#call-deadlines-and-admission) for defaults and finite-call admission limits.
+Business-call waiting is independent. `cc.with_call_options` returns a view of an existing connection; its timeout does not become a resource method argument. A call deadline can end caller waiting after dispatch while native work still holds the input until completion. It does not cancel a running resource method or authorize replay. Direct IPC waits indefinitely by default; HTTP uses the configured logical-call budget. Same-process synchronous calls accept inherited or unlimited waiting. See [configuration](configuration.md#call-deadlines-and-admission) for defaults and finite-call admission limits.
 
-Unix processes sharing an IPC domain use the same configured root (`cc.endpoint.set_local_endpoint(root=...)` or `C2_IPC_ROOT`). The application provisions custom roots; `0755` is accepted with verified ownership and protection from other-user mutation. The default is `0700`, and sockets are `0600`. Windows uses TokenUser-scoped Named Pipes across logons and rejects Unix root overrides. Native connections require the same user and a server integrity of at least Medium; cross-session payloads automatically avoid inaccessible Local mappings. C-Two 0.10.0 moves the RPC handshake from 13 to 14 behind a permanent fixed version preamble, so upgrade communicating peers together. Different versions that both implement the fixed preamble raise `CoreError` with `category='protocol_version_mismatch'` and nonzero `local_protocol_version` / `peer_protocol_version` (`None` on every other error); mixing with 0.9.x still yields a generic connection/protocol failure. See the [0.10.0 migration](releases/0.10.0.md) and the [handshake spec](ipc-handshake.md). See [endpoint configuration](configuration.en.md#local-endpoint-directories) and [lifecycle management](local-endpoint-lifecycle.en.md).
+Unix processes sharing an IPC domain use the same configured root (`cc.endpoint.set_local_endpoint(root=...)` or `C2_IPC_ROOT`). The application provisions custom roots; `0755` is accepted with verified ownership and protection from other-user mutation. The default is `0700`, and sockets are `0600`. Windows uses TokenUser-scoped Named Pipes across logons and rejects Unix root overrides. Native connections require the same user and a server integrity of at least Medium; cross-session payloads automatically avoid inaccessible Local mappings. C-Two 0.10.0 moves the RPC handshake from 13 to 14 behind a permanent fixed version preamble, so upgrade communicating peers together. Different versions that both implement the fixed preamble raise `CoreError` with `category='protocol_version_mismatch'` and nonzero `local_protocol_version` / `peer_protocol_version` (`None` on every other error); mixing with 0.9.x still yields a generic connection/protocol failure. See the [0.10.0 migration](../releases/0.10.0.md) and the [handshake spec](ipc-handshake.md). See [endpoint configuration](configuration.md#local-endpoint-directories) and [lifecycle management](local-endpoint-lifecycle.md).
 
 ## Low-level server bridge
 
@@ -124,7 +128,7 @@ On the server side, portable inputs are owned by default. Registering with `cc.r
 
 ### Python SDK
 
-The main user surface, shown throughout the guides. The top-level `cc` namespace groups:
+The `c_two` root holds only the everyday API: contract decorators, `hold` / `HeldResult`, register / connect / close / unregister / serve / shutdown, `server_address`, `with_call_options`, setters, `Runtime`, `ConcurrencyConfig` and `error`. Owner control, endpoint maintenance, diagnostics and contract tooling live in `c_two.owner`, `c_two.endpoint`, `c_two.observe` and `c_two.contract`; the Rust SDK uses the same four modules under `c_two::`. Do not add root names, aliases or second spellings for these capabilities; option values such as concurrency modes and input lifetimes are string literals.
 
 Applications start with `import c_two as cc`. Import the specialized modules when needed:
 
@@ -132,7 +136,16 @@ Applications start with `import c_two as cc`. Import the specialized modules whe
 from c_two import owner, endpoint, observe, contract
 ```
 
-Owner supervision lives in `c_two.owner`, local endpoint administration in `c_two.endpoint`, diagnostics in `c_two.observe`, and contract tooling in `c_two.contract`. Module functions use the default Runtime; the same methods on `cc.Runtime()` use that explicit instance. Contract export and owner capability construction do not select a Runtime. Both `namespace` and `version` are required by `@cc.crm`. Concurrency modes are `'parallel'`, `'exclusive'`, and `'read_parallel'`; registration input lifetimes are `'materialized'` and `'borrowed'`.
+Rust users import the user-facing package as `c_two`, not by a Core or transport crate name:
+
+```rust
+use c_two::{Connect, ContractRelease, Runtime};
+use fastdb::Payload;
+```
+
+Generated Rust modules may use the hidden `c_two::generated` seam. Ordinary application code must not assemble `c2-ipc`, `c2-http`, `c2-server`, `SyncClient`, or route bindings directly.
+
+Contract export and owner capability construction do not select a Runtime. Concurrency modes are `'parallel'`, `'exclusive'`, and `'read_parallel'`; registration input lifetimes are `'materialized'` and `'borrowed'`.
 
 - Authoring: `@cc.crm`, `@cc.read`, `@cc.write`, `@cc.on_shutdown`, `@cc.transfer`, `cc.hold`
 - Calls: `cc.with_call_options` (per-call deadline views, see [remote connections and deadlines](#remote-connections-and-deadlines))
@@ -145,13 +158,70 @@ Owner supervision lives in `c_two.owner`, local endpoint administration in `c_tw
 - Errors: `cc.error.CoreError` (structured local/Core errors), `cc.error.CCError` (semantic errors), with common `cc.error.CCBaseError`
 - Monitoring: `cc.observe.memory_stats`, `cc.observe.call_execution_snapshot`, `cc.observe.lifecycle_snapshot`, `cc.observe.shutdown_outcome` (read-only)
 
-Use `cc.set_server(startup_timeout=...)` before registration to choose a native startup wait. Startup expiry has `CoreError.lifecycle_kind == 'startup_timeout'`, `startup_stage` and `timeout_seconds`; see [startup configuration and errors](configuration.en.md#server-startup-deadlines).
+Use `cc.set_server(startup_timeout=...)` before registration to choose a native startup wait. Startup expiry has `CoreError.lifecycle_kind == 'startup_timeout'`, `startup_stage` and `timeout_seconds`; see [startup configuration and errors](configuration.md#server-startup-deadlines).
 
-After a listener reaches Ready, `cc.endpoint.server_credential() -> cc.endpoint.EndpointCredential | None` returns its native credential from the existing lifecycle watch without inspection or filesystem I/O. It returns `None` before start and after terminal shutdown; a snapshot is not proof of liveness or cleanup authority. See the [lifecycle guide](local-endpoint-lifecycle.en.md#exact-cleanup-and-bounded-sweeps).
+After a listener reaches Ready, `cc.endpoint.server_credential() -> cc.endpoint.EndpointCredential | None` returns its native credential from the existing lifecycle watch without inspection or filesystem I/O. It returns `None` before start and after terminal shutdown; a snapshot is not proof of liveness or cleanup authority. See the [lifecycle guide](local-endpoint-lifecycle.md#exact-cleanup-and-bounded-sweeps).
 
-Runtime-scoped IPC policy, call admission limits and relay settings are documented in the [configuration guide](configuration.en.md).
+Runtime-scoped IPC policy, call admission limits and relay settings are documented in the [configuration guide](configuration.md).
 
-The [lifecycle API guide](local-endpoint-lifecycle.en.md) specifies observation return values, timeout/end/lag behavior, owner ticket issuance and revocation, the single-commit takeover sequence and error outcomes. Its [bind/connect section](local-endpoint-lifecycle.en.md#bind-and-connect-failures) documents the structured OS fields on public `cc.error.CoreError`. These observations do not prove process exit or authorize replay or cleanup.
+The [lifecycle API guide](local-endpoint-lifecycle.md) specifies observation return values, timeout/end/lag behavior, owner ticket issuance and revocation, the single-commit takeover sequence and error outcomes. Its [bind/connect section](local-endpoint-lifecycle.md#bind-and-connect-failures) documents the structured OS fields on public `cc.error.CoreError`. These observations do not prove process exit or authorize replay or cleanup.
+
+### CRM contracts, clients and names
+
+CRM contract classes are interfaces with `...` method bodies. `@cc.crm()` requires `namespace` and `version`; contract class names have no `I` prefix. Resource implementations are plain classes named for the domain, such as `NestedGrid` or `PostgresVectorLayer`; `{ContractName}Impl` is acceptable for generated code. Transferable classes use descriptive data names such as `GridAttribute`.
+
+```python
+@cc.crm(namespace='cc.demo', version='0.1.0')
+class Grid:
+    def some_method(self, arg: int) -> str:
+        ...
+```
+
+Any code calling `cc.connect(CRMClass, name='...', address='...')` is a client. Its typed proxy matches the CRM contract and supports context-manager close:
+
+```python
+with cc.connect(Grid, name='grid', address='ipc://server') as grid:
+    result = grid.subdivide_grids([1], [0])
+```
+
+There is no separate `compo/` module, `@cc.runtime.connect` decorator, or `Component` type. Routing names are user-chosen strings passed to `cc.register(name=...)` and `cc.connect(name=...)`, distinct from the CRM `namespace`. Different CRM contracts, or different instances of one contract, can coexist under distinct names. For remote IPC and relay paths, the native runtime also matches the expected CRM tag and contract hashes derived from the client's CRM class.
+
+### Default Runtime API pattern
+
+Module-level registration, connection, configuration and shutdown delegate to the default Python Runtime. `cc.close(proxy)` follows the proxy's owner. `cc.Runtime()` creates an application-owned instance with the same register / connect / configure / shutdown methods and an empty-Host `start()`:
+
+```python
+import c_two as cc
+
+# Server side
+cc.set_relay_anchor('http://relay-host:8080')
+cc.set_transport_policy(shm_threshold=64 * 1024)
+cc.set_server(ipc_overrides={'pool_segment_size': 2 * 1024 * 1024 * 1024})
+cc.register(Grid, grid_instance, name='grid')
+cc.register(Network, net_instance, name='network')
+cc.serve()
+
+# Client side, same process: thread preference
+grid = cc.connect(Grid, name='grid')
+grid.some_method(arg)
+cc.close(grid)
+
+# Client side, direct IPC
+cc.set_client(ipc_overrides={'pool_segment_size': 2 * 1024 * 1024 * 1024})
+grid = cc.connect(Grid, name='grid', address='ipc://my_server')
+grid.some_method(arg)
+cc.close(grid)
+
+# Client side, relay-based name resolution and routing
+cc.set_relay_anchor('http://relay-host:8080')
+grid = cc.connect(Grid, name='grid')
+grid.some_method(arg)
+cc.close(grid)
+
+# Cleanup
+cc.unregister('grid')
+cc.shutdown()
+```
 
 ### Independent Python runtimes
 
@@ -163,4 +233,4 @@ Calling `runtime.shutdown(timeout=...)` starts the Core Runtime's single permane
 
 The deadline passed to remote `connect()` also bounds the SDK's final publication check. If that original deadline expires before publication, connect raises the corresponding deadline error and releases only its own logical client; it does not retry. An otherwise successful connection continues to reuse its pooled client normally. A `runtime_retired` lifecycle error has no I/O cause. HTTP-only use does not create an IPC pool, and shutdown does not promise that every HTTP keepalive socket has physically closed. The Rust low-level Host shutdown/restart lifecycle remains separate and restartable; this permanent retirement applies to the Python SDK Runtime scope. IPC handshake 14, SHM 3 and C/FFI ABI 6 are unchanged. R07 final Drop remains separate work.
 
-After completed handoff, configured endpoint selection, transport policy, call limits and relay override retain their existing handoff behavior, while server identity, IPC overrides, startup timeout and one-use owner capability reset. An existing `connection_events()` subscription observes its original session only; subscribe again for the new session. The return value is the closing session's result, and held payloads retain their own lifetime. An application owns any custom endpoint directory it creates; the Runtime does not remove that directory. The [preflight example](../examples/python/independent_runtime.py) checks the shutdown outcome before deleting its newly created private directory.
+After completed handoff, configured endpoint selection, transport policy, call limits and relay override retain their existing handoff behavior, while server identity, IPC overrides, startup timeout and one-use owner capability reset. An existing `connection_events()` subscription observes its original session only; subscribe again for the new session. The return value is the closing session's result, and held payloads retain their own lifetime. An application owns any custom endpoint directory it creates; the Runtime does not remove that directory. The [preflight example](../../examples/python/independent_runtime.py) checks the shutdown outcome before deleting its newly created private directory.
