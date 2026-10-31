@@ -15,8 +15,13 @@ See the [unreleased notes](docs/releases/unreleased.md).
 
 ### Removed
 
+- `C2_RELAY_ROUTE_MAX_ATTEMPTS`, the sweep and relay owner caps, duplicate lease counters, two shutdown-outcome fields, and dead Rust surface: `FreeResult`, the `SyncClient` preallocation API, IPC route-watch recovery, the relay route event history, configurable contract limits, and never-constructed errors.
 - `cc.Held`, `cc.hold_stats()`, the public `ConcurrencyMode` and `InputLifetime` enums (use string values), and the default namespace and version of `@cc.crm`.
 - Contract inference (`infer_crm_from_resource`, `c3 contract infer`) and the resource bridge (`cc.bridge`, `cc.ResourceBridge`, `register(bridge=...)`).
+
+### Fixed
+
+- Large chunked payloads, malformed control frames and acknowledgements, custom IPC roots with many entries, contended listener drops, oversized pool segments, relay mesh versions and registration retries, `c3 registry` on malformed responses, TypeScript NACKs with new error codes, and several silent Python fallbacks. See the [unreleased notes](docs/releases/unreleased.md).
 
 ## [0.10.1] — companion c3 0.6.0
 

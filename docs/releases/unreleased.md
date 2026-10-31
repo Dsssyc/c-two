@@ -49,3 +49,49 @@ The `c_two` crate root keeps runtime, hosting, connection, configuration-source,
 ### Validation
 
 Local macOS validation passed on the integrated candidate, with C-Two and FastDB 0.2.4 checked out side by side, and the full fork CI run [41173746331](https://github.com/Dsssyc/c-two/actions/runs/41173746331) on `f0f9efaa` passed on Linux, macOS, Windows x64 and Windows ARM64.
+
+## Defect fixes and dead-code removal (breaking)
+
+These come from the [over-defense review](../plans/2026-10-31-over-defense-review.md) and its [batch plan](../plans/2026-10-31-defect-and-dead-code-batches.md).
+
+### Fixed
+
+- **Large chunked payloads.** Payloads larger than 64 MiB no longer fail when they travel as chunks, for example when shared memory is unavailable. A request is limited only by `max_payload_size` and `max_reassembly_bytes`; an oversized request reports a size error, not a protocol violation.
+- **Malformed input is an error.**
+  - A malformed call-control frame closes the connection with a protocol error, instead of leaving the caller to wait until its deadline.
+  - A malformed shutdown acknowledgement, and a malformed control address, raise errors instead of reporting "not acknowledged" or `False`.
+  - `c3 registry` reports malformed relay responses instead of printing "No routes registered."
+- **Local endpoints.**
+  - A custom IPC root that already holds more than 64 unrelated entries initializes normally.
+  - Listeners dropped while another process holds the namespace gate no longer leave sockets and leases behind.
+- **Configuration.** A `pool_segment_size` whose buddy layout would overflow `u32` is rejected when configured, instead of silently disabling buddy shared memory. Explicit `max_execution_workers` values above 64 are accepted; only the default stays capped.
+- **Relay.**
+  - Mesh peers must speak the same protocol version; older peers are no longer accepted.
+  - The HTTP `/_register` path and `c3 relay --upstream` share one registration that retries only transport errors, never a version mismatch.
+- **TypeScript.** Generated TypeScript accepts NACKs that carry error codes it does not list.
+- **Python.**
+  - Relay connection errors keep their own type instead of all becoming `RegistryUnavailable`.
+  - `cc.close()` with something other than a connected CRM raises `TypeError`.
+  - A closed proxy no longer breaks `hasattr()`.
+  - Signature errors in transfer bindings are reported instead of silently treated as "no payload".
+
+### Removed
+
+| Removed | Instead |
+| --- | --- |
+| `C2_RELAY_ROUTE_MAX_ATTEMPTS` | relay-aware clients always make one route observation plus at most one refresh |
+| the 4096-address sweep cap and the relay's 1024-owner cap | — |
+| the duplicate `active_leases` and `total_leased_bytes` counters in `memory_stats()["holds"]`, and `retention` in lease snapshots | `active_holds`, `total_held_bytes` |
+| `http_clients_drained` and `ipc_clients_abnormally_closed` in shutdown outcomes | count `ipc_client_close_details` |
+| Rust: `FreeResult` | `free_at` and `release_handle` return `()` |
+| Rust: the `SyncClient` preallocation API, injected pools and pool-less `IpcClient` constructors | the configured `IpcClient::with_config` / `with_endpoint` constructors |
+| Rust: IPC route-watch recovery, the relay route event history, and unused `RelayAwareHttpClient` entry points | — |
+| Rust: `ContractLimits`, `ContractLimitsProfile` and the `*_with_limits` functions | contract limits are fixed constants |
+| Rust: the never-constructed `RelayDuplicateRoute` and `RelayHttp` errors, and the test-only aggregate config resolver | — |
+| Python native: the producerless server-side writable sink | resources return bytes or buffer-protocol data |
+
+Rust `MemPool` constructors now return `Result` instead of panicking on an invalid name or geometry.
+
+### Validation
+
+Validation is pending: the integrated candidate still needs the side-by-side FastDB gates and the three-platform GitHub Actions run.

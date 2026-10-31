@@ -263,16 +263,14 @@ Memory subsystem:
   their actual pool. Prepared SHM replies carry the allocated owner. Do not
   expose replaceable receive-pool slots or restore safe coordinate-to-lease
   constructors. A reconnect gives its receive task and replies a new pool
-  container while retained replies keep the old one. Request preallocation
-  keeps its existing Armed/Dispatched/Released transaction; it must not gain
-  a second release state machine. `IpcClient` and `SyncClient` take ownership of an injected
-  pool; preallocated publication uses the block's requested length and checks
-  the connection's request-pool identity before dispatch. Server callbacks
+  container while retained replies keep the old one. Request SHM blocks
+  keep their Armed/Dispatched/Released transaction; it must not gain a second
+  release state machine. Server callbacks
   receive the fixed `ResponsePool` owner; normal response preparation uses
   `try_prepare_shm_response`, while raw mutable pool access requires `unsafe`.
   Read access returns a mapped guard: an ordinary read guard can reveal its
   original writable lock through `RwLockReadGuard::rwlock`.
-- Explicit failed release retains its original owner: `release_handle` returns `ReleaseHandleError` with the moved handle; request/response leases clear their carrier only on success. `RequestPreparationError` privately holds a failed request block for cleanup only, preserving both initial errors. Do not extract/publish that block, replay its fill, or silently discard a `pool_free` error. Core/Held keeps a failed native lease for explicit retry; invalidation is attempted once. Consuming exits and final carrier Drop abandon unconfirmed cleanup without refunding its charge and increment the original scope's saturating `abandoned_releases` once; no background recovery.
+- Explicit failed release retains its original owner: `release_handle` returns `ReleaseHandleError` with the moved handle; request/response leases clear their carrier only on success. Do not silently discard a `pool_free` error. Core/Held keeps a failed native lease for explicit retry; invalidation is attempted once. Consuming exits and final carrier Drop abandon unconfirmed cleanup without refunding its charge and increment the original scope's saturating `abandoned_releases` once; no background recovery.
 - `c2-mem` owns SDK-visible buffer lease accounting. Lease tracking records metadata and retention state only; it must not read payload bytes, allocate a second buffer, or replace `MemPool::free_at()` / `release_handle()` as the memory release authority.
 - Python buffer export admission and lifecycle transitions share the existing owner boundary: `PyCoreResponse` checks exports under `inner`; `PyCoreRequestBuffer` serializes export, release and retained tracking under `lease`. An active export must reject release before invalidation or lease removal, and tracking after release cannot revive a lease. Keep view-release counter decrements atomic and preserve Core snapshot and release authority.
 - Each owner pool appends a fresh PID/UUID incarnation to its logical label. `MemPool` alone derives bounded OS backing names; SDKs must not concatenate prefix/index suffixes.
@@ -312,7 +310,7 @@ Do not add CLI command behavior under `sdk/python/src/c_two`.
 | `--idle-timeout` | `C2_RELAY_IDLE_TIMEOUT` | `60` | IPC idle disconnect timeout in seconds; `0` disables time-based eviction |
 | `--upstream` | none | empty | Pre-register upstream as `NAME=SERVER_ID@ADDRESS`; `SERVER_ID` must match the IPC server handshake identity |
 
-Relay-aware clients use `C2_RELAY_ROUTE_MAX_ATTEMPTS` to cap route acquisition attempts before reporting failure. This setting belongs to the client side, not the relay server resolver.
+Relay-aware clients make one route observation plus at most one refresh before reporting failure; the count is fixed, not configurable.
 
 ## Key Conventions
 
@@ -381,7 +379,7 @@ class Grid:
 
 FastDB Core is the sole authority for nested parsing, canonical identity, digest, binary layout, build/open/view/materialize/invalidate behavior, and payload-only codegen. C-Two validates only the outer contract and binding relationship. Server-side borrowed input is explicit registration policy through `cc.register(..., input_lifetime={...})`; method metadata must not bypass that gate.
 
-The old Python `CRMProxy.call_prepared`, `CoreClient.call_prepared`, and `NativePreparedCall.call_prepared` write-plan entry points are retired. Client requests retain `begin_call` / `charge_input` / `call` / `close` and the Python-only pickle fallback; do not restore arbitrary client encoding plans as a formal alternative to FastDB. Core opaque-byte interfaces, server-side writable sinks, Rust IPC preallocation, and the existing custom client/scheduler adaptation protocols remain unchanged.
+The old Python `CRMProxy.call_prepared`, `CoreClient.call_prepared`, and `NativePreparedCall.call_prepared` write-plan entry points are retired. Client requests retain `begin_call` / `charge_input` / `call` / `close` and the Python-only pickle fallback; do not restore arbitrary client encoding plans as a formal alternative to FastDB. Core opaque-byte interfaces and the existing custom client/scheduler adaptation protocols remain unchanged; the producerless server-side writable sinks and the Rust IPC preallocation API are removed.
 
 ### Hold Mode Pattern
 
@@ -469,7 +467,6 @@ Wire codec and transport code in Rust (`c2-wire`, `c2-ipc`, `c2-mem`) prioritize
 | Variable | Purpose | Default |
 | --- | --- | --- |
 | `C2_RELAY_ANCHOR_ADDRESS` | SDK relay anchor URL for CRM registration and client name resolution | none |
-| `C2_RELAY_ROUTE_MAX_ATTEMPTS` | Relay-aware client route acquisition attempts | `3` |
 | `C2_RELAY_CALL_TIMEOUT` | Relay HTTP CRM call timeout seconds; `0` disables the reqwest total timeout | `300` |
 | `C2_REMOTE_PAYLOAD_CHUNK_SIZE` | C-Two remote payload body batching size for relay HTTP and future remote protocols; not a TCP packet, HTTP/1 chunk, or HTTP/2 DATA frame guarantee | `1048576` |
 | `C2_RELAY_BIND` | Relay HTTP listen address for `c3 relay --bind` | `0.0.0.0:8080` |
@@ -487,7 +484,7 @@ Wire codec and transport code in Rust (`c2-wire`, `c2-ipc`, `c2-mem`) prioritize
 | `C2_IPC_MAX_FRAME_SIZE` | Max inline frame size | `2147483648` |
 | `C2_IPC_MAX_PAYLOAD_SIZE` | Max single-call payload size | `17179869184` |
 | `C2_IPC_MAX_PENDING_REQUESTS` | Max concurrent pending requests per connection | `1024` |
-| `C2_IPC_MAX_EXECUTION_WORKERS` | Max blocking execution workers for server-side resource callbacks | available parallelism clamped to `4..=64` |
+| `C2_IPC_MAX_EXECUTION_WORKERS` | Max blocking execution workers for server-side resource callbacks; explicit values are not capped | available parallelism clamped to `4..=64` |
 | `C2_IPC_HEARTBEAT_INTERVAL` | Heartbeat interval seconds; `0` disables | `15.0` |
 | `C2_IPC_HEARTBEAT_TIMEOUT` | Heartbeat timeout seconds | `30.0` |
 | `C2_IPC_MAX_TOTAL_CHUNKS` | Max total in-flight chunks across all connections | `512` |
