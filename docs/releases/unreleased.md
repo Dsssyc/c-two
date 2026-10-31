@@ -48,4 +48,4 @@ The `c_two` crate root keeps runtime, hosting, connection, configuration-source,
 
 ### Validation
 
-Local macOS validation passed on the integrated candidate, with C-Two and FastDB 0.2.4 checked out side by side. Linux and Windows GitHub Actions have not run yet.
+Local macOS validation passed on the integrated candidate, with C-Two and FastDB 0.2.4 checked out side by side, and the full fork CI run [41173746331](https://github.com/Dsssyc/c-two/actions/runs/41173746331) on `f0f9efaa` passed on Linux, macOS, Windows x64 and Windows ARM64.

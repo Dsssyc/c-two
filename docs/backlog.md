@@ -6,8 +6,8 @@
 
 - **接口精简第一批**
   - 范围：[接口审查](plans/2026-10-31-api-surface-review.md)的第一、二节，以及决定 2、3。
-  - 状态：已在分支 `socu/interface-slimming` 实施，macOS 上与 FastDB 0.2.4 并排验证通过；fork 上的全量 CI [41173746331](https://github.com/Dsssyc/c-two/actions/runs/41173746331) 正在运行。
-  - 之后：CI 通过后收尾。向上游的 PR 暂缓，等后面几批一起开（用户 2026-10-31）。
+  - 状态：已在分支 `socu/interface-slimming` 实施并验收；macOS 上与 FastDB 0.2.4 并排验证通过，fork 全量 CI [41173746331](https://github.com/Dsssyc/c-two/actions/runs/41173746331)（`f0f9efaa`）在 Linux、macOS、Windows x64 与 ARM64 上全部通过。
+  - 之后：向上游的 PR 暂缓，等后面几批一起开（用户 2026-10-31）。
 
 ## 顺序（Host 建议，待用户确认）
 
