@@ -4,7 +4,7 @@
 
 [English](windows-native-usage.md) · 简体中文
 
-该后端使用字节模式 Named Pipe 传输 `ipc://` 控制流量，并使用具名文件映射存放共享载荷内存。它跨登录会话使用进程的 TokenUser SID。同一会话的对端可以使用 SHM；不同会话使用自有缓冲区、内联或分块传输。原生连接在发送数据前要求用户一致，且服务端完整性级别至少为 Medium。普通 SDK 代码继续使用逻辑 `ipc://` 地址；不要在 SDK 中构造管道或映射名称。HTTP relay 仍提供网络传输路径。
+该后端使用字节模式 Named Pipe 传输 `ipc://` 控制流量，并使用具名文件映射存放共享载荷内存。它跨登录会话使用进程的 TokenUser SID。同一会话的对端可以使用 SHM；不同会话使用自有缓冲区、内联或分片传输。原生连接在发送数据前要求用户一致，且服务端完整性级别至少为 Medium。普通 SDK 代码继续使用逻辑 `ipc://` 地址；不要在 SDK 中构造管道或映射名称。HTTP relay 仍提供网络传输路径。
 
 本指南涵盖 Windows x64 和 ARM64 上的 Python C-Two **0.10.1**、c3 **0.6.0** 和 FastDB **0.2.4**。请配套安装对应版本的 Python 包与 c3；端点行为见 [0.10.0 迁移说明](../releases/0.10.0.md)和[生命周期指南](local-endpoint-lifecycle.md)。
 

@@ -24,7 +24,7 @@ C-Two 是面向分布式科学计算的资源 RPC 运行时。它把模拟器、
 
 **CRM 契约**声明可调用的方法以及 namespace、version；**resource** 是实现这些方法并持有状态的普通类；**client** 通过 `cc.connect(...)` 获得类型化代理。一个进程可以同时承载多个资源，并连接其他资源。
 
-**C-Two 0.10.1** 支持 Python 3.10+。普通调用无 Python 运行时依赖；FastDB 载荷使用 `c-two[fastdb]`（`fastdb4py==0.2.4`）。IPC 握手 14 把版本不匹配报告为结构化错误，Unix 端点改用带版本号默认目录的命名空间格式 3，Python 新增独立的 `cc.Runtime()` 实例与 `cc.endpoint.server_credential()`。内存释放失败时由原持有者保留以便重试；已无法交还时保守放弃并计数。见 [0.10.0 更新说明](docs/releases/0.10.0.md)；0.10.1 让 `cc.serve()` 在标准输出编码不了其消息时也不退出（[说明](docs/releases/0.10.1.md)）。
+**C-Two 0.10.1** 支持 Python 3.10+。普通调用无 Python 运行时依赖；FastDB 载荷使用 `c-two[fastdb]`（`fastdb4py==0.2.4`）。IPC 握手 14 把版本不匹配报告为结构化错误，Unix 端点命名空间改用格式 3 与带版本号的默认目录，Python 新增独立的 `cc.Runtime()` 实例与 `cc.endpoint.server_credential()`。内存释放失败时由原持有者保留以便重试；已无法交还时保守放弃并计数。见 [0.10.0 更新说明](docs/releases/0.10.0.md)；0.10.1 让 `cc.serve()` 在标准输出编码不了其消息时也不退出（[说明](docs/releases/0.10.1.md)）。
 
 ## 特点
 
@@ -32,8 +32,8 @@ C-Two 是面向分布式科学计算的资源 RPC 运行时。它把模拟器、
 - **状态与并发**：资源在调用之间保留状态。`@cc.read`、`@cc.write` 声明访问语义，默认采用写访问；原生路由调度统一约束本地和远程调用的并发与排队数量。
 - **跨语言契约与载荷**：`@cc.transfer(...)` 绑定 FastDB `Payload` 规格。契约工具验证描述符并生成 Python、Rust、TypeScript 绑定；Python 之间也支持普通 Python 值。
 - **按契约路由**：客户端匹配路由名称、CRM 身份和契约哈希。Relay 发现选择经过验证的本机 IPC 路径或 HTTP 目标；`c3` 独立运行 relay，并支持 relay mesh。
-- **原生内存传输**：IPC 使用按需 buddy 池、独占共享内存、检查过的分块传输及文件溢出。通过预算和空闲回收控制大载荷的内存与文件用量。详见[内存策略](docs/reference/memory-policy.md)。
-- **明确的载荷生命周期**：`cc.hold()` 保留响应租约，资源注册可选择借用输入；释放时先使 FastDB owner 和 checked view 失效，再释放传输存储。详见 [Python 载荷用法](docs/reference/python-usage.zh-CN.md)。
+- **原生内存传输**：IPC 使用按需 buddy 池、独占共享内存、检查过的分片传输及文件溢出。通过预算和空闲回收控制大载荷的内存与文件用量。详见[内存策略](docs/reference/memory-policy.md)。
+- **明确的载荷生命周期**：`cc.hold()` 保留响应租约，资源注册可选择借用输入；释放时先使载荷所有者和 checked view 失效，再释放传输存储。详见 [Python 载荷用法](docs/reference/python-usage.zh-CN.md)。
 - **连接观察**：`cc.observe.connection_events()` 汇总客户端和服务端物理 IPC 连接，一个可关闭的消费者替代逐连接阻塞等待；原因只描述连接事实，不证明进程已经退出。
 - **资源生命周期管理**：资源采用 `Persistent` 或控制器持有的 `OwnerBound` 生命周期；原生 shutdown 排空工作，限定范围的端点维护清理已确认退出的端点。详见[生命周期指南](docs/reference/local-endpoint-lifecycle.md)。
 - **统一 Rust core**：Python 与 Rust 共用路由、传输、内存、错误和生命周期机制。原生 c3 CLI 在 Linux、macOS、Windows x64 / ARM64 上提供 relay、契约工具和端点维护。
@@ -54,7 +54,7 @@ curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.6.
 
 Windows x64 或 ARM64 使用 [x64 可执行文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.6.0/c3-x86_64-pc-windows-msvc.exe)、[ARM64 可执行文件](https://github.com/world-in-progress/c-two/releases/download/c3-v0.6.0/c3-aarch64-pc-windows-msvc.exe)或 [PowerShell 安装器](https://github.com/world-in-progress/c-two/releases/download/c3-v0.6.0/c3-installer.ps1)。安装与校验步骤见 [Windows 指南](docs/reference/windows-native-usage.zh-CN.md#安装-python-包和-c3)。
 
-C3 0.6.0 配合 C-Two 0.10.x 使用。IPC 握手 14 与 0.9.x（IPC 13）的对端无法互通，Unix 命名空间格式 3 使用新的默认目录，因此同一主机上的 Python 与 Rust SDK、c3 和 Node 使用方要一起升级；先停止旧服务，再升级并重启。C/FFI ABI 6、SHM 3 与所有者控制 1 的格式保持不变。见 [0.10.0 迁移说明](docs/releases/0.10.0.md)、[握手规范](docs/reference/ipc-handshake.md)和[端点生命周期指南](docs/reference/local-endpoint-lifecycle.md)。
+C3 0.6.0 配合 C-Two 0.10.x 使用。IPC 握手 14 与 0.9.x（IPC 13）的对端无法互通，Unix 端点命名空间格式 3 使用新的默认目录，因此同一主机上的 Python 与 Rust SDK、c3 和 Node 使用方要一起升级；先停止旧服务，再升级并重启。C/FFI ABI 6、SHM 3 与所有者控制 1 的格式保持不变。见 [0.10.0 迁移说明](docs/releases/0.10.0.md)、[握手规范](docs/reference/ipc-handshake.md)和[端点生命周期指南](docs/reference/local-endpoint-lifecycle.md)。
 
 源码构建需要 Rust 1.95 或更新版本；构建与测试见[开发指南](docs/reference/development.md)。
 

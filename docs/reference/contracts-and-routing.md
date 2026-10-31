@@ -33,7 +33,7 @@ The ABI fingerprint covers CRM identity, ordered method names, and opaque input/
 
 C-Two has a language-neutral Rust core and user-facing Rust and Python SDKs. Neither SDK is the canonical home for generic runtime mechanisms. The Rust SDK at `sdk/rust` is package `c-two`, imported as `c_two`, and is a thin facade over Core plus generated typed clients/services. The Python SDK owns Python domain logic, CRM authoring, Python resource invocation, serialization orchestration, and same-process direct-call glue. Rust `c2-core` is the single shared owner of route selection, client/host calls, retry classification, error normalization, transport lease ordering, and runtime lifecycle; the lower Core crates own memory, wire, contract, relay, and configuration mechanisms. PyO3/maturin projects that same Core into Python as `c_two._native`.
 
-The Rust SDK may depend on the official `fastdb` Rust binding to adapt portable payloads, but `c2-core` must remain payload-owner-neutral. Rust users continue to name `fastdb::Payload`; do not re-export it under a C-Two semantic namespace. Rust and Python must expose the same portable route, payload, error, and lifetime capabilities even when their language-level syntax differs.
+The Rust SDK may depend on the official `fastdb` Rust binding to adapt portable payloads, but `c2-core` must not depend on FastDB. Rust users continue to name `fastdb::Payload`; do not re-export it under a C-Two semantic namespace. Rust and Python must expose the same portable route, payload, error, and lifetime capabilities even when their language-level syntax differs.
 
 ## Direct IPC
 

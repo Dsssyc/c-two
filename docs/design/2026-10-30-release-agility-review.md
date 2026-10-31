@@ -67,7 +67,7 @@
 
 0.10.0 第一次尝试（10-29）：合并后的 main 运行首轮在 Windows 2025 与 ARM64 各遇到一个偶发失败（36.8 分钟）；约 43 分钟后只重跑失败的 job，整个运行在开始 102 分钟后才通过；候选 25 分钟通过；两个预演都拒绝了它，因为重跑让两条线各留下两份同名完整产物（“retains 2 … artifacts”）；只好再发起一轮完整运行（21 分钟）。之后因 FastDB 内存泄漏暂停。
 
-0.10.1（10-30，未完成）：09:22 开 PR，首轮 PR CI 在 macOS 与两条 Linux 线失败——新测试在非 Windows 上的平台跳过没有登记进 `tools/dev/test_python.py` 的冻结表；补登记后 09:55–10:17 通过；10:19 合并，main 运行在 Windows 2025 遇到偶发失败（`test_runtime_session_lifecycle.py` 中零期限的第二次 shutdown）；10:55 重新发起的完整运行 [41044322502](https://github.com/world-in-progress/c-two/actions/runs/41044322502) 里，其他五条线都已通过，macOS 线在 11:00 进入 Emscripten 缓存步骤后再无进展，job 跑了 47 分钟，11:45 以 “The hosted runner lost communication with the server” 失败，日志与证据产物都没有上传——这是 GitHub runner 掉线，与代码无关。按现行规则，这一轮也不能靠重跑 macOS 线补齐，只能再来一轮完整验证。同一来源 `028e791d` 上的两轮 main 验证（10:19–11:45）都因与改动无关的原因失败，没有留下可用的证据；用户随后暂停了 0.10.1。
+0.10.1（10-30，未完成）：09:22 开 PR，首轮 PR CI 在 macOS 与两条 Linux 线失败——新测试在非 Windows 上的平台跳过没有登记进 `tools/dev/test_python.py` 的冻结表；补登记后 09:55–10:17 通过；10:19 合并，main 运行在 Windows 2025 遇到偶发失败（`test_runtime_session_lifecycle.py` 中零超时的第二次 shutdown）；10:55 重新发起的完整运行 [41044322502](https://github.com/world-in-progress/c-two/actions/runs/41044322502) 里，其他五条线都已通过，macOS 线在 11:00 进入 Emscripten 缓存步骤后再无进展，job 跑了 47 分钟，11:45 以 “The hosted runner lost communication with the server” 失败，日志与证据产物都没有上传——这是 GitHub runner 掉线，与代码无关。按现行规则，这一轮也不能靠重跑 macOS 线补齐，只能再来一轮完整验证。同一来源 `028e791d` 上的两轮 main 验证（10:19–11:45）都因与改动无关的原因失败，没有留下可用的证据；用户随后暂停了 0.10.1。
 
 ### 1.5 失败后退回到哪一步
 
@@ -83,7 +83,7 @@
 ### 1.6 10 月的失败统计
 
 - upstream 上 10 月共 138 次 Source Validation，其中 84 次是完整运行（大于 10 分钟）。
-- main 上的 17 次完整运行有 4 次首轮失败（24%），且都只有一两条线失败：[38941100899](https://github.com/world-in-progress/c-two/actions/runs/38941100899)（Ubuntu，原因未查）、40857187478（Windows 2025 `generated_call_options_consumer`；ARM64 PowerShell 安装器测试超时）、[41024013834](https://github.com/world-in-progress/c-two/actions/runs/41024013834)（Windows 2025 `c2-ipc` `shutdown_ack_only_proves_initiation_and_retries_before_sending`）、41039841188（Windows 2025 零期限第二次 shutdown）。最近三次都落在 Windows 2025。
+- main 上的 17 次完整运行有 4 次首轮失败（24%），且都只有一两条线失败：[38941100899](https://github.com/world-in-progress/c-two/actions/runs/38941100899)（Ubuntu，原因未查）、40857187478（Windows 2025 `generated_call_options_consumer`；ARM64 PowerShell 安装器测试超时）、[41024013834](https://github.com/world-in-progress/c-two/actions/runs/41024013834)（Windows 2025 `c2-ipc` `shutdown_ack_only_proves_initiation_and_retries_before_sending`）、41039841188（Windows 2025 零超时第二次 shutdown）。最近三次都落在 Windows 2025。
 - 最近四次合并（`4c3e587d`、`4b1d9161`、`169dc53c`、`028e791d`）的提交树都与对应 PR 头完全相同，而这四个 PR 头的完整 PR CI 都已通过。main 上的那一轮是同一棵树的第二次验证，四次里三次因偶发失败变红。
 - 发版要连过 PR CI 与 main 运行两轮完整验证。按 24% 的单轮失败率，两轮都首轮通过的概率约为 58%。
 
@@ -104,7 +104,7 @@
 | workflow policy（actionlint 与 `tests/repo`） | 工作流写错会直接拖累发版；保留，但不必挡在六条线前面（见 D7）。 |
 | 测试结束后清理进程树，有残留进程就判失败 | 真实发生过：并行派生的子进程继承了测试探针的文件句柄，锁迟迟不释放（`c2-local` 偶发失败的根因）。 |
 | 每个 gate 的超时与聚合预算 | 子进程变慢或卡住时要有界地失败；ARM64 上模拟的 x86 PowerShell 曾在一次运行里慢到约 50 秒。 |
-| Windows standard-user 消费者、Windows 管道外来所有者身份测试 | 产品在 Windows 上依赖 SID/DACL 语义，管理员与普通用户行为不同。 |
+| Windows standard-user 消费者、Windows 管道外来 owner 身份测试 | 产品在 Windows 上依赖 SID/DACL 语义，管理员与普通用户行为不同。 |
 | IPC 内存矩阵基准本身 | 几秒钟，守的是内存回收回归；只删它的回执复验（见 D10）。 |
 
 ### 2.2 合并或删除：重复、冗余或过度防御
@@ -133,10 +133,10 @@
 
 生产代码里“真实问题与想象中的防线”的逐项复核，已经在 [2026-10-13 防御式编程复核](../acceptance/2026-10-13-defensive-programming-regression-reassessment.md) 中按 R01–R39、T01–T07、C01–C07 做过，后续进度记在批次台账里；本文不重做，只补充与发版直接相关的发现：
 
-- 10 月卡住发版的偶发失败分三类：测试里写死的短期限（codegen 消费者，已修；`c2-ipc` 用 1 秒的 `PROBE_BUDGET` 断言 ACK 语义，在繁忙的 Windows 2025 上超时，未修），测试环境本身（ARM64 上模拟的 x86 PowerShell 每次运行要编译 `Add-Type`，已修），以及产品语义（零期限的第二次 shutdown 在 `try_lock_until` 遇到短暂锁竞争时失败，另行修复中）。前两类应在测试里改：验证语义的测试给宽裕的期限，验证期限行为的测试留出余量。第三类是真实的产品边角，应在产品里修。
+- 10 月卡住发版的偶发失败分三类：测试里写死的短超时（codegen 消费者，已修；`c2-ipc` 用 1 秒的 `PROBE_BUDGET` 断言 ACK 语义，在繁忙的 Windows 2025 上超时，未修），测试环境本身（ARM64 上模拟的 x86 PowerShell 每次运行要编译 `Add-Type`，已修），以及产品语义（零超时的第二次 shutdown 在 `try_lock_until` 遇到短暂锁竞争时失败，另行修复中）。前两类应在测试里改：验证语义的测试给宽裕的超时，验证超时行为的测试留出余量。第三类是真实的产品边角，应在产品里修。
 - 已核对的测试接缝（`c2-ipc` control 的 `test_seam`）在 `#[cfg(test)]` 里；生产代码中没有读取测试专用环境变量（`CTWO_*`、`C2_PORTABLE_MATRIX_*`、`C2_TYPESCRIPT_*`）的地方。
-- 验收方案 A 时又遇到一处同类偶发失败：`tests/repo/test_local_test_platform.py::test_stop_cleans_orphan_grandchild_without_touching_unrelated_process` 在整组运行时失败一次，单独重跑 3/3 通过；它用 5 秒的固定期限等待子进程启动与退出，属于“测试里写死的短期限”。
-- 规模：Python SDK 源码 6.8 千行，测试 2.8 万行、937 个测试；Rust 共 2094 个测试。粗略检索：Python 测试中零期限或亚秒期限 92 处，`time.sleep` 70 处；Rust（含生产代码）1 秒及以下的 `Duration` 字面量 528 处。这些数字没有逐项分类，只说明“短期限断言”这一类偶发失败的来源还有不少；建议遇到一处修一处，不做一次性的大扫除。
+- 验收方案 A 时又遇到一处同类偶发失败：`tests/repo/test_local_test_platform.py::test_stop_cleans_orphan_grandchild_without_touching_unrelated_process` 在整组运行时失败一次，单独重跑 3/3 通过；它用 5 秒的固定超时等待子进程启动与退出，属于“测试里写死的短超时”。
+- 规模：Python SDK 源码 6.8 千行，测试 2.8 万行、937 个测试；Rust 共 2094 个测试。粗略检索：Python 测试中零超时或亚秒超时 92 处，`time.sleep` 70 处；Rust（含生产代码）1 秒及以下的 `Duration` 字面量 528 处。这些数字没有逐项分类，只说明“短超时断言”这一类偶发失败的来源还有不少；建议遇到一处修一处，不做一次性的大扫除。
 - `PYTHONUTF8=1` 一项（D13）同时属于测试与产品：测试环境与用户环境不一致，产品缺陷就藏了起来。
 
 ### 2.4 候选与 PR CI 的分工
@@ -194,7 +194,7 @@ A7 平台跳过规则。在 `sdk/python/tests/conftest.py` 定义唯一的平台
 - B3 FastDB 版本只出现一次：版本只写在 `sdk/python/pyproject.toml` 的 extra、`sdk/rust` 与 `c2-codegen` 的 Cargo 依赖里，源码提交只写在 `cli/` 与 `sdk/python/native/` 的 `fastdb-sys` 补丁里；工作流、`prepare_fastdb_sdk.py`、测试运行器与夹具在运行时从这些声明读取，不再保存常量，也不再互相断言。目标：下次升级只改依赖声明与锁文件。
 - B4 不再让 `PYTHONUTF8=1` 遮住产品缺陷。缺陷本身与这个变量无关，它只让 CI 看不见：Windows 用户的 Python 用系统代码页（英文系统 cp1252，中文系统 GBK），`cc.serve()` 的崩溃就是用户先遇到的。这一类缺陷分两种，各用最小的办法兜住：一是读写文件或子进程文本时不指定编码。`python -X warn_default_encoding` 会对每一处发出 `EncodingWarning`，而且在 UTF-8 模式下照样发出（已实测），所以在 SDK 测试里把来自 `c_two` 包的 `EncodingWarning` 当作错误，任何平台、任何开发机上都能拦住，不必等 Windows CI；已实测它指向 `c_two/crm/template.py:31` 读取用户 CRM 源文件的那一行，同文件写出生成代码与 `c_two/cli/contract.py` 写出契约文件也属此类，先把这 3 处改为显式 UTF-8。二是向非 UTF-8 的标准输出打印，`EncodingWarning` 管不到，由 0.10.1 那样的针对性测试覆盖，并让 Windows 上的安装后冒烟（最接近用户的环境）不再设 `PYTHONUTF8`。工具自己的输入输出改为显式 UTF-8，不再用会传给子进程的环境变量；全局去掉这个变量并不必要。
 - B5 条线 gate 精简：source-harness-tests 只在 Windows 线跑 PowerShell 安装器测试；`core-check` 只在 Linux 跑；删掉 `fastdb-rust-test`；wheel 构建与安装消费者只留 Linux 一条作为早期信号，其余由候选覆盖。ARM64 线预计再省 2.5–3 分钟。
-- B6 修完已知的偶发失败：`c2-ipc` 的 1 秒 `PROBE_BUDGET`（测试侧），零期限第二次 shutdown（产品侧，另行修复中）。
+- B6 修完已知的偶发失败：`c2-ipc` 的 1 秒 `PROBE_BUDGET`（测试侧），零超时第二次 shutdown（产品侧，另行修复中）。
 - B7 Windows x64 只保留一条线：用户 2026-10-30 同意，保留 Server 2025（与候选构建 x64 wheel 的 `windows-latest` 一致），去掉 Server 2022；已并入方案 A 的改动。Windows ARM64 线不受影响。约束要求的是 Windows x64 与 ARM64，不是两个 Server 版本；代价是少了 Server 2022 的覆盖，收益是少一条线的偶发失败暴露与机时，墙钟不变（关键路径在 ARM64）。
 
 方案 A 加 B 之后的预计时长：PR CI 约 17–18 分钟 → 约 2 分钟 → 候选约 13 分钟 → 约 7 分钟，共约 40 分钟。

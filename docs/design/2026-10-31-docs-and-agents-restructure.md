@@ -1,6 +1,6 @@
 # 文档与 AGENTS.md 重组的执行计划
 
-日期：2026-10-31。输入：分支 `socu/over-defense-batches`（`c4c53c08`）。依据：[接口审查](2026-10-31-api-surface-review.md)第五节用户已同意的 AGENTS.md 重组；用户 2026-10-31 同意先瘦 AGENTS.md、再按 hey-my-buddy 仓库的分法整理 `docs/`，两步都叠在 `socu/over-defense-batches` 上做，上游另开 PR，暂不建嵌套的 AGENTS.md。状态：两步都已完成并验收，第一步合入为 `a86403af`，第二步合入为 `143c11e3`；剩下 `CONTEXT.md` 术语表待用户确认。第五节第 1、3 项用户已于 2026-10-31 确认。
+日期：2026-10-31。输入：分支 `socu/over-defense-batches`（`c4c53c08`）。依据：[接口审查](2026-10-31-api-surface-review.md)第五节用户已同意的 AGENTS.md 重组；用户 2026-10-31 同意先瘦 AGENTS.md、再按 hey-my-buddy 仓库的分法整理 `docs/`，两步都叠在 `socu/over-defense-batches` 上做，上游另开 PR，暂不建嵌套的 AGENTS.md。状态：两步都已完成并验收，第一步合入为 `a86403af`，第二步合入为 `143c11e3`；`CONTEXT.md` 术语表用户 2026-10-31 确认，同一次提交统一了现行文档的用词。第五节第 1、3 项用户已于 2026-10-31 确认。
 
 ## 一、量过的问题
 
@@ -35,7 +35,7 @@
 1. 0.x 约束、项目概述（CRM、Resource、Client）；
 2. 架构地图：crate 表，每层一句话说明归属；
 3. 构建、测试与运行命令；
-4. 跨模块的不变量，每条一句：Rust core 拥有通用运行时机制，SDK 只是外观；直接 IPC 不依赖 relay；解析与调用按路由加契约身份；Core 拥有截止时间、就绪与生命周期；Python 不保留 Rust 权威的第二份状态；请求快照与传输租约的顺序，以及不多拷贝；`c2-core` 与载荷属主无关；同进程调用直接传 Python 对象；
+4. 跨模块的不变量，每条一句：Rust core 拥有通用运行时机制，SDK 只是外观；直接 IPC 不依赖 relay；解析与调用按路由加契约身份；Core 拥有截止时间、就绪与生命周期；Python 不保留 Rust 权威的第二份状态；请求快照与传输租约的顺序，以及不多拷贝；`c2-core` 不依赖 FastDB；同进程调用直接传 Python 对象；
 5. 已退役接口：合成一张表，旧名字对应现在的做法；
 6. 文档规则与路由表（措辞见下）；
 7. Agent Working Rules，原样保留。
@@ -155,14 +155,14 @@
 | `superpowers/specs/2026-04-01-rust-transport-sink-design.md` §6.2 | 新写的 `#[pyclass]` 默认 `frozen`，内部可变性按场景选用，只持有 `Py<T>`；现有两处例外 | `reference/development.md` 新增"原生扩展约定" |
 | `superpowers/specs/2026-04-02-dedicated-lifecycle-design.md` | dedicated 段由 SHM 头的 `read_done` 驱动回收，时间只作对端崩溃时的兜底 | `reference/memory-policy.md`"Lazy allocation and reclamation" |
 | `superpowers/specs/2026-04-25-resource-registration-error-design.md` | 重名注册：经 relay 返回 409 并映射为 703；无 relay 时不做跨进程防重、不加文件锁；同进程重名报本地错误；relay 拒绝后回滚本地注册 | `reference/contracts-and-routing.md` relay 一节；`reference/errors.md` 补 703 |
-| `superpowers/specs/2026-04-29-relay-peer-trust-boundary-design.md` | 消息体里的 `sender_relay_id` 只是声明，IP 白名单也不算身份；只校验已知成员与属主一致，保护本地路由，清除只在本地可见的 IPC 字段；HMAC 不在范围内 | `reference/contracts-and-routing.md` relay 一节 |
+| `superpowers/specs/2026-04-29-relay-peer-trust-boundary-design.md` | 消息体里的 `sender_relay_id` 只是声明，IP 白名单也不算身份；只校验已知成员与路由归属一致，保护本地路由，清除只在本地可见的 IPC 字段；HMAC 不在范围内 | `reference/contracts-and-routing.md` relay 一节 |
 | `superpowers/specs/2026-05-12-server-execution-backpressure-design.md` | 不变量 I1–I6、I10、I13、I14、I19：两级预算、排队与拒绝的界线、本地调用共享路由并发状态而不占全局执行线程、写者不被饿死、连接关闭取消未开始的排队调用、未拼完的分片不计入准入、注册过提交闸门 | `reference/runtime-lifecycle.md` 新增"执行准入" |
 | `superpowers/specs/2026-07-20-relay-mesh-resource-discovery-design.md` | 同一 relay 重名先 ping 旧进程，活着返回 409，否则覆盖；跨节点允许重名；解析 LOCAL 优先，其余按 `(registered_at, relay_id)` 排序，墙钟偏差是已知限制 | `reference/contracts-and-routing.md` relay 一节 |
 | `superpowers/specs/2026-07-24-portable-payload-contract-composition-design.md` | §5.2–5.5 外层校验、方法形状、两种指纹投影、生命周期不进规格；§7 FastDB 错误字段；§8.2–8.4 产物路径约束与上限、目录布局、只发布到新目录树 | `reference/contracts-and-routing.md` 新增"可移植契约 v2" |
 | `superpowers/specs/2026-07-24-rust-sdk-portable-payload-local-release-candidate-design.md` | §11 路由状态错误表与"只在派发前回退"；§12 ContractLimits V1；§10.3 FastDB cause 字段；§15 18 行矩阵的定义 | §11、§12 进 `contracts-and-routing.md`；§10.3 进 `errors.md`；§15 进 `development.md` |
-| `designs/0.7.1-runtime-configuration-and-call-deadlines.md` | 期限到期不撤路由、不触发 OwnerBound 关闭；Windows 不用连接级 `CancelIoEx` 取消单次调用 | `reference/configuration.md`"Call deadlines"；`reference/windows-native-implementation.md` |
-| `issues/relay-large-payload-transport-design.md` | 先验 header 再读 body；body 有界；上限取上游路由的能力；只重试可重放的 body；c2-http 不碰 MemPool；远程分块只有一个配置项 | `reference/contracts-and-routing.md` relay 转发一节；`reference/configuration.md` |
-| `issues/relay-stale-owner-revival-race.md` | 替换旧属主需要认证之后的最终探测证据；租约到期不等于放弃所有权；属主新鲜度只在本 relay 内，不随 gossip 传播 | `reference/contracts-and-routing.md` relay 一节 |
+| `designs/0.7.1-runtime-configuration-and-call-deadlines.md` | 截止时间到期不撤路由、不触发 OwnerBound 关闭；Windows 不用连接级 `CancelIoEx` 取消单次调用 | `reference/configuration.md`"Call deadlines"；`reference/windows-native-implementation.md` |
+| `issues/relay-large-payload-transport-design.md` | 先验 header 再读 body；body 有界；上限取上游路由的能力；只重试可重放的 body；c2-http 不碰 MemPool；远程分片只有一个配置项 | `reference/contracts-and-routing.md` relay 转发一节；`reference/configuration.md` |
+| `issues/relay-stale-owner-revival-race.md` | 替换旧注册者需要认证之后的最终探测证据；租约到期不等于放弃所有权；注册者新鲜度只在本 relay 内，不随 gossip 传播 | `reference/contracts-and-routing.md` relay 一节 |
 | `vision/route-token-endpoint-connection-architecture.md` | 一条连接对应一个服务实例，不按路由分；watch/list 不承担正确性；只有语义错误能改路由权威，I/O 错误只影响那条连接 | `reference/contracts-and-routing.md` 新增"Route bindings and endpoint connections" |
 | `plans/2026-06-05-route-catalog-watch-redesign.md` | 路由是服务端实例拥有的带版本资源，连接只是载体；目录有版本、可订阅，出现历史缺口时整表重建；调用时由服务端裁决。写入前对照代码：RouteWatch 不是持续推送 | `reference/contracts-and-routing.md` 新增"Route catalog" |
 | `spikes/architecture-ipc-oom-protection-spike.md` | Linux overcommit 下建段几乎不会失败，真正的 OOM 发生在写入时，所以要主动感知内存压力 | `reference/memory-policy.md` 压力一节 |
@@ -199,6 +199,6 @@
 
 瘦身账本只保留暂缓表与条目边界表，执行正文拆为 [2026-10-13-local-slimming-execution.md](../acceptance/2026-10-13-local-slimming-execution.md)。7 月本地候选的实施计划命名为 [2026-07-24-rust-sdk-portable-payload-local-release-candidate-plan.md](../acceptance/2026-07-24-rust-sdk-portable-payload-local-release-candidate-plan.md)，与同名闭环报告区分。
 
-所有内容迁移均对照源码；使用当前固定契约上限与轮询 RouteWatch，未恢复旧连接写入屏障。延后能力删除已关闭的 FastDB Rust、Python/TypeScript 分发、Host 期限投影和 hosted 验证四行；部分关闭的 C-Two 分发、浏览器证明与 SHM 对端权限行按当前边界修正。待办新增两条归组记录，复用已有协议、TypeScript、内存与发布事项；原待办误写的 704 StaleResource 更正为已在生产使用的 RouteStale，保留 706 WriteConflict 决定。错误参考与 crate 地图同步当前 C2E1 编码。
+所有内容迁移均对照源码；使用当前固定契约上限与轮询 RouteWatch，未恢复旧连接写入屏障。延后能力删除已关闭的 FastDB Rust、Python/TypeScript 分发、Host 截止时间投影和 hosted 验证四行；部分关闭的 C-Two 分发、浏览器证明与 SHM 对端权限行按当前边界修正。待办新增两条归组记录，复用已有协议、TypeScript、内存与发布事项；原待办误写的 704 StaleResource 更正为已在生产使用的 RouteStale，保留 706 WriteConflict 决定。错误参考与 crate 地图同步当前 C2E1 编码。
 
 修正后的本地仓库检查为 845 passed、11 skipped、1 warning；规定的 Rust error_normalization 为 8 passed、0 failed。文档检查覆盖全部 219 份受版本管理 Markdown，233 passed；冻结记录核对为 151 份 Markdown 正文一致、122 份非 Markdown 字节一致（其中 67 份 evidence JSON），0 处差异。CLI 包清单有 19 个文件并包含 `assets/banner_unicode.txt`，CLI 构建退出码为 0。本地路径检查包含冻结 evidence；主目录与主检出的可见目录标记同时检查两种分隔符，9 个目录标记用例通过，`GITHUB_ACTIONS=true` 时本项为 1 skipped。报告直接交付给 Host；本地命令日志仍保存在 `target/d2-validation/`。这些数字仅说明本地文档改动验证。Host 继续编写 `docs/README.md` 与 `CONTEXT.md`，并做整体审查与验收。

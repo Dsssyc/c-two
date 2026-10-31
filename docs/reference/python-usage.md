@@ -73,7 +73,7 @@ A portable method carries zero or one `Payload` envelope in each direction; C-Tw
 
 ## Remote connections and deadlines
 
-Use the resource process's `cc.server_address()` value for direct IPC. Direct IPC works without a relay. For discovery by resource name, set `cc.set_relay_anchor(...)` before registration or connection and run `c3 relay` separately. Calls in the registering process prefer same-process dispatch when no explicit address is supplied.
+Use the resource process's `cc.server_address()` value for direct IPC. Direct IPC works without a relay. For discovery by route name, set `cc.set_relay_anchor(...)` before registration or connection and run `c3 relay` separately. Calls in the registering process prefer same-process dispatch when no explicit address is supplied.
 
 ```python
 source = build_value(7)
@@ -107,7 +107,7 @@ The session owns identity, IPC overrides and relay configuration. `Server(runtim
 
 ## Payload lifetimes
 
-The proven portable receive path opens a **copy-backed** FastDB owner. `cc.hold()` is a lifetime contract, not a zero-copy claim: it retains the C-Two response lease together with the payload owner and guarantees that release invalidates the FastDB owner and its checked views *before* the lease goes back.
+The proven portable receive path opens a **copy-backed** payload owner. `cc.hold()` is a lifetime contract, not a zero-copy claim: it retains the C-Two response lease together with the payload owner and guarantees that release invalidates the payload owner and its checked views *before* the lease goes back.
 
 ```python
 with cc.hold(echo.echo)(source) as held:
@@ -118,7 +118,7 @@ with cc.hold(echo.echo)(source) as held:
 
 Release is layered: explicit `.release()`, the `with` context manager, and a `__del__` fallback that warns if you forget both. `cc.observe.memory_stats()["holds"]` reports active holds for monitoring.
 
-`held.unsafe_buffer` exposes the retained raw wire buffer as a `memoryview` escape hatch. Raw NumPy arrays or pointers derived from it bypass FastDB's checked owner/view model and **cannot be revoked mechanically** — materialize values through FastDB before storing them beyond the hold scope.
+`held.unsafe_buffer` exposes the retained raw wire buffer as a `memoryview` escape hatch. Raw NumPy arrays or pointers derived from it bypass FastDB's payload owner and checked views and **cannot be revoked mechanically** — materialize values through FastDB before storing them beyond the hold scope.
 
 On the server side, portable inputs are owned by default. Registering with `cc.register(..., input_lifetime={...: 'borrowed'})` opts specific methods into call-scoped borrowed inputs: C-Two invalidates the payload and its checked views before releasing the request lease when the call returns or raises. Do not retain a borrowed payload or view after the method returns.
 
@@ -158,7 +158,7 @@ Contract export and owner capability construction do not select a Runtime. Concu
 - Errors: `cc.error.CoreError` (structured local/Core errors), `cc.error.CCError` (semantic errors), with common `cc.error.CCBaseError`
 - Monitoring: `cc.observe.memory_stats`, `cc.observe.call_execution_snapshot`, `cc.observe.lifecycle_snapshot`, `cc.observe.shutdown_outcome` (read-only)
 
-Use `cc.set_server(startup_timeout=...)` before registration to choose a native startup wait. Startup expiry has `CoreError.lifecycle_kind == 'startup_timeout'`, `startup_stage` and `timeout_seconds`; see [startup configuration and errors](configuration.md#server-startup-deadlines).
+Use `cc.set_server(startup_timeout=...)` before registration to choose a native startup wait. Startup expiry has `CoreError.lifecycle_kind == 'startup_timeout'`, `startup_stage` and `timeout_seconds`; see [startup configuration and errors](configuration.md#server-startup-timeout).
 
 After a listener reaches Ready, `cc.endpoint.server_credential() -> cc.endpoint.EndpointCredential | None` returns its native credential from the existing lifecycle watch without inspection or filesystem I/O. It returns `None` before start and after terminal shutdown; a snapshot is not proof of liveness or cleanup authority. See the [lifecycle guide](local-endpoint-lifecycle.md#exact-cleanup-and-bounded-sweeps).
 
@@ -188,7 +188,7 @@ There is no separate `compo/` module, `@cc.runtime.connect` decorator, or `Compo
 
 ### Default Runtime API pattern
 
-Module-level registration, connection, configuration and shutdown delegate to the default Python Runtime. `cc.close(proxy)` follows the proxy's owner. `cc.Runtime()` creates an application-owned instance with the same register / connect / configure / shutdown methods and an empty-Host `start()`:
+Module-level registration, connection, configuration and shutdown delegate to the default Python Runtime. `cc.close(proxy)` follows the Runtime that created the proxy. `cc.Runtime()` creates an application-owned instance with the same register / connect / configure / shutdown methods and an empty-Host `start()`:
 
 ```python
 import c_two as cc
@@ -223,11 +223,11 @@ cc.unregister('grid')
 cc.shutdown()
 ```
 
-### Independent Python runtimes
+### Independent Python Runtime instances
 
-`cc.Runtime()` creates an independent Python binding owner and native session. Its `set_*`, `register`, `connect`, `unregister` and `shutdown` methods have the module-level signatures. Module functions use a separate default Runtime. Each explicit instance starts with empty code overrides; process environment and `.env` remain shared configuration sources, resolved by Core at the usual freeze points. Use instance setters when different runtimes need different settings. Independence means separate route, connection, observation and configuration ownership within one process.
+`cc.Runtime()` creates independent Python bindings over one native session. Its `set_*`, `register`, `connect`, `unregister` and `shutdown` methods have the module-level signatures. Module functions use a separate default Runtime. Each explicit instance starts with empty code overrides; process environment and `.env` remain shared configuration sources, resolved by Core at the usual freeze points. Use instance setters when different Runtime instances need different settings. Independence means separate route, connection, observation and configuration ownership within one process.
 
-`runtime.start()` starts a Host with no registered CRM and waits for native readiness and the existing IPC PING/PONG. A later `runtime.register()` uses that Host. Without an explicit address, `runtime.connect()` searches only that instance's local routes; use `address=other.server_address()` and the same Unix endpoint context for a cross-instance IPC call. `cc.close(proxy)`, its context manager, `cc.hold()` and `cc.with_call_options()` follow the proxy's original owner. Explicit instances have no `serve()` method or automatic signal/atexit cleanup; `cc.serve()` handles the module-level default Runtime.
+`runtime.start()` starts a Host with no registered CRM and waits for native readiness and the existing IPC PING/PONG. A later `runtime.register()` uses that Host. Without an explicit address, `runtime.connect()` searches only that instance's local routes; use `address=other.server_address()` and the same Unix endpoint context for a cross-instance IPC call. `cc.close(proxy)`, its context manager, `cc.hold()` and `cc.with_call_options()` follow the Runtime that created the proxy. Explicit instances have no `serve()` method or automatic signal/atexit cleanup; `cc.serve()` handles the module-level default Runtime.
 
 Calling `runtime.shutdown(timeout=...)` starts the Core Runtime's single permanent retirement scope for that SDK session; module-level `cc.shutdown()` does the same for the default Runtime. This scope seals the Core client pool and closes admission for new registration, start and remote connection work. A pending observation keeps the old session and its slots; later Core completion alone does not replace them. Call SDK shutdown again to consume the completed receipt and perform the session handoff. A zero or short wait budget limits only this caller's observation and does not cancel the driver. If the deadline expires before retirement is handed off, shutdown raises `CoreError` with `lifecycle_kind='shutdown_wait_timeout'`, `details.stage` and `timeout_seconds`; this is not a pending receipt. Python's numeric conversion happens before the SDK instance lock. Waiting to acquire that lock remains outside the shutdown deadline; after acquiring it, Native Host, Core and pool waits share one absolute deadline. Shutdown error projection and shutdown hooks run outside the Python binding lock. Hooks run after session replacement; if replacement construction fails, the original slots and journal remain available.
 

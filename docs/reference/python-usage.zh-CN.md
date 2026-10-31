@@ -67,13 +67,13 @@ finally:
 
 可移植方法在每个方向携带零个或一个 `Payload` 封套；C-Two 将每个嵌套规格作为不透明 JSON 值嵌入，且不重新解释它。没有明确绑定的方法仍可使用普通 Python 值进行仅限 Python 的原型开发，但可移植描述符导出与代码生成会诊断并拒绝这些方法。
 
-`cc.hold(echo.echo)(source)` 将响应保留为 `HeldResult`。显式 `release()` 先尝试让 FastDB 所有者失效一次，再释放原生存储。原生清理失败时，结果保留原始响应，供再次调用 `release()`；失效操作不会重放，且该值仍不可访问。如果导出被拒绝，先释放额外导出的 memoryview 再重试；拒绝发生在失效操作之前。手工构造的 `HeldResult(release_cb=...)` 回调仍只运行一次。常规作用域使用 `with cc.hold(...) as held`，需要超出作用域存活的值应实体化。
+`cc.hold(echo.echo)(source)` 将响应保留为 `HeldResult`。显式 `release()` 先尝试让载荷所有者失效一次，再释放原生存储。原生清理失败时，结果保留原始响应，供再次调用 `release()`；失效操作不会重放，且该值仍不可访问。如果导出被拒绝，先释放额外导出的 memoryview 再重试；拒绝发生在失效操作之前。手工构造的 `HeldResult(release_cb=...)` 回调仍只运行一次。常规作用域使用 `with cc.hold(...) as held`，需要超出作用域存活的值应实体化。
 
 `cc.observe.memory_stats()` 在每个原生内存作用域中包含 `abandoned_releases`。最终的消耗式清理失败会保留未返还的占用，并计入一次放弃的释放义务；原生载体返回或记录该错误。没有后台恢复。计数器也包含已发布、可能由对端稍后释放的 SHM 不确定结果。同用户的异常 SHM 对端可以声称无效、重放或过期的分配坐标；无法释放的这些引用也会计数，因此该计数可能超过实际未释放分配数。核算边界见[内存策略](memory-policy.md#statistics-and-payload-lifetime)。
 
 ## 远程连接与截止时间
 
-直接 IPC 使用资源进程的 `cc.server_address()` 值。直接 IPC 无需 relay。若要按资源名称发现，在注册或连接前设置 `cc.set_relay_anchor(...)`，并单独运行 `c3 relay`。注册所在进程的调用在未指定地址时优先使用同进程分派。
+直接 IPC 使用资源进程的 `cc.server_address()` 值。直接 IPC 无需 relay。若要按路由名发现，在注册或连接前设置 `cc.set_relay_anchor(...)`，并单独运行 `c3 relay`。注册所在进程的调用在未指定地址时优先使用同进程分派。
 
 ```python
 source = build_value(7)
@@ -107,7 +107,7 @@ server = session.ensure_server_bridge()
 
 ## 载荷生命周期
 
-已经证实的可移植接收路径打开的是**由副本支持**的 FastDB 所有者。`cc.hold()` 是生命周期契约，不构成零拷贝声明：它一同保留 C-Two 响应租约与载荷所有者，并保证释放租约*之前*，先让 FastDB 所有者及其受检查的视图失效。
+已经证实的可移植接收路径打开的是**由副本支持**的载荷所有者。`cc.hold()` 是生命周期契约，不构成零拷贝声明：它一同保留 C-Two 响应租约与载荷所有者，并保证释放租约*之前*，先让载荷所有者及其受检查的视图失效。
 
 ```python
 with cc.hold(echo.echo)(source) as held:
@@ -118,7 +118,7 @@ with cc.hold(echo.echo)(source) as held:
 
 释放有三层方式：显式 `.release()`、`with` 上下文管理器，以及遗漏前两者时发出警告的 `__del__` 兜底。`cc.observe.memory_stats()["holds"]` 报告监控中的活动 hold 数量。
 
-`held.unsafe_buffer` 将保留的原始线格式缓冲区作为 `memoryview` 逃逸入口暴露。从中派生的原始 NumPy 数组或指针绕开 FastDB 受检查的所有者和视图模型，**无法通过机制撤销**；要把值保存到 hold 作用域之外，应先通过 FastDB 实体化。
+`held.unsafe_buffer` 将保留的原始线格式缓冲区作为 `memoryview` 逃逸入口暴露。从中派生的原始 NumPy 数组或指针绕开 FastDB 的载荷所有者与受检查视图，**无法通过机制撤销**；要把值保存到 hold 作用域之外，应先通过 FastDB 实体化。
 
 服务端的可移植输入默认由服务端拥有。以 `cc.register(..., input_lifetime={...: 'borrowed'})` 注册，可将指定方法设为仅在调用期间借用输入：调用返回或抛出异常时，C-Two 在释放请求租约前让载荷及其受检查视图失效。方法返回后不要保留借用的载荷或视图。
 
@@ -158,7 +158,7 @@ use fastdb::Payload;
 - 错误：`cc.error.CoreError`（结构化本地/Core 错误）、`cc.error.CCError`（语义错误），共同基类为 `cc.error.CCBaseError`
 - 监控：`cc.observe.memory_stats`、`cc.observe.call_execution_snapshot`、`cc.observe.lifecycle_snapshot`、`cc.observe.shutdown_outcome`（只读）
 
-在注册前使用 `cc.set_server(startup_timeout=...)` 选择原生启动等待。启动超时包含 `CoreError.lifecycle_kind == 'startup_timeout'`、`startup_stage` 和 `timeout_seconds`；参见[启动配置与错误](configuration.zh-CN.md#服务启动期限)。
+在注册前使用 `cc.set_server(startup_timeout=...)` 选择原生启动等待。启动超时包含 `CoreError.lifecycle_kind == 'startup_timeout'`、`startup_stage` 和 `timeout_seconds`；参见[启动配置与错误](configuration.zh-CN.md#服务启动超时)。
 
 监听器达到 Ready 后，`cc.endpoint.server_credential() -> cc.endpoint.EndpointCredential | None` 从现有生命周期观察器返回其原生凭据，无需检查或文件系统 I/O。启动前以及终止关闭后返回 `None`；快照不能证明服务仍存活，也不能授予清理权限。参见[生命周期指南](local-endpoint-lifecycle.md#exact-cleanup-and-bounded-sweeps)。
 
@@ -188,7 +188,7 @@ with cc.connect(Grid, name='grid', address='ipc://server') as grid:
 
 ### 默认 Runtime API 模式
 
-模块级注册、连接、配置及关闭委托给默认 Python Runtime。`cc.close(proxy)` 跟随代理的所有者。`cc.Runtime()` 创建应用拥有的实例，提供相同的注册/连接/配置/关闭方法，以及用于空 Host 的 `start()`：
+模块级注册、连接、配置及关闭委托给默认 Python Runtime。`cc.close(proxy)` 跟随创建该代理的 Runtime。`cc.Runtime()` 创建应用拥有的实例，提供相同的注册/连接/配置/关闭方法，以及用于空 Host 的 `start()`：
 
 ```python
 import c_two as cc
@@ -225,9 +225,9 @@ cc.shutdown()
 
 ### 独立的 Python Runtime
 
-`cc.Runtime()` 创建独立的 Python 绑定所有者和原生会话。它的 `set_*`、`register`、`connect`、`unregister` 和 `shutdown` 方法与模块级函数签名相同。模块函数使用另一个默认 Runtime。每个显式实例的代码覆盖值初始为空；进程环境和 `.env` 仍是共享配置来源，由 Core 在通常的冻结点解析。不同 Runtime 需要不同设置时，使用各自的实例 setter。独立性意味着在同一进程内分别拥有路由、连接、观察及配置。
+`cc.Runtime()` 在一个原生会话之上创建独立的 Python 绑定。它的 `set_*`、`register`、`connect`、`unregister` 和 `shutdown` 方法与模块级函数签名相同。模块函数使用另一个默认 Runtime。每个显式实例的代码覆盖值初始为空；进程环境和 `.env` 仍是共享配置来源，由 Core 在通常的冻结点解析。不同 Runtime 需要不同设置时，使用各自的实例 setter。独立性意味着在同一进程内分别拥有路由、连接、观察及配置。
 
-`runtime.start()` 启动未注册 CRM 的 Host，并等待原生就绪及现有 IPC PING/PONG。随后 `runtime.register()` 使用该 Host。没有显式地址时，`runtime.connect()` 仅搜索该实例的本地路由；跨实例 IPC 调用应使用 `address=other.server_address()`，并采用相同的 Unix 端点上下文。`cc.close(proxy)`、代理的上下文管理器、`cc.hold()` 和 `cc.with_call_options()` 均跟随代理原来的所有者。显式实例没有 `serve()` 方法，也没有自动信号或 atexit 清理；`cc.serve()` 处理模块级默认 Runtime。
+`runtime.start()` 启动未注册 CRM 的 Host，并等待原生就绪及现有 IPC PING/PONG。随后 `runtime.register()` 使用该 Host。没有显式地址时，`runtime.connect()` 仅搜索该实例的本地路由；跨实例 IPC 调用应使用 `address=other.server_address()`，并采用相同的 Unix 端点上下文。`cc.close(proxy)`、代理的上下文管理器、`cc.hold()` 和 `cc.with_call_options()` 均跟随创建该代理的 Runtime。显式实例没有 `serve()` 方法，也没有自动信号或 atexit 清理；`cc.serve()` 处理模块级默认 Runtime。
 
 调用 `runtime.shutdown(timeout=...)` 会为该 SDK 会话启动 Core Runtime 唯一且永久的退役作用域；模块级 `cc.shutdown()` 对默认 Runtime 执行相同操作。该作用域封闭 Core 客户端池，并停止接受新的注册、启动和远程连接任务。待定观察保留旧会话及其槽位；Core 此后自行完成也不会替换它们。应再次调用 SDK shutdown，消费已完成的回执并进行会话交接。零或较短的等待预算只限制当前调用方的观察，不取消驱动任务。如果交接退役之前截止时间到期，shutdown 抛出 `CoreError`，包含 `lifecycle_kind='shutdown_wait_timeout'`、`details.stage` 和 `timeout_seconds`；这不是待定回执。Python 的数值转换在取得 SDK 实例锁前发生。等待取得该锁不计入 shutdown 截止时间；取得锁后，Native Host、Core 与连接池等待共用一个绝对截止时间。关闭错误投影和关闭回调在 Python 绑定锁外运行。回调在会话替换后运行；如果构造替换会话失败，原始槽位及日志仍可用。
 

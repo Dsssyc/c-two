@@ -55,7 +55,7 @@ use fastdb::Payload;
 
 C-Two-generated Rust modules provide typed clients and service definitions. They consume the hidden `c_two::generated` seam; ordinary applications should not construct encoded calls or service dispatch tables by hand.
 
-All portable receive paths are currently copy-backed. `Held<Payload>` adds a checked lifetime: explicit `release()` and `Drop` invalidate the FastDB owner before releasing the C-Two response lease. Generated service inputs use the same ordering at callback exit. This is not a zero-copy claim, and unsafe raw pointers extracted outside FastDB's checked owner/view model cannot be revoked.
+All portable receive paths are currently copy-backed. `Held<Payload>` adds a checked lifetime: explicit `release()` and `Drop` invalidate the payload owner before releasing the C-Two response lease. Generated service inputs use the same ordering at callback exit. This is not a zero-copy claim, and unsafe raw pointers extracted outside FastDB's checked owner/view model cannot be revoked.
 
 `Held::release()` retries a failed native cleanup using the original response; the invalidator runs once, including after a caught panic. `value()` becomes `None` when invalidation starts. Core `HeldResponse::is_released()` describes that access state, while `has_pending_release()` reports native obligations. A native failure keeps the exact connection pin until cleanup succeeds or the final owner abandons it.
 

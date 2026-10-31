@@ -50,15 +50,15 @@ Typed overrides 为 `BaseIPCOverrides`、`ServerIPCOverrides`、`ClientIPCOverri
 | Relay 注册与名称发现 | `cc.set_relay_anchor(url)` | `C2_RELAY_ANCHOR_ADDRESS` | 无 relay |
 | 服务启动等待 | `cc.set_server(startup_timeout=...)` | — | 5 秒 |
 | SHM/inline 分界 | `cc.set_transport_policy(shm_threshold=...)` | `C2_SHM_THRESHOLD` | 4 KiB |
-| 远程载荷分块大小 | `cc.set_transport_policy(remote_payload_chunk_size=...)` | `C2_REMOTE_PAYLOAD_CHUNK_SIZE` | 1 MiB |
+| 远程载荷分片大小 | `cc.set_transport_policy(remote_payload_chunk_size=...)` | `C2_REMOTE_PAYLOAD_CHUNK_SIZE` | 1 MiB |
 | 单个服务端 frame 限额 | `set_server(ipc_overrides={'max_frame_size': ...})` | `C2_IPC_MAX_FRAME_SIZE` | 2 GiB |
 | 单条逻辑载荷限额 | `set_server(ipc_overrides={'max_payload_size': ...})` | `C2_IPC_MAX_PAYLOAD_SIZE` | 16 GiB |
 | 整个服务端待处理请求 | `set_server(ipc_overrides={'max_pending_requests': ...})` | `C2_IPC_MAX_PENDING_REQUESTS` | 1,024 |
 | Resource 执行线程 | `set_server(ipc_overrides={'max_execution_workers': ...})` | `C2_IPC_MAX_EXECUTION_WORKERS` | 默认按 Host 并行度取 4–64；显式值必须为正，且不受 4–64 的限制 |
 
-显式 `address='ipc://...'` 连接独立于 relay 发现直接使用本地 IPC。Relay anchor 负责注册和发现，HTTP 调用使用解析结果中的目标 relay URL。远程分块大小控制 C-Two 载荷批次，不等同于 TCP 包或 HTTP frame 大小。
+显式 `address='ipc://...'` 连接独立于 relay 发现直接使用本地 IPC。Relay anchor 负责注册和发现，HTTP 调用使用解析结果中的目标 relay URL。远程分片大小控制 C-Two 载荷批次，不等同于 TCP 包或 HTTP frame 大小。
 
-## 服务启动期限
+## 服务启动超时
 
 在首次注册前用 `cc.set_server(startup_timeout=seconds)` 设置 Core 的启动等待预算。原生 `RuntimeSession` 构造器和 `set_server_options` 接受同名参数。数值必须有限、非负且能由原生时钟表示；零表示立即到期。省略或 `None` 使用原有的 5 秒有限默认值，不表示无限等待。保留默认值是为了约束无人配置时的启动等待，不保证繁忙运行器能在 5 秒内就绪；应用应明确选择自己的部署预算。
 
@@ -66,7 +66,7 @@ Core 在首次 Host 启动尝试时冻结服务配置，失败也保持冻结；
 
 启动到期产生公开的 `c_two.error.CoreError`：`category='lifecycle'`、`lifecycle_kind='startup_timeout'`，并携带 `startup_stage`（`readiness`、`responsiveness` 或 `owner_control`）及 `timeout_seconds`。三个本地 I/O 字段 `io_operation`、`io_kind`、`raw_os_error` 均为 `None`。真实 bind 失败保持原结构化系统原因，消息不再添加错误的 `config error` 前缀。这些诊断不提供重试、接管或清理端点的权限。完整类型及取值范围见[公开错误字段表](local-endpoint-lifecycle.md#public-structured-python-errors)。
 
-## IPC 内存、分块与心跳
+## IPC 内存、分片与心跳
 
 下面的 pool、budget、reassembly 字段通过对应端的 `ipc_overrides` 设置。具体分配、释放和回退语义见[内存策略](memory-policy.md)。
 
@@ -86,13 +86,13 @@ Core 在首次 Host 启动尝试时冻结服务配置，失败也保持冻结；
 | `max_total_chunks` | `C2_IPC_MAX_TOTAL_CHUNKS` | 512 | 所有连接中在途分片的总数上限 |
 | `chunk_size` | `C2_IPC_CHUNK_SIZE` | 128 KiB | 单个分片的字节数 |
 | `chunk_threshold_ratio` | `C2_IPC_CHUNK_THRESHOLD_RATIO` | 0.9 | 最大 frame 大小的配置比例；接受并校验，但当前传输选择不使用此值 |
-| `chunk_assembler_timeout` | `C2_IPC_CHUNK_ASSEMBLER_TIMEOUT` | 60 秒 | 未完成分块组装的超时秒数 |
-| `chunk_gc_interval` | `C2_IPC_CHUNK_GC_INTERVAL` | 5 秒 | 分块垃圾回收扫描的间隔秒数 |
+| `chunk_assembler_timeout` | `C2_IPC_CHUNK_ASSEMBLER_TIMEOUT` | 60 秒 | 未完成分片重组的超时秒数 |
+| `chunk_gc_interval` | `C2_IPC_CHUNK_GC_INTERVAL` | 5 秒 | 分片垃圾回收扫描的间隔秒数 |
 | `max_reassembly_bytes` | `C2_IPC_MAX_REASSEMBLY_BYTES` | 8 GiB | 重组缓冲内存的最大字节数 |
 | `heartbeat_interval`（服务端） | `C2_IPC_HEARTBEAT_INTERVAL` | 15 秒 | 心跳间隔秒数；0 关闭心跳 |
 | `heartbeat_timeout`（服务端） | `C2_IPC_HEARTBEAT_TIMEOUT` | 30 秒 | 心跳超时秒数 |
 
-`pool_segment_size` 是池段容量，向上取 2 的幂后须能用 u32 表示，即最大为 2 GiB；`max_payload_size` 是单条消息限额，两者独立。关闭 buddy 池仍允许 dedicated SHM、分块传输和文件溢出。Backing budget 和 live-reassembly budget 的 `0` 拒绝正数预留；`pool_decay_seconds=0` 在下一维护周期回收空闲段；`heartbeat_interval=0` 关闭心跳。
+`pool_segment_size` 是池段容量，向上取 2 的幂后须能用 u32 表示，即最大为 2 GiB；`max_payload_size` 是单条消息限额，两者独立。关闭 buddy 池仍允许 dedicated SHM、分片传输和文件溢出。Backing budget 和 live-reassembly budget 的 `0` 拒绝正数预留；`pool_decay_seconds=0` 在下一维护周期回收空闲段；`heartbeat_interval=0` 关闭心跳。
 
 `cc.observe.memory_stats()` 查看原生内存域，`cc.observe.memory_stats()["holds"]` 查看 SDK 租约，二者均为只读统计。它们不表示整个进程的 RSS。
 
@@ -122,7 +122,7 @@ C2_RELAY_IDLE_TIMEOUT=60
 | 系统 HTTP proxy | — | `C2_RELAY_USE_PROXY` | `false` |
 | 反熵交换间隔 | — | `C2_RELAY_ANTI_ENTROPY_INTERVAL` | 60 秒 |
 
-`remote_payload_chunk_size` 是唯一的远程 body 分批策略，由 Rust 从传输策略覆盖值或 `C2_REMOTE_PAYLOAD_CHUNK_SIZE` 解析；默认 1 MiB，允许大于零且不超过 128 MiB。Relay HTTP 将其用于发出的请求 body 及已物化响应 body 的流式发送；`C2_IPC_CHUNK_SIZE` 独立控制 IPC 线格式分块与重组。远程配置值不指定 TCP packet 或 HTTP frame 的边界。
+`remote_payload_chunk_size` 是唯一的远程 body 分批策略，由 Rust 从传输策略覆盖值或 `C2_REMOTE_PAYLOAD_CHUNK_SIZE` 解析；默认 1 MiB，允许大于零且不超过 128 MiB。Relay HTTP 将其用于发出的请求 body 及已物化响应 body 的流式发送；`C2_IPC_CHUNK_SIZE` 独立控制 IPC 线格式分片与重组。远程配置值不指定 TCP packet 或 HTTP frame 的边界。
 
 Core relay-aware 客户端进行一次路由观察，随后至多进行一次派发前刷新；此上限固定，不通过 SDK 设置配置。
 
@@ -130,7 +130,7 @@ Core relay-aware 客户端进行一次路由观察，随后至多进行一次派
 
 Relay 在启动时冻结转发限额，所有业务转发均受约束，包括调用方无限等待的请求。数量限额 `0` 拒绝全部新转发；输入预算 `0` 拒绝正数输入。已知长度在移交请求前预留，未知长度随实际输入检查增长；超限返回容量错误，不撤销路由。该预算独立于上游 IPC backing 和 reassembly budget，不代表整个进程内存。
 
-Relay 容量不足时，拒绝结果在业务准入前确定。对于没有 Expect 头、长度声明有效的请求，HTTP handler 按帧丢弃传输数据，受声明长度和 2 秒总期限约束；不聚合整包、不解码、不调用资源、不再次申请业务准入。期间容量释放也不改变拒绝结果。Expect 或未知长度的拒绝请求不读取 body；读取错误、长度不符或超时保留原容量错误。未完成或错误的传输可能使客户端无法收到该响应。
+Relay 容量不足时，拒绝结果在业务准入前确定。对于没有 Expect 头、长度声明有效的请求，HTTP handler 按帧丢弃传输数据，受声明长度和 2 秒的总截止时间约束；不聚合整包、不解码、不调用资源、不再次申请业务准入。期间容量释放也不改变拒绝结果。Expect 或未知长度的拒绝请求不读取 body；读取错误、长度不符或超时保留原容量错误。未完成或错误的传输可能使客户端无法收到该响应。
 
 HTTP 调用方断开后，已经派发的转发仍持有其输入和上游连接，直到实际完成。Relay 关闭先停止准入，再等待转发和原生客户端清理。始终不返回的资源方法会持续占用名额，也会阻塞关闭。
 
@@ -143,7 +143,7 @@ HTTP 调用方断开后，已经派发的转发仍持有其输入和上游连接
 
 Unix root 是最终端点目录，实际 socket 位于 `<root>/<32 字符标识>`。自定义目录由应用预建，允许 `0755`：当前用户持有目录，具备读、写、遍历权限，组和其他用户没有写权限。默认目录由 C-Two 创建为 `0700`。Socket 在开始监听前设置并核实为 `0600`。路径允许中文和空格，绑定、连接与探测通过目录句柄定位短名称，目录长度受文件系统限制。C-Two 只管理自身端点、租约及协调文件，不修改已有目录权限、不递归创建父目录、不删除应用目录或无关文件。
 
-macOS 默认命名空间的 gate/marker/lease 协调记录放在 `confstr(_CS_DARWIN_USER_DIR)/c2-ipc-coordination-v3`，与 `/tmp/c2-v3-<uidhex>` 下的 socket 分离；默认目录的别名共用同一协调器。两个默认目录均随 namespace 磁盘格式 3 改名。非默认自定义 root 与 Linux 保持同目录布局。默认目录中的 `v3` 取自 namespace 磁盘格式版本；自定义 root 不追加版本名。不同格式各用自己的默认目录，旧默认目录无需同名冷切换。显式共享同一自定义物理 root 不受支持；若出现 `unsupported-namespace-format`，须在全部旧进程退出并禁止重启、完整离线归档该 root 后重建。协调记录与精确回收规则见[生命周期指南](local-endpoint-lifecycle.md)。
+macOS 默认端点命名空间的 gate/marker/lease 协调记录放在 `confstr(_CS_DARWIN_USER_DIR)/c2-ipc-coordination-v3`，与 `/tmp/c2-v3-<uidhex>` 下的 socket 分离；默认目录的别名共用同一协调器。两个默认目录均随 namespace 磁盘格式 3 改名。非默认自定义 root 与 Linux 保持同目录布局。默认目录中的 `v3` 取自 namespace 磁盘格式版本；自定义 root 不追加版本名。不同格式各用自己的默认目录，旧默认目录无需同名冷切换。显式共享同一自定义物理 root 不受支持；若出现 `unsupported-namespace-format`，须在全部旧进程退出并禁止重启、完整离线归档该 root 后重建。协调记录与精确回收规则见[生命周期指南](local-endpoint-lifecycle.md)。
 
 macOS 会额外拒绝允许修改目录内容、属性或权限的扩展 ACL 条目，包括继承条目；只读、遍历和 deny 条目可用。
 
@@ -158,9 +158,9 @@ cc.endpoint.set_local_endpoint(root=str(ipc_dir))
 
 共享本地域的资源进程、客户端和 relay 上游使用相同目录。Root 不改变 SHM 或 file-spill 的位置。配置在首次本地 I/O 尝试时冻结，包括失败的尝试。端点凭据保留其捕获的作用域；控制器在确认进程退出后使用精确凭据清理。参见[生命周期指南](local-endpoint-lifecycle.md)和 [0.7.4 指南](../releases/0.7.4.md)。
 
-## 连接期限
+## 连接截止时间
 
-`cc.connect(CRM, name='resource', address='ipc://server', timeout=0.1)` 为本次连接获取设置总预算。省略或 `None` 不增加调用方总期限，保留已有阶段保护；`0` 在入口到期，负数和非有限值被拒绝。预算贯穿池等待、连接、握手、路由查询及 relay 发现与获取，重试不重置期限。Rust 使用 `ConnectOptions::new().with_timeout(Duration::from_millis(100))` 和 `Runtime::connect_with_options`。
+`cc.connect(CRM, name='resource', address='ipc://server', timeout=0.1)` 为本次连接获取设置总预算。省略或 `None` 不增加调用方截止时间，保留已有阶段保护；`0` 在入口到期，负数和非有限值被拒绝。预算贯穿池等待、连接、握手、路由查询及 relay 发现与获取，重试不重置预算。Rust 使用 `ConnectOptions::new().with_timeout(Duration::from_millis(100))` 和 `Runtime::connect_with_options`。
 
 到期返回 `CallDeadlineExceeded`，details 中 `operation=connect`、`transport_phase=pre_dispatch` 和 `stage` 标明失败位置。连接操作尚未执行资源方法。成功连接后，业务调用的等待由 `cc.with_call_options(...)` 独立设置。
 
@@ -169,15 +169,15 @@ cc.endpoint.set_local_endpoint(root=str(ipc_dir))
 | 配置 | 入口 | 默认值 | 含义 |
 | --- | --- | --- | --- |
 | 单次调用等待 | `cc.with_call_options(proxy, timeout=...)` | 继承传输默认 | 单次远程业务调用的调用方等待预算 |
-| Relay 逻辑调用期限 | `C2_RELAY_CALL_TIMEOUT` | 300 秒，`0` 为无限 | Relay HTTP CRM 调用超时秒数；0 关闭 reqwest 总超时 |
-| 有限调用名额 | `cc.set_call_execution_limits(max_outstanding_calls=...)` / `C2_CALL_MAX_OUTSTANDING` | 1,024 / Runtime | 保留原生事务的有限期限并发调用数上限 |
-| 有限调用保留输入 | `retained_input_budget_bytes=...` / `C2_CALL_RETAINED_INPUT_BUDGET_BYTES` | 16 GiB / Runtime | 上述有限期限调用所保留输入的字节预算 |
+| Relay 逻辑调用截止时间 | `C2_RELAY_CALL_TIMEOUT` | 300 秒，`0` 为无限 | Relay HTTP CRM 调用超时秒数；0 关闭 reqwest 总超时 |
+| 有限调用名额 | `cc.set_call_execution_limits(max_outstanding_calls=...)` / `C2_CALL_MAX_OUTSTANDING` | 1,024 / Runtime | 保留原生事务、带有限截止时间的并发调用数上限 |
+| 有限调用保留输入 | `retained_input_budget_bytes=...` / `C2_CALL_RETAINED_INPUT_BUDGET_BYTES` | 16 GiB / Runtime | 上述带有限截止时间的调用所保留输入的字节预算 |
 
 直连 IPC 默认无限等待；HTTP 的预算覆盖一个逻辑调用和其内的路由重取。`timeout=None` 显式无限，`0` 在派发前到期，负数和非有限值在入口拒绝。同进程同步调用只接受继承或无限策略。
 
-期限到达结束调用方等待，已经派发的原生事务仍可能继续完成传输，随后释放其保留的输入。单次调用期限到期不会撤销 relay 路由、发起 OwnerBound 关闭，也不会使已经取得的 held 响应属主失效。错误区分派发前到期与派发状态不确定；后者不能自动重放调用。
+截止时间到达后结束调用方等待，已经派发的原生事务仍可能继续完成传输，随后释放其保留的输入。单次调用截止时间到期不会撤销 relay 路由、发起 OwnerBound 关闭，也不会使已经取得的 held 响应的载荷所有者失效。错误区分派发前到期与派发状态不确定；后者不能自动重放调用。
 
-有限调用的数量上限 `0` 拒绝所有新有限调用，字节预算 `0` 只拒绝正数输入；无限调用不受这两项准入限额约束。`cc.observe.call_execution_snapshot()` 查看当前及退休域的真实计费。示例与错误阶段见[调用期限指南](../releases/0.7.1.md#per-call-deadlines-for-remote-calls)。
+有限调用的数量上限 `0` 拒绝所有新有限调用，字节预算 `0` 只拒绝正数输入；无限调用不受这两项准入限额约束。`cc.observe.call_execution_snapshot()` 查看当前及退休域的真实计费。示例与错误阶段见[调用截止时间指南](../releases/0.7.1.md#per-call-deadlines-for-remote-calls)。
 
 ## 并发与资源生命周期
 
@@ -185,7 +185,7 @@ cc.endpoint.set_local_endpoint(root=str(ipc_dir))
 
 服务端 `max_pending_requests` 是所有连接共用的一个信号量，计算等待或使用执行容量的完整远程调用，不随连接数倍增。`max_execution_workers` 单独限制正在执行的远程回调。路由自己的 `max_pending` 和 `max_workers` 也约束同进程调用。机制见[执行准入](runtime-lifecycle.md#execution-admission)。
 
-`cc.owner.LifecycleConfig` 选择默认 `Persistent` 或显式 `OwnerBound`。后者使用控制器预先准备的私有 owner capability。`cc.shutdown(timeout=...)` 在取得 Python 实例锁后，用一个期限约束 Native owner/Core/pool 锁等待和本次关闭观察；Python 实例锁等待不计入该期限，已启动的原生收尾不会被等待超时取消；监听关闭、工作排空和 held lease 释放分别报告。完整接入方式见[生命周期指南](local-endpoint-lifecycle.md)。
+`cc.owner.LifecycleConfig` 选择默认 `Persistent` 或显式 `OwnerBound`。后者使用控制器预先准备的私有 owner capability。`cc.shutdown(timeout=...)` 在取得 Python 实例锁后，用一个截止时间约束 Native owner/Core/pool 锁等待和本次关闭观察；Python 实例锁等待不计入该截止时间，已启动的原生收尾不会被等待超时取消；监听关闭、工作排空和 held lease 释放分别报告。完整接入方式见[生命周期指南](local-endpoint-lifecycle.md)。
 
 ## 原生配置权威
 

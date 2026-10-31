@@ -19,7 +19,8 @@
   - 范围：[执行计划](2026-10-31-docs-and-agents-restructure.md)。
   - 状态：第一步已完成并验收，合入分支 `socu/docs-restructure`（`a86403af`）。根 AGENTS.md 从 64,905 字节瘦到 21,934 字节，机制细节移入 `docs/reference/`；文档卫生检查守住 32 KiB、相对链接与中英两版的互链；独立审查确认旧 AGENTS.md 的规则都有着落。
   - 第二步：用户 2026-10-31 批准执行计划第八节的清退清单，已实施并验收，合入为 `143c11e3`。`docs/` 只剩 reference、design、acceptance、research、releases、assets 六个目录；删除 151 份，另有 15 份在核对代码、挪出仍然成立的内容后删除；链接全部迁移。文档卫生检查改用 markdown-it-py，覆盖全部 Markdown，并拒绝本机的主目录与工作目录布局（hosted CI 上跳过）。
-  - 之后：`CONTEXT.md` 术语表待用户确认词条；然后跑一次 fork 全量 CI，向上游的 PR 在代码批次之后单独开。
+  - 术语表：`CONTEXT.md` 用户 2026-10-31 确认，同一次提交统一了现行文档的用词（期限改为截止时间或超时，分块改为分片，所有者、载荷所有者与属主分开，端点命名空间写全）；冻结的验收记录与已发布的说明不改。
+  - 之后：跑一次 fork 全量 CI，向上游的 PR 在代码批次之后单独开。
 
 ## 顺序（Host 建议，待用户确认）
 
@@ -81,7 +82,6 @@
 ## 待用户决定
 
 - 配置项的逐项表。
-- `CONTEXT.md` 的词条（文档清退清单已于 2026-10-31 批准）。
 - 所有者子系统是否删除。
 - relay 轮询的间隔。
 - `/_admin/unregister` 有没有人手动使用（F7）。
@@ -94,6 +94,7 @@
 下一批碰到同一块代码时顺带做掉：
 
 - 删除从没产生过的错误码 706 `WriteConflict`，连同 Python 的错误类、映射与相关测试（用户 2026-10-31 同意）。它原本属于上面"多副本一致性"的写锁设想；以后真要做，按新设计重新登记。704 是还在使用的 `RouteStale`，不动。
+- 代码里两处与术语表不符的用词：`sdk/python/src/c_two/error.py` 里重复注册错误的 docstring 写成 resource name，应为 route name；`c2-http` relay 的 `LocalEndpointNamespaceRequired` 消息写成 "the resource namespace"，应为资源一方的本地端点命名空间。
 
 - 本地直接跑 pytest 时，TypeScript 测试要先构建 c2-mem-ffi 的 Node 绑定（`core/foundation/c2-mem-ffi/bindings/typescript` 下 `npm ci && npm run build`）。没构建时，有 2 项报错、约 30 项被跳过，看上去像回归。可以让夹具缺这个绑定时直接报出来，或者在开发文档里写明这一步。
 

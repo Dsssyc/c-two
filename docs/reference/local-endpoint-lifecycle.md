@@ -32,7 +32,7 @@ On Windows, the Global listener lease is non-inheritable and connected streams d
 
 ## Bind and connect failures
 
-Since 0.8.1, startup deadline expiry has `CoreError.lifecycle_kind='startup_timeout'`, `startup_stage` and `timeout_seconds`. Local bind failure messages no longer carry the incorrect `config error` prefix; their existing OS fields are preserved. Configure the wait with `cc.set_server(startup_timeout=...)` before registration. See [startup deadlines](configuration.md#server-startup-deadlines) for the finite default, freezing and cleanup boundary.
+Since 0.8.1, startup deadline expiry has `CoreError.lifecycle_kind='startup_timeout'`, `startup_stage` and `timeout_seconds`. Local bind failure messages no longer carry the incorrect `config error` prefix; their existing OS fields are preserved. Configure the wait with `cc.set_server(startup_timeout=...)` before registration. See [startup deadlines](configuration.md#server-startup-timeout) for the finite default, freezing and cleanup boundary.
 
 Public `c_two.error.CoreError` exposes `io_operation` (`bind` or `connect`), `io_kind` (`permission_denied`, `not_found`, `connection_refused`, `address_in_use` or `other`) and `raw_os_error` (the native errno/Win32 code, or `None` when no native code exists). An unverifiable endpoint at bind reports native `InvalidData`, `io_kind=other` and `endpoint_unverified_reason` with the same finite strings as inspection; policy refusals do not fabricate an errno. Actual OS errors retain their kind and errno. Configuration, handshake, contract and deadline failures have no local cause. The existing Windows PIPE_BUSY wait retains its original connection budget; gate-wait expiry is `WouldBlock`, while a live address or listener lease conflict is `AddrInUse`.
 

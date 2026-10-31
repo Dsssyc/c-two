@@ -57,7 +57,7 @@ finally:
 
 FastDB can enforce stale-use detection only through its public `Payload` owner and checked-view contract. C-Two must invalidate held responses and borrowed inputs before releasing the associated transport lease. Values that must outlive that lease must be materialized through the official FastDB API.
 
-FastDB cannot reliably invalidate every raw pointer a user deliberately extracts from a view. In particular, unsafe NumPy access can produce an ndarray or pointer that no longer consults the FastDB owner on later reads. Treat such APIs as explicit unsafe escapes: tests should assert normal FastDB view invalidation after release, but do not claim that a leaked raw NumPy pointer can be made mechanically impossible in Python.
+FastDB cannot reliably invalidate every raw pointer a user deliberately extracts from a view. In particular, unsafe NumPy access can produce an ndarray or pointer that no longer consults the payload owner on later reads. Treat such APIs as explicit unsafe escapes: tests should assert normal FastDB view invalidation after release, but do not claim that a leaked raw NumPy pointer can be made mechanically impossible in Python.
 
 IPC request and response memory pools are directional rather than one full-duplex shared pool, so leaked or malicious stale access in one direction should not expose the opposite channel. HTTP/relay paths necessarily copy at the relay/network boundary, breaking the shared-memory eavesdropping path. These mitigations do not replace FastDB view invalidation or explicit materialization; C-Two treats stale raw-pointer exposure as a developer-safety/performance footgun rather than a primary cross-channel security model.
 

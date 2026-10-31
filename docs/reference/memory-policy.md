@@ -16,7 +16,7 @@ Both server and client IPC overrides accept these independent byte budgets:
 | `file_backing_budget_bytes` | 16 GiB | Locally created file backing length |
 | `live_reassembly_budget_bytes` | 8 GiB | Reassembly capacity retained by incomplete, queued, executing or held payloads |
 
-Zero rejects every positive reservation. The entire `u64` range is valid; zero does not mean unlimited. Per-message `max_payload_size` and `max_reassembly_bytes` limits apply independently; `max_total_chunks` applies to chunks in flight across requests, and `max_pool_segments` limits pool segments. Budgets cover C-Two-owned IPC backing and assembly, without bounding Python/FastDB heaps, HTTP buffers, receiver-opened peer mappings or total process RSS.
+Zero rejects every positive reservation. The entire `u64` range is valid; zero does not mean unlimited. Per-message `max_payload_size` and `max_reassembly_bytes` limits apply independently; `max_total_chunks` applies to chunks in flight across requests, and `max_pool_segments` limits pool segments. Budgets cover C-Two-owned IPC backing and reassembly, without bounding Python/FastDB heaps, HTTP buffers, receiver-opened peer mappings or total process RSS.
 
 Server response pools, reassembly and prewarming share one server-direction budget. Cached request and reassembly pools in one Runtime's outgoing client domain share another. Directions and separate Runtimes are independent. Reservation occurs atomically before backing creation: refusal creates no mapping or file. Reusing free blocks in charged backing does not charge it again. Dedicated storage remains charged while waiting for peer `read_done` or owner GC.
 
@@ -42,7 +42,7 @@ Server responses up to `shm_threshold` use inline frames. Larger responses try b
 
 SHM header version 3 records each buddy allocation's level and non-wrapping id under the existing allocator lock. Release must match that live record before changing free bits or counters, rejecting parent, child and stale-id releases. Logical sizes still round up to the allocation level, and trimming preserves the original release capacity. Records add 8 bytes per minimum block: the default 256 MiB / 4 KiB backing and its creation budget grow by 512 KiB. IPC 12 and C/FFI ABI 5 introduced this allocation-id representation. 0.9.x uses IPC 13 and C/FFI ABI 6 with SHM header 3. 0.10.0 uses the [IPC 14 fixed preamble](ipc-handshake.md), retaining ABI 6 and SHM header 3; retired handshakes and ABIs are rejected.
 
-Receiver assembly reserves full capacity, `total_chunks × chunk_size`, before accepting the storage. Allocation tries buddy reuse, reuse after GC, buddy expansion, dedicated SHM and finally file mmap. Completion may trim logical length while the capacity charge remains until storage release. Resources receive the complete assembled input; chunk transfer does not provide incremental resource input.
+Receiver reassembly reserves full capacity, `total_chunks × chunk_size`, before accepting the storage. Allocation tries buddy reuse, reuse after GC, buddy expansion, dedicated SHM and finally file mmap. Completion may trim logical length while the capacity charge remains until storage release. Resources receive the complete assembled input; chunk transfer does not provide incremental resource input.
 
 Low-level explicit Rust release retains authority on failure. `MemPool::release_handle` returns `ReleaseHandleError` containing the original `handle` and `reason`; `RequestLease::release` and `ResponseLease::release` clear their carrier only after success. Never discard a `pool_free` failure. A caller may retry after contention ends; retry does not repair poison, stale identity or a wrong pool. Reassembly reservations are refunded only after storage release; cached mapping charges still follow the existing GC policy.
 
@@ -66,7 +66,7 @@ Fallback uses the existing IPC inline/chunk and SHM paths; do not introduce a th
 
 ## Disabling buddy
 
-`pool_enabled=False` skips buddy reuse and expansion, including cached segments. Dedicated SHM, inline, chunks and file backing remain available. Receiver assembly also uses dedicated SHM and file fallback. Dedicated mappings still consume the SHM backing budget.
+`pool_enabled=False` skips buddy reuse and expansion, including cached segments. Dedicated SHM, inline, chunks and file backing remain available. Receiver reassembly also uses dedicated SHM and file fallback. Dedicated mappings still consume the SHM backing budget.
 
 `pool_enabled` is accepted by `BaseIPCOverrides`, `ServerIPCOverrides` and `ClientIPCOverrides`. This minimal configuration disables only buddy, with dedicated SHM and the existing fallback paths still available:
 
@@ -78,7 +78,7 @@ cc.set_server(ipc_overrides={'pool_enabled': False})
 cc.set_client(ipc_overrides={'pool_enabled': False})
 ```
 
-`shm_threshold` selects the inline/SHM boundary and does not disable every SHM path. The native parser rejects `shm_threshold` in `ipc_overrides`; configure it through `cc.set_transport_policy(shm_threshold=...)`. Raising the threshold can move sender traffic to inline or chunks while receiver assembly still needs backing.
+`shm_threshold` selects the inline/SHM boundary and does not disable every SHM path. The native parser rejects `shm_threshold` in `ipc_overrides`; configure it through `cc.set_transport_policy(shm_threshold=...)`. Raising the threshold can move sender traffic to inline or chunks while receiver reassembly still needs backing.
 
 Disabled buddy requires `pool_prewarm_segments=0`. `pool_min_retained_segments` cannot exceed `max_pool_segments` or `reassembly_max_segments`. Native parsing rejects invalid combinations.
 
@@ -131,7 +131,7 @@ c3 relay --bind 127.0.0.1:8080 \
 
 These flags override `C2_IPC_POOL_ENABLED` and the three budget variables. Other client IPC settings, including prewarming, decay and `C2_SHM_THRESHOLD`, use the existing resolver. `c3 relay --dry-run` reports resolved policy. Disabled buddy still requires zero prewarming, and zero budgets still reject positive reservations.
 
-This accounting covers relay-owned data-plane IPC backing and assembly. Registration proofs and control watches use separate lazy contexts. Peer mappings and HTTP buffers are outside these IPC budgets. HTTP response materialization can still consume the full response before batched sending. Relay forwarding admission separately bounds continuing transactions and retained input; see [relay configuration](configuration.md#relay-and-c3).
+This accounting covers relay-owned data-plane IPC backing and reassembly. Registration proofs and control watches use separate lazy contexts. Peer mappings and HTTP buffers are outside these IPC budgets. HTTP response materialization can still consume the full response before batched sending. Relay forwarding admission separately bounds continuing transactions and retained input; see [relay configuration](configuration.md#relay-and-c3).
 
 ## Statistics and payload lifetime
 

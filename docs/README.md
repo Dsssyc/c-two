@@ -8,6 +8,7 @@ This page routes each subject to the document that owns it. It states no behavio
 | --- | --- |
 | [README.md](../README.md) | English entry point: what C-Two does, installation and a first resource |
 | [README.zh-CN.md](../README.zh-CN.md) | Chinese entry point with the same content |
+| [CONTEXT.md](../CONTEXT.md) | The glossary: one word per concept, with its Chinese and English names and the words to avoid |
 | [AGENTS.md](../AGENTS.md) | Instructions for coding agents: architecture map, commands, invariants, retired interfaces and the table of documents to read before changing each path |
 | [CONTRIBUTING.md](../CONTRIBUTING.md) | How to contribute and validate a change locally |
 | [CHANGELOG.md](../CHANGELOG.md) | Release history; per-release notes are in [releases/](releases/) |

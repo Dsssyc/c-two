@@ -12,7 +12,7 @@ The Python transport layer is a thin orchestration shell around a Rust-native co
 
 | File | Purpose |
 | --- | --- |
-| `registry.py` | Public `cc.Runtime()` owns independent Python bindings over one native session; module-level registration, connection, shutdown and setters use the default Runtime. `cc.close(proxy)` follows the proxy's owner. |
+| `registry.py` | Public `cc.Runtime()` owns independent Python bindings over one native session; module-level registration, connection, shutdown and setters use the default Runtime. `cc.close(proxy)` follows the Runtime that created the proxy. |
 | `wire.py` | `MethodTable` for Python resource method dispatch |
 | `server/native.py` | `NativeServerBridge` exported as `Server` |
 | `server/scheduler.py` | `ConcurrencyConfig` facade plus thin native route-concurrency adapter for same-process direct calls |

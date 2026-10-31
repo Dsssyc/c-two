@@ -32,7 +32,7 @@ Host 检索了本机已知的下游仓库，只读：
 - **hey-my-buddy 为了得到一个轻量配置，设了 9 个内部开关**（`src/hey_my_buddy/protocol/rpc_config.py:29-46`）：
   - 关掉 buddy 池；
   - 重组段 16 MiB × 2，重组上限 16 MiB；
-  - 分块总数 256；
+  - 分片总数 256；
   - 执行线程 64（即上限），pending 256；
   - 载荷 32 MiB，帧 16 MiB。
   - 它还用 `memory_stats()[scope] is not None` 来判断某个角色是否已经开始 I/O、配置是否还能改（同文件 `:163`）。这说明 C-Two 没有直接回答这个问题的接口。
@@ -97,13 +97,13 @@ Python 的布局：
 - 大多数 IPC 变量在 Python 测试里只出现一次，都在列举全部变量的配置解析测试 `sdk/python/tests/unit/test_ipc_config.py` 里；在 `docs/configuration.md` 里也只出现一次。
 - 环境变量本身没有下游在用，但同名的代码覆盖键有：hey-my-buddy 用了其中 9 个，来得到一个轻量配置（见"下游的实际用法"）。
 
-它真正想表达的只有三件事：单条消息不超过 32 MiB，总内存要小，执行线程要够用。为此它却要懂池、重组段、分块与帧这些内部机制。
+它真正想表达的只有三件事：单条消息不超过 32 MiB，总内存要小，执行线程要够用。为此它却要懂池、重组段、分片与帧这些内部机制。
 
 ### 收敛方向
 
 - **不再提供池的开关。** 实测开池不额外占内存，关掉只会变慢。初稿建议让共享内存段自适应大小；量过之后撤回，因为删掉开关这个更小的办法就够了。
 - **`shm_threshold` 改为常量。** 取值按三个平台实测的交叉点定。
-- **用户只表达意图。** 留下的设置是：单条消息上限、内存上限、文件溢出上限、端点根目录与 relay 锚点。帧、分块、重组的各项限制都从它们推导。
+- **用户只表达意图。** 留下的设置是：单条消息上限、内存上限、文件溢出上限、端点根目录与 relay 锚点。帧、分片、重组的各项限制都从它们推导。
 - **定时器与调优常数改为固定常量。**
 
 ### 逐项表（草案，待用户决定）
@@ -121,7 +121,7 @@ Python 的布局：
 | `heartbeat_interval`、`heartbeat_timeout` | 随单一属主的详细设计定 | 本机 IPC 上对端死亡会有 EOF；心跳只剩"释放停住的对端占着的许可"这一用处 |
 | `max_pending_requests`（Server 级）、`max_execution_workers` | 待定：与路由级 `ConcurrencyConfig` 的 `max_pending` / `max_workers` 合并 | 同一件事分了两层；后者还有缺陷 H12，hey-my-buddy 设成了上限 64 |
 | `C2_CALL_MAX_OUTSTANDING`、`C2_CALL_RETAINED_INPUT_BUDGET_BYTES` | 待定：前者删除，后者并入内存上限 | 只有测试在用 |
-| `C2_RELAY_CALL_TIMEOUT` | 待定：并入调用期限 | 已有逐次调用的期限，这是第二种限制调用时长的方式 |
+| `C2_RELAY_CALL_TIMEOUT` | 待定：并入调用截止时间 | 已有逐次调用的截止时间，这是第二种限制调用时长的方式 |
 | `C2_RELAY_USE_PROXY` | 保留 | 公司网络的代理是真实的部署需要 |
 | relay 服务端的部署参数（bind、seeds、id、advertise url、idle timeout） | 保留 | `c3 relay` 的部署参数 |
 

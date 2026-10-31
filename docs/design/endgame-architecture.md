@@ -417,7 +417,7 @@ Toodle 可以在自己的声明中表达“需要某类 Resource Service/CRM con
 | IPC / HTTP / Relay 传输 | **c-two** | 跨进程/跨机能力 |
 | `ExpectedRouteContract` 与 contract-scoped route resolve | **C-Two** | 活跃 RuntimeInstance 的精确寻址与调用准入 |
 | 方法级读写并发 (`@cc.read`/`@cc.write`) | **c-two** | 单 CRM 内部的调度 |
-| Buffer/lease 生命周期、SHM transport 与 Hold | **c-two** | Transport 与 lifetime 原语；不替代 FastDB payload owner |
+| Buffer/lease 生命周期、SHM transport 与 Hold | **c-two** | Transport 与 lifetime 原语；不替代 FastDB 对载荷格式的职责 |
 | `auth_hook` + call metadata 透传 | **c-two（待补）** | 让 Toodle 构建安全层的钩子 |
 | Dry-run / 审批预估 | **c-two（待补）** | 让 Toodle / Agent 做影响分析 |
 | Streaming 返回 | **c-two（待补）** | 长任务进度回传 |
@@ -462,7 +462,7 @@ Toodle 可以在自己的声明中表达“需要某类 Resource Service/CRM con
 
 ### Milestone M5 · Toodle Authority 起步
 - Rust authority kernel：Catalog、Resource/Resource Service identity 与 revision、resource graph 和 optional tree views
-- Policy、Service declaration、runtime activation 与 federation 的同一对象模型；本地与集群只更换宿主 adapter
+- Policy、Service declaration、runtime activation 与 federation 的同一对象模型；本地与集群只更换托管 adapter
 - Extension/Agent 作为受治理 Resource 与 Resource Service 消费者，不创建第二套运行时协议
 
 ### Milestone M6 · Gridmen endgame

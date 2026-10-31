@@ -15,7 +15,7 @@ C-Two is a resource-oriented RPC runtime that enables remote invocation of state
 The core abstraction is resources, not services.
 
 - CRM (Core Resource Model): the contract class decorated with `@cc.crm(...)`. It declares remotely callable methods. Method bodies are `...`.
-- Resource: the runtime instance implementing a CRM contract. It is a plain Python class, not decorated. Name it by domain semantics.
+- Resource: the stateful object implementing a CRM contract. It is a plain Python class, not decorated. Name it by domain semantics.
 - Client: any code that calls `cc.connect(...)` to consume a resource. There is no separate "Component" abstraction.
 
 ## Build, Test, And Run
@@ -126,7 +126,7 @@ The language-neutral Cargo workspace is `core/`; the Python SDK owns its PyO3/ma
 - Route acquisition and dispatch validate the route name, complete CRM identity, ABI hash and signature hash in Rust.
 - Core owns deadlines, readiness, registration and lifecycle transactions; Python projects the native authority without retaining a second state machine.
 - Core retains each request transport lease through invocation and moves its owned snapshot into PyO3 without a second copy; response carriers retain their lease ordering.
-- `c2-core` remains payload-owner-neutral; Rust users name `fastdb::Payload`, and Rust and Python expose the same portable capabilities.
+- `c2-core` does not depend on FastDB; Rust users name `fastdb::Payload`, and Rust and Python expose the same portable capabilities.
 - Same-process calls pass Python objects directly and skip serialization.
 - Python imports `c_two as cc`; Rust applications import the `c_two` facade and leave hidden `c_two::generated` seams to generated code.
 - CRM classes use plain names without an `I` prefix; resource implementations use domain names, with `{ContractName}Impl` allowed for generated code.
@@ -171,6 +171,8 @@ Retired surfaces have no compatibility aliases; names of still-supported interna
 **Read before changing.** Before changing files under a path in this table, read the documents it names; they own that mechanism and its invariants. Update the owning document in the same change as the behavior.
 
 **Documentation layout.** `docs/README.md` routes each subject to the document that owns it. `docs/reference/` states current behavior; `docs/decisions/` holds one ADR per decision, amended with dated notes rather than rewritten; `docs/design/` holds the backlog, the roadmap and plans in progress; `docs/acceptance/` holds verification records and evidence; `docs/research/` holds notes made before a decision. Before deleting a superseded document, move what still holds into its owning page. Name locations with `~` or a placeholder, never a machine's home directory.
+
+**Terms.** [`CONTEXT.md`](CONTEXT.md) is the glossary. Use its words in code, comments, documentation and messages. When a term is defined or renamed, update `CONTEXT.md` and every current use in the same change; frozen records under `docs/acceptance/` and past release notes keep their wording.
 
 | Path or mechanism | Owning documents to read before changing |
 | --- | --- |

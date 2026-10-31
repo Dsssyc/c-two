@@ -11,7 +11,7 @@ This guide covers the native c3 interface. Configuration is documented in the [c
 `c3` owns product-level runtime commands:
 
 - `c3 relay` starts the HTTP relay used for cross-machine discovery.
-- `c3 registry list-routes` lists resource names registered with a relay.
+- `c3 registry list-routes` lists route names registered with a relay.
 - `c3 registry peers` lists peer relays known by a mesh relay.
 - `c3 endpoint inspect/reap/sweep` projects native local endpoint maintenance.
 - `c3 contract` validates/releases `c-two.contract.v2` descriptors and composes complete Rust, Python, or TypeScript project trees.

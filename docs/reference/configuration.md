@@ -58,7 +58,7 @@ Typed overrides are `BaseIPCOverrides`, `ServerIPCOverrides` and `ClientIPCOverr
 
 An explicit `address='ipc://...'` uses local IPC independently of relay discovery. The relay anchor handles registration and discovery; HTTP calls use the relay URL selected by resolution. Remote batch size controls C-Two payload batches, without specifying TCP packets or HTTP frames.
 
-## Server startup deadlines
+## Server startup timeout
 
 `cc.set_server(startup_timeout=seconds)` configures the Core startup wait before the first registration. The native `RuntimeSession` constructor and `set_server_options` accept the same keyword. Values must be finite, non-negative seconds representable by the native clock; zero expires immediately. Omitted/`None` selects the existing finite five-second default, not unlimited waiting. This default bounds unattended startup; it is not a performance guarantee for a busy runner. Applications should choose their deployment budget explicitly.
 
@@ -86,7 +86,7 @@ Set the following fields through the appropriate endpoint's `ipc_overrides`. All
 | `max_total_chunks` | `C2_IPC_MAX_TOTAL_CHUNKS` | 512 | Maximum total in-flight chunks across all connections |
 | `chunk_size` | `C2_IPC_CHUNK_SIZE` | 128 KiB | Individual chunk size in bytes |
 | `chunk_threshold_ratio` | `C2_IPC_CHUNK_THRESHOLD_RATIO` | 0.9 | Configured fraction of maximum frame size; accepted and validated, but not currently used by transport selection |
-| `chunk_assembler_timeout` | `C2_IPC_CHUNK_ASSEMBLER_TIMEOUT` | 60 seconds | Incomplete chunk-assembly timeout in seconds |
+| `chunk_assembler_timeout` | `C2_IPC_CHUNK_ASSEMBLER_TIMEOUT` | 60 seconds | Incomplete chunk-reassembly timeout in seconds |
 | `chunk_gc_interval` | `C2_IPC_CHUNK_GC_INTERVAL` | 5 seconds | Chunk garbage-collection sweep interval in seconds |
 | `max_reassembly_bytes` | `C2_IPC_MAX_REASSEMBLY_BYTES` | 8 GiB | Maximum reassembly buffer memory in bytes |
 | `heartbeat_interval` (server) | `C2_IPC_HEARTBEAT_INTERVAL` | 15 seconds | Heartbeat interval in seconds; 0 disables heartbeat |
