@@ -22,21 +22,6 @@ impl BufferStorage {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum LeaseRetention {
-    Transient,
-    Retained,
-}
-
-impl LeaseRetention {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Transient => "transient",
-            Self::Retained => "retained",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LeaseDirection {
     ClientResponse,
@@ -57,7 +42,6 @@ pub struct BufferLeaseMeta {
     pub route_name: String,
     pub method_name: String,
     pub direction: LeaseDirection,
-    pub retention: LeaseRetention,
     pub storage: BufferStorage,
     pub bytes: usize,
 }
@@ -69,30 +53,25 @@ struct LeaseEntry {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct StorageLeaseStats {
-    pub active_leases: usize,
+pub struct HoldBucketStats {
     pub active_holds: usize,
-    pub total_leased_bytes: usize,
     pub total_held_bytes: usize,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DirectionLeaseStats {
-    pub active_leases: usize,
-    pub active_holds: usize,
-    pub total_leased_bytes: usize,
-    pub total_held_bytes: usize,
+impl HoldBucketStats {
+    fn merge(&mut self, other: &Self) {
+        self.active_holds = self.active_holds.saturating_add(other.active_holds);
+        self.total_held_bytes = self.total_held_bytes.saturating_add(other.total_held_bytes);
+    }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct BufferLeaseStats {
-    pub active_leases: usize,
     pub active_holds: usize,
-    pub total_leased_bytes: usize,
     pub total_held_bytes: usize,
     pub oldest_hold_seconds: f64,
-    pub by_storage: BTreeMap<BufferStorage, StorageLeaseStats>,
-    pub by_direction: BTreeMap<LeaseDirection, DirectionLeaseStats>,
+    pub by_storage: BTreeMap<BufferStorage, HoldBucketStats>,
+    pub by_direction: BTreeMap<LeaseDirection, HoldBucketStats>,
 }
 
 impl BufferLeaseStats {
@@ -104,36 +83,19 @@ impl BufferLeaseStats {
     /// age. Saturating arithmetic keeps the reporting path safe; observing
     /// never allocates or resets leases.
     pub fn merge(&mut self, other: &BufferLeaseStats) {
-        self.active_leases = self.active_leases.saturating_add(other.active_leases);
         self.active_holds = self.active_holds.saturating_add(other.active_holds);
-        self.total_leased_bytes = self
-            .total_leased_bytes
-            .saturating_add(other.total_leased_bytes);
         self.total_held_bytes = self.total_held_bytes.saturating_add(other.total_held_bytes);
         if other.oldest_hold_seconds > self.oldest_hold_seconds {
             self.oldest_hold_seconds = other.oldest_hold_seconds;
         }
         for (storage, stats) in &other.by_storage {
-            let entry = self.by_storage.entry(*storage).or_default();
-            entry.active_leases = entry.active_leases.saturating_add(stats.active_leases);
-            entry.active_holds = entry.active_holds.saturating_add(stats.active_holds);
-            entry.total_leased_bytes = entry
-                .total_leased_bytes
-                .saturating_add(stats.total_leased_bytes);
-            entry.total_held_bytes = entry
-                .total_held_bytes
-                .saturating_add(stats.total_held_bytes);
+            self.by_storage.entry(*storage).or_default().merge(stats);
         }
         for (direction, stats) in &other.by_direction {
-            let entry = self.by_direction.entry(*direction).or_default();
-            entry.active_leases = entry.active_leases.saturating_add(stats.active_leases);
-            entry.active_holds = entry.active_holds.saturating_add(stats.active_holds);
-            entry.total_leased_bytes = entry
-                .total_leased_bytes
-                .saturating_add(stats.total_leased_bytes);
-            entry.total_held_bytes = entry
-                .total_held_bytes
-                .saturating_add(stats.total_held_bytes);
+            self.by_direction
+                .entry(*direction)
+                .or_default()
+                .merge(stats);
         }
     }
 }
@@ -144,7 +106,6 @@ pub struct BufferLeaseSnapshot {
     pub route_name: String,
     pub method_name: String,
     pub direction: LeaseDirection,
-    pub retention: LeaseRetention,
     pub storage: BufferStorage,
     pub bytes: usize,
     pub age_seconds: f64,
@@ -152,7 +113,6 @@ pub struct BufferLeaseSnapshot {
 
 #[derive(Debug)]
 struct BufferLeaseTrackerInner {
-    track_transient: bool,
     next_id: AtomicU64,
     entries: Mutex<HashMap<u64, LeaseEntry>>,
 }
@@ -226,20 +186,19 @@ impl BufferLeaseObserver {
 
 #[derive(Debug)]
 pub struct BufferLeaseGuard {
-    id: Option<u64>,
+    id: u64,
     // Strong by design: a retained lease is itself a real owner of its
     // tracker's metadata, so a hold published just before a session swap keeps
     // that metadata — and its observation record — alive without the observer
     // retaining anything. The tracker stores only lease metadata entries and
     // never references its guards, so this cannot cycle or retain payloads.
-    tracker: Option<Arc<BufferLeaseTrackerInner>>,
+    tracker: Arc<BufferLeaseTrackerInner>,
 }
 
 impl BufferLeaseTracker {
-    pub fn new(track_transient: bool) -> Self {
+    pub fn new() -> Self {
         Self {
             inner: Arc::new(BufferLeaseTrackerInner {
-                track_transient,
                 next_id: AtomicU64::new(1),
                 entries: Mutex::new(HashMap::new()),
             }),
@@ -254,13 +213,6 @@ impl BufferLeaseTracker {
     }
 
     pub fn track(&self, meta: BufferLeaseMeta) -> BufferLeaseGuard {
-        if meta.retention == LeaseRetention::Transient && !self.inner.track_transient {
-            return BufferLeaseGuard {
-                id: None,
-                tracker: None,
-            };
-        }
-
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let entry = LeaseEntry {
             meta,
@@ -269,8 +221,8 @@ impl BufferLeaseTracker {
         self.inner.entries().insert(id, entry);
 
         BufferLeaseGuard {
-            id: Some(id),
-            tracker: Some(Arc::clone(&self.inner)),
+            id,
+            tracker: Arc::clone(&self.inner),
         }
     }
 
@@ -280,34 +232,21 @@ impl BufferLeaseTracker {
         let mut stats = BufferLeaseStats::default();
 
         for entry in entries.values() {
-            stats.active_leases = stats.active_leases.saturating_add(1);
-            stats.total_leased_bytes = stats.total_leased_bytes.saturating_add(entry.meta.bytes);
+            stats.active_holds = stats.active_holds.saturating_add(1);
+            stats.total_held_bytes = stats.total_held_bytes.saturating_add(entry.meta.bytes);
 
             let storage = stats.by_storage.entry(entry.meta.storage).or_default();
-            storage.active_leases = storage.active_leases.saturating_add(1);
-            storage.total_leased_bytes =
-                storage.total_leased_bytes.saturating_add(entry.meta.bytes);
+            storage.active_holds = storage.active_holds.saturating_add(1);
+            storage.total_held_bytes = storage.total_held_bytes.saturating_add(entry.meta.bytes);
 
             let direction = stats.by_direction.entry(entry.meta.direction).or_default();
-            direction.active_leases = direction.active_leases.saturating_add(1);
-            direction.total_leased_bytes = direction
-                .total_leased_bytes
-                .saturating_add(entry.meta.bytes);
+            direction.active_holds = direction.active_holds.saturating_add(1);
+            direction.total_held_bytes =
+                direction.total_held_bytes.saturating_add(entry.meta.bytes);
 
-            if entry.meta.retention == LeaseRetention::Retained {
-                stats.active_holds = stats.active_holds.saturating_add(1);
-                stats.total_held_bytes = stats.total_held_bytes.saturating_add(entry.meta.bytes);
-                storage.active_holds = storage.active_holds.saturating_add(1);
-                storage.total_held_bytes =
-                    storage.total_held_bytes.saturating_add(entry.meta.bytes);
-                direction.active_holds = direction.active_holds.saturating_add(1);
-                direction.total_held_bytes =
-                    direction.total_held_bytes.saturating_add(entry.meta.bytes);
-
-                let age = now.duration_since(entry.created_at).as_secs_f64();
-                if age > stats.oldest_hold_seconds {
-                    stats.oldest_hold_seconds = age;
-                }
+            let age = now.duration_since(entry.created_at).as_secs_f64();
+            if age > stats.oldest_hold_seconds {
+                stats.oldest_hold_seconds = age;
             }
         }
 
@@ -320,10 +259,6 @@ impl BufferLeaseTracker {
         let mut snapshots = Vec::new();
 
         for (id, entry) in entries.iter() {
-            if entry.meta.retention != LeaseRetention::Retained {
-                continue;
-            }
-
             let age = now.duration_since(entry.created_at);
             if age >= threshold {
                 snapshots.push(BufferLeaseSnapshot {
@@ -331,7 +266,6 @@ impl BufferLeaseTracker {
                     route_name: entry.meta.route_name.clone(),
                     method_name: entry.meta.method_name.clone(),
                     direction: entry.meta.direction,
-                    retention: entry.meta.retention,
                     storage: entry.meta.storage,
                     bytes: entry.meta.bytes,
                     age_seconds: age.as_secs_f64(),
@@ -346,18 +280,13 @@ impl BufferLeaseTracker {
 
 impl Default for BufferLeaseTracker {
     fn default() -> Self {
-        Self::new(false)
+        Self::new()
     }
 }
 
 impl Drop for BufferLeaseGuard {
     fn drop(&mut self) {
-        let Some(id) = self.id.take() else {
-            return;
-        };
-        if let Some(inner) = self.tracker.take() {
-            inner.entries().remove(&id);
-        }
+        self.tracker.entries().remove(&self.id);
     }
 }
 
@@ -371,7 +300,6 @@ mod tests {
             route_name: "grid".to_string(),
             method_name: "subdivide_grids".to_string(),
             direction: LeaseDirection::ClientResponse,
-            retention: LeaseRetention::Retained,
             storage: BufferStorage::Inline,
             bytes: 128,
         }
@@ -379,7 +307,7 @@ mod tests {
 
     #[test]
     fn retained_inline_lease_counts_until_guard_drop() {
-        let tracker = BufferLeaseTracker::new(false);
+        let tracker = BufferLeaseTracker::new();
         let guard = tracker.track(retained_inline_meta());
         let stats = tracker.stats();
         assert_eq!(stats.active_holds, 1);
@@ -400,12 +328,11 @@ mod tests {
 
     #[test]
     fn retained_shm_snapshot_reports_route_method_storage_and_age() {
-        let tracker = BufferLeaseTracker::new(false);
+        let tracker = BufferLeaseTracker::new();
         let _guard = tracker.track(BufferLeaseMeta {
             route_name: "grid".to_string(),
             method_name: "subdivide_grids".to_string(),
             direction: LeaseDirection::ClientResponse,
-            retention: LeaseRetention::Retained,
             storage: BufferStorage::Shm,
             bytes: 8192,
         });
@@ -420,48 +347,12 @@ mod tests {
     }
 
     #[test]
-    fn transient_leases_are_noop_by_default_to_keep_view_path_cheap() {
-        let tracker = BufferLeaseTracker::new(false);
-        let _guard = tracker.track(BufferLeaseMeta {
-            route_name: "grid".to_string(),
-            method_name: "subdivide_grids".to_string(),
-            direction: LeaseDirection::ClientResponse,
-            retention: LeaseRetention::Transient,
-            storage: BufferStorage::Shm,
-            bytes: 4096,
-        });
-        let stats = tracker.stats();
-        assert_eq!(stats.active_leases, 0);
-        assert_eq!(stats.active_holds, 0);
-    }
-
-    #[test]
-    fn transient_tracking_can_be_enabled_for_diagnostics() {
-        let tracker = BufferLeaseTracker::new(true);
-        let guard = tracker.track(BufferLeaseMeta {
-            route_name: "grid".to_string(),
-            method_name: "subdivide_grids".to_string(),
-            direction: LeaseDirection::ClientResponse,
-            retention: LeaseRetention::Transient,
-            storage: BufferStorage::Shm,
-            bytes: 4096,
-        });
-        let stats = tracker.stats();
-        assert_eq!(stats.active_leases, 1);
-        assert_eq!(stats.active_holds, 0);
-        assert_eq!(stats.total_leased_bytes, 4096);
-        drop(guard);
-        assert_eq!(tracker.stats().active_leases, 0);
-    }
-
-    #[test]
     fn retained_leases_are_counted_by_direction() {
-        let tracker = BufferLeaseTracker::new(false);
+        let tracker = BufferLeaseTracker::new();
         let _client = tracker.track(BufferLeaseMeta {
             route_name: "grid".to_string(),
             method_name: "read".to_string(),
             direction: LeaseDirection::ClientResponse,
-            retention: LeaseRetention::Retained,
             storage: BufferStorage::Inline,
             bytes: 32,
         });
@@ -469,7 +360,6 @@ mod tests {
             route_name: "grid".to_string(),
             method_name: "write".to_string(),
             direction: LeaseDirection::ResourceInput,
-            retention: LeaseRetention::Retained,
             storage: BufferStorage::Shm,
             bytes: 64,
         });
@@ -500,7 +390,7 @@ mod tests {
         // hold is itself a real owner, so the metadata — and any weak
         // observation of it — must stay alive until the hold releases.
         let observer = {
-            let tracker = BufferLeaseTracker::new(false);
+            let tracker = BufferLeaseTracker::new();
             let observer = tracker.observer();
             let _hold = tracker.track(retained_inline_meta());
             drop(tracker);
@@ -514,7 +404,7 @@ mod tests {
 
     #[test]
     fn observer_is_alive_while_any_owner_holds_the_tracker() {
-        let producer = BufferLeaseTracker::new(false);
+        let producer = BufferLeaseTracker::new();
         let observer = producer.observer();
         let other_observer = producer.observer();
         assert!(observer.is_alive());
@@ -527,7 +417,7 @@ mod tests {
         drop(session_handle);
         assert!(!observer.is_alive(), "last owner gone detaches the record");
 
-        let unrelated = BufferLeaseTracker::new(false).observer();
+        let unrelated = BufferLeaseTracker::new().observer();
         assert!(!observer.ptr_eq(&unrelated));
     }
 }

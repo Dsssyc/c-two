@@ -3,7 +3,6 @@ use std::time::Duration;
 
 use c2_mem::{
     BufferLeaseGuard, BufferLeaseMeta, BufferLeaseTracker, BufferStorage, LeaseDirection,
-    LeaseRetention,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -37,7 +36,6 @@ impl PyBufferLeaseTracker {
             route_name: route_name.to_string(),
             method_name: method_name.to_string(),
             direction: parse_direction(direction)?,
-            retention: LeaseRetention::Retained,
             storage: parse_storage(storage)?,
             bytes,
         }))
@@ -81,7 +79,6 @@ pub(crate) fn lease_snapshot_dict<'py>(
     dict.set_item("route_name", &snapshot.route_name)?;
     dict.set_item("method_name", &snapshot.method_name)?;
     dict.set_item("direction", snapshot.direction.as_str())?;
-    dict.set_item("retention", snapshot.retention.as_str())?;
     dict.set_item("storage", snapshot.storage.as_str())?;
     dict.set_item("bytes", snapshot.bytes)?;
     dict.set_item("age_seconds", snapshot.age_seconds)?;
@@ -98,9 +95,7 @@ pub(crate) fn lease_stats_dict<'py>(
     stats: &c2_mem::BufferLeaseStats,
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
-    dict.set_item("active_leases", stats.active_leases)?;
     dict.set_item("active_holds", stats.active_holds)?;
-    dict.set_item("total_leased_bytes", stats.total_leased_bytes)?;
     dict.set_item("total_held_bytes", stats.total_held_bytes)?;
     dict.set_item("oldest_hold_seconds", stats.oldest_hold_seconds)?;
 
@@ -112,7 +107,7 @@ pub(crate) fn lease_stats_dict<'py>(
         BufferStorage::FileSpill,
     ] {
         let value = stats.by_storage.get(&storage).cloned().unwrap_or_default();
-        by_storage.set_item(storage.as_str(), storage_stats_dict(py, &value)?)?;
+        by_storage.set_item(storage.as_str(), hold_bucket_stats_dict(py, &value)?)?;
     }
     dict.set_item("by_storage", by_storage)?;
 
@@ -126,7 +121,7 @@ pub(crate) fn lease_stats_dict<'py>(
             .get(&direction)
             .cloned()
             .unwrap_or_default();
-        by_direction.set_item(direction.as_str(), direction_stats_dict(py, &value)?)?;
+        by_direction.set_item(direction.as_str(), hold_bucket_stats_dict(py, &value)?)?;
     }
     dict.set_item("by_direction", by_direction)?;
     Ok(dict)
@@ -154,26 +149,12 @@ fn parse_direction(direction: &str) -> PyResult<LeaseDirection> {
     }
 }
 
-fn storage_stats_dict<'py>(
+fn hold_bucket_stats_dict<'py>(
     py: Python<'py>,
-    stats: &c2_mem::StorageLeaseStats,
+    stats: &c2_mem::HoldBucketStats,
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
-    dict.set_item("active_leases", stats.active_leases)?;
     dict.set_item("active_holds", stats.active_holds)?;
-    dict.set_item("total_leased_bytes", stats.total_leased_bytes)?;
-    dict.set_item("total_held_bytes", stats.total_held_bytes)?;
-    Ok(dict)
-}
-
-fn direction_stats_dict<'py>(
-    py: Python<'py>,
-    stats: &c2_mem::DirectionLeaseStats,
-) -> PyResult<Bound<'py, PyDict>> {
-    let dict = PyDict::new(py);
-    dict.set_item("active_leases", stats.active_leases)?;
-    dict.set_item("active_holds", stats.active_holds)?;
-    dict.set_item("total_leased_bytes", stats.total_leased_bytes)?;
     dict.set_item("total_held_bytes", stats.total_held_bytes)?;
     Ok(dict)
 }
@@ -181,10 +162,9 @@ fn direction_stats_dict<'py>(
 #[pymethods]
 impl PyBufferLeaseTracker {
     #[new]
-    #[pyo3(signature = (track_transient=false))]
-    fn new(track_transient: bool) -> Self {
+    fn new() -> Self {
         Self {
-            inner: Arc::new(BufferLeaseTracker::new(track_transient)),
+            inner: Arc::new(BufferLeaseTracker::new()),
         }
     }
 

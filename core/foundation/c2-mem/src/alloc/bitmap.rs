@@ -55,22 +55,6 @@ impl LevelBitmap {
         }
     }
 
-    /// Initialize all blocks as free (set bits to 1).
-    /// Only valid blocks are marked; trailing bits in the last word are 0.
-    pub fn init_all_free(&self) {
-        let full_words = self.num_blocks / 64;
-        let remainder = self.num_blocks % 64;
-
-        for i in 0..full_words {
-            self.word(i).store(u64::MAX, Ordering::Release);
-        }
-        if remainder > 0 {
-            // Only set `remainder` bits in the last word.
-            let mask = (1u64 << remainder) - 1;
-            self.word(full_words).store(mask, Ordering::Release);
-        }
-    }
-
     /// Find and claim a free block. Returns the block index, or None.
     /// Uses atomic CAS to ensure cross-process safety.
     pub fn alloc_one(&self) -> Option<usize> {
@@ -123,19 +107,9 @@ impl LevelBitmap {
             .fetch_and(!(1u64 << bit), Ordering::Release);
     }
 
-    /// Number of words in this bitmap.
-    pub fn word_count(&self) -> usize {
-        self.num_words
-    }
-
     /// Total bytes needed for this bitmap.
     pub fn byte_size(&self) -> usize {
         self.num_words * 8
-    }
-
-    /// Total number of blocks at this level.
-    pub fn block_count(&self) -> usize {
-        self.num_blocks
     }
 
     fn word(&self, idx: usize) -> &AtomicU64 {
@@ -181,10 +155,16 @@ mod tests {
         (bm, ptr, layout)
     }
 
+    fn fill_bitmap(bm: &LevelBitmap, num_blocks: usize) {
+        for index in 0..num_blocks {
+            bm.free_one(index);
+        }
+    }
+
     #[test]
     fn test_init_and_alloc() {
         let (bm, ptr, layout) = make_bitmap(4);
-        bm.init_all_free();
+        fill_bitmap(&bm, 4);
         assert!(bm.is_free(0));
         assert!(bm.is_free(3));
         let idx = bm.alloc_one().unwrap();
@@ -196,7 +176,7 @@ mod tests {
     #[test]
     fn test_alloc_all_then_fail() {
         let (bm, ptr, layout) = make_bitmap(3);
-        bm.init_all_free();
+        fill_bitmap(&bm, 3);
         assert_eq!(bm.alloc_one(), Some(0));
         assert_eq!(bm.alloc_one(), Some(1));
         assert_eq!(bm.alloc_one(), Some(2));
@@ -207,7 +187,7 @@ mod tests {
     #[test]
     fn test_free_and_realloc() {
         let (bm, ptr, layout) = make_bitmap(2);
-        bm.init_all_free();
+        fill_bitmap(&bm, 2);
         let a = bm.alloc_one().unwrap();
         let b = bm.alloc_one().unwrap();
         assert_eq!(bm.alloc_one(), None);
@@ -221,7 +201,7 @@ mod tests {
     #[test]
     fn test_large_bitmap() {
         let (bm, ptr, layout) = make_bitmap(256);
-        bm.init_all_free();
+        fill_bitmap(&bm, 256);
         for i in 0..256 {
             let idx = bm.alloc_one().unwrap();
             assert_eq!(idx, i);

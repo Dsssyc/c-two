@@ -37,3 +37,44 @@ pub use server::{
 };
 
 pub use response::ResponsePool;
+
+#[cfg(test)]
+mod test_support {
+    use c2_local::{DEFAULT_CONNECT_TIMEOUT, EndpointReapResult, LocalListener, LocalStream};
+
+    pub(crate) async fn isolated_pair() -> (LocalStream, LocalStream) {
+        #[cfg(unix)]
+        let root = tempfile::Builder::new()
+            .prefix("r07")
+            .tempdir_in("/tmp")
+            .unwrap();
+        #[cfg(unix)]
+        let context = c2_config::LocalEndpointContext::with_unix_root(root.path()).unwrap();
+        #[cfg(windows)]
+        let context = c2_config::LocalEndpointContext::default_for_platform().unwrap();
+        let endpoint = context
+            .endpoint(&format!("ipc://r07-{}", uuid::Uuid::new_v4().simple()))
+            .unwrap();
+        let mut listener = LocalListener::bind(&endpoint).unwrap();
+        let pair = tokio::try_join!(
+            LocalStream::connect(&endpoint, DEFAULT_CONNECT_TIMEOUT),
+            listener.accept()
+        )
+        .unwrap();
+        assert!(matches!(
+            listener.close(),
+            EndpointReapResult::Reaped | EndpointReapResult::NotApplicable
+        ));
+        #[cfg(unix)]
+        assert!(
+            std::fs::read_dir(root.path())
+                .unwrap()
+                .all(|entry| matches!(
+                    entry.unwrap().file_name().to_str(),
+                    Some(".gate" | ".gate.marker")
+                )),
+            "task root must have no socket or lease after listener close"
+        );
+        pair
+    }
+}

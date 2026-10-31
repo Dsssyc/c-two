@@ -415,6 +415,7 @@ mod tests {
                 sequence
             ),
         )
+        .unwrap()
     }
 
     fn make_pool(label: &str) -> Arc<RwLock<MemPool>> {
@@ -426,11 +427,14 @@ mod tests {
         use std::time::Duration;
 
         let budget = c2_mem::MemoryBudget::new(0, 8192, 8192);
-        let pool = Arc::new(RwLock::new(MemPool::new_with_prefix_and_budget(
-            make_mempool("try-release-file").config().clone(),
-            format!("/cc3try{:08x}", std::process::id()),
-            budget.clone(),
-        )));
+        let pool = Arc::new(RwLock::new(
+            MemPool::new_with_prefix_and_budget(
+                make_mempool("try-release-file").config().clone(),
+                format!("/cc3try{:08x}", std::process::id()),
+                budget.clone(),
+            )
+            .unwrap(),
+        ));
         let mut backing = ReassemblyBacking::admit(Arc::clone(&pool), 1, 4096).unwrap();
         backing.write_at(0, &[21; 4096]).unwrap();
         let mut held = ReassemblyBacking::admit(Arc::clone(&pool), 1, 4096).unwrap();
@@ -502,15 +506,18 @@ mod tests {
     fn admission_guard_must_belong_to_carrier_pool_before_charging() {
         let make = || {
             let budget = c2_mem::MemoryBudget::new(0, 0, 0);
-            let pool = Arc::new(RwLock::new(MemPool::new_with_prefix_and_budget(
-                PoolConfig {
-                    buddy_enabled: false,
-                    spill_threshold: 0.0,
-                    ..PoolConfig::default()
-                },
-                "admission-guard-pure".to_string(),
-                budget.clone(),
-            )));
+            let pool = Arc::new(RwLock::new(
+                MemPool::new_with_prefix_and_budget(
+                    PoolConfig {
+                        buddy_enabled: false,
+                        spill_threshold: 0.0,
+                        ..PoolConfig::default()
+                    },
+                    "admission-guard-pure".to_string(),
+                    budget.clone(),
+                )
+                .unwrap(),
+            ));
             (pool, budget)
         };
         let (owner, owner_budget) = make();
@@ -705,7 +712,7 @@ mod tests {
         let mut backing = ReassemblyBacking::admit(pool.clone(), 1, 512).unwrap();
         backing.write_at(0, &[0x11; 512]).unwrap();
         let prefix = pool.read().prefix().to_owned();
-        let mut peer = MemPool::open_peer(PoolConfig::default(), prefix.clone());
+        let mut peer = MemPool::open_peer(PoolConfig::default(), prefix.clone()).unwrap();
         let (seg, generation, _) = coordinates(&backing.live_state().unwrap().handle);
         peer.ensure_peer_segment(u32::from(seg), generation, 512)
             .unwrap();
@@ -768,16 +775,19 @@ mod tests {
     fn self_owned_file_survives_pool_replacement_and_releases_its_charge() {
         // Pure file path: no SHM seam is attempted, including under sandboxing.
         let budget = c2_mem::MemoryBudget::new(0, 4096, 4096);
-        let pool = Arc::new(RwLock::new(MemPool::new_with_prefix_and_budget(
-            PoolConfig {
-                max_segments: 0,
-                min_retained_segments: 0,
-                max_dedicated_segments: 0,
-                ..PoolConfig::default()
-            },
-            "/cc3fileowner".into(),
-            budget.clone(),
-        )));
+        let pool = Arc::new(RwLock::new(
+            MemPool::new_with_prefix_and_budget(
+                PoolConfig {
+                    max_segments: 0,
+                    min_retained_segments: 0,
+                    max_dedicated_segments: 0,
+                    ..PoolConfig::default()
+                },
+                "/cc3fileowner".into(),
+                budget.clone(),
+            )
+            .unwrap(),
+        ));
         let mut backing = ReassemblyBacking::admit(pool.clone(), 2, 256).unwrap();
         assert!(backing.is_file_spill());
         let path = backing.file_spill_path().unwrap();

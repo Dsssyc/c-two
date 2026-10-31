@@ -31,10 +31,9 @@ pub use dedicated::DedicatedSegment;
 pub use handle::MemHandle;
 pub use lease::{
     BufferLeaseGuard, BufferLeaseMeta, BufferLeaseObserver, BufferLeaseSnapshot, BufferLeaseStats,
-    BufferLeaseTracker, BufferStorage, DirectionLeaseStats, LeaseDirection, LeaseRetention,
-    StorageLeaseStats,
+    BufferLeaseTracker, BufferStorage, HoldBucketStats, LeaseDirection,
 };
-pub use pool::{FreeResult, MemPool, ReleaseHandleError};
+pub use pool::{MemPool, ReleaseHandleError};
 pub use retention::{
     RetentionBudget, RetentionError, RetentionPermit, RetentionRejectReason, RetentionSnapshot,
 };

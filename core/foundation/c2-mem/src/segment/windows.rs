@@ -124,18 +124,6 @@ impl ShmRegion {
     pub fn is_owner(&self) -> bool {
         self.is_owner
     }
-
-    /// # Safety
-    /// The caller must synchronize access to the full mapped region.
-    pub unsafe fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.base_ptr(), self.size()) }
-    }
-
-    /// # Safety
-    /// The caller must ensure exclusive access to the full mapped region.
-    pub unsafe fn as_slice_mut(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.base_ptr(), self.size()) }
-    }
 }
 
 fn validate_size(size: usize) -> Result<(), String> {

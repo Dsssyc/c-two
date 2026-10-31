@@ -19,17 +19,6 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-/// Result of a free operation — signals whether the segment became fully idle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FreeResult {
-    /// Block freed normally, segment still has active allocations.
-    Normal,
-    /// Block freed and the segment is now completely idle (zero active allocations).
-    SegmentIdle { seg_idx: u16 },
-    /// Dedicated segment freed — caller may schedule delayed GC.
-    DedicatedFreed { seg_idx: u16 },
-}
-
 /// A rejected release, retaining the exact allocation owner for the caller.
 ///
 /// The handle is unchanged. Returning it does not repair a poisoned backing
@@ -123,7 +112,7 @@ impl MemPool {
     /// The pool carries a private finite budget built from the canonical
     /// [`c2_config::MemoryBudgetLimits`] defaults; share one budget across
     /// pools with [`MemPool::new_with_prefix_and_budget`].
-    pub fn new(config: PoolConfig) -> Self {
+    pub fn new(config: PoolConfig) -> Result<Self, String> {
         let pid = std::process::id();
         let name_prefix = format!("/cc3b{:08x}", pid);
         Self::new_with_prefix(config, name_prefix)
@@ -136,7 +125,7 @@ impl MemPool {
     ///
     /// Each pool receives its own private finite budget from the canonical
     /// limits; pools constructed this way do not share accounting.
-    pub fn new_with_prefix(config: PoolConfig, name_prefix: String) -> Self {
+    pub fn new_with_prefix(config: PoolConfig, name_prefix: String) -> Result<Self, String> {
         let name_prefix = format!(
             "{name_prefix}_{:08x}{}",
             std::process::id(),
@@ -155,7 +144,7 @@ impl MemPool {
         config: PoolConfig,
         name_prefix: String,
         budget: MemoryBudget,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let name_prefix = format!(
             "{name_prefix}_{:08x}{}",
             std::process::id(),
@@ -168,7 +157,7 @@ impl MemPool {
     ///
     /// Peer pools open existing peer backings and never charge the
     /// owner-creation budget; they carry no budget context.
-    pub fn open_peer(config: PoolConfig, name_prefix: String) -> Self {
+    pub fn open_peer(config: PoolConfig, name_prefix: String) -> Result<Self, String> {
         Self::with_identity(config, name_prefix, true, None)
     }
 
@@ -190,17 +179,17 @@ impl MemPool {
         name_prefix: String,
         is_peer: bool,
         budget: Option<MemoryBudget>,
-    ) -> Self {
-        assert!(
-            name_prefix.len() <= Self::MAX_SHM_PREFIX_LEN,
-            "SHM prefix '{}' is {} bytes, exceeds handshake maximum {}",
-            name_prefix,
-            name_prefix.len(),
-            Self::MAX_SHM_PREFIX_LEN,
-        );
-        Self::validate_config(&config).expect("invalid PoolConfig");
+    ) -> Result<Self, String> {
+        if name_prefix.len() > Self::MAX_SHM_PREFIX_LEN {
+            return Err(format!(
+                "SHM prefix is {} bytes, exceeds handshake maximum {}",
+                name_prefix.len(),
+                Self::MAX_SHM_PREFIX_LEN,
+            ));
+        }
+        Self::validate_config(&config)?;
         let pressure = PressureEngine::new(config.spill_threshold);
-        Self {
+        Ok(Self {
             config,
             segments: Vec::new(),
             generations: Vec::new(),
@@ -213,7 +202,7 @@ impl MemPool {
             budget,
             pressure,
             counters: TierCounters::default(),
-        }
+        })
     }
 
     /// Validate pool configuration, returning Err on invalid values.
@@ -238,6 +227,14 @@ impl MemPool {
                 config.segment_size, config.min_block_size
             ));
         }
+        BuddyAllocator::checked_layout(config.segment_size, config.min_block_size).ok_or_else(
+            || {
+                format!(
+                    "buddy backing geometry unsupported: segment_size {} with min_block {} exceeds the u32 data capacity or the addressable mapping span",
+                    config.segment_size, config.min_block_size
+                )
+            },
+        )?;
         if config.max_segments > u16::MAX as usize + 1 {
             return Err("max_segments exceeds the wire segment-index range".into());
         }
@@ -554,18 +551,6 @@ impl MemPool {
                 .is_some_and(|entry| entry.freed_at.is_some())
     }
 
-    /// Ensure at least one buddy segment exists.
-    ///
-    /// No-op when the buddy tiers are policy-disabled; transports prewarm only
-    /// through [`MemPool::ensure_buddy_segments`] so laziness stays explicit.
-    /// Does nothing if segments already exist.
-    pub fn ensure_ready(&mut self) -> Result<(), String> {
-        if self.config.buddy_enabled && self.config.max_segments > 0 {
-            self.ensure_buddy_segments(1)?;
-        }
-        Ok(())
-    }
-
     /// Ensure a stable set of buddy segments exists before peer advertisement.
     ///
     /// Runtime adapters that advertise their client buddy pool in an IPC
@@ -630,21 +615,6 @@ impl MemPool {
     /// Get the pool name prefix (for handshake exchange).
     pub fn prefix(&self) -> &str {
         &self.name_prefix
-    }
-
-    /// Check that this pool is the allocation owner with the captured
-    /// incarnation, without opening, reading, or releasing any backing.
-    ///
-    /// Coordinates alone can collide across owner pools. Peer caches may
-    /// carry an owner's advertised prefix but are not that owner authority.
-    pub fn validate_owner_incarnation(&self, expected: &str) -> Result<(), String> {
-        if self.is_peer {
-            return Err("peer pool is not an owner authority".into());
-        }
-        if self.name_prefix != expected {
-            return Err("pool owner incarnation mismatch".into());
-        }
-        Ok(())
     }
 
     pub fn segment_generation(&self, idx: usize) -> Option<u32> {
@@ -824,7 +794,7 @@ impl MemPool {
         data_size: u32,
         is_dedicated: bool,
         allocation_id: u64,
-    ) -> Result<FreeResult, String> {
+    ) -> Result<(), String> {
         self.validate_generation(seg_idx, generation, is_dedicated)?;
         if is_dedicated && allocation_id != 0 {
             return Err("dedicated allocation identity must be zero".into());
@@ -839,9 +809,7 @@ impl MemPool {
                 return Err("dedicated backing has already been released".into());
             }
             self.free_dedicated(seg_idx);
-            Ok(FreeResult::DedicatedFreed {
-                seg_idx: seg_idx as u16,
-            })
+            Ok(())
         } else if let Some(seg) = self.segment(seg_idx as usize) {
             let actual_size = (data_size as usize)
                 .next_power_of_two()
@@ -856,11 +824,9 @@ impl MemPool {
                     if self.is_peer {
                         self.segments[idx].take();
                     }
-                    return Ok(FreeResult::SegmentIdle {
-                        seg_idx: seg_idx as u16,
-                    });
+                    return Ok(());
                 }
-                Ok(FreeResult::Normal)
+                Ok(())
             } else {
                 Err("could not determine buddy level for free_at".into())
             }
@@ -1158,10 +1124,9 @@ impl MemPool {
 
     /// Release resources held by a [`MemHandle`].
     ///
-    /// Returns `FreeResult` so callers can trigger deferred GC. A failed
-    /// release returns the original handle instead of consuming its authority.
-    /// For `FileSpill`, always returns `Normal` (OS handles cleanup via Drop).
-    pub fn release_handle(&mut self, handle: MemHandle) -> Result<FreeResult, ReleaseHandleError> {
+    /// A failed release returns the original handle instead of consuming its
+    /// authority. File-spill handles release their OS resources on drop.
+    pub fn release_handle(&mut self, handle: MemHandle) -> Result<(), ReleaseHandleError> {
         let result = self
             .validate_handle_owner(&handle)
             .and_then(|()| match &handle.backing {
@@ -1181,11 +1146,9 @@ impl MemPool {
                 }
                 HandleBacking::Shm { allocation: a, .. } => {
                     self.free_dedicated(a.seg_idx);
-                    Ok(FreeResult::DedicatedFreed {
-                        seg_idx: a.seg_idx as u16,
-                    })
+                    Ok(())
                 }
-                HandleBacking::FileSpill { .. } => Ok(FreeResult::Normal),
+                HandleBacking::FileSpill { .. } => Ok(()),
             });
         result.map_err(|reason| ReleaseHandleError { handle, reason })
     }
@@ -1196,15 +1159,13 @@ impl MemPool {
         if self.segments.is_empty() && self.segments.len() < self.config.max_segments {
             // BuddySegment::create auto-inflates so data region >= segment_size.
             // The data region is the checked layout's power-of-two capacity; an
-            // unsupported geometry yields 0 (buddy creation disabled) instead
-            // of wrapping or panicking. Normal allocation may then try
-            // dedicated/file backing; explicit prewarm reports the geometry error.
+            // The constructor has already validated the buddy geometry.
             return BuddyAllocator::checked_layout(
                 self.config.segment_size,
                 self.config.min_block_size,
             )
-            .map(|layout| layout.data_size)
-            .unwrap_or(0);
+            .expect("validated buddy geometry")
+            .data_size;
         }
         // Return the data size of existing segments.
         self.segments
@@ -1465,26 +1426,14 @@ impl MemPool {
             .checked_add(1)
             .ok_or_else(|| BackingError::Other("buddy backing generation exhausted".into()))?;
         let name = Self::buddy_segment_name(&self.name_prefix, idx as u32, generation);
-        // Preflight the geometry with the single checked-layout authority
-        // before reserving or mapping: unsupported layouts (u32 data bound,
-        // header/bitmap overflow, addressable-span overflow) must reject
-        // here rather than map first and panic inside BuddyAllocator::init.
-        let layout = BuddyAllocator::checked_layout(
-            self.config.segment_size,
-            self.config.min_block_size,
-        )
-        .ok_or_else(|| {
-            BackingError::Other(format!(
-                "buddy backing geometry unsupported: segment_size {} with min_block {} exceeds the u32 data capacity or the addressable mapping span",
-                self.config.segment_size, self.config.min_block_size
-            ))
-        })?;
+        // Constructor validation guarantees this layout before reservation.
+        let layout =
+            BuddyAllocator::checked_layout(self.config.segment_size, self.config.min_block_size)
+                .expect("validated buddy geometry");
         // Charge the exact total BuddySegment::create maps — header and
         // bitmaps included, from the same validated layout — so reusing
         // blocks inside an already-charged segment never charges again.
-        let backing_bytes = u64::try_from(layout.total_size).map_err(|_| {
-            BackingError::Other("buddy backing size exceeds budget accounting range".into())
-        })?;
+        let backing_bytes = layout.total_size as u64;
         // Creation seam: judge the full segment's validated total mapped
         // bytes — never the payload size — against OS-memory pressure before
         // the budget reservation. Reuse of existing segments never reaches
@@ -1563,7 +1512,7 @@ mod tests {
     fn test_pool(config: PoolConfig) -> MemPool {
         let id = TEST_COUNTER.fetch_add(1, AtOrd::Relaxed);
         let prefix = format!("/cc3t{:04x}{:04x}", std::process::id() as u16, id);
-        MemPool::new_with_prefix(config, prefix)
+        MemPool::new_with_prefix(config, prefix).unwrap()
     }
 
     fn small_config() -> PoolConfig {
@@ -1579,39 +1528,6 @@ mod tests {
 
     fn test_config() -> PoolConfig {
         small_config()
-    }
-
-    #[test]
-    fn owner_incarnation_validation_is_non_destructive() {
-        // Lazy pools: this check requires no SHM mapping or payload access.
-        let owner = MemPool::new_with_prefix(small_config(), "same-label".into());
-        let expected = owner.prefix().to_owned();
-        let replacement = MemPool::new_with_prefix(small_config(), "same-label".into());
-        let peer = MemPool::open_peer(small_config(), expected.clone());
-        assert!(owner.validate_owner_incarnation(&expected).is_ok());
-        assert!(
-            replacement
-                .validate_owner_incarnation(&expected)
-                .unwrap_err()
-                .contains("incarnation")
-        );
-        assert_eq!(peer.prefix(), expected);
-        assert!(
-            peer.validate_owner_incarnation(&expected)
-                .unwrap_err()
-                .contains("authority")
-        );
-        // Moving/restoring the actual owner preserves its identity.
-        let restored = owner;
-        assert!(restored.validate_owner_incarnation(&expected).is_ok());
-        for pool in [&restored, &replacement, &peer] {
-            assert_eq!(pool.stats().alloc_count, 0);
-            assert_eq!(pool.stats().total_segments, 0);
-        }
-        let snapshot = restored.budget().unwrap().snapshot();
-        assert_eq!(snapshot.shm.used_bytes, 0);
-        assert_eq!(snapshot.file.used_bytes, 0);
-        assert_eq!(snapshot.reassembly.used_bytes, 0);
     }
 
     #[test]
@@ -1818,44 +1734,40 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "invalid PoolConfig")]
     fn test_validate_zero_min_block() {
         let config = PoolConfig {
             min_block_size: 0,
             ..small_config()
         };
-        test_pool(config);
+        assert!(MemPool::validate_config(&config).is_err());
     }
 
     #[test]
-    #[should_panic(expected = "invalid PoolConfig")]
     fn test_validate_non_power_of_two_min_block() {
         let config = PoolConfig {
             min_block_size: 3000,
             ..small_config()
         };
-        test_pool(config);
+        assert!(MemPool::validate_config(&config).is_err());
     }
 
     #[test]
-    #[should_panic(expected = "invalid PoolConfig")]
     fn test_validate_segment_too_small() {
         let config = PoolConfig {
             segment_size: 4096,
             min_block_size: 4096,
             ..small_config()
         };
-        test_pool(config);
+        assert!(MemPool::validate_config(&config).is_err());
     }
 
     #[test]
-    #[should_panic(expected = "invalid PoolConfig")]
     fn test_validate_nan_gc_delay() {
         let config = PoolConfig {
             dedicated_crash_timeout_secs: f64::NAN,
             ..small_config()
         };
-        test_pool(config);
+        assert!(MemPool::validate_config(&config).is_err());
     }
 
     #[test]
@@ -2067,17 +1979,19 @@ mod tests {
     #[test]
     fn test_prefix_max_valid_length() {
         let prefix = "x".repeat(214); // 41 bytes of PID/UUID incarnation follow.
-        let mut pool = MemPool::new_with_prefix(test_config(), prefix);
+        let mut pool = MemPool::new_with_prefix(test_config(), prefix).unwrap();
         assert_eq!(pool.prefix().len(), 255);
-        pool.ensure_ready().unwrap();
+        pool.ensure_buddy_segments(1).unwrap();
         assert!(pool.segment_name(0).unwrap().len() <= 30);
     }
 
     #[test]
-    #[should_panic(expected = "exceeds handshake maximum")]
-    fn test_prefix_too_long_panics() {
+    fn test_prefix_too_long_is_rejected() {
         let prefix = "x".repeat(215);
-        let _ = MemPool::new_with_prefix(test_config(), prefix);
+        let error = MemPool::new_with_prefix(test_config(), prefix)
+            .err()
+            .unwrap();
+        assert!(error.contains("exceeds handshake maximum"));
     }
 
     #[test]
@@ -2176,7 +2090,7 @@ mod tests {
         let mut owner = test_pool(config.clone());
         let first = owner.alloc(32 * 1024).unwrap();
         let old = owner.alloc(32 * 1024).unwrap();
-        let mut peer = MemPool::open_peer(config, owner.prefix().to_owned());
+        let mut peer = MemPool::open_peer(config, owner.prefix().to_owned()).unwrap();
         peer.ensure_peer_segment(old.seg_idx, old.generation, 32 * 1024)
             .unwrap();
         unsafe {
@@ -2292,10 +2206,10 @@ mod tests {
 
     #[test]
     fn owner_incarnations_do_not_reuse_identical_labels() {
-        let mut first = MemPool::new_with_prefix(test_config(), "same-label".into());
-        let mut second = MemPool::new_with_prefix(test_config(), "same-label".into());
-        first.ensure_ready().unwrap();
-        second.ensure_ready().unwrap();
+        let mut first = MemPool::new_with_prefix(test_config(), "same-label".into()).unwrap();
+        let mut second = MemPool::new_with_prefix(test_config(), "same-label".into()).unwrap();
+        first.ensure_buddy_segments(1).unwrap();
+        second.ensure_buddy_segments(1).unwrap();
         assert_ne!(first.prefix(), second.prefix());
         assert_ne!(first.segment_name(0), second.segment_name(0));
     }
@@ -2310,7 +2224,7 @@ mod tests {
         let mut owner = test_pool(config.clone());
         let low = owner.alloc(32 * 1024).unwrap();
         let high = owner.alloc(32 * 1024).unwrap();
-        let mut peer = MemPool::open_peer(config, owner.prefix().to_owned());
+        let mut peer = MemPool::open_peer(config, owner.prefix().to_owned()).unwrap();
         peer.ensure_peer_segment(high.seg_idx, high.generation, 32 * 1024)
             .unwrap();
         let high_ptr = peer
@@ -2362,7 +2276,7 @@ mod tests {
         let mut owner = test_pool(config.clone());
         owner.ensure_buddy_segments(2).unwrap();
         let generation = owner.segment_generation(1).unwrap();
-        let mut peer = MemPool::open_peer(config, owner.prefix().to_owned());
+        let mut peer = MemPool::open_peer(config, owner.prefix().to_owned()).unwrap();
         peer.ensure_peer_segment(1, generation, 4096).unwrap();
         let word = unsafe {
             owner
@@ -2401,7 +2315,7 @@ mod tests {
         let mut owner = test_pool(config.clone());
         owner.ensure_buddy_segments(2).unwrap();
         let generation = owner.segment_generation(1).unwrap();
-        let mut peer = MemPool::open_peer(config, owner.prefix().to_owned());
+        let mut peer = MemPool::open_peer(config, owner.prefix().to_owned()).unwrap();
         peer.ensure_peer_segment(1, generation, 4096).unwrap();
         let word = unsafe {
             owner
@@ -2413,7 +2327,7 @@ mod tests {
         let lock = unsafe { crate::ShmSpinlock::new(word) };
         lock.try_lock().unwrap();
         lock.poison_panicked(std::process::id());
-        assert!(owner.segment(1).unwrap().allocator().is_poisoned());
+        assert!(!owner.segment(1).unwrap().allocator().can_retire());
         assert_eq!(owner.gc_buddy(), 0);
         assert_eq!(peer.gc_buddy(), 0);
         assert!(
@@ -2430,7 +2344,7 @@ mod tests {
         let config = test_config();
         let mut owner = test_pool(config.clone());
         let allocation = owner.alloc(config.segment_size * 2).unwrap();
-        let mut peer = MemPool::open_peer(config, owner.prefix().to_owned());
+        let mut peer = MemPool::open_peer(config, owner.prefix().to_owned()).unwrap();
         peer.ensure_peer_dedicated(allocation.seg_idx, 4096)
             .unwrap();
         unsafe { peer.free_at(allocation.seg_idx, 0, 0, 4096, true, 0) }.unwrap();
@@ -2652,7 +2566,6 @@ mod tests {
 
         // No buddy segment may ever be mapped, including through prewarm.
         assert_eq!(pool.segment_count(), 0);
-        assert!(pool.ensure_ready().is_ok());
         assert_eq!(pool.segment_count(), 0);
         assert!(
             pool.ensure_buddy_segments(1)
@@ -2865,16 +2778,13 @@ mod handle_tests {
     #[test]
     fn test_alloc_handle_backing_kind_and_length() {
         for (size, is_buddy) in [(4096, true), (128 * 1024, false)] {
-            let mut pool = MemPool::new(test_config());
+            let mut pool = MemPool::new(test_config()).unwrap();
             let handle = pool.alloc_handle(size).unwrap();
             assert_eq!(handle.is_buddy(), is_buddy);
             assert_eq!(handle.is_dedicated(), !is_buddy);
             assert_eq!(handle.len(), size);
-            let result = pool.release_handle(handle).unwrap();
-            assert_eq!(
-                matches!(result, FreeResult::DedicatedFreed { .. }),
-                !is_buddy
-            );
+            pool.release_handle(handle).unwrap();
+            assert_eq!(pool.stats().alloc_count, 0);
         }
     }
 
@@ -2886,7 +2796,7 @@ mod handle_tests {
             spill_dir: dir.clone(),
             ..test_config()
         };
-        let mut pool = MemPool::new(config);
+        let mut pool = MemPool::new(config).unwrap();
         let handle = pool.alloc_handle(4096).unwrap();
         assert!(handle.is_file_spill());
         pool.release_handle(handle).unwrap();
@@ -2895,7 +2805,7 @@ mod handle_tests {
 
     #[test]
     fn test_handle_slice_write_read() {
-        let mut pool = MemPool::new(test_config());
+        let mut pool = MemPool::new(test_config()).unwrap();
         let mut handle = pool.alloc_handle(4096).unwrap();
         let pattern = b"test_data_pattern";
         pool.handle_slice_mut(&mut handle)[..pattern.len()].copy_from_slice(pattern);
@@ -2915,7 +2825,7 @@ mod handle_tests {
             spill_dir: dir.clone(),
             ..test_config()
         };
-        let mut pool = MemPool::new(config);
+        let mut pool = MemPool::new(config).unwrap();
         let mut handle = pool.alloc_handle(8192).unwrap();
         let pattern = b"spill_pattern_data";
         pool.handle_slice_mut(&mut handle)[..pattern.len()].copy_from_slice(pattern);
@@ -2937,14 +2847,14 @@ mod handle_tests {
     #[test]
     fn owner_access_rejects_foreign_and_peer_pools() {
         for size in [4096, 128 * 1024] {
-            let mut owner = MemPool::new(test_config());
+            let mut owner = MemPool::new(test_config()).unwrap();
             let mut handle = owner.alloc_shm_handle(size).unwrap();
             let allocation = handle.shm_allocation().unwrap();
             owner.handle_slice_mut(&mut handle)[0] = 0x11;
-            let mut other = MemPool::new(test_config());
+            let mut other = MemPool::new(test_config()).unwrap();
             let mut survivor = other.alloc_shm_handle(size).unwrap();
             other.handle_slice_mut(&mut survivor)[0] = 0x22;
-            let peer = MemPool::open_peer(test_config(), owner.prefix().to_owned());
+            let peer = MemPool::open_peer(test_config(), owner.prefix().to_owned()).unwrap();
             assert!(peer.validate_handle(&handle).is_err());
             assert!(other.copy_handle_data(&handle).is_err());
             assert!(
@@ -2970,7 +2880,7 @@ mod handle_tests {
     #[test]
     fn destroy_does_not_reauthorize_old_handles() {
         for size in [4096, 128 * 1024] {
-            let mut pool = MemPool::new(test_config());
+            let mut pool = MemPool::new(test_config()).unwrap();
             let old = pool.alloc_shm_handle(size).unwrap();
             pool.destroy();
             let mut fresh = pool.alloc_shm_handle(size).unwrap();
@@ -2994,7 +2904,7 @@ mod handle_tests {
         use crate::{SegmentHeader, ShmSpinlock};
         use std::mem::offset_of;
 
-        let mut pool = MemPool::new(test_config());
+        let mut pool = MemPool::new(test_config()).unwrap();
         let handle = pool.alloc_shm_handle(4096).unwrap();
         let allocation = handle.shm_allocation().unwrap();
         let word = pool
@@ -3031,7 +2941,7 @@ mod handle_tests {
         use crate::{SegmentHeader, ShmSpinlock};
         use std::mem::offset_of;
 
-        let mut pool = MemPool::new(test_config());
+        let mut pool = MemPool::new(test_config()).unwrap();
         let handle = pool.alloc_shm_handle(4096).unwrap();
         let allocation = handle.shm_allocation().unwrap();
         let seg_idx = allocation.seg_idx as usize;
@@ -3064,7 +2974,7 @@ mod handle_tests {
     #[test]
     fn trimmed_handles_release_the_original_allocation() {
         for length in [0, 1, 4096] {
-            let mut pool = MemPool::new(test_config());
+            let mut pool = MemPool::new(test_config()).unwrap();
             let initial = 32 * 1024;
             let mut handle = pool.try_alloc_shm(initial).unwrap();
             let capacity = pool.segment(0).unwrap().allocator().data_size() as u64;
@@ -3114,7 +3024,7 @@ mod budget_tests {
     }
 
     fn budget_pool(config: PoolConfig, budget: MemoryBudget) -> MemPool {
-        MemPool::new_with_prefix_and_budget(config, unique_prefix(), budget)
+        MemPool::new_with_prefix_and_budget(config, unique_prefix(), budget).unwrap()
     }
 
     #[test]
@@ -3127,7 +3037,7 @@ mod budget_tests {
 
         // Prewarm is a creation entry point and must reject before mapping.
         assert!(
-            pool.ensure_ready()
+            pool.ensure_buddy_segments(1)
                 .unwrap_err()
                 .contains("memory budget cell 'shm'")
         );
@@ -3264,8 +3174,8 @@ mod budget_tests {
         unsafe { pool_b.free(&b) }.unwrap();
 
         // Existing owner constructors carry distinct private canonical budgets.
-        let mut private_a = MemPool::new_with_prefix(config.clone(), unique_prefix());
-        let mut private_b = MemPool::new_with_prefix(config.clone(), unique_prefix());
+        let mut private_a = MemPool::new_with_prefix(config.clone(), unique_prefix()).unwrap();
+        let mut private_b = MemPool::new_with_prefix(config.clone(), unique_prefix()).unwrap();
         let a = private_a.alloc(8192).unwrap();
         assert_eq!(
             private_a.budget().unwrap().snapshot().shm.used_bytes,
@@ -3285,7 +3195,7 @@ mod budget_tests {
         unsafe { private_b.free(&b) }.unwrap();
 
         // Peer pools never charge owner-creation budget.
-        let peer = MemPool::open_peer(config, unique_prefix());
+        let peer = MemPool::open_peer(config, unique_prefix()).unwrap();
         assert!(peer.budget().is_none());
     }
 
@@ -3293,8 +3203,8 @@ mod budget_tests {
     fn owner_constructors_carry_canonical_private_limits() {
         let config = budget_config();
         for pool in [
-            MemPool::new(config.clone()),
-            MemPool::new_with_prefix(config.clone(), unique_prefix()),
+            MemPool::new(config.clone()).unwrap(),
+            MemPool::new_with_prefix(config.clone(), unique_prefix()).unwrap(),
         ] {
             let budget = pool.budget().expect("owner pools carry a budget");
             let snap = budget.snapshot();
@@ -3436,7 +3346,7 @@ mod budget_tests {
         );
 
         // File spill owns its mapping, independently of either owner or peer pool identity.
-        let mut peer = MemPool::open_peer(budget_config(), "unused-peer-prefix".into());
+        let mut peer = MemPool::open_peer(budget_config(), "unused-peer-prefix".into()).unwrap();
         assert_eq!(peer.copy_handle_data(&moved).unwrap(), b"hold");
         peer.release_handle(moved).unwrap();
         assert_eq!(budget.snapshot().file.used_bytes, 0);
@@ -3626,61 +3536,53 @@ mod geometry_and_guard_tests {
     }
 
     #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn invalid_buddy_geometry_cannot_fall_back_to_dedicated() {
+        for segment_size in [(1usize << 31) + 4096, (1usize << 32) + 4096] {
+            let mut config = geometry_config();
+            config.segment_size = segment_size;
+            let result = MemPool::new_with_prefix(config, unique_prefix()).err();
+            assert!(
+                result
+                    .as_ref()
+                    .is_some_and(|error| error.contains("buddy backing geometry unsupported")),
+                "invalid buddy geometry must fail before selecting another backing: {result:?}"
+            );
+        }
+    }
+
+    #[test]
     fn unsupported_buddy_geometry_rejects_before_any_mapping() {
-        // validate_config deliberately accepts these (only doubling and shape
-        // are checked there); the creation seam must preflight the geometry,
-        // reject before the budget charge, and create no named region.
+        // Construction rejects before taking a budget charge or creating a
+        // named region.
         let mut sizes = vec![usize::MAX];
         if usize::BITS >= 64 {
-            sizes.extend([(1usize << 63) + 1, (1usize << 32) + 12345]);
+            sizes.extend([
+                (1usize << 63) + 1,
+                (1usize << 32) + 12345,
+                (1usize << 31) + 12345,
+            ]);
         }
         for segment_size in sizes {
             let mut config = geometry_config();
             config.segment_size = segment_size;
-            MemPool::validate_config(&config).expect("validation accepts; the seam preflights");
-
             let budget = MemoryBudget::from_limits(&c2_config::MemoryBudgetLimits::default());
-            let mut pool =
-                MemPool::new_with_prefix_and_budget(config, unique_prefix(), budget.clone());
-            let error = pool.ensure_ready().unwrap_err();
+            let error =
+                MemPool::new_with_prefix_and_budget(config, unique_prefix(), budget.clone())
+                    .err()
+                    .unwrap();
             assert!(
                 error.contains("buddy backing geometry unsupported"),
                 "segment_size {segment_size}: {error}"
             );
-            assert_eq!(pool.segment_count(), 0);
-
-            // No charge was taken and no budget rejection was recorded: the
-            // geometry preflight rejects before the reservation.
+            // No charge was taken and no budget rejection was recorded.
             let snap = budget.snapshot();
             assert_eq!(snap.shm.used_bytes, 0, "segment_size {segment_size}");
             assert_eq!(
                 snap.shm.rejected_allocations, 0,
                 "segment_size {segment_size}"
             );
-
-            // No named region exists: derive the name segment 0 would have
-            // used and prove nothing is registered under it.
-            let name = MemPool::buddy_segment_name(pool.prefix(), 0, 1);
-            assert!(
-                BuddySegment::open(&name, 4096).is_err(),
-                "no SHM region may exist for {name} (segment_size {segment_size})"
-            );
         }
-    }
-
-    #[test]
-    #[should_panic(expected = "at most one owner-creation reservation")]
-    fn budget_guard_attachment_is_single_shot() {
-        let name = format!("/c2bgs_{}", std::process::id());
-        let segment = BuddySegment::create(&name, 8192, 4096).unwrap();
-        let budget = MemoryBudget::new(u64::MAX, u64::MAX, u64::MAX);
-        let first = budget.reserve(BudgetKind::Shm, 1024).unwrap();
-        let segment = segment.with_budget_guard(first);
-        assert_eq!(budget.snapshot().shm.used_bytes, 1024);
-        // A second attachment must not be able to replace and silently drop
-        // the live charge.
-        let second = budget.reserve(BudgetKind::Shm, 512).unwrap();
-        let _ = segment.with_budget_guard(second);
     }
 
     #[test]
@@ -3689,7 +3591,8 @@ mod geometry_and_guard_tests {
         // remove the named POSIX SHM objects, not just the pool's containers.
         let config = geometry_config();
         let budget = MemoryBudget::from_limits(&c2_config::MemoryBudgetLimits::default());
-        let mut pool = MemPool::new_with_prefix_and_budget(config, unique_prefix(), budget.clone());
+        let mut pool =
+            MemPool::new_with_prefix_and_budget(config, unique_prefix(), budget.clone()).unwrap();
 
         let block = pool.alloc(4096).unwrap();
         let dedicated = pool.alloc(20000).unwrap();
@@ -3801,7 +3704,8 @@ mod pressure_seam_tests {
         let config = pressure_config();
         let budget = default_budget();
         let mut pool =
-            MemPool::new_with_prefix_and_budget(config.clone(), unique_prefix(), budget.clone());
+            MemPool::new_with_prefix_and_budget(config.clone(), unique_prefix(), budget.clone())
+                .unwrap();
         let buddy = buddy_total(&config);
         let dedicated = dedicated_backing(4096);
         assert!(
@@ -3834,10 +3738,11 @@ mod pressure_seam_tests {
         // Pressure denies the buddy segment but a dedicated backing fits:
         // every entry point selects dedicated, none errors or spills.
         let budget = default_budget();
-        let mut pool = MemPool::new_with_prefix_and_budget(config.clone(), unique_prefix(), budget);
+        let mut pool =
+            MemPool::new_with_prefix_and_budget(config.clone(), unique_prefix(), budget).unwrap();
         Script::install(&mut pool, 2 * dedicated);
         assert!(
-            pool.ensure_ready()
+            pool.ensure_buddy_segments(1)
                 .unwrap_err()
                 .contains("OS memory pressure"),
             "explicit prewarm obeys the same backing policy"
@@ -3861,11 +3766,12 @@ mod pressure_seam_tests {
         let mut forced_config = config;
         forced_config.spill_threshold = 0.0;
         let mut forced =
-            MemPool::new_with_prefix_and_budget(forced_config, unique_prefix(), default_budget());
+            MemPool::new_with_prefix_and_budget(forced_config, unique_prefix(), default_budget())
+                .unwrap();
         Script::install(&mut forced, u64::MAX);
         assert!(
             forced
-                .ensure_ready()
+                .ensure_buddy_segments(1)
                 .unwrap_err()
                 .contains("forces new shared-memory backings")
         );
@@ -3884,7 +3790,7 @@ mod pressure_seam_tests {
         let spilled = forced.alloc_handle(4096).unwrap();
         assert!(spilled.is_file_spill());
         assert_eq!(forced.segment_count(), 0);
-        // ensure_ready(1) + alloc(buddy+dedicated) + try_alloc_shm(2) +
+        // ensure_buddy_segments(1) + alloc(buddy+dedicated) + try_alloc_shm(2) +
         // alloc_handle(2) pressure denials in total.
         assert_eq!(forced.stats().pressure_denied_backings, 7);
         assert_eq!(forced.stats().file_spill_allocs, 1);
@@ -3896,7 +3802,8 @@ mod pressure_seam_tests {
         let config = pressure_config();
         let budget = default_budget();
         let mut pool =
-            MemPool::new_with_prefix_and_budget(config.clone(), unique_prefix(), budget.clone());
+            MemPool::new_with_prefix_and_budget(config.clone(), unique_prefix(), budget.clone())
+                .unwrap();
 
         // Ample availability maps one buddy segment holding two blocks.
         Script::install(&mut pool, 1 << 40);
@@ -3927,13 +3834,14 @@ mod pressure_seam_tests {
             pressure_config(),
             unique_prefix(),
             default_budget(),
-        );
+        )
+        .unwrap();
         // Zero availability denies every creation seam deterministically.
         let script = Script::install(&mut pool, 0);
 
         for _ in 0..5 {
             assert!(
-                pool.ensure_ready()
+                pool.ensure_buddy_segments(1)
                     .unwrap_err()
                     .contains("OS memory pressure")
             );
@@ -3947,7 +3855,7 @@ mod pressure_seam_tests {
         // After the TTL a fresh sample is taken.
         script.advance_ms(1_001);
         assert!(
-            pool.ensure_ready()
+            pool.ensure_buddy_segments(1)
                 .unwrap_err()
                 .contains("OS memory pressure")
         );
@@ -3959,11 +3867,11 @@ mod pressure_seam_tests {
         let config = pressure_config();
         let buddy = buddy_total(&config);
         let mut pool =
-            MemPool::new_with_prefix_and_budget(config, unique_prefix(), default_budget());
+            MemPool::new_with_prefix_and_budget(config, unique_prefix(), default_budget()).unwrap();
         // Direct bar: buddy needs 2*buddy observed bytes at threshold 0.5.
         let script = Script::install(&mut pool, 2 * buddy - 1);
         assert!(
-            pool.ensure_ready()
+            pool.ensure_buddy_segments(1)
                 .unwrap_err()
                 .contains("OS memory pressure")
         );
@@ -3973,7 +3881,7 @@ mod pressure_seam_tests {
         script.advance_ms(1_001);
         script.set_available(2 * buddy + 2);
         assert!(
-            pool.ensure_ready()
+            pool.ensure_buddy_segments(1)
                 .unwrap_err()
                 .contains("OS memory pressure"),
             "availability inside the recovery band must stay denied"
@@ -3983,7 +3891,7 @@ mod pressure_seam_tests {
         // Genuine recovery admits the same tier again.
         script.advance_ms(1_001);
         script.set_available(3 * buddy);
-        pool.ensure_ready().unwrap();
+        pool.ensure_buddy_segments(1).unwrap();
         assert_eq!(pool.segment_count(), 1);
     }
 
@@ -3991,7 +3899,8 @@ mod pressure_seam_tests {
     fn pressure_denied_shm_escapes_to_file_backing() {
         let config = pressure_config();
         let budget = MemoryBudget::new(u64::MAX, u64::MAX, u64::MAX);
-        let mut pool = MemPool::new_with_prefix_and_budget(config, unique_prefix(), budget.clone());
+        let mut pool =
+            MemPool::new_with_prefix_and_budget(config, unique_prefix(), budget.clone()).unwrap();
         // A failed (zero) availability observation denies every SHM seam.
         Script::install(&mut pool, 0);
         let handle = pool.alloc_handle(4096).unwrap();
@@ -4007,7 +3916,8 @@ mod pressure_seam_tests {
         let mut config = pressure_config();
         config.spill_threshold = 0.0;
         let budget = MemoryBudget::new(u64::MAX, 0, u64::MAX);
-        let mut pool = MemPool::new_with_prefix_and_budget(config, unique_prefix(), budget);
+        let mut pool =
+            MemPool::new_with_prefix_and_budget(config, unique_prefix(), budget).unwrap();
         Script::install(&mut pool, u64::MAX);
 
         let error = pool.alloc_handle(4096).unwrap_err();
@@ -4025,7 +3935,8 @@ mod pressure_seam_tests {
         let config = pressure_config();
         let budget = default_budget();
         let mut pool =
-            MemPool::new_with_prefix_and_budget(config.clone(), unique_prefix(), budget.clone());
+            MemPool::new_with_prefix_and_budget(config.clone(), unique_prefix(), budget.clone())
+                .unwrap();
         Script::install(&mut pool, 1 << 40);
 
         // First small allocation expands the buddy pool; the next reuses it.
@@ -4086,7 +3997,8 @@ mod pressure_seam_tests {
         let _ = std::fs::remove_dir_all(&spill_dir);
         forced_config.spill_dir = spill_dir.clone();
         let mut spiller =
-            MemPool::new_with_prefix_and_budget(forced_config, unique_prefix(), budget.clone());
+            MemPool::new_with_prefix_and_budget(forced_config, unique_prefix(), budget.clone())
+                .unwrap();
         let handle = spiller.alloc_handle(4096).unwrap();
         assert!(handle.is_file_spill());
         stats = spiller.stats();

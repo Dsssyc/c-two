@@ -115,7 +115,9 @@ def test_memory_stats_is_observable_without_freezing_an_unused_runtime() -> None
     )
     # The retained-buffer counters stay Rust-owned and are composed, not
     # duplicated, into the snapshot.
-    assert set(first['holds']) >= {'active_holds', 'total_held_bytes'}
+    assert set(first['holds']) == {
+        'active_holds', 'total_held_bytes', 'oldest_hold_seconds', 'by_storage', 'by_direction'
+    }
     assert 'not process RSS' in ' '.join(cc.observe.memory_stats.__doc__.split())
 
 

@@ -11,7 +11,6 @@ use std::ptr;
 use std::sync::Mutex;
 
 const MAX_SHM_PREFIX_LEN: usize = 255;
-const OWNER_INCARNATION_SUFFIX_LEN: usize = 41;
 const MAX_IPC_SHM_SEGMENTS: u16 = 16;
 const C2_MEM_FFI_ABI_VERSION: u32 = 6;
 
@@ -177,7 +176,6 @@ fn request_pool_config(
         max_segments: max_segments as usize,
         ..PoolConfig::default()
     };
-    MemPool::validate_config(&config).map_err(|_| C2MemFfiStatus::InvalidArgument)?;
     Ok(config)
 }
 
@@ -685,11 +683,9 @@ pub unsafe extern "C" fn c2_mem_ffi_request_pool_new(
             *out_pool = ptr::null_mut();
         }
         let prefix = parse_prefix(prefix)?;
-        if prefix.len() > MAX_SHM_PREFIX_LEN - OWNER_INCARNATION_SUFFIX_LEN {
-            return Err(C2MemFfiStatus::InvalidArgument);
-        }
         let config = request_pool_config(segment_size, max_segments, min_block_size)?;
-        let mut pool = MemPool::new_with_prefix(config, prefix);
+        let mut pool = MemPool::new_with_prefix(config, prefix)
+            .map_err(|_| C2MemFfiStatus::InvalidArgument)?;
         pool.ensure_buddy_segments(max_segments as usize)
             .map_err(|_| C2MemFfiStatus::PoolError)?;
         let handle = Box::new(C2MemFfiRequestPool {
@@ -875,48 +871,34 @@ pub unsafe extern "C" fn c2_mem_ffi_request_pool_write(
             .pool
             .alloc(data_len)
             .map_err(|_| C2MemFfiStatus::PoolError)?;
-        let copy_result = state
+        let ptr = state
             .pool
             .data_ptr(&alloc)
-            .map_err(|_| C2MemFfiStatus::PoolError)
-            .and_then(|ptr| {
-                unsafe {
-                    ptr::copy_nonoverlapping(data, ptr, data_len);
-                }
-                let segment_index =
-                    u16::try_from(alloc.seg_idx).map_err(|_| C2MemFfiStatus::PoolError)?;
-                unsafe {
-                    *out_block = C2MemFfiRequestBlock {
-                        segment_index,
-                        is_dedicated: u8::from(alloc.is_dedicated),
-                        reserved: 0,
-                        generation: alloc.generation,
-                        offset: alloc.offset,
-                        byte_length: data_len as u32,
-                        allocation_id: alloc.allocation_id,
-                    };
-                }
-                Ok(())
-            });
-        if copy_result.is_err() {
-            let _ = unsafe { state.pool.free(&alloc) };
-        } else {
-            let segment_index =
-                u16::try_from(alloc.seg_idx).map_err(|_| C2MemFfiStatus::PoolError)?;
-            let inserted = state.local_blocks.insert(C2MemFfiBlockKey {
+            .expect("new allocation has a valid data pointer");
+        unsafe {
+            ptr::copy_nonoverlapping(data, ptr, data_len);
+        }
+        let segment_index = alloc.seg_idx as u16;
+        unsafe {
+            *out_block = C2MemFfiRequestBlock {
                 segment_index,
+                is_dedicated: u8::from(alloc.is_dedicated),
+                reserved: 0,
                 generation: alloc.generation,
                 offset: alloc.offset,
                 byte_length: data_len as u32,
-                is_dedicated: alloc.is_dedicated,
                 allocation_id: alloc.allocation_id,
-            });
-            if !inserted {
-                let _ = unsafe { state.pool.free(&alloc) };
-                return Err(C2MemFfiStatus::PoolError);
-            }
+            };
         }
-        copy_result
+        state.local_blocks.insert(C2MemFfiBlockKey {
+            segment_index,
+            generation: alloc.generation,
+            offset: alloc.offset,
+            byte_length: data_len as u32,
+            is_dedicated: alloc.is_dedicated,
+            allocation_id: alloc.allocation_id,
+        });
+        Ok(())
     })
 }
 
@@ -1061,7 +1043,8 @@ pub unsafe extern "C" fn c2_mem_ffi_response_pool_new(
         }
         let prefix = parse_prefix(prefix)?;
         let config = request_pool_config(segment_size, max_segments, min_block_size)?;
-        let pool = MemPool::open_peer(config, prefix);
+        let pool =
+            MemPool::open_peer(config, prefix).map_err(|_| C2MemFfiStatus::InvalidArgument)?;
         let handle = Box::new(C2MemFfiResponsePool {
             inner: Mutex::new(C2MemFfiResponsePoolState {
                 buddy_segment_size: segment_size as usize,
@@ -2124,11 +2107,7 @@ mod tests {
             CString::new("/").unwrap(),
             CString::new("cc2ffi_no_slash").unwrap(),
             CString::new("/cc2ffi/extra").unwrap(),
-            CString::new(format!(
-                "/{}",
-                "x".repeat(MAX_SHM_PREFIX_LEN - OWNER_INCARNATION_SUFFIX_LEN)
-            ))
-            .unwrap(),
+            CString::new(format!("/{}", "x".repeat(MAX_SHM_PREFIX_LEN - 1))).unwrap(),
         ] {
             let mut pool = ptr::null_mut();
             assert_eq!(
@@ -2442,7 +2421,8 @@ static void use_response_api(void) {
                 ..PoolConfig::default()
             },
             prefix.to_string(),
-        );
+        )
+        .unwrap();
         server.ensure_buddy_segments(2).unwrap();
         let alloc = server.alloc(payload.len()).unwrap();
         assert!(!alloc.is_dedicated);
@@ -2479,6 +2459,7 @@ static void use_response_api(void) {
             },
             prefix.to_string(),
         )
+        .unwrap()
     }
 
     /// Allocate and fill one buddy block, returning its response coordinates.
@@ -2855,7 +2836,8 @@ static void use_response_api(void) {
                 ..PoolConfig::default()
             },
             prefix.to_str().unwrap().to_string(),
-        );
+        )
+        .unwrap();
         server.ensure_buddy_segments(2).unwrap();
         let full_segment = vec![1_u8; 65_536];
         let first = server.alloc(full_segment.len()).unwrap();

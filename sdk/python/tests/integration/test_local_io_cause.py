@@ -237,7 +237,7 @@ def test_response_admission_preserves_outer_transport_and_inner_semantic_message
                 assert resource.calls == 1
                 assert proxy.echo('after') == 'after'
                 assert resource.calls == 2
-                assert cc.observe.memory_stats()["holds"]['active_leases'] == 0
+                assert cc.observe.memory_stats()["holds"]['active_holds'] == 0
                 cells = cc.observe.memory_stats()['runtime_outgoing']['cells']
                 assert all(cells[cell]['used_bytes'] == 0 for cell in ('reassembly', 'file', 'shm'))
             finally:

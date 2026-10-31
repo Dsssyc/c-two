@@ -158,18 +158,6 @@ impl BuddyAllocator {
             "SHM base address must be aligned to SegmentHeader requirements"
         );
 
-        // R-C4: Verify atomics are lock-free for cross-process SHM correctness.
-        // On stable Rust, is_lock_free() is unavailable; cfg!(target_has_atomic)
-        // verifies the platform supports native (lock-free) atomics.
-        assert!(
-            cfg!(target_has_atomic = "64"),
-            "AtomicU64 must be lock-free for cross-process SHM"
-        );
-        assert!(
-            cfg!(target_has_atomic = "32"),
-            "AtomicU32 must be lock-free for cross-process SHM"
-        );
-
         // Write header.
         // SAFETY: caller guarantees `base` is a valid, writable SHM pointer
         // with at least `total_size` bytes, aligned for SegmentHeader.
@@ -314,12 +302,6 @@ impl BuddyAllocator {
             Ok(result) => result,
             Err(err) => Err(format!("buddy free refused: {err}")),
         }
-    }
-
-    /// Poisoned counters may reflect an interrupted mutation and cannot
-    /// authorize backing retirement, even when they currently report zero.
-    pub fn is_poisoned(&self) -> bool {
-        self.lock.is_poisoned()
     }
 
     /// Called under the pool's allocation/cache lock. A busy or poisoned

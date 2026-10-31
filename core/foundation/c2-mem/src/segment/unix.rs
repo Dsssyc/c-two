@@ -157,18 +157,6 @@ impl ShmRegion {
     pub fn is_owner(&self) -> bool {
         self.is_owner
     }
-
-    /// # Safety
-    /// The caller must ensure the full range is within the mapped region.
-    pub unsafe fn as_slice(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.base, self.size) }
-    }
-
-    /// # Safety
-    /// The caller must ensure exclusive access and valid range.
-    pub unsafe fn as_slice_mut(&mut self) -> &mut [u8] {
-        unsafe { std::slice::from_raw_parts_mut(self.base, self.size) }
-    }
 }
 
 impl Drop for ShmRegion {

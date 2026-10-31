@@ -24,17 +24,13 @@ use c2_mem::config::PoolConfig;
 const MIN_BUDDY_SEGMENT_SIZE: usize = 2 * 4096;
 
 struct PeerShmState {
-    prefix: String,
     /// MemPool opened over the client's SHM segments for data access + free.
     pool: Option<Arc<RwLock<MemPool>>>,
 }
 
 impl PeerShmState {
     fn new() -> Self {
-        Self {
-            prefix: String::new(),
-            pool: None,
-        }
+        Self { pool: None }
     }
 }
 
@@ -215,20 +211,12 @@ impl Connection {
         state.pool.clone()
     }
 
-    /// Return the peer's SHM pool prefix (empty if handshake not done).
-    pub fn peer_prefix(&self) -> String {
-        self.peer_shm.lock().prefix.clone()
-    }
-
     /// Initialise the peer SHM cache from its handshake pool incarnation.
     ///
     /// Always creates a `MemPool` with the peer's prefix so that later
     /// admitted request carriers can lazy-open segments by
     /// resolving names through MemPool's prefix, index, and generation authority.
-    pub fn init_peer_shm(&self, prefix: String) {
-        let mut state = self.peer_shm.lock();
-        state.prefix = prefix;
-
+    pub fn init_peer_shm(&self, prefix: String) -> Result<(), String> {
         // Receive-side cache: `buddy_enabled` is irrelevant (peer pools never
         // allocate) and `min_retained_segments` is 0 so cached views retire as
         // soon as their peer frees — matching MemPool's peer-cache behavior.
@@ -248,18 +236,9 @@ impl Connection {
             buddy_enabled: true,
             min_retained_segments: 0,
         };
-        let peer_prefix = state.prefix.clone();
-        let pool = MemPool::open_peer(cfg, peer_prefix);
-        state.pool = Some(Arc::new(RwLock::new(pool)));
-    }
-
-    /// Run buddy GC on the peer's SHM pool — reclaim idle trailing segments.
-    pub fn gc_peer_buddy(&self) {
-        let state = self.peer_shm.lock();
-        if let Some(pool_arc) = state.pool.as_ref() {
-            let mut pool = pool_arc.write();
-            pool.gc_buddy();
-        }
+        let pool = MemPool::open_peer(cfg, prefix)?;
+        self.peer_shm.lock().pool = Some(Arc::new(RwLock::new(pool)));
+        Ok(())
     }
 
     /// Record activity — updates the last-activity timestamp to *now*.
@@ -347,7 +326,6 @@ mod tests {
         assert!(!conn.native_shm_reachable());
         assert!(!conn.shm_request_capable());
         assert!(!conn.shm_response_capable());
-        assert!(conn.peer_prefix().is_empty());
         assert!(conn.peer_pool_arc().is_none());
         assert_eq!(conn.inflight_count(), 0);
     }
@@ -355,8 +333,8 @@ mod tests {
     #[test]
     fn init_peer_shm_initializes_unmapped_peer_pool() {
         let conn = Connection::new(1);
-        conn.init_peer_shm("prefix".into());
-        assert_eq!(conn.peer_prefix(), "prefix");
+        conn.init_peer_shm("prefix".into()).unwrap();
+        assert_eq!(conn.peer_pool_arc().unwrap().read().prefix(), "prefix");
         assert_eq!(conn.peer_pool_arc().unwrap().read().segment_count(), 0);
     }
 

@@ -115,20 +115,23 @@ mod tests {
     }
 
     fn test_pool() -> ResponsePool {
-        ResponsePool::new(MemPool::new_with_prefix(
-            PoolConfig {
-                segment_size: 64 * 1024,
-                min_block_size: 4096,
-                max_segments: 1,
-                max_dedicated_segments: 1,
-                dedicated_crash_timeout_secs: 0.0,
-                buddy_idle_decay_secs: 60.0,
-                spill_threshold: 0.8,
-                spill_dir: std::env::temp_dir().join("c2_response_helper_test"),
-                ..PoolConfig::default()
-            },
-            unique_prefix("a"),
-        ))
+        ResponsePool::new(
+            MemPool::new_with_prefix(
+                PoolConfig {
+                    segment_size: 64 * 1024,
+                    min_block_size: 4096,
+                    max_segments: 1,
+                    max_dedicated_segments: 1,
+                    dedicated_crash_timeout_secs: 0.0,
+                    buddy_idle_decay_secs: 60.0,
+                    spill_threshold: 0.8,
+                    spill_dir: std::env::temp_dir().join("c2_response_helper_test"),
+                    ..PoolConfig::default()
+                },
+                unique_prefix("a"),
+            )
+            .unwrap(),
+        )
     }
 
     #[test]
@@ -193,22 +196,25 @@ mod tests {
 
     #[test]
     fn allocation_failure_falls_back_to_owned_inline_path() {
-        let pool = ResponsePool::new(MemPool::new_with_prefix(
-            PoolConfig {
-                segment_size: 64 * 1024,
-                min_block_size: 4096,
-                max_segments: 0,
-                max_dedicated_segments: 0,
-                dedicated_crash_timeout_secs: 0.0,
-                buddy_idle_decay_secs: 60.0,
-                spill_threshold: 0.8,
-                spill_dir: std::env::temp_dir().join("c2_response_helper_alloc_fail"),
-                // max_segments 0 requires a zero retirement floor.
-                min_retained_segments: 0,
-                ..PoolConfig::default()
-            },
-            unique_prefix("b"),
-        ));
+        let pool = ResponsePool::new(
+            MemPool::new_with_prefix(
+                PoolConfig {
+                    segment_size: 64 * 1024,
+                    min_block_size: 4096,
+                    max_segments: 0,
+                    max_dedicated_segments: 0,
+                    dedicated_crash_timeout_secs: 0.0,
+                    buddy_idle_decay_secs: 60.0,
+                    spill_threshold: 0.8,
+                    spill_dir: std::env::temp_dir().join("c2_response_helper_alloc_fail"),
+                    // max_segments 0 requires a zero retirement floor.
+                    min_retained_segments: 0,
+                    ..PoolConfig::default()
+                },
+                unique_prefix("b"),
+            )
+            .unwrap(),
+        );
 
         let meta = super::try_prepare_shm_response(&pool, 1024, 8192, |_| {
             panic!("allocation failure should not request a SHM destination")

@@ -13,8 +13,12 @@ def test_native_buffer_lease_tracker_counts_inline_retained():
         bytes=128,
     )
     stats = tracker.stats()
+    assert set(stats) == {
+        "active_holds", "total_held_bytes", "oldest_hold_seconds", "by_storage", "by_direction"
+    }
     assert stats["active_holds"] == 1
     assert stats["total_held_bytes"] == 128
+    assert set(stats["by_storage"]["inline"]) == {"active_holds", "total_held_bytes"}
     assert stats["by_storage"]["inline"]["active_holds"] == 1
     lease.release()
     assert tracker.stats()["active_holds"] == 0
@@ -32,6 +36,9 @@ def test_native_buffer_lease_tracker_sweeps_retained_snapshots():
     time.sleep(0.01)
     stale = tracker.sweep_retained(0.001)
     assert len(stale) == 1
+    assert set(stale[0]) == {
+        "id", "route_name", "method_name", "direction", "storage", "bytes", "age_seconds"
+    }
     assert stale[0]["route_name"] == "grid"
     assert stale[0]["method_name"] == "subdivide_grids"
     assert stale[0]["direction"] == "client_response"

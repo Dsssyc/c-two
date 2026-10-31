@@ -20,8 +20,6 @@ pub enum HeartbeatResult {
     TimedOut,
     /// Failed to write the PING frame (broken pipe / closed socket).
     WriteError,
-    /// Heartbeat was disabled (`heartbeat_interval <= 0`).
-    Disabled,
 }
 
 /// Build a PING signal frame.
@@ -55,8 +53,7 @@ pub async fn run_heartbeat(
 ) -> HeartbeatResult {
     if config.heartbeat_interval_secs <= 0.0 {
         // Heartbeat disabled — park forever.
-        std::future::pending::<()>().await;
-        return HeartbeatResult::Disabled;
+        return std::future::pending().await;
     }
 
     let check_interval = Duration::from_secs_f64(config.heartbeat_interval_secs / 2.0);
@@ -101,6 +98,7 @@ pub async fn run_heartbeat(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::isolated_pair;
 
     #[test]
     fn ping_frame_structure() {
@@ -135,7 +133,7 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
 
         // Exercise the actual local OS backend while heartbeat is disabled.
-        let (sock_a, _sock_b) = c2_local::LocalStream::pair().await.unwrap();
+        let (sock_a, _sock_b) = isolated_pair().await;
         let (_reader, write_half) = sock_a.into_split();
         let writer = Arc::new(Mutex::new(write_half));
 
@@ -143,7 +141,7 @@ mod tests {
         let handle = tokio::spawn(async move {
             tokio::select! {
                 result = run_heartbeat(conn2, writer, &config) => {
-                    assert_eq!(result, HeartbeatResult::Disabled);
+                    panic!("disabled heartbeat completed: {result:?}");
                 }
                 _ = async { rx.await.ok() } => {
                     // Test timeout — heartbeat correctly parked.
@@ -168,7 +166,7 @@ mod tests {
             ..ServerIpcConfig::default()
         };
 
-        let (sock_a, sock_b) = c2_local::LocalStream::pair().await.unwrap();
+        let (sock_a, sock_b) = isolated_pair().await;
         let (_read_a, write_half) = sock_a.into_split();
         let (mut read_b, _write_b) = sock_b.into_split();
         let writer = Arc::new(Mutex::new(write_half));
@@ -208,7 +206,7 @@ mod tests {
             ..ServerIpcConfig::default()
         };
 
-        let (sock_a, mut sock_b) = c2_local::LocalStream::pair().await.unwrap();
+        let (sock_a, mut sock_b) = isolated_pair().await;
         let (mut read_a, write_half) = sock_a.with_connection_publisher(publisher).into_split();
         let writer = Arc::new(Mutex::new(write_half));
         let reader_conn = Arc::clone(&conn);

@@ -68,7 +68,7 @@ def test_chunked_response_capacity_is_canonical_and_resource_executes_once(failu
         assert cells['reassembly']['used_bytes'] == 0
         assert cells['file']['used_bytes'] == 0
         assert cells['shm']['used_bytes'] == 0
-        assert cc.observe.memory_stats()["holds"]['active_leases'] == 0
+        assert cc.observe.memory_stats()["holds"]['active_holds'] == 0
         if failure == 'reassembly':
             assert cells['reassembly']['rejected_allocations'] >= 1
         else:

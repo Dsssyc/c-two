@@ -88,17 +88,9 @@ impl DedicatedSegment {
 
     /// Attach this backing's single owner-creation budget reservation.
     ///
-    /// Crate-private and single-shot by invariant: the reservation is
-    /// attached exactly once, immediately after a budgeted creation succeeds
-    /// and before the owner is published into a pool, so no caller can
-    /// replace or drop the charge while the backing is live. A second
-    /// attachment is an internal bug and panics rather than silently
-    /// releasing the live charge. There is no way to clear the guard.
+    /// The pool attaches this once after budgeted creation and before
+    /// publishing the backing.
     pub(crate) fn with_budget_guard(mut self, guard: BudgetReservation) -> Self {
-        assert!(
-            self.budget_guard.is_none(),
-            "a backing carries at most one owner-creation reservation"
-        );
         self.budget_guard = Some(guard);
         self
     }

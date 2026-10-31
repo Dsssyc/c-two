@@ -271,7 +271,9 @@ impl PyMemPool {
     fn new(config: Option<&PyPoolConfig>) -> PyResult<Self> {
         let cfg = config.map(PoolConfig::from).unwrap_or_default();
         Ok(Self {
-            pool: Arc::new(RwLock::new(MemPool::new(cfg))),
+            pool: Arc::new(RwLock::new(
+                MemPool::new(cfg).map_err(PyValueError::new_err)?,
+            )),
         })
     }
 
@@ -442,7 +444,7 @@ impl PyMemPool {
         allocation_id: u64,
     ) -> PyResult<()> {
         let mut pool = self.pool.write();
-        let _ = unsafe {
+        unsafe {
             pool.free_at(
                 seg_idx,
                 generation,
@@ -549,17 +551,17 @@ impl PyMemPool {
     #[pyo3(signature = (prefix, config = None))]
     fn open_peer(prefix: String, config: Option<&PyPoolConfig>) -> PyResult<Self> {
         let cfg = config.map(PoolConfig::from).unwrap_or_default();
-        if prefix.len() > 255
-            || !prefix.starts_with('/')
+        if !prefix.starts_with('/')
             || prefix.len() < 2
             || prefix[1..].contains('/')
             || prefix.contains('\0')
         {
             return Err(PyValueError::new_err("invalid peer pool prefix"));
         }
-        MemPool::validate_config(&cfg).map_err(PyValueError::new_err)?;
         Ok(Self {
-            pool: Arc::new(RwLock::new(MemPool::open_peer(cfg, prefix))),
+            pool: Arc::new(RwLock::new(
+                MemPool::open_peer(cfg, prefix).map_err(PyValueError::new_err)?,
+            )),
         })
     }
 

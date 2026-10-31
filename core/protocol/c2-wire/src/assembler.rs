@@ -54,22 +54,16 @@ impl ChunkAssembler {
     ///
     /// `pool` is the shared owner pool that allocates the reassembly buffer
     /// and carries the canonical reassembly budget. `total_chunks` and
-    /// `chunk_size` come from the first chunk's header. Per-message limits
-    /// (`max_total_chunks`, `max_reassembly_bytes`) and geometry are checked
+    /// `chunk_size` come from the first chunk's header. The per-message byte
+    /// limit and geometry are checked
     /// before any budget reservation or allocation.
     pub fn new(
         pool: Arc<RwLock<MemPool>>,
         total_chunks: usize,
         chunk_size: usize,
-        max_total_chunks: usize,
-        max_reassembly_bytes: usize,
+        max_reassembly_bytes: u64,
     ) -> Result<Self, ChunkAdmissionError> {
-        let geometry = Self::check_geometry(
-            total_chunks,
-            chunk_size,
-            max_total_chunks,
-            max_reassembly_bytes,
-        )?;
+        let geometry = Self::check_geometry(total_chunks, chunk_size, max_reassembly_bytes)?;
         let guard = pool.write();
         Self::new_with_guard(Arc::clone(&pool), guard, geometry)
     }
@@ -77,18 +71,12 @@ impl ChunkAssembler {
     pub(crate) fn check_geometry(
         total_chunks: usize,
         chunk_size: usize,
-        max_total_chunks: usize,
-        max_reassembly_bytes: usize,
+        max_reassembly_bytes: u64,
     ) -> Result<ChunkGeometry, ChunkAdmissionError> {
-        if total_chunks > max_total_chunks {
-            return Err(ChunkAdmissionError::Protocol(format!(
-                "total_chunks {total_chunks} exceeds limit {max_total_chunks}"
-            )));
-        }
         let capacity =
             checked_capacity(total_chunks, chunk_size).map_err(ChunkAdmissionError::Protocol)?;
-        if capacity > max_reassembly_bytes {
-            return Err(ChunkAdmissionError::Protocol(format!(
+        if u64::try_from(capacity).map_or(true, |capacity| capacity > max_reassembly_bytes) {
+            return Err(ChunkAdmissionError::Capacity(format!(
                 "reassembly size {capacity} exceeds limit {max_reassembly_bytes}"
             )));
         }
@@ -226,37 +214,43 @@ mod tests {
     use c2_mem::config::PoolConfig;
 
     fn test_pool_arc() -> Arc<RwLock<MemPool>> {
-        Arc::new(RwLock::new(MemPool::new(PoolConfig {
-            segment_size: 64 * 1024,
-            min_block_size: 4096,
-            max_segments: 2,
-            max_dedicated_segments: 2,
-            dedicated_crash_timeout_secs: 0.0,
-            buddy_idle_decay_secs: 0.0,
-            spill_threshold: 1.0,
-            spill_dir: std::env::temp_dir().join("c2_asm_test"),
-            ..PoolConfig::default()
-        })))
+        Arc::new(RwLock::new(
+            MemPool::new(PoolConfig {
+                segment_size: 64 * 1024,
+                min_block_size: 4096,
+                max_segments: 2,
+                max_dedicated_segments: 2,
+                dedicated_crash_timeout_secs: 0.0,
+                buddy_idle_decay_secs: 0.0,
+                spill_threshold: 1.0,
+                spill_dir: std::env::temp_dir().join("c2_asm_test"),
+                ..PoolConfig::default()
+            })
+            .unwrap(),
+        ))
     }
 
     fn budgeted_pool_arc(reassembly_limit: u64) -> (Arc<RwLock<MemPool>>, MemoryBudget) {
         let budget = MemoryBudget::new(1 << 20, 1 << 20, reassembly_limit);
         (
-            Arc::new(RwLock::new(MemPool::new_with_prefix_and_budget(
-                PoolConfig {
-                    segment_size: 64 * 1024,
-                    min_block_size: 4096,
-                    max_segments: 2,
-                    max_dedicated_segments: 2,
-                    dedicated_crash_timeout_secs: 0.0,
-                    buddy_idle_decay_secs: 0.0,
-                    spill_threshold: 1.0,
-                    spill_dir: std::env::temp_dir().join("c2_asm_test_budget"),
-                    ..PoolConfig::default()
-                },
-                format!("/cc3ab{:08x}", std::process::id()),
-                budget.clone(),
-            ))),
+            Arc::new(RwLock::new(
+                MemPool::new_with_prefix_and_budget(
+                    PoolConfig {
+                        segment_size: 64 * 1024,
+                        min_block_size: 4096,
+                        max_segments: 2,
+                        max_dedicated_segments: 2,
+                        dedicated_crash_timeout_secs: 0.0,
+                        buddy_idle_decay_secs: 0.0,
+                        spill_threshold: 1.0,
+                        spill_dir: std::env::temp_dir().join("c2_asm_test_budget"),
+                        ..PoolConfig::default()
+                    },
+                    format!("/cc3ab{:08x}", std::process::id()),
+                    budget.clone(),
+                )
+                .unwrap(),
+            )),
             budget,
         )
     }
@@ -264,15 +258,18 @@ mod tests {
     #[test]
     fn try_release_file_keeps_partial_assembly_for_retry() {
         let budget = MemoryBudget::new(0, 8192, 8192);
-        let pool = Arc::new(RwLock::new(MemPool::new_with_prefix_and_budget(
-            PoolConfig {
-                spill_threshold: 0.0,
-                ..PoolConfig::default()
-            },
-            "assembler-try-release-file".into(),
-            budget.clone(),
-        )));
-        let mut asm = ChunkAssembler::new(Arc::clone(&pool), 2, 4096, 2, 8192).unwrap();
+        let pool = Arc::new(RwLock::new(
+            MemPool::new_with_prefix_and_budget(
+                PoolConfig {
+                    spill_threshold: 0.0,
+                    ..PoolConfig::default()
+                },
+                "assembler-try-release-file".into(),
+                budget.clone(),
+            )
+            .unwrap(),
+        ));
+        let mut asm = ChunkAssembler::new(Arc::clone(&pool), 2, 4096, 8192).unwrap();
         assert!(asm.backing.is_file_spill());
         assert!(!asm.feed_chunk(0, &[27; 4096]).unwrap());
         {
@@ -301,7 +298,7 @@ mod tests {
     #[test]
     fn test_single_chunk() {
         let pool = test_pool_arc();
-        let mut asm = ChunkAssembler::new(pool.clone(), 1, 4096, 512, 8 * (1 << 30)).unwrap();
+        let mut asm = ChunkAssembler::new(pool.clone(), 1, 4096, 8 * (1 << 30)).unwrap();
         let data = b"hello world";
         let complete = asm.feed_chunk(0, data).unwrap();
         assert!(complete);
@@ -314,7 +311,7 @@ mod tests {
     #[test]
     fn test_multi_chunk_in_order() {
         let pool = test_pool_arc();
-        let mut asm = ChunkAssembler::new(pool.clone(), 3, 8, 512, 8 * (1 << 30)).unwrap();
+        let mut asm = ChunkAssembler::new(pool.clone(), 3, 8, 8 * (1 << 30)).unwrap();
         assert!(!asm.feed_chunk(0, b"aaaaaaaa").unwrap()); // full
         assert!(!asm.feed_chunk(1, b"bbbbbbbb").unwrap()); // full
         assert!(asm.feed_chunk(2, b"cc").unwrap()); // last, short
@@ -332,7 +329,7 @@ mod tests {
     #[test]
     fn test_out_of_order() {
         let pool = test_pool_arc();
-        let mut asm = ChunkAssembler::new(pool.clone(), 2, 8, 512, 8 * (1 << 30)).unwrap();
+        let mut asm = ChunkAssembler::new(pool.clone(), 2, 8, 8 * (1 << 30)).unwrap();
         assert!(!asm.feed_chunk(1, b"second").unwrap()); // last, short
         assert!(asm.feed_chunk(0, b"firstttt").unwrap()); // full
         let mut backing = asm.finish().unwrap();
@@ -364,8 +361,7 @@ mod tests {
                 })
                 .collect();
             let mut asm =
-                ChunkAssembler::new(pool.clone(), total_chunks, chunk_size, 512, 8 * (1 << 30))
-                    .unwrap();
+                ChunkAssembler::new(pool.clone(), total_chunks, chunk_size, 8 * (1 << 30)).unwrap();
             for step in 0..total_chunks {
                 let idx = if reverse {
                     total_chunks - 1 - step
@@ -389,7 +385,7 @@ mod tests {
     #[test]
     fn test_duplicate_chunk_rejected() {
         let pool = test_pool_arc();
-        let mut asm = ChunkAssembler::new(pool.clone(), 2, 8, 512, 8 * (1 << 30)).unwrap();
+        let mut asm = ChunkAssembler::new(pool.clone(), 2, 8, 8 * (1 << 30)).unwrap();
         assert!(!asm.feed_chunk(0, b"data0000").unwrap());
         assert_eq!(asm.received(), 1);
         let err = asm.feed_chunk(0, b"dup").unwrap_err();
@@ -406,20 +402,23 @@ mod tests {
     #[test]
     fn test_abort_releases_handle_and_charge() {
         let budget = MemoryBudget::new(1 << 20, 0, 64 * 1024);
-        let pool = Arc::new(RwLock::new(MemPool::new_with_prefix_and_budget(
-            PoolConfig {
-                segment_size: 64 * 1024,
-                min_block_size: 4096,
-                max_segments: 1,
-                min_retained_segments: 1,
-                max_dedicated_segments: 0,
-                spill_threshold: 1.0,
-                ..PoolConfig::default()
-            },
-            format!("/cc3abort{:08x}", std::process::id()),
-            budget.clone(),
-        )));
-        let mut asm = ChunkAssembler::new(pool.clone(), 4, 4096, 512, 8 * (1 << 30)).unwrap();
+        let pool = Arc::new(RwLock::new(
+            MemPool::new_with_prefix_and_budget(
+                PoolConfig {
+                    segment_size: 64 * 1024,
+                    min_block_size: 4096,
+                    max_segments: 1,
+                    min_retained_segments: 1,
+                    max_dedicated_segments: 0,
+                    spill_threshold: 1.0,
+                    ..PoolConfig::default()
+                },
+                format!("/cc3abort{:08x}", std::process::id()),
+                budget.clone(),
+            )
+            .unwrap(),
+        ));
+        let mut asm = ChunkAssembler::new(pool.clone(), 4, 4096, 8 * (1 << 30)).unwrap();
         assert!(asm.backing.is_buddy());
         assert_eq!(pool.read().stats().alloc_count, 1);
         assert!(!asm.feed_chunk(0, &[7; 200]).unwrap());
@@ -454,7 +453,7 @@ mod tests {
     #[test]
     fn test_finish_incomplete_fails_and_returns_charge_once() {
         let (pool, budget) = budgeted_pool_arc(64 * 1024);
-        let mut asm = ChunkAssembler::new(pool.clone(), 3, 8, 512, 8 * (1 << 30)).unwrap();
+        let mut asm = ChunkAssembler::new(pool.clone(), 3, 8, 8 * (1 << 30)).unwrap();
         asm.feed_chunk(0, b"data").unwrap();
         assert_eq!(
             budget.snapshot().cell(BudgetKind::Reassembly).used_bytes,
@@ -465,14 +464,14 @@ mod tests {
         // The dropped incomplete assembler released storage and refunded.
         assert_eq!(budget.snapshot().cell(BudgetKind::Reassembly).used_bytes, 0);
         // The pool remains usable for a fresh assembly.
-        let fresh = ChunkAssembler::new(pool, 1, 4096, 512, 8 * (1 << 30)).unwrap();
+        let fresh = ChunkAssembler::new(pool, 1, 4096, 8 * (1 << 30)).unwrap();
         fresh.abort();
     }
 
     #[test]
     fn test_zero_chunks_rejected() {
         let pool = test_pool_arc();
-        let err = ChunkAssembler::new(pool, 0, 4096, 512, 8 * (1 << 30))
+        let err = ChunkAssembler::new(pool, 0, 4096, 8 * (1 << 30))
             .unwrap_err()
             .to_string();
         assert!(err.contains("total_chunks must be > 0"));
@@ -481,7 +480,7 @@ mod tests {
     #[test]
     fn test_zero_chunk_size_rejected_before_charge_or_allocation() {
         let (pool, budget) = budgeted_pool_arc(64 * 1024);
-        let err = ChunkAssembler::new(pool.clone(), 1, 0, 512, 8 * (1 << 30))
+        let err = ChunkAssembler::new(pool.clone(), 1, 0, 8 * (1 << 30))
             .unwrap_err()
             .to_string();
         assert!(err.contains("chunk_size must be > 0"));
@@ -496,7 +495,7 @@ mod tests {
     #[test]
     fn test_oversized_chunk_data() {
         let pool = test_pool_arc();
-        let mut asm = ChunkAssembler::new(pool, 2, 8, 512, 8 * (1 << 30)).unwrap();
+        let mut asm = ChunkAssembler::new(pool, 2, 8, 8 * (1 << 30)).unwrap();
         let err = asm.feed_chunk(0, &[0u8; 16]).unwrap_err();
         assert!(err.contains("exceeds chunk_size"));
         asm.abort();
@@ -505,7 +504,7 @@ mod tests {
     #[test]
     fn budget_rejection_leaves_no_mapping_and_reports_cell_and_size() {
         let (pool, budget) = budgeted_pool_arc(100);
-        let err = ChunkAssembler::new(pool.clone(), 2, 64, 512, 8 * (1 << 30))
+        let err = ChunkAssembler::new(pool.clone(), 2, 64, 8 * (1 << 30))
             .unwrap_err()
             .to_string();
         assert!(
@@ -530,7 +529,7 @@ mod tests {
     fn finished_backing_keeps_charge_and_pool_alive_after_creators_drop() {
         let (pool, budget) = budgeted_pool_arc(64 * 1024);
         let registry_view = pool.clone();
-        let mut asm = ChunkAssembler::new(pool, 2, 8, 512, 8 * (1 << 30)).unwrap();
+        let mut asm = ChunkAssembler::new(pool, 2, 8, 8 * (1 << 30)).unwrap();
         asm.feed_chunk(0, b"firstttt").unwrap();
         asm.feed_chunk(1, b"sec").unwrap();
         let mut backing = asm.finish().unwrap();

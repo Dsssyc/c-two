@@ -203,8 +203,7 @@ impl<C> ChunkRegistry<C> {
             let geometry = match ChunkAssembler::check_geometry(
                 total_chunks,
                 chunk_size,
-                self.config.max_chunks_per_request,
-                self.config.max_bytes_per_request,
+                self.config.max_reassembly_bytes,
             ) {
                 Ok(geometry) => geometry,
                 Err(error) => return Err((error, context)),
@@ -609,26 +608,86 @@ mod tests {
     }
 
     fn test_pool() -> Arc<RwLock<MemPool>> {
-        Arc::new(RwLock::new(MemPool::new_with_prefix(
-            base_config(),
-            unique_prefix(""),
-        )))
+        Arc::new(RwLock::new(
+            MemPool::new_with_prefix(base_config(), unique_prefix("")).unwrap(),
+        ))
     }
 
     fn budgeted_pool(reassembly_limit: u64) -> (Arc<RwLock<MemPool>>, MemoryBudget) {
         let budget = MemoryBudget::new(1 << 20, 1 << 20, reassembly_limit);
         (
-            Arc::new(RwLock::new(MemPool::new_with_prefix_and_budget(
-                base_config(),
-                unique_prefix("b"),
-                budget.clone(),
-            ))),
+            Arc::new(RwLock::new(
+                MemPool::new_with_prefix_and_budget(
+                    base_config(),
+                    unique_prefix("b"),
+                    budget.clone(),
+                )
+                .unwrap(),
+            )),
             budget,
         )
     }
 
     fn reassembly_used(budget: &MemoryBudget) -> u64 {
         budget.snapshot().cell(BudgetKind::Reassembly).used_bytes
+    }
+
+    #[test]
+    fn forced_chunked_100_mib_request_reassembles_beyond_512_chunks() {
+        const CHUNK_SIZE: usize = 128 * 1024;
+        const TOTAL_CHUNKS: usize = 800;
+        const TOTAL_SIZE: usize = CHUNK_SIZE * TOTAL_CHUNKS;
+
+        let spill_dir = std::env::temp_dir().join(format!(
+            "c2-wire-100mib-{}-{}",
+            std::process::id(),
+            TEST_ID.fetch_add(1, TestOrdering::Relaxed)
+        ));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&spill_dir).unwrap();
+
+        let budget = MemoryBudget::new(0, TOTAL_SIZE as u64, TOTAL_SIZE as u64);
+        let pool = Arc::new(RwLock::new(
+            MemPool::new_with_prefix_and_budget(
+                PoolConfig {
+                    buddy_enabled: false,
+                    spill_threshold: 0.0,
+                    spill_dir: spill_dir.clone(),
+                    ..base_config()
+                },
+                unique_prefix("large"),
+                budget.clone(),
+            )
+            .unwrap(),
+        ));
+        let reg = ChunkRegistry::new(pool, ChunkConfig::default());
+        reg.insert(1, 1, TOTAL_CHUNKS, CHUNK_SIZE, ()).unwrap();
+        let data = vec![0xa5; CHUNK_SIZE];
+        for index in 0..TOTAL_CHUNKS {
+            assert_eq!(
+                reg.feed(1, 1, index, &data).unwrap(),
+                index + 1 == TOTAL_CHUNKS
+            );
+        }
+        let (assembler, ()) = reg.take(1, 1).unwrap();
+        let mut backing = assembler.finish().unwrap();
+        assert_eq!(backing.len(), TOTAL_SIZE);
+        assert_eq!(backing.capacity_bytes(), TOTAL_SIZE as u64);
+        assert!(
+            backing
+                .copy_bytes()
+                .unwrap()
+                .iter()
+                .all(|byte| *byte == 0xa5)
+        );
+        backing.release().unwrap();
+        assert_eq!(reassembly_used(&budget), 0);
+        std::fs::remove_dir(&spill_dir).unwrap();
     }
 
     #[test]
@@ -683,7 +742,7 @@ mod tests {
             reg.insert(1, 7, 1, 4096, ()).unwrap();
             let original = std::mem::replace(
                 &mut *pool.write(),
-                MemPool::new_with_prefix(base_config(), unique_prefix("failed")),
+                MemPool::new_with_prefix(base_config(), unique_prefix("failed")).unwrap(),
             );
 
             match exit {
@@ -1158,11 +1217,14 @@ mod tests {
         // admissions cannot exceed the shared live bytes.
         let budget = MemoryBudget::new(1 << 20, 1 << 20, 4 * 256);
         let mk_registry = |tag: char| {
-            let pool = Arc::new(RwLock::new(MemPool::new_with_prefix_and_budget(
-                base_config(),
-                unique_prefix(&tag.to_string()),
-                budget.clone(),
-            )));
+            let pool = Arc::new(RwLock::new(
+                MemPool::new_with_prefix_and_budget(
+                    base_config(),
+                    unique_prefix(&tag.to_string()),
+                    budget.clone(),
+                )
+                .unwrap(),
+            ));
             ChunkRegistry::new(pool, ChunkConfig::default())
         };
         let reg_a = mk_registry('a');
@@ -1199,21 +1261,24 @@ mod tests {
         const LIMIT: u64 = SEATS as u64 * ASSEMBLY_BYTES as u64;
 
         let budget = MemoryBudget::new(1 << 20, 1 << 20, LIMIT);
-        let pool = Arc::new(RwLock::new(MemPool::new_with_prefix_and_budget(
-            PoolConfig {
-                segment_size: 256 * 1024,
-                min_block_size: 4096,
-                max_segments: 4,
-                max_dedicated_segments: 8,
-                dedicated_crash_timeout_secs: 0.0,
-                buddy_idle_decay_secs: 0.0,
-                spill_threshold: 1.0,
-                spill_dir: std::env::temp_dir().join("c2_reg_test"),
-                ..PoolConfig::default()
-            },
-            unique_prefix("c"),
-            budget.clone(),
-        )));
+        let pool = Arc::new(RwLock::new(
+            MemPool::new_with_prefix_and_budget(
+                PoolConfig {
+                    segment_size: 256 * 1024,
+                    min_block_size: 4096,
+                    max_segments: 4,
+                    max_dedicated_segments: 8,
+                    dedicated_crash_timeout_secs: 0.0,
+                    buddy_idle_decay_secs: 0.0,
+                    spill_threshold: 1.0,
+                    spill_dir: std::env::temp_dir().join("c2_reg_test"),
+                    ..PoolConfig::default()
+                },
+                unique_prefix("c"),
+                budget.clone(),
+            )
+            .unwrap(),
+        ));
         let reg = Arc::new(ChunkRegistry::new(pool, ChunkConfig::default()));
 
         // Phase 1: SEATS threads race to admit one assembly each and HOLD
@@ -1385,26 +1450,32 @@ mod tests {
     /// `should_spill` returns true for any size when the threshold is 0.0,
     /// and the pool starts with no pre-created buddy segments.
     fn spill_pool() -> Arc<RwLock<MemPool>> {
-        Arc::new(RwLock::new(MemPool::new_with_prefix(
-            PoolConfig {
-                spill_threshold: 0.0,
-                ..base_config()
-            },
-            unique_prefix("s"),
-        )))
+        Arc::new(RwLock::new(
+            MemPool::new_with_prefix(
+                PoolConfig {
+                    spill_threshold: 0.0,
+                    ..base_config()
+                },
+                unique_prefix("s"),
+            )
+            .unwrap(),
+        ))
     }
 
     fn budgeted_spill_pool(reassembly_limit: u64) -> (Arc<RwLock<MemPool>>, MemoryBudget) {
         let budget = MemoryBudget::new(1 << 20, 1 << 20, reassembly_limit);
         (
-            Arc::new(RwLock::new(MemPool::new_with_prefix_and_budget(
-                PoolConfig {
-                    spill_threshold: 0.0,
-                    ..base_config()
-                },
-                unique_prefix("t"),
-                budget.clone(),
-            ))),
+            Arc::new(RwLock::new(
+                MemPool::new_with_prefix_and_budget(
+                    PoolConfig {
+                        spill_threshold: 0.0,
+                        ..base_config()
+                    },
+                    unique_prefix("t"),
+                    budget.clone(),
+                )
+                .unwrap(),
+            )),
             budget,
         )
     }
@@ -1724,15 +1795,18 @@ mod tests {
         ));
         std::fs::create_dir_all(&spill_dir).unwrap();
         let budget = MemoryBudget::new(1 << 20, 1 << 20, 100);
-        let pool = Arc::new(RwLock::new(MemPool::new_with_prefix_and_budget(
-            PoolConfig {
-                spill_threshold: 0.0,
-                spill_dir: spill_dir.clone(),
-                ..base_config()
-            },
-            unique_prefix("r"),
-            budget.clone(),
-        )));
+        let pool = Arc::new(RwLock::new(
+            MemPool::new_with_prefix_and_budget(
+                PoolConfig {
+                    spill_threshold: 0.0,
+                    spill_dir: spill_dir.clone(),
+                    ..base_config()
+                },
+                unique_prefix("r"),
+                budget.clone(),
+            )
+            .unwrap(),
+        ));
         let before: Vec<std::path::PathBuf> = std::fs::read_dir(&spill_dir)
             .into_iter()
             .flatten()
@@ -1763,15 +1837,18 @@ mod tests {
         file_limit: u64,
     ) -> (Arc<ChunkRegistry<()>>, Arc<RwLock<MemPool>>, MemoryBudget) {
         let budget = MemoryBudget::new(0, file_limit, live_limit);
-        let pool = Arc::new(RwLock::new(MemPool::new_with_prefix_and_budget(
-            PoolConfig {
-                buddy_enabled: false,
-                spill_threshold: 0.0,
-                ..base_config()
-            },
-            unique_prefix("typed"),
-            budget.clone(),
-        )));
+        let pool = Arc::new(RwLock::new(
+            MemPool::new_with_prefix_and_budget(
+                PoolConfig {
+                    buddy_enabled: false,
+                    spill_threshold: 0.0,
+                    ..base_config()
+                },
+                unique_prefix("typed"),
+                budget.clone(),
+            )
+            .unwrap(),
+        ));
         (
             Arc::new(ChunkRegistry::new(pool.clone(), ChunkConfig::default())),
             pool,
@@ -1786,7 +1863,7 @@ mod tests {
         chunks: u32,
         data_len: usize,
     ) -> Result<ChunkAssemblyId, ChunkAdmissionError> {
-        use crate::chunk::{decode_reply_chunk_meta, encode_reply_chunk_meta};
+        use crate::chunk::header::{decode_reply_chunk_meta, encode_reply_chunk_meta};
         let mut bytes = encode_reply_chunk_meta(size, chunks, 0).to_vec();
         bytes.resize(bytes.len() + data_len, 0x42);
         let (size, chunks, index, consumed) = decode_reply_chunk_meta(&bytes, 0).unwrap();
@@ -1803,7 +1880,6 @@ mod tests {
             (0, 2, 64),
             (128, 2, 0),
             (128, 1, 0),
-            (1024, 513, 1),
         ] {
             let error = raw_reply(&reg, 1, size, chunks, len).unwrap_err();
             assert!(
@@ -1816,6 +1892,24 @@ mod tests {
         assert!(overflow.to_string().contains("geometry overflow"));
         assert_eq!(budget.snapshot().reassembly.rejected_allocations, 0);
         assert_eq!(reassembly_used(&budget), 0);
+        assert_eq!(reg.active_count(), 0);
+        assert_no_shm_mappings(&pool);
+    }
+
+    #[test]
+    fn reassembly_byte_limit_is_a_size_error_before_reservation() {
+        let (_default_reg, pool, budget) = typed_file_registry(0, 0);
+        let reg = ChunkRegistry::new(
+            pool.clone(),
+            ChunkConfig {
+                max_reassembly_bytes: 100,
+                ..ChunkConfig::default()
+            },
+        );
+        let error = raw_reply(&reg, 1, 128, 2, 64).unwrap_err();
+        assert!(matches!(error, ChunkAdmissionError::Capacity(_)));
+        assert_eq!(error.to_string(), "reassembly size 128 exceeds limit 100");
+        assert_eq!(budget.snapshot().reassembly.rejected_allocations, 0);
         assert_eq!(reg.active_count(), 0);
         assert_no_shm_mappings(&pool);
     }

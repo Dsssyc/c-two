@@ -126,15 +126,15 @@ impl PreparedShmResponse {
         )
     }
 
-    pub(crate) fn release(&mut self) -> Result<c2_mem::FreeResult, String> {
+    pub(crate) fn release(&mut self) -> Result<(), String> {
         let Some(handle) = self.handle.as_ref() else {
-            return Ok(c2_mem::FreeResult::Normal);
+            return Ok(());
         };
         let mut pool = self.pool.write();
         pool.validate_handle(handle)?;
         let a = handle.shm_allocation().expect("prepared SHM allocation");
         // SAFETY: the original pool and private owner remain bound until success.
-        let result = unsafe {
+        unsafe {
             pool.free_at(
                 a.seg_idx,
                 a.generation,
@@ -146,7 +146,7 @@ impl PreparedShmResponse {
         }?;
         drop(pool);
         self.handle.take();
-        Ok(result)
+        Ok(())
     }
 
     pub(crate) fn transfer(&mut self) {
@@ -291,9 +291,9 @@ impl PeerShmRequest {
     }
 
     /// Validate then release the peer's block exactly once.
-    pub(crate) fn release(&mut self) -> Result<c2_mem::FreeResult, String> {
+    pub(crate) fn release(&mut self) -> Result<(), String> {
         if self.released {
-            return Ok(c2_mem::FreeResult::Normal);
+            return Ok(());
         }
         let mut pool = self.mapped_pool()?;
         pool.validate_data_at(
@@ -307,7 +307,7 @@ impl PeerShmRequest {
         // SAFETY: this carrier is the sole release authority for the
         // admitted block (read-then-release protocol) and the complete span
         // was just validated against the live backing.
-        let result = unsafe {
+        unsafe {
             pool.free_at(
                 u32::from(self.seg_idx),
                 self.generation,
@@ -320,7 +320,7 @@ impl PeerShmRequest {
         .map_err(|error| format!("request SHM release failed: {error}"))?;
         drop(pool);
         self.released = true;
-        Ok(result)
+        Ok(())
     }
 
     pub(crate) fn ensure_mapped(&self) -> Result<(), String> {
@@ -394,7 +394,7 @@ impl RequestData {
     fn release(&mut self) -> Result<(), String> {
         match self {
             Self::Inline(_) => Ok(()),
-            Self::Shm(carrier) => carrier.release().map(|_| ()),
+            Self::Shm(carrier) => carrier.release(),
             Self::Handle(backing) => backing
                 .release()
                 .map_err(|error| format!("request handle release failed: {error}")),
@@ -428,20 +428,11 @@ impl RequestLease {
 
     /// Failure retains the original carrier; success ends its release authority.
     pub fn release(&mut self) -> Result<(), String> {
-        self.release_with_result().map(|_| ())
-    }
-
-    pub(crate) fn release_with_result(&mut self) -> Result<c2_mem::FreeResult, String> {
-        let result = match self.request.as_mut() {
-            Some(RequestData::Shm(carrier)) => carrier.release()?,
-            Some(request) => {
-                request.release()?;
-                c2_mem::FreeResult::Normal
-            }
-            None => return Ok(c2_mem::FreeResult::Normal),
-        };
+        if let Some(request) = self.request.as_mut() {
+            request.release()?;
+        }
         self.request.take();
-        Ok(result)
+        Ok(())
     }
 
     /// Consume this obligation without another free or invalidation.
@@ -834,7 +825,7 @@ mod tests {
     }
 
     fn request_test_pool() -> MemPool {
-        MemPool::new_with_prefix(request_pool_config(), request_pool_prefix())
+        MemPool::new_with_prefix(request_pool_config(), request_pool_prefix()).unwrap()
     }
 
     fn request_pool_with_reassembly_budget(limit: u64) -> Arc<parking_lot::RwLock<MemPool>> {
@@ -843,7 +834,8 @@ mod tests {
                 request_pool_config(),
                 request_pool_prefix(),
                 c2_mem::MemoryBudget::new(8 * 1024 * 1024, 16 * 1024 * 1024, limit),
-            ),
+            )
+            .unwrap(),
         ))
     }
 
@@ -917,10 +909,9 @@ mod tests {
         let a = handle.shm_allocation().unwrap();
         assert!(a.is_dedicated);
         let budget = producer.budget().unwrap().clone();
-        let peer = Arc::new(parking_lot::RwLock::new(MemPool::open_peer(
-            request_pool_config(),
-            producer.prefix().to_owned(),
-        )));
+        let peer = Arc::new(parking_lot::RwLock::new(
+            MemPool::open_peer(request_pool_config(), producer.prefix().to_owned()).unwrap(),
+        ));
         let admit = || {
             PeerShmRequest::admit(
                 peer.clone(),
@@ -1020,10 +1011,13 @@ mod tests {
 
         let payload = b"file-backed request".repeat(256);
         for logical_len in [payload.len(), 1, 0] {
-            let pool = Arc::new(parking_lot::RwLock::new(MemPool::new(PoolConfig {
-                spill_threshold: 0.0,
-                ..PoolConfig::default()
-            })));
+            let pool = Arc::new(parking_lot::RwLock::new(
+                MemPool::new(PoolConfig {
+                    spill_threshold: 0.0,
+                    ..PoolConfig::default()
+                })
+                .unwrap(),
+            ));
             let mut backing =
                 ReassemblyBacking::admit(Arc::clone(&pool), 1, payload.len()).unwrap();
             assert!(backing.is_file_spill());
@@ -1094,7 +1088,7 @@ mod tests {
 
         // invoke the callback through the route
         let pool = Arc::new(crate::ResponsePool::new(
-            MemPool::new(PoolConfig::default()),
+            MemPool::new(PoolConfig::default()).unwrap(),
         ));
         let result = route
             .callback
@@ -1209,7 +1203,7 @@ mod tests {
         }
 
         let pool = Arc::new(crate::ResponsePool::new(
-            MemPool::new(PoolConfig::default()),
+            MemPool::new(PoolConfig::default()).unwrap(),
         ));
         let cb: Arc<dyn CrmCallback> = Arc::new(FailCallback);
         let err = cb
