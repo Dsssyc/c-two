@@ -15,9 +15,14 @@
   - CI：首轮 fork 全量 CI（`8b756c74`）暴露两个遗留测试：relay 的容量测试还依赖 F9 删掉的 1024 上限，c2-local 的一个 Drop 测试与后台退役线程有时序竞争。打回 M4、M2 修正后，fork 全量 CI [41192397960](https://github.com/Dsssyc/c-two/actions/runs/41192397960)（`e1630cf1`）在 Linux、macOS、Windows x64 与 ARM64 上全部通过。五个微任务已在看板上验收。
   - 之后：向上游的 PR 暂缓，与接口精简第一批一起开（用户 2026-10-31）。
 
+- **文档与 AGENTS.md 重组**
+  - 范围：[执行计划](plans/2026-10-31-docs-and-agents-restructure.md)。
+  - 状态：第一步已完成并验收，合入分支 `socu/docs-restructure`（`a86403af`）。根 AGENTS.md 从 64,905 字节瘦到 21,934 字节，机制细节移入 `docs/reference/`；文档卫生检查守住 32 KiB、相对链接与中英两版的互链；独立审查确认旧 AGENTS.md 的规则都有着落。
+  - 之后：第二步，先分批只读盘点，再由用户过目清退清单。
+
 ## 顺序（Host 建议，待用户确认）
 
-1. [文档与 AGENTS.md 重组](plans/2026-10-31-docs-and-agents-restructure.md)：先把根 AGENTS.md 瘦到 32 KiB 以内，再按 hey-my-buddy 的分法整理 `docs/`；用户 2026-10-31 同意这个方向与两步的先后。
+1. 文档与 AGENTS.md 重组的第二步（见进行中）。
 2. 重复校验；tmpfiles 先在 Linux 上复现。
 3. 结构调整，先出方案。
 4. 协议批，先出详细设计，附一份流式 RPC 草图。
@@ -44,7 +49,7 @@
 
 ## 接口审查的余项
 
-- **配置收敛**（第三节）：逐项表待用户决定。它与 B8、H3、H12 交叉，实施时一并处理。
+- **配置收敛**（第三节）：逐项表待用户决定。它与 B8、H3、H12 交叉，实施时一并处理。`chunk_threshold_ratio`（`C2_IPC_CHUNK_THRESHOLD_RATIO`）已证实没有作用：只在 c2-config 里解析与校验，c2-ipc 只在比较两份客户端池配置时用到它，分片判断不读它；收敛时连同环境变量、Python 字段与测试一起删除。
 - **AGENTS.md 重组**（第五节）：并入[文档与 AGENTS.md 重组](plans/2026-10-31-docs-and-agents-restructure.md)，叠在 `socu/over-defense-batches` 上做，不再等接口精简合入上游。
 - **错误类型**（第四节）：排在协议批之后。
 - **所有者子系统去留**（第六节）：待用户决定。在此之前，它留在 `c_two.owner`，行为不变。
@@ -60,8 +65,7 @@
 ## 待用户决定
 
 - 配置项的逐项表。
-- 参考文档的语言：Host 建议使用者指南保留双语、机制参考只留英文（[文档重组](plans/2026-10-31-docs-and-agents-restructure.md)第五节）。
-- 文档重组第三节的三段新规则措辞。
+- 文档重组第二步：盘点之后的清退清单；`CONTEXT.md` 的词条。
 - 所有者子系统是否删除。
 - relay 轮询的间隔。
 - `/_admin/unregister` 有没有人手动使用（F7）。

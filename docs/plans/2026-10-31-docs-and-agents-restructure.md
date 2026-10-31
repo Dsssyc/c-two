@@ -1,6 +1,6 @@
 # 文档与 AGENTS.md 重组的执行计划
 
-日期：2026-10-31。输入：分支 `socu/over-defense-batches`（`c4c53c08`）。依据：[接口审查](2026-10-31-api-surface-review.md)第五节用户已同意的 AGENTS.md 重组；用户 2026-10-31 同意先瘦 AGENTS.md、再按 hey-my-buddy 仓库的分法整理 `docs/`，两步都叠在 `socu/over-defense-batches` 上做，上游另开 PR，暂不建嵌套的 AGENTS.md。状态：计划，第五节的几项待用户决定。
+日期：2026-10-31。输入：分支 `socu/over-defense-batches`（`c4c53c08`）。依据：[接口审查](2026-10-31-api-surface-review.md)第五节用户已同意的 AGENTS.md 重组；用户 2026-10-31 同意先瘦 AGENTS.md、再按 hey-my-buddy 仓库的分法整理 `docs/`，两步都叠在 `socu/over-defense-batches` 上做，上游另开 PR，暂不建嵌套的 AGENTS.md。状态：第一步已完成并验收，合入为 `a86403af`；第二步待开始。第五节第 1、3 项用户已于 2026-10-31 确认。
 
 ## 一、量过的问题
 
@@ -86,6 +86,11 @@
 | 按类处理 | `logs/`、`spikes/` | 抽查是否有被引用或未记录的结论，没有就整批删除 |
 | 整批迁移 | `reports/`（含 `evidence/`）、`reviews/` | 挪进 `acceptance/`，不删；只剔除明显的临时文件 |
 
+### 第一步留下的事
+
+- `tests/repo/test_docs_hygiene.py` 手写了 Markdown 链接解析；把检查扩到全部 Markdown 时，改用现成的解析库（例如 markdown-it-py）。
+- 工作规则里写着待办在 `docs/backlog.md`，文档规则却说它在 `docs/design/`；移动待办时把工作规则一并改掉。
+
 ### 处置规则
 
 - 仍然成立的内容，先挪进它的去处（参考文档、ADR 或待办），再删原文件；git 历史保留原文。
@@ -110,9 +115,9 @@
 
 ## 五、待用户决定
 
-1. **参考文档的语言。** Host 建议：面向使用者的指南（配置、Python 用法、Windows 用法）保留中英双语，统一用 README 的命名（`X.md` 英文、`X.zh-CN.md` 中文）；机制参考（IPC 握手、本地端点生命周期、内存策略、运行时生命周期、契约与路由、错误、载荷生命周期、C ABI）只留英文一份；计划、验收与待办这类工作记录用中文。按这个做法，`ipc-handshake.md` 要译成英文，`memory-policy.md` 与 `local-endpoint-lifecycle.md` 的中文版在核对英文版完整之后删除。理由是两份同样的机制文档要一直同步，现在中英两版的篇幅已经对不上。
+1. **参考文档的语言（用户 2026-10-31 已确认）。** Host 建议：面向使用者的指南（配置、Python 用法、Windows 用法）保留中英双语，统一用 README 的命名（`X.md` 英文、`X.zh-CN.md` 中文）；机制参考（IPC 握手、本地端点生命周期、内存策略、运行时生命周期、契约与路由、错误、载荷生命周期、C ABI）只留英文一份；计划、验收与待办这类工作记录用中文。按这个做法，`ipc-handshake.md` 要译成英文，`memory-policy.md` 与 `local-endpoint-lifecycle.md` 的中文版在核对英文版完整之后删除。理由是两份同样的机制文档要一直同步，现在中英两版的篇幅已经对不上。
 2. **清退清单。** 方向已同意：`spikes/`、`logs/`、`superpowers/`、已完成的计划、`designs/` 与 v0.3.0 的架构评审。逐份的清单在盘点之后给出，由用户过目。
-3. **第三节的三段新规则措辞。**
+3. **第三节的三段新规则措辞（用户 2026-10-31 已确认，已照原文写入）。**
 4. **术语表的词条**，在第二步起草后确认。
 
 ## 六、分工与顺序
