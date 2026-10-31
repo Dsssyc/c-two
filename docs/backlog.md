@@ -12,7 +12,8 @@
 - **过度防御复审的真缺陷与死代码两批**
   - 范围与分工：见[执行计划](plans/2026-10-31-defect-and-dead-code-batches.md)。按 crate 分成四个微任务：内存、wire 与服务端；IPC 与本地端点；Core、配置与 Python；relay、代码生成与 CLI。
   - 状态：五个微任务都已集成到分支 `socu/over-defense-batches`。M1 至 M4 按 crate 并行；M5 迁移跨范围调用点，并补做 C1、C3、C8 零碎与 H13。macOS 上与 FastDB 0.2.4 并排验证通过：Python 1375 项、代码生成 33 项、Rust SDK 23 项、CLI 78 项、c2-core 145 项、native 16 项、`tests/repo` 612 项。
-  - 之后：完整的 Core relay 测试套件要在干净的 runner 上跑，交给 fork 全量 CI；CI 通过后，在看板上验收这五个微任务。
+  - CI：fork 全量 CI [41188223489](https://github.com/Dsssyc/c-two/actions/runs/41188223489)（`8b756c74`）的 core-test 里有两个测试失败，其余各步在四个平台上都通过。relay 的 `watch_capacity_recovers_or_shutdown_drains` 还依赖 F9 删掉的 1024 上限，四个平台都失败，已打回 M4；c2-local 的 `managed_drop_without_gate_leaves_metadata_for_the_reaper` 与 Drop 的后台退役线程有时序竞争，只在 macOS 上失败，已打回 M2。
+  - 之后：两处修正合入后重跑 fork 全量 CI；通过后，在看板上验收这五个微任务。
 
 ## 顺序（Host 建议，待用户确认）
 
