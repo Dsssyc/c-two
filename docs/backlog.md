@@ -23,7 +23,7 @@
 
 ## 过度防御复审
 
-[复审](plans/2026-10-31-over-defense-review.md)第八节列出的批次，都还没有开始：
+[复审](plans/2026-10-31-over-defense-review.md)第八节列出的批次。真缺陷与死代码已开工（见上），其余还没有开始：
 
 - **真缺陷**（第一节，不涉及协议）：B8、D-drop、D4、A8、H3、H10、H11、H12、G4、B10、C8、F5c、F6、D9、F9。E-host 归入结构调整。
 - **tmpfiles**（D-tmp）：先在 Linux 上复现 systemd-tmpfiles 清掉 gate 与 marker 的情形，再实施目录 flock。本机与 Windows 测试机都不是 Linux。
