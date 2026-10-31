@@ -288,7 +288,7 @@ fn ordinary_host_shutdown_preserves_runtime_restart_and_reacquire() {
 }
 
 #[test]
-fn terminal_delivered_host_journal_survives_retirement_of_late_clients() {
+fn terminal_host_journal_survives_retirement_of_late_clients() {
     let fixture = Fixture::new();
     let runtime = &fixture.runtime;
     let host = runtime

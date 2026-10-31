@@ -24,6 +24,19 @@ def test_top_level_exposes_only_explicit_transfer_api():
     assert 'transfer' in cc.__all__
 
 
+def test_invalid_callable_signature_is_reported():
+    from c_two.crm.transferable import _rpc_parameters
+
+    class BrokenSignature:
+        __signature__ = 42
+
+        def __call__(self, payload):
+            return payload
+
+    with pytest.raises(TypeError):
+        _rpc_parameters(BrokenSignature())
+
+
 def test_default_transferables_use_pinned_pickle_protocol(monkeypatch):
     payload_plan_mod = importlib.import_module('c_two.crm.payload_plan')
     from c_two.crm.payload_plan import (

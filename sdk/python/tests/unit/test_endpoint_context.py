@@ -239,7 +239,7 @@ def test_admin_probes_accept_long_directory_in_all_contexts(
 
 
 @pytest.mark.parametrize('probe', ['ping', 'shutdown'])
-def test_admin_invalid_targets_remain_negative_in_native_and_public_contexts(probe: str) -> None:
+def test_admin_invalid_targets_raise_in_native_and_public_contexts(probe: str) -> None:
     _run_isolated(f'''
         from functools import partial
         import c_two as cc
@@ -250,10 +250,6 @@ def test_admin_invalid_targets_remain_negative_in_native_and_public_contexts(pro
         from c_two.transport.registry import _get_default_runtime
         session = _native.RuntimeSession(use_process_relay_anchor=False)
         context = session.local_endpoint_context()
-        expected = False if {probe!r} == 'ping' else {{
-            'acknowledged': False, 'shutdown_started': False,
-            'server_stopped': False, 'route_outcomes': [],
-        }}
         for address in (
             'tcp://not-ipc', 'ipc://', 'ipc://../escape', 'ipc://bad/name',
             'ipc://bad\\\\name', 'ipc://.', 'ipc://..', 'ipc:// leading',
@@ -269,7 +265,12 @@ def test_admin_invalid_targets_remain_negative_in_native_and_public_contexts(pro
             if context.root is not None:
                 operations.append(partial(getattr(util, {probe!r}), address, root=context.root))
             for operation in operations:
-                assert operation(0.01) == expected, address
+                try:
+                    operation(0.01)
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError(f'invalid target was accepted: {{address}}')
                 for timeout in (-1.0, float('nan'), float('inf'), 1e300):
                     try:
                         operation(timeout)

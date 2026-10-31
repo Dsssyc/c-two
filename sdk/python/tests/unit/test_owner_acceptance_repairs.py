@@ -264,13 +264,13 @@ def test_failed_native_lifecycle_handoff_keeps_both_capabilities_usable():
             first.transfer_unstarted_lifecycle_to(RuntimeSession())
         first_keepalive.close()
         second_keepalive.close()
-        assert first.shutdown(route_names=[], timeout_seconds=5)['completed']
-        assert second.shutdown(route_names=[], timeout_seconds=5)['completed']
+        assert first.shutdown(timeout_seconds=5)['completed']
+        assert second.shutdown(timeout_seconds=5)['completed']
     finally:
         first_keepalive.close()
         second_keepalive.close()
-        first.shutdown(route_names=[], timeout_seconds=5)
-        second.shutdown(route_names=[], timeout_seconds=5)
+        first.shutdown(timeout_seconds=5)
+        second.shutdown(timeout_seconds=5)
 
 
 def test_shared_reaper_observes_short_child_while_another_child_is_alive():
@@ -299,14 +299,14 @@ def test_owner_bound_restart_refuses_reuse_and_retains_terminal_journal():
         session.set_lifecycle_policy('owner_bound', 0)
         session.attach_owner_control(receiver)
         session.ensure_host_started()
-        terminal = session.shutdown(route_names=[], timeout_seconds=5)
+        terminal = session.shutdown(timeout_seconds=5)
         with pytest.raises(RuntimeError, match='already consumed'):
             session.ensure_host_started()
         assert session.native_terminal_outcome() == terminal
         assert not session.host_started
     finally:
         keepalive.close()
-        session.shutdown(route_names=[], timeout_seconds=5)
+        session.shutdown(timeout_seconds=5)
 
 
 def test_failed_persistent_restart_retains_terminal_journal(monkeypatch):
@@ -314,7 +314,7 @@ def test_failed_persistent_restart_retains_terminal_journal(monkeypatch):
     session = RuntimeSession()
     try:
         session.ensure_host_started()
-        terminal = session.shutdown(route_names=[], timeout_seconds=5)
+        terminal = session.shutdown(timeout_seconds=5)
         monkeypatch.setenv('C2_RELAY_USE_PROXY', 'invalid-boolean')
         monkeypatch.setenv('C2_RELAY_ANCHOR_ADDRESS', 'http://127.0.0.1:9')
         with pytest.raises(Exception):
@@ -327,7 +327,7 @@ def test_failed_persistent_restart_retains_terminal_journal(monkeypatch):
         assert session.host_started
         assert session.native_terminal_outcome() is None
     finally:
-        session.shutdown(route_names=[], timeout_seconds=5)
+        session.shutdown(timeout_seconds=5)
 
 
 def test_owner_bootstrap_uses_its_public_native_name():

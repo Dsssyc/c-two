@@ -108,7 +108,6 @@ def test_client_shutdown_with_live_proxy(monkeypatch, freeze: bool, hosted: bool
                 assert outcome['ipc_client_close_error'] is None, outcome
                 assert outcome['removed_routes'] == (['local-echo'] if hosted else []), outcome
                 assert all(route['active_drained'] for route in outcome['route_outcomes']), outcome
-                assert outcome['ipc_clients_abnormally_closed'] == int(freeze), outcome
                 abnormal = outcome['ipc_client_close_details']
                 if freeze:
                     assert abnormal == [{

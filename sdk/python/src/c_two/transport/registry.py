@@ -51,7 +51,6 @@ from c_two.mem import MemoryStats
 from c_two.config.settings import C2Settings, _clean_optional_str, settings
 from c_two.error import (
     CCError,
-    CoreError,
     ResourceNotFound,
     ResourceUnavailable,
     RegistryUnavailable,
@@ -702,14 +701,7 @@ class Runtime:
                     raise ResourceNotFound(f"Resource '{name}' not found") from exc
                 if status is not None:
                     raise ResourceUnavailable(f"Relay error: {status}") from exc
-                if isinstance(exc, LookupError):
-                    raise LookupError(
-                        f'Name {name!r} is not registered locally '
-                        f'and no address was provided',
-                    ) from exc
-                if isinstance(exc, CoreError) and exc.lifecycle_kind == 'runtime_retired':
-                    raise
-                raise RegistryUnavailable(f"Relay unavailable: {exc}") from exc
+                raise
             mode = getattr(client, 'mode', 'http')
             if mode == 'ipc':
                 proxy = CRMProxy.ipc(
@@ -785,9 +777,6 @@ class Runtime:
 
     def shutdown(self, *, timeout: float = 30.0) -> ShutdownOutcome:
         """Consume native shutdown; retain the session until Core proves completion."""
-        from c_two._native import RuntimeSession
-
-        timeout = RuntimeSession.shutdown_timeout_seconds(timeout)
         with self._lock:
             server = self._server
             runtime_session = self._runtime_session
@@ -900,18 +889,13 @@ class Runtime:
         if not blocking:
             return
 
-        try:
-            # The native lifecycle is the truth: an owner-bound host can stop
-            # itself when its controller closes, without any signal, so serve()
-            # must also watch the native terminal outcome instead of polling
-            # only for a stop request.
-            while not serve_stop.wait(timeout=0.1):
-                if self._native_host_terminated():
-                    break
-        except KeyboardInterrupt:
-            # On some platforms, SIGINT also raises KeyboardInterrupt
-            # even when a custom handler is installed.
-            pass
+        # The native lifecycle is the truth: an owner-bound host can stop
+        # itself when its controller closes, without any signal, so serve()
+        # must also watch the native terminal outcome instead of polling
+        # only for a stop request.
+        while not serve_stop.wait(timeout=0.1):
+            if self._native_host_terminated():
+                break
 
         # Graceful shutdown. A host that already drained (owner EOF) or that is
         # still draining reaches the same consume path, which returns without
@@ -1158,8 +1142,9 @@ def close(crm: object) -> None:
     The proxy carries its own native client and release callback.
     """
     proxy = getattr(crm, 'client', None)
-    if proxy is not None and hasattr(proxy, 'terminate'):
-        proxy.terminate()
+    if not isinstance(proxy, CRMProxy):
+        raise TypeError('cc.close() requires a connected CRM instance')
+    proxy.terminate()
 
 
 def unregister(name: str) -> None:

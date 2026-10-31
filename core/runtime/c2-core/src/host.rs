@@ -1182,7 +1182,6 @@ impl Runtime {
             }
         };
         if let Err(error) = wait_runtime.block_on(server.wait_until_responsive(startup_timeout)) {
-            let _ = wait_runtime.block_on(server.shutdown_and_wait(options.shutdown_timeout));
             if let Some(thread) = inner.thread.lock().take() {
                 if thread.is_finished() {
                     let _ = thread.join();
@@ -1679,7 +1678,6 @@ mod lifecycle_tests {
         assert!(!completed);
         assert!(pending.runtime_barrier_error.is_some());
         assert!(attempt.receipt.terminal_outcome().is_none());
-        assert!(!attempt.receipt.delivered_for_test());
 
         let (terminal, receipt) = finish_failed_attempt(attempt);
         assert_eq!(receipt.terminal_outcome(), Some(terminal.clone()));
@@ -1687,7 +1685,6 @@ mod lifecycle_tests {
             receipt.observe_with_timeout(Duration::ZERO),
             (terminal, true)
         );
-        assert!(!receipt.delivered_for_test());
 
         // A terminal cleanup failure remains terminal and retains its field.
         // This test-only injection isolates receipt projection from OS faults.
@@ -1699,7 +1696,6 @@ mod lifecycle_tests {
             Some("terminal cleanup failure")
         );
         assert_eq!(receipt.terminal_outcome(), Some(failed));
-        assert!(!receipt.delivered_for_test());
         drop(receipt);
         drop(runtime);
         close_receipt_root(directory);

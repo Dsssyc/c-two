@@ -33,9 +33,6 @@ mod route_concurrency_ffi;
 #[cfg(feature = "python")]
 mod runtime_session_ffi;
 #[cfg(feature = "python")]
-mod writable_sink;
-
-#[cfg(feature = "python")]
 use pyo3::prelude::*;
 
 /// The unified `c_two._native` Python module.

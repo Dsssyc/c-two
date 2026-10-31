@@ -648,10 +648,7 @@ def auto_transfer(func=None, *, input=None, output=None):
 
 
 def _rpc_parameters(func: Callable[..., object]) -> list[inspect.Parameter]:
-    try:
-        parameters = list(inspect.signature(func).parameters.values())
-    except (TypeError, ValueError):
-        return []
+    parameters = list(inspect.signature(func).parameters.values())
     if parameters and parameters[0].name in {"self", "cls"}:
         parameters = parameters[1:]
     return parameters

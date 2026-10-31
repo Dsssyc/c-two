@@ -448,7 +448,7 @@ def test_short_shutdown_retains_inflight_borrowed_and_held_owners(owner_bound: b
         if owner_bound:
             assert serve_done.wait(5), 'serve never consumed the native terminal journal'
         assert not session.host_started
-        assert session.shutdown(route_names=[], timeout_seconds=0) == completed
+        assert session.shutdown(timeout_seconds=0) == completed
         assert read_value(retained) == 7
         held.release()
         with pytest.raises(PayloadError) as expired:

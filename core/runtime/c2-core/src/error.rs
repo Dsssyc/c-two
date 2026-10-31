@@ -24,12 +24,7 @@ pub enum LifecycleError {
     ConfigFrozen,
     DuplicateRoute(String),
     MissingRoute(String),
-    RelayDuplicateRoute(String),
     MissingRelayAddress,
-    RelayHttp {
-        status_code: u16,
-        message: String,
-    },
     RegisterFailure(Box<RegisterFailureOutcome>),
     HeldResponseCopy {
         copy_error: String,
@@ -58,14 +53,7 @@ impl fmt::Display for LifecycleError {
             Self::ClientConfigFrozen => formatter.write_str("client IPC configuration is frozen"),
             Self::DuplicateRoute(name) => write!(formatter, "route already registered: {name}"),
             Self::MissingRoute(name) => write!(formatter, "route not registered: {name}"),
-            Self::RelayDuplicateRoute(name) => {
-                write!(formatter, "relay route already registered: {name}")
-            }
             Self::MissingRelayAddress => formatter.write_str("no relay address configured"),
-            Self::RelayHttp {
-                status_code,
-                message,
-            } => write!(formatter, "relay HTTP {status_code}: {message}"),
             Self::RegisterFailure(outcome) => write!(
                 formatter,
                 "registration failed at {}: {}",

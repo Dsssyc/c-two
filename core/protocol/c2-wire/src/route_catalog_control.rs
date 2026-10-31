@@ -460,7 +460,7 @@ fn validate_contract(contract: &RouteContractWire) -> Result<(), String> {
 }
 
 fn validate_route_name(route_name: &str) -> Result<(), String> {
-    c2_contract::validate_named_route_name("route_name", route_name).map_err(|err| err.to_string())
+    c2_contract::validate_call_route_key("route_name", route_name).map_err(|err| err.to_string())
 }
 
 fn validate_route_uid(value: &str) -> Result<(), String> {

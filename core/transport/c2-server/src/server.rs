@@ -1878,7 +1878,7 @@ fn parse_local_endpoint(address: &str) -> Result<LocalEndpoint, ServerError> {
 }
 
 fn validate_region_id(region: &str) -> Result<(), String> {
-    c2_config::validate_ipc_region_id(region)
+    c2_config::validate_server_id(region)
 }
 
 // ---------------------------------------------------------------------------

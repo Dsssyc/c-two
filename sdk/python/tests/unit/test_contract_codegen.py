@@ -71,7 +71,6 @@ def test_python_codegen_preserves_structured_fastdb_error_fields() -> None:
     assert isinstance(error.path, str) and error.path
     assert isinstance(error.message, str) and error.message
     assert isinstance(json.loads(error.details_json), dict)
-    assert error.profile is None
     assert error.metric is None
     assert error.limit is None
     assert error.observed is None
@@ -87,7 +86,6 @@ def test_python_codegen_non_fastdb_errors_have_explicit_empty_cause_fields() -> 
     assert error.symbol is None
     assert error.path is None
     assert error.details_json is None
-    assert error.profile is None
     assert error.metric is None
     assert error.limit is None
     assert error.observed is None
@@ -114,7 +112,6 @@ def test_python_codegen_projects_typed_contract_admission_fields() -> None:
     assert error.code is None
     assert error.symbol is None
     assert error.details_json is None
-    assert error.profile == "v1"
     assert error.metric == "methods"
     assert error.limit == 256
     assert error.observed == 257

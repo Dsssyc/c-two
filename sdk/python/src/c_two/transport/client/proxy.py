@@ -175,9 +175,6 @@ class CRMProxy:
     # ------------------------------------------------------------------
 
     def __getattr__(self, name: str) -> Any:
-        with self._close_lock:
-            if self._closed:
-                raise RuntimeError('Proxy is closed')
         raise AttributeError(
             f'{type(self).__name__!r} object has no attribute {name!r}',
         )

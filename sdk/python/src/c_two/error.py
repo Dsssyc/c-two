@@ -91,8 +91,8 @@ class CoreError(CCBaseError, RuntimeError):
     peer_protocol_version: int | None
     lifecycle_kind: Literal[
         'invalid_server_id', 'config_frozen', 'client_config_frozen',
-        'duplicate_route', 'missing_route', 'relay_duplicate_route',
-        'missing_relay_address', 'relay_http', 'register_failure',
+        'duplicate_route', 'missing_route', 'missing_relay_address',
+        'register_failure',
         'held_response_copy', 'held_response_release', 'response_copy',
         'configuration', 'server', 'startup_timeout', 'relay',
         'runtime_retired', 'shutdown_wait_timeout',
@@ -101,7 +101,6 @@ class CoreError(CCBaseError, RuntimeError):
     timeout_seconds: float | None
     route_name: str | None
     status_code: int | None
-    body: str | None
     relay_duplicate: bool | None
     failure_source: Literal[
         'relay_projection', 'relay_prepare', 'commit', 'relay_register', 'route_open',
@@ -137,7 +136,6 @@ class CoreError(CCBaseError, RuntimeError):
         self.timeout_seconds = None
         self.route_name = None
         self.status_code = None
-        self.body = None
         self.relay_duplicate = None
         self.failure_source = None
         self.registration_failure = None

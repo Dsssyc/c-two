@@ -17,7 +17,6 @@ use c2_mem::BufferLeaseGuard;
 
 use crate::core_error_ffi::{core_error_to_py, lifecycle_error_to_py};
 use crate::lease_ffi::PyBufferLeaseTracker;
-use crate::writable_sink::{materialize_python_payload_plan, prepared_plan_nbytes};
 
 #[pyclass(name = "CoreClient", frozen, skip_from_py_object)]
 pub(crate) struct PyCoreClient {
@@ -690,11 +689,8 @@ fn materialize_python_bytes(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResul
         let materialized = to_bytes.call0()?;
         return materialize_python_bytes(py, &materialized);
     }
-    if let Some(nbytes) = prepared_plan_nbytes(value)? {
-        return materialize_python_payload_plan(py, value, nbytes);
-    }
     Err(PyValueError::new_err(
-        "Core service/client payload must expose the buffer protocol, to_bytes(), or write_into()",
+        "Core service/client payload must expose the buffer protocol or to_bytes()",
     ))
 }
 
@@ -1337,69 +1333,6 @@ source = CustomBytes(b'snapshot')
             let caller: u64 = module.getattr("caller").unwrap().extract().unwrap();
             let events: Vec<u64> = module.getattr("events").unwrap().extract().unwrap();
             assert_eq!(events, vec![caller]);
-        });
-    }
-
-    #[test]
-    fn response_writer_transfers_its_only_vec_and_escaped_failure_stays_safe() {
-        Python::initialize();
-        Python::attach(|py| {
-            let module = module(
-                py,
-                r#"
-import ctypes
-class Plan:
-    nbytes = 32
-    def write_into(self, sink):
-        self.address = ctypes.addressof(ctypes.c_char.from_buffer(sink))
-        with memoryview(sink) as view:
-            view[:] = b'a' * self.nbytes
-plan = Plan()
-class EscapingPlan:
-    nbytes = 32
-    def __init__(self, fail):
-        self.fail = fail
-    def write_into(self, sink):
-        self.view = memoryview(sink)
-        self.view[:] = b'b' * self.nbytes
-        if self.fail:
-            raise ValueError('writer failed')
-"#,
-            );
-            let plan = module.getattr("plan").unwrap();
-            let bytes = materialize_python_bytes(py, &plan).unwrap();
-            let address: usize = plan.getattr("address").unwrap().extract().unwrap();
-            assert_eq!(address, bytes.as_ptr() as usize);
-            assert_eq!(bytes, vec![b'a'; 32]);
-            for fail in [false, true] {
-                let plan = module
-                    .getattr("EscapingPlan")
-                    .unwrap()
-                    .call1((fail,))
-                    .unwrap();
-                let error = materialize_python_bytes(py, &plan).unwrap_err();
-                if fail {
-                    assert!(error.is_instance_of::<PyValueError>(py));
-                } else {
-                    assert!(error.is_instance_of::<PyBufferError>(py));
-                }
-                // A Python exception traceback can also retain callback
-                // locals. Release it before proving export-only ownership.
-                drop(error);
-                let view = plan.getattr("view").unwrap();
-                // Drop the plan/sink callback owners before using the escaped
-                // view: its buffer export alone keeps the native Vec alive.
-                drop(plan);
-                assert_eq!(
-                    view.call_method0("tobytes")
-                        .unwrap()
-                        .extract::<Vec<u8>>()
-                        .unwrap(),
-                    vec![b'b'; 32]
-                );
-                view.set_item(0, b'c').unwrap();
-                view.call_method0("release").unwrap();
-            }
         });
     }
 }

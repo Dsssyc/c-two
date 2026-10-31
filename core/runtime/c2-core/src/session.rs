@@ -7,7 +7,6 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -189,7 +188,6 @@ struct ShutdownTransaction {
     shutdown_timeout: Duration,
     outcome: Mutex<ShutdownProgress>,
     completed: Condvar,
-    delivered: AtomicBool,
 }
 
 #[derive(Default)]
@@ -248,7 +246,6 @@ impl ShutdownTransaction {
             shutdown_timeout,
             outcome: Mutex::new(ShutdownProgress::default()),
             completed: Condvar::new(),
-            delivered: AtomicBool::new(false),
         })
     }
 
@@ -330,8 +327,7 @@ impl fmt::Debug for FailedStartShutdownReceipt {
 }
 
 impl FailedStartShutdownReceipt {
-    /// Wait within this caller's budget without consuming the transaction's
-    /// one-time route handoff. Completion is separate from cleanup success.
+    /// Wait within this caller's budget. Completion is separate from cleanup success.
     pub fn observe_with_timeout(&self, timeout: Duration) -> (ShutdownOutcome, bool) {
         self.transaction.observation(Instant::now() + timeout)
     }
@@ -344,11 +340,6 @@ impl FailedStartShutdownReceipt {
     #[cfg(test)]
     pub(crate) fn same_transaction_for_test(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.transaction, &other.transaction)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn delivered_for_test(&self) -> bool {
-        self.transaction.delivered.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -421,13 +412,6 @@ struct RelayProjection {
     relay_use_proxy: bool,
     control: Arc<RelayControlClient>,
     local_endpoint_context: Option<c2_config::LocalEndpointContext>,
-}
-
-pub(crate) struct RelayClientSettings {
-    pub(crate) use_proxy: bool,
-    pub(crate) max_attempts: usize,
-    pub(crate) call_timeout_secs: f64,
-    pub(crate) remote_payload_chunk_size: u64,
 }
 
 pub(crate) enum RelayResolvedConnection {
@@ -1274,7 +1258,7 @@ impl Runtime {
     pub(crate) fn relay_client_settings_with_deadline(
         &self,
         deadline: ConnectDeadline,
-    ) -> Result<RelayClientSettings, crate::Error> {
+    ) -> Result<c2_config::ResolvedRelayClientConfig, crate::Error> {
         let sources = c2_config::ConfigSources::from_process();
         connect_stage_check(deadline, "relay_config")?;
         #[cfg(test)]
@@ -1284,29 +1268,13 @@ impl Runtime {
         {
             return Err(LifecycleError::Relay(message).into());
         }
-        let use_proxy = c2_config::ConfigResolver::resolve_relay_use_proxy(sources.clone())
-            .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
-        let configured_attempts =
-            c2_config::ConfigResolver::resolve_relay_route_max_attempts(sources.clone())
-                .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
-        let call_timeout_secs =
-            c2_config::ConfigResolver::resolve_relay_call_timeout_secs(sources.clone())
-                .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
-        let remote_payload_chunk_size =
-            c2_config::ConfigResolver::resolve_remote_payload_chunk_size(
-                connect_state_lock(&self.state, deadline, "relay_config")?
-                    .remote_payload_chunk_size,
-                sources,
-            )
-            .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
+        let config = c2_config::ConfigResolver::resolve_relay_client(
+            connect_state_lock(&self.state, deadline, "relay_config")?.remote_payload_chunk_size,
+            sources,
+        )
+        .map_err(|error| LifecycleError::Configuration(error.to_string()))?;
         connect_stage_check(deadline, "relay_config")?;
-        Ok(RelayClientSettings {
-            use_proxy,
-            // One initial observation plus at most one pre-dispatch refresh.
-            max_attempts: configured_attempts.clamp(1, 2),
-            call_timeout_secs,
-            remote_payload_chunk_size,
-        })
+        Ok(config)
     }
 
     pub(crate) fn relay_use_proxy(&self) -> Result<bool, LifecycleError> {
@@ -1824,8 +1792,7 @@ impl Runtime {
         let route_name = name.to_string();
         let effective_relay_anchor_address =
             self.effective_relay_anchor_address_arg(relay_anchor_address)?;
-        let mut scopes =
-            self.capture_registration_scopes(server, std::slice::from_ref(&route_name));
+        let mut scopes = self.capture_registration_scopes(server);
         scopes.retain(|name, _| name == &route_name);
         let rt = Self::server_runtime()?;
         let local_removed = rt.block_on(server.unregister_route(&route_name));
@@ -1862,33 +1829,14 @@ impl Runtime {
     fn capture_registration_scopes(
         &self,
         server: &c2_server::Server,
-        names: &[String],
     ) -> HashMap<String, RelayRegistrationScope> {
         let key = format!("{}:{:p}", server.server_instance_id(), server);
-        let mut scopes = self
-            .state
+        self.state
             .lock()
             .registration_scopes
             .get(&key)
             .cloned()
-            .unwrap_or_default();
-        for name in names {
-            if !scopes.contains_key(name) {
-                if let Some((route_uid, route_revision)) = server.registered_route_identity(name) {
-                    scopes.insert(
-                        name.clone(),
-                        RelayRegistrationScope {
-                            name: name.clone(),
-                            server_id: server.server_id().to_owned(),
-                            server_instance_id: server.server_instance_id().to_owned(),
-                            route_uid,
-                            route_revision,
-                        },
-                    );
-                }
-            }
-        }
-        scopes
+            .unwrap_or_default()
     }
 
     fn retire_registration_scopes(
@@ -1969,7 +1917,7 @@ impl Runtime {
         }
         let deadline = Instant::now() + shutdown_timeout;
         let scopes = server
-            .map(|server| self.capture_registration_scopes(server, &route_names))
+            .map(|server| self.capture_registration_scopes(server))
             .unwrap_or_default();
         let Some(server) = server else {
             return self.shutdown_transaction(
@@ -2014,12 +1962,6 @@ impl Runtime {
                 ..Default::default()
             };
         };
-        if receipt.transaction.delivered.swap(true, Ordering::AcqRel) {
-            return ShutdownOutcome {
-                ipc_clients_drained: true,
-                ..Default::default()
-            };
-        }
         result
     }
 
@@ -2038,7 +1980,7 @@ impl Runtime {
             let state = self.state.lock();
             state.call_execution_observer.close();
         }
-        let scopes = self.capture_registration_scopes(server, &route_names);
+        let scopes = self.capture_registration_scopes(server);
         self.begin_server_shutdown_transaction(
             server,
             route_names,
@@ -2523,7 +2465,6 @@ impl Runtime {
                 .ipc_client_close_details
                 .append(&mut report.abnormal);
         }
-        outcome.ipc_clients_abnormally_closed = outcome.ipc_client_close_details.len();
         outcome.ipc_clients_drained = report.unconfirmed.is_empty() && report.error.is_none();
         if !outcome.ipc_clients_drained {
             let mut detail = report.error.unwrap_or_default();
@@ -2555,7 +2496,6 @@ impl Runtime {
         relay_anchor_address: &str,
         expected: ExpectedRouteContract,
         relay_use_proxy: bool,
-        max_attempts: usize,
         call_timeout_secs: f64,
         remote_payload_chunk_size: u64,
         deadline: ConnectDeadline,
@@ -2575,7 +2515,8 @@ impl Runtime {
             expected,
             projection.relay_use_proxy,
             RelayAwareClientConfig {
-                max_attempts,
+                // One observation followed by at most one pre-dispatch refresh.
+                max_attempts: 2,
                 call_timeout_secs,
                 remote_payload_chunk_size,
             },
@@ -2649,7 +2590,6 @@ impl Runtime {
         relay_url: &str,
         expected: ExpectedRouteContract,
         relay_use_proxy: bool,
-        max_attempts: usize,
         call_timeout_secs: f64,
         remote_payload_chunk_size: u64,
         deadline: ConnectDeadline,
@@ -2660,7 +2600,8 @@ impl Runtime {
             expected,
             relay_use_proxy,
             RelayAwareClientConfig {
-                max_attempts,
+                // One observation followed by at most one pre-dispatch refresh.
+                max_attempts: 2,
                 call_timeout_secs,
                 remote_payload_chunk_size,
             },
@@ -4028,7 +3969,9 @@ mod tests {
         })
         .expect("session");
         let server = test_server("relay-fail-server");
-        register_dummy(&server, &route_name);
+        session
+            .register_route(&server, dummy_route(&server, &route_name), None, false)
+            .expect("Core registration captures the concrete relay cleanup scope");
 
         let outcome = session
             .unregister_route(&server, &route_name, Some("http://127.0.0.1:9"), false)
@@ -4239,7 +4182,7 @@ mod tests {
         let rt = Runtime::server_runtime().expect("runtime");
         let pending = rt.block_on(server.route_scheduler_snapshot(&route_name));
         let old_scope = session
-            .capture_registration_scopes(&server, std::slice::from_ref(&route_name))
+            .capture_registration_scopes(&server)
             .remove(&route_name);
         let replacement = if matches!(interference, FinalInterference::Replace) {
             // Both removal and replacement go through Core's real transactions,
@@ -4266,7 +4209,7 @@ mod tests {
         let remaining_identity = server.registered_route_identity(&route_name);
         let remaining_scheduler = rt.block_on(server.route_scheduler_snapshot(&route_name));
         let remaining_scope = session
-            .capture_registration_scopes(&server, std::slice::from_ref(&route_name))
+            .capture_registration_scopes(&server)
             .remove(&route_name);
         let shutdown = session.shutdown(
             Some(&server),
@@ -4467,7 +4410,7 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_is_idempotent_and_reports_removed_routes_once() {
+    fn shutdown_is_idempotent_and_retains_its_terminal_outcome() {
         let first = unique_route_name("shutdown-a");
         let second = unique_route_name("shutdown-b");
         let session = Runtime::new(RuntimeOptions {
@@ -4499,8 +4442,7 @@ mod tests {
             None,
             Duration::from_secs(5),
         );
-        assert!(second_outcome.removed_routes.is_empty());
-        assert!(second_outcome.relay_errors.is_empty());
+        assert_eq!(second_outcome, first_outcome);
     }
 
     #[test]
@@ -4930,8 +4872,7 @@ mod tests {
             None,
             Duration::from_secs(5),
         );
-        assert!(repeated.removed_routes.is_empty());
-        assert!(repeated.route_outcomes.is_empty());
+        assert_eq!(repeated, outcome);
         assert_eq!(session.shutdown_observation(&server), Some(outcome));
     }
 
@@ -5265,11 +5206,8 @@ mod retirement_tests {
                     .unwrap()
                     .server
                     .unwrap();
-                // Exercise the existing delivered branch before Runtime retirement.
-                let delivered =
-                    runtime.shutdown(Some(&server), Vec::new(), None, false, None, WAIT);
-                assert_eq!(delivered, original_outcome);
-                assert!(original.delivered.load(Ordering::Acquire));
+                let repeated = runtime.shutdown(Some(&server), Vec::new(), None, false, None, WAIT);
+                assert_eq!(repeated, original_outcome);
                 let receipt = runtime
                     .begin_session_retirement(
                         RuntimeShutdownTarget::Host(&host),

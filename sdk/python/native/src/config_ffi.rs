@@ -78,11 +78,6 @@ fn validate_server_id(server_id: &str) -> PyResult<()> {
     c2_config::validate_server_id(server_id).map_err(PyValueError::new_err)
 }
 
-#[pyfunction]
-fn validate_ipc_region_id(region_id: &str) -> PyResult<()> {
-    c2_config::validate_ipc_region_id(region_id).map_err(PyValueError::new_err)
-}
-
 /// Opaque projection of one Core-owned deadline across SDK glue and transport.
 #[pyclass(name = "ConnectAttempt", module = "c_two._native", frozen)]
 pub(crate) struct PyConnectAttempt {
@@ -384,12 +379,10 @@ fn client_overrides(overrides: Option<&Bound<'_, PyAny>>) -> PyResult<ClientIpcC
 }
 
 fn reject_forbidden_ipc_fields(dict: &Bound<'_, PyDict>) -> PyResult<()> {
-    for key in c2_config::FORBIDDEN_IPC_OVERRIDE_KEYS {
-        if dict.contains(*key)? {
-            return Err(PyValueError::new_err(
-                "shm_threshold is a global transport policy; use set_transport_policy(shm_threshold=...)",
-            ));
-        }
+    if dict.contains("shm_threshold")? {
+        return Err(PyValueError::new_err(
+            "shm_threshold is a global transport policy; use set_transport_policy(shm_threshold=...)",
+        ));
     }
     Ok(())
 }
@@ -487,7 +480,6 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(resolve_server_ipc_config, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_client_ipc_config, m)?)?;
     m.add_function(wrap_pyfunction!(validate_server_id, m)?)?;
-    m.add_function(wrap_pyfunction!(validate_ipc_region_id, m)?)?;
     Ok(())
 }
 

@@ -526,7 +526,7 @@ pub struct BuiltRoute {
 
 impl BuiltRoute {
     pub(crate) fn new(route: CrmRoute) -> Result<Self, ServerError> {
-        c2_contract::validate_named_route_name("route name", &route.name)
+        c2_contract::validate_call_route_key("route name", &route.name)
             .map_err(|e| ServerError::Protocol(e.to_string()))?;
         if route.method_names.len() > MAX_METHODS {
             return Err(ServerError::Protocol(format!(

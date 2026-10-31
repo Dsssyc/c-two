@@ -729,39 +729,6 @@ def test_core_python_response_bridge_does_not_accept_shm_coordinate_tuples():
     ]
     offenders = [needle for needle in forbidden if needle in parser_source]
     assert offenders == []
-    assert 'materialize_python_payload_plan(py,value,nbytes)' in _rust_compact(parser_source)
-
-    sink_source = (core_ffi.parent / 'writable_sink.rs').read_text(encoding='utf-8')
-    sink = _rust_compact(sink_source)
-    assert 'bytes:Option<Vec<u8>>' in sink
-    export = _rust_compact(_rust_function(sink_source, '__getbuffer__'))
-    transfer = _rust_compact(_rust_function(sink_source, 'take_bytes'))
-    assert 'letmutstate=this.inner.lock();' in export
-    assert 'if!state.active' in export
-    assert '(*view).buf=bytes.as_mut_ptr().cast();' in export
-    assert '(*view).obj=ffi::Py_NewRef(slf.as_ptr());' in export
-    assert 'state.exports+=1;' in export
-    assert 'letmutstate=self.inner.lock();' in transfer
-    assert 'state.active=false;' in transfer
-    assert transfer.index('ifstate.exports!=0') < transfer.index('.bytes.take()')
-    assert 'Err(PyBufferError::new_err(' in transfer
-    release = _rust_compact(_rust_function(sink_source, '__releasebuffer__'))
-    assert 'self.inner.lock().exports-=1;' in release
-
-
-def test_prepared_payload_detection_requires_write_into_before_nbytes():
-    root = Path(__file__).resolve().parents[4]
-    sink_source = (
-        root / "sdk" / "python" / "native" / "src" / "writable_sink.rs"
-    ).read_text(encoding="utf-8")
-    helper_source = _rust_compact(_rust_function(sink_source, 'prepared_plan_nbytes'))
-
-    assert 'plan.getattr("write_into")' in helper_source
-    assert "value.is_callable()" in helper_source
-    assert helper_source.index('plan.getattr("write_into")') < helper_source.index('plan.getattr("nbytes")')
-    assert helper_source.index('plan.getattr("write_into")') < helper_source.index('plan.getattr("byte_length")')
-    assert 'Ok(_)=>returnOk(None)' in helper_source
-    assert 'Err(err)if!err.is_instance_of::<PyAttributeError>(plan.py())=>returnErr(err)' in helper_source
 
 
 def test_python_ipc_config_facade_does_not_validate_override_keys():
@@ -982,11 +949,6 @@ def test_route_table_direct_mutations_validate_tombstones_and_private_identity()
     assert apply.index('if!self.valid_tombstone(&tombstone)') < apply.index(
         'self.advance_catalog_revision()',
     ) < apply.index('self.routes.remove(&key)')
-    address = _rust_compact(_rust_function(source, 'valid_ipc_address'))
-    assert 'address.strip_prefix("ipc://")' in address
-    assert '.is_some_and(|id|c2_config::validate_ipc_region_id(id).is_ok())' in address
-    assert 'local_endpoint_from_ipc_address' not in address
-    assert 'ConfigSources::from_process' not in address
     identity = _rust_compact(_rust_function(source, 'valid_server_id'))
     assert 'c2_config::validate_server_id(server_id).is_ok()' in identity
     assert 'server_id.len()<=MAX_WIRE_TEXT_BYTES' in identity

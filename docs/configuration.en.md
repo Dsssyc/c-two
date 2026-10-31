@@ -54,7 +54,7 @@ Typed overrides are `BaseIPCOverrides`, `ServerIPCOverrides` and `ClientIPCOverr
 | Server frame limit | `set_server(ipc_overrides={'max_frame_size': ...})` | `C2_IPC_MAX_FRAME_SIZE` | 2 GiB |
 | Logical payload limit | `set_server(ipc_overrides={'max_payload_size': ...})` | `C2_IPC_MAX_PAYLOAD_SIZE` | 16 GiB |
 | Pending requests per connection | `set_server(ipc_overrides={'max_pending_requests': ...})` | `C2_IPC_MAX_PENDING_REQUESTS` | 1,024 |
-| Resource execution threads | `set_server(ipc_overrides={'max_execution_workers': ...})` | `C2_IPC_MAX_EXECUTION_WORKERS` | Host parallelism, clamped to 4–64 |
+| Resource execution threads | `set_server(ipc_overrides={'max_execution_workers': ...})` | `C2_IPC_MAX_EXECUTION_WORKERS` | Default uses host parallelism clamped to 4–64; explicit values must be positive |
 
 An explicit `address='ipc://...'` uses local IPC independently of relay discovery. The relay anchor handles registration and discovery; HTTP calls use the relay URL selected by resolution. Remote batch size controls C-Two payload batches, without specifying TCP packets or HTTP frames.
 
@@ -92,7 +92,7 @@ Set the following fields through the appropriate endpoint's `ipc_overrides`. All
 | `heartbeat_interval` (server) | `C2_IPC_HEARTBEAT_INTERVAL` | 15 seconds |
 | `heartbeat_timeout` (server) | `C2_IPC_HEARTBEAT_TIMEOUT` | 30 seconds |
 
-Pool segment capacity and the per-message payload limit are independent. Disabling the buddy pool still permits dedicated SHM, checked chunk transfer and file spill. A zero backing or reassembly budget rejects positive reservations; `pool_decay_seconds=0` reclaims idle segments on the next maintenance pass; `heartbeat_interval=0` disables heartbeat.
+Pool segment capacity and the per-message payload limit are independent. Rounding `pool_segment_size` up to a power of two must fit in u32, so its maximum is 2 GiB. Disabling the buddy pool still permits dedicated SHM, checked chunk transfer and file spill. A zero backing or reassembly budget rejects positive reservations; `pool_decay_seconds=0` reclaims idle segments on the next maintenance pass; `heartbeat_interval=0` disables heartbeat.
 
 `cc.observe.memory_stats()` observes native memory domains, and `cc.observe.memory_stats()["holds"]` observes SDK leases. These are accounting snapshots, without measuring total process RSS.
 
@@ -121,7 +121,8 @@ C2_RELAY_IDLE_TIMEOUT=60
 | Retained forwarding input | `--call-retained-input-budget-bytes` | `C2_CALL_RETAINED_INPUT_BUDGET_BYTES` | 16 GiB per relay |
 | System HTTP proxy | — | `C2_RELAY_USE_PROXY` | `false` |
 | Anti-entropy interval | — | `C2_RELAY_ANTI_ENTROPY_INTERVAL` | 60 seconds |
-| Client route acquisition attempts | SDK native configuration | `C2_RELAY_ROUTE_MAX_ATTEMPTS` | 3; range 1–32, with `0` treated as 1 |
+
+Client route acquisition performs one observation and at most one refresh before dispatch.
 
 Pre-register upstreams as `--upstream NAME=SERVER_ID@ADDRESS`; `SERVER_ID` must match the IPC handshake. See the [c3 guide](../cli/README.md) for upstream budgets, mesh and dry-run options.
 

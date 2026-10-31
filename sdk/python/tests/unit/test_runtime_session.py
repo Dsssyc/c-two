@@ -19,11 +19,11 @@ def test_native_shutdown_rejects_invalid_timeout_without_changing_identity(timeo
 
     session = RuntimeSession(server_id='timeout-validation')
     with pytest.raises(ValueError, match='timeout_seconds'):
-        session.shutdown(route_names=[], timeout_seconds=timeout)
+        session.shutdown(timeout_seconds=timeout)
     assert session.server_id is None
     assert session.server_address is None
     # A rejected call leaves the session usable for an ordinary shutdown.
-    outcome = dict(session.shutdown(route_names=[], timeout_seconds=0.0))
+    outcome = dict(session.shutdown(timeout_seconds=0.0))
     assert outcome['ipc_clients_drained'] is True
     assert outcome['runtime_barrier_error'] is None
 
@@ -32,7 +32,7 @@ def test_native_shutdown_rejects_invalid_timeout_without_changing_identity(timeo
 def test_native_shutdown_accepts_zero_and_normal_timeout(timeout: float) -> None:
     from c_two._native import RuntimeSession
 
-    outcome = dict(RuntimeSession().shutdown(route_names=[], timeout_seconds=timeout))
+    outcome = dict(RuntimeSession().shutdown(timeout_seconds=timeout))
     assert outcome['ipc_clients_drained'] is True
     assert outcome['runtime_barrier_error'] is None
 
@@ -75,7 +75,7 @@ def test_invalid_native_shutdown_preserves_registered_host_and_shutdown_hook() -
         assert proxy.ping() == 'pong'
         for timeout in BAD_SHUTDOWN_TIMEOUTS:
             with pytest.raises(ValueError, match='timeout_seconds'):
-                session.shutdown(route_names=['timeout-alive'], timeout_seconds=timeout)
+                session.shutdown(timeout_seconds=timeout)
             assert (session.server_id, session.server_address) == identity
             assert cc.endpoint.server_credential().to_json() == credential.to_json()
             assert proxy.ping() == 'pong'
@@ -848,7 +848,7 @@ def test_runtime_session_exposes_no_language_owned_http_pool(monkeypatch) -> Non
     assert not hasattr(session, 'release_http_client')
     assert not hasattr(session, 'http_client_refcount')
 
-    outcome = dict(session.shutdown(route_names=[]))
+    outcome = dict(session.shutdown())
 
     assert outcome['route_outcomes'] == []
     assert outcome['route_close_error'] is None

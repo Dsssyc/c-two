@@ -81,28 +81,6 @@ mod connect_attempt_tests {
     use super::*;
 
     #[test]
-    fn retired_hostless_session_keeps_explicit_name_validation() {
-        Python::initialize();
-        Python::attach(|py| {
-            let session = Py::new(
-                py,
-                PyRuntimeSession::new(None, None, None, None, None, false, None, None, None)
-                    .unwrap(),
-            )
-            .unwrap();
-            PyRuntimeSession::begin_shutdown(session.clone_ref(py), py, 3.0)
-                .unwrap()
-                .observe(py)
-                .unwrap();
-            let error = session
-                .borrow(py)
-                .shutdown(py, Some(vec!["missing".into()]), None, 1.0)
-                .unwrap_err();
-            assert!(error.is_instance_of::<PyValueError>(py));
-        });
-    }
-
-    #[test]
     fn retirement_owner_lock_timeout_does_not_seal_or_hold_the_gil() {
         Python::initialize();
         Python::attach(|py| {
@@ -243,68 +221,6 @@ cc.error.CoreError.__init__ = observe_error
                     .unwrap()
                     .is_none()
             );
-        });
-    }
-
-    #[test]
-    fn retired_explicit_name_observation_keeps_all_lock_waits_in_original_deadline() {
-        Python::initialize();
-        Python::attach(|py| {
-            let session = Py::new(
-                py,
-                PyRuntimeSession::new(None, None, None, None, None, false, None, None, None)
-                    .unwrap(),
-            )
-            .unwrap();
-            PyRuntimeSession::begin_shutdown(session.clone_ref(py), py, 3.0)
-                .unwrap()
-                .observe(py)
-                .unwrap();
-            let borrowed = session.borrow(py);
-            for stage in ["shutdown_owner_wait", "shutdown_registrations_wait"] {
-                let owner = (stage == "shutdown_owner_wait").then(|| borrowed.host.lock());
-                let registrations =
-                    (stage == "shutdown_registrations_wait").then(|| borrowed.registrations.lock());
-                let worker_session = session.clone_ref(py);
-                let (done, observed) = std::sync::mpsc::channel();
-                let worker = std::thread::spawn(move || {
-                    Python::attach(|py| {
-                        let error = worker_session
-                            .borrow(py)
-                            .shutdown(py, Some(Vec::new()), None, 0.0)
-                            .unwrap_err();
-                        let value = error.value(py);
-                        done.send((
-                            value
-                                .getattr("lifecycle_kind")
-                                .unwrap()
-                                .extract::<String>()
-                                .unwrap(),
-                            value
-                                .getattr("details")
-                                .unwrap()
-                                .get_item("stage")
-                                .unwrap()
-                                .extract::<String>()
-                                .unwrap(),
-                            value
-                                .getattr("timeout_seconds")
-                                .unwrap()
-                                .extract::<f64>()
-                                .unwrap(),
-                        ))
-                        .unwrap();
-                    })
-                });
-                let result = py.detach(move || observed.recv_timeout(Duration::from_secs(3)));
-                drop(registrations);
-                drop(owner);
-                py.detach(|| worker.join()).unwrap();
-                assert_eq!(
-                    result.unwrap(),
-                    ("shutdown_wait_timeout".into(), stage.into(), 0.0)
-                );
-            }
         });
     }
 
@@ -458,39 +374,6 @@ pub struct PyRetiredMemoryObservation {
 }
 
 impl PyRuntimeSession {
-    fn check_shutdown_route_names(
-        &self,
-        route_names: Option<&[String]>,
-        wait: Option<(Instant, f64)>,
-    ) -> PyResult<()> {
-        if let Some(names) = route_names {
-            let registered = match wait {
-                Some((deadline, seconds)) => {
-                    self.registrations.try_lock_until(deadline).ok_or_else(|| {
-                        Python::attach(|py| {
-                            shutdown_error_to_py(
-                                py,
-                                c2_core::LifecycleError::ShutdownWaitTimeout {
-                                    stage: "shutdown_registrations_wait",
-                                },
-                                seconds,
-                            )
-                        })
-                    })?
-                }
-                None => self.registrations.lock(),
-            };
-            for name in names {
-                if !registered.contains_key(name) {
-                    return Err(PyValueError::new_err(format!(
-                        "Name not registered: {name:?}"
-                    )));
-                }
-            }
-        }
-        Ok(())
-    }
-
     fn project_shutdown_observation<'py>(
         &self,
         py: Python<'py>,
@@ -1141,13 +1024,6 @@ impl PyRuntimeSession {
     }
 
     #[getter]
-    fn effective_relay_anchor_address(&self) -> PyResult<Option<String>> {
-        self.inner
-            .effective_relay_anchor_address()
-            .map_err(lifecycle_error_to_py)
-    }
-
-    #[getter]
     fn remote_payload_chunk_size_override(&self) -> Option<u64> {
         self.inner.remote_payload_chunk_size_override()
     }
@@ -1351,7 +1227,7 @@ impl PyRuntimeSession {
         lifecycle_policy_to_dict(py, &self.inner.lifecycle_policy())
     }
 
-    #[pyo3(signature = (name, dispatcher, method_names, access_map, concurrency_mode, max_pending, max_workers, crm_ns, crm_name, crm_ver, abi_hash, signature_hash, descriptor_json, relay_anchor_address=None))]
+    #[pyo3(signature = (name, dispatcher, method_names, access_map, concurrency_mode, max_pending, max_workers, crm_ns, crm_name, crm_ver, abi_hash, signature_hash, descriptor_json))]
     #[allow(clippy::too_many_arguments)] // PyO3 signature is the existing Python call boundary.
     fn register_route<'py>(
         &self,
@@ -1369,23 +1245,12 @@ impl PyRuntimeSession {
         abi_hash: &str,
         signature_hash: &str,
         descriptor_json: &[u8],
-        relay_anchor_address: Option<String>,
     ) -> PyResult<Py<PyAny>> {
         if self.registrations.lock().contains_key(name) {
             return Err(PyValueError::new_err(format!(
                 "Name already registered: {name:?}",
             )));
         }
-        if let Some(relay_anchor_address) = relay_anchor_address {
-            if self.host.lock().host.is_some() {
-                return Err(PyRuntimeError::new_err(
-                    "explicit registration relay anchor must be configured before the Core host starts",
-                ));
-            }
-            self.inner
-                .set_relay_anchor_address(Some(relay_anchor_address));
-        }
-
         let methods = method_definitions(&method_names, access_map)?;
         let expected =
             expected_route_contract(name, crm_ns, crm_name, crm_ver, abi_hash, signature_hash)?;
@@ -1416,12 +1281,7 @@ impl PyRuntimeSession {
             .unbind())
     }
 
-    fn unregister_route<'py>(
-        &self,
-        py: Python<'py>,
-        name: &str,
-        _relay_anchor_address: Option<String>,
-    ) -> PyResult<Bound<'py, PyDict>> {
+    fn unregister_route<'py>(&self, py: Python<'py>, name: &str) -> PyResult<Bound<'py, PyDict>> {
         let mut registration = self
             .registrations
             .lock()
@@ -1431,13 +1291,6 @@ impl PyRuntimeSession {
             .detach(|| registration.close())
             .map_err(core_error_to_py)?;
         unregister_outcome_to_dict(py, outcome)
-    }
-
-    /// Extract Python numeric input before the SDK takes its binding lock.
-    /// Range/deadline validation occurs once, at begin_shutdown.
-    #[staticmethod]
-    fn shutdown_timeout_seconds(seconds: f64) -> f64 {
-        seconds
     }
 
     #[pyo3(signature = (connect_attempt=None))]
@@ -1495,17 +1348,10 @@ impl PyRuntimeSession {
         })
     }
 
-    #[pyo3(signature = (route_names=None, relay_anchor_address=None, timeout_seconds=5.0))]
-    fn shutdown<'py>(
-        &self,
-        py: Python<'py>,
-        route_names: Option<Vec<String>>,
-        relay_anchor_address: Option<String>,
-        timeout_seconds: f64,
-    ) -> PyResult<Bound<'py, PyDict>> {
+    #[pyo3(signature = (timeout_seconds=5.0))]
+    fn shutdown<'py>(&self, py: Python<'py>, timeout_seconds: f64) -> PyResult<Bound<'py, PyDict>> {
         // Validate before taking the Host or changing any session state.
         let timeout = checked_timeout(timeout_seconds).map_err(PyValueError::new_err)?;
-        let _ = relay_anchor_address;
         let deadline = Instant::now().checked_add(timeout).ok_or_else(|| {
             PyValueError::new_err("timeout_seconds cannot be represented as a shutdown deadline")
         })?;
@@ -1513,34 +1359,6 @@ impl PyRuntimeSession {
             .detach(|| self.inner.retirement_receipt(deadline))
             .map_err(|error| shutdown_error_to_py(py, error, timeout_seconds))?;
         if let Some(receipt) = receipt {
-            if route_names.is_some() {
-                let check_names = py
-                    .detach(|| {
-                        let record = self.host.try_lock_until(deadline).ok_or(
-                            c2_core::LifecycleError::ShutdownWaitTimeout {
-                                stage: "shutdown_owner_wait",
-                            },
-                        )?;
-                        if record.failed_start_receipt.is_some() {
-                            return Ok(false);
-                        }
-                        let host = record.host.clone();
-                        drop(record);
-                        Ok::<_, c2_core::LifecycleError>(match host {
-                            Some(host) => host.shutdown_outcome_until(deadline)?.is_none(),
-                            None => true,
-                        })
-                    })
-                    .map_err(|error| shutdown_error_to_py(py, error, timeout_seconds))?;
-                if check_names {
-                    py.detach(|| {
-                        self.check_shutdown_route_names(
-                            route_names.as_deref(),
-                            Some((deadline, timeout_seconds)),
-                        )
-                    })?;
-                }
-            }
             let (outcome, completed) = py.detach(|| receipt.observe_until(deadline));
             return self.project_shutdown_observation(py, outcome, completed);
         }
@@ -1567,12 +1385,6 @@ impl PyRuntimeSession {
             let dict = shutdown_outcome_to_dict(py, outcome)?;
             dict.set_item("completed", completed)?;
             return Ok(dict);
-        }
-        if host
-            .as_ref()
-            .is_none_or(|host| host.shutdown_outcome().is_none())
-        {
-            self.check_shutdown_route_names(route_names.as_deref(), None)?;
         }
         let (outcome, completed) = py.detach(|| {
             // Completion and the projected result are one immutable native
@@ -1627,10 +1439,6 @@ impl PyRuntimeSession {
         self.inner
             .clear_server_identity()
             .map_err(runtime_configuration_error_to_py)
-    }
-
-    fn clear_relay_projection_cache(&self) {
-        self.inner.clear_relay_projection_cache();
     }
 
     #[allow(clippy::too_many_arguments)] // PyO3 signature is the existing Python call boundary.
@@ -1990,14 +1798,9 @@ fn shutdown_outcome_to_dict<'py>(
     dict.set_item("relay_errors", PyList::new(py, relay_errors)?)?;
     dict.set_item("server_was_started", outcome.server_was_started)?;
     dict.set_item("ipc_clients_drained", outcome.ipc_clients_drained)?;
-    dict.set_item("http_clients_drained", outcome.http_clients_drained)?;
     dict.set_item("route_close_error", outcome.route_close_error)?;
     dict.set_item("runtime_barrier_error", outcome.runtime_barrier_error)?;
     dict.set_item("ipc_client_close_error", outcome.ipc_client_close_error)?;
-    dict.set_item(
-        "ipc_clients_abnormally_closed",
-        outcome.ipc_clients_abnormally_closed,
-    )?;
     let client_close_details = outcome
         .ipc_client_close_details
         .into_iter()

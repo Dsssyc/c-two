@@ -273,7 +273,6 @@ class NativeServerBridge:
                     abi_hash,
                     signature_hash,
                     descriptor_json,
-                    None,
                 )
             except Exception as exc:
                 if (
@@ -296,29 +295,14 @@ class NativeServerBridge:
             if slot is None:
                 raise KeyError(f'Name not registered: {name!r}')
 
-        outcome = dict(self._runtime_session.unregister_route(name, None))
+        outcome = dict(self._runtime_session.unregister_route(name))
         if not outcome.get('local_removed', False):
             raise KeyError(f'Name not registered in native server: {name!r}')
-        close = outcome.get('close')
-        if not _close_outcome_is_hook_safe(close):
-            # The route is gone from the native table but its work is still
-            # draining (or the close reported an error). Keep the Python slot:
-            # dropping it here would either run the hook early or lose it, and
-            # the same slot must serve the later structured completion.
-            return outcome
-
         with self._slots_lock:
             slot = self._slots.pop(name, None)
         if slot is not None:
             self._invoke_shutdown(slot)
         return outcome
-
-    def get_slot_info(self, name: str) -> Scheduler:
-        with self._slots_lock:
-            slot = self._slots.get(name)
-        if slot is None:
-            raise KeyError(f'Name not registered: {name!r}')
-        return slot.scheduler
 
     def get_local_slot_info(
         self, name: str, *, connect_attempt=None,
@@ -387,8 +371,6 @@ class NativeServerBridge:
 
     def shutdown(self, *, timeout: float = 5.0) -> ShutdownOutcome:
         outcome = dict(self._runtime_session.shutdown(
-            route_names=None,
-            relay_anchor_address=None,
             timeout_seconds=float(timeout),
         ))
 
@@ -424,10 +406,6 @@ class NativeServerBridge:
     @staticmethod
     def _discover_methods(crm_class: type) -> list[str]:
         return rpc_method_names(crm_class)
-
-    @staticmethod
-    def _extract_namespace(crm_class: type) -> str:
-        return NativeServerBridge._extract_contract_identity(crm_class)[0]
 
     @staticmethod
     def _extract_contract_identity(crm_class: type) -> tuple[str, str, str]:

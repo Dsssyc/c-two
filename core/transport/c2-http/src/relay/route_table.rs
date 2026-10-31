@@ -743,7 +743,7 @@ impl RouteTable {
 }
 
 pub(crate) fn valid_route_name(name: &str) -> bool {
-    c2_contract::validate_named_route_name("route name", name).is_ok()
+    c2_contract::validate_call_route_key("route name", name).is_ok()
 }
 
 fn valid_relay_id(relay_id: &str) -> bool {
@@ -794,7 +794,7 @@ fn valid_ipc_address(address: &str) -> bool {
     // the authority's frozen context, never a platform-default derivation.
     address
         .strip_prefix("ipc://")
-        .is_some_and(|id| c2_config::validate_ipc_region_id(id).is_ok())
+        .is_some_and(|id| c2_config::validate_server_id(id).is_ok())
 }
 
 pub(crate) fn valid_relay_url(url: &str) -> bool {

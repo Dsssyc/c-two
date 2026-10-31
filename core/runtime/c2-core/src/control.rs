@@ -49,11 +49,6 @@ pub fn ping_direct_ipc(
     timeout: Duration,
 ) -> Result<bool, LifecycleError> {
     let context = context.cloned().map_or_else(process_context, Ok)?;
-    // A malformed probe target has no reachable server. Configuration and
-    // native-name derivation failures for valid targets must remain errors.
-    if LocalEndpoint::validate_address(address).is_err() {
-        return Ok(false);
-    }
     c2_ipc::ping_with_context(address, &context, timeout)
         .map_err(|error| LifecycleError::Configuration(error.to_string()))
 }
@@ -66,14 +61,6 @@ pub fn shutdown_direct_ipc(
     timeout: Duration,
 ) -> Result<DirectIpcShutdownOutcome, LifecycleError> {
     let context = context.cloned().map_or_else(process_context, Ok)?;
-    if LocalEndpoint::validate_address(address).is_err() {
-        return Ok(DirectIpcShutdownOutcome {
-            acknowledged: false,
-            shutdown_started: false,
-            server_stopped: false,
-            route_outcomes: Vec::new(),
-        });
-    }
     c2_ipc::shutdown_with_context(address, &context, timeout)
         .map(DirectIpcShutdownOutcome::from)
         .map_err(|error| LifecycleError::Configuration(error.to_string()))
@@ -168,7 +155,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_probe_targets_are_negative_results() {
+    fn malformed_control_targets_are_configuration_errors() {
         let context = LocalEndpointContext::default_for_platform().unwrap();
         for address in [
             "tcp://not-ipc",
@@ -182,12 +169,14 @@ mod tests {
             "ipc://trailing ",
             "ipc://bad\nname",
         ] {
-            assert!(!ping_direct_ipc(address, Some(&context), Duration::ZERO).unwrap());
-            let outcome = shutdown_direct_ipc(address, Some(&context), Duration::ZERO).unwrap();
-            assert!(!outcome.acknowledged);
-            assert!(!outcome.shutdown_started);
-            assert!(!outcome.server_stopped);
-            assert!(outcome.route_outcomes.is_empty());
+            assert!(matches!(
+                ping_direct_ipc(address, Some(&context), Duration::ZERO),
+                Err(LifecycleError::Configuration(_))
+            ));
+            assert!(matches!(
+                shutdown_direct_ipc(address, Some(&context), Duration::ZERO),
+                Err(LifecycleError::Configuration(_))
+            ));
             assert!(direct_ipc_endpoint(address, Some(&context)).is_err());
         }
     }

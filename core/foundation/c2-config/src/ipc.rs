@@ -22,26 +22,6 @@ pub const MAX_EXECUTION_WORKERS: u32 = 64;
 /// against the peer-cache `max_segments`).
 pub const MAX_IPC_POOL_SEGMENTS: u32 = 255;
 
-/// Code-level IPC override fields shared by both server and client roles.
-pub const BASE_IPC_OVERRIDE_KEYS: &[&str] = &[
-    "pool_enabled",
-    "pool_segment_size",
-    "max_pool_segments",
-    "pool_prewarm_segments",
-    "pool_min_retained_segments",
-    "reassembly_segment_size",
-    "reassembly_max_segments",
-    "max_total_chunks",
-    "chunk_gc_interval",
-    "chunk_threshold_ratio",
-    "chunk_assembler_timeout",
-    "max_reassembly_bytes",
-    "chunk_size",
-    "shm_backing_budget_bytes",
-    "file_backing_budget_bytes",
-    "live_reassembly_budget_bytes",
-];
-
 /// Code-level IPC override fields accepted for server config resolution.
 pub const SERVER_IPC_OVERRIDE_KEYS: &[&str] = &[
     "pool_enabled",
@@ -89,9 +69,6 @@ pub const CLIENT_IPC_OVERRIDE_KEYS: &[&str] = &[
     "live_reassembly_budget_bytes",
     "pool_decay_seconds",
 ];
-
-/// Global transport policy fields that are not valid role-level IPC overrides.
-pub const FORBIDDEN_IPC_OVERRIDE_KEYS: &[&str] = &["shm_threshold"];
 
 // ─── Base ────────────────────────────────────────────────────────────────────
 
@@ -225,10 +202,7 @@ impl Default for ServerIpcConfig {
 impl Default for ClientIpcConfig {
     fn default() -> Self {
         Self {
-            base: BaseIpcConfig {
-                reassembly_segment_size: 64 * 1024 * 1024, // 64 MB override
-                ..BaseIpcConfig::default()
-            },
+            base: BaseIpcConfig::default(),
             shm_threshold: 4_096,
             pool_decay_seconds: 60.0,
         }
@@ -366,9 +340,13 @@ impl BaseIpcConfig {
         if self.pool_segment_size == 0 {
             return Err("pool_segment_size must be > 0".into());
         }
-        if self.pool_segment_size > u32::MAX as u64 {
+        if self
+            .pool_segment_size
+            .checked_next_power_of_two()
+            .is_none_or(|size| size > u32::MAX as u64)
+        {
             return Err(format!(
-                "pool_segment_size ({}) must be <= u32::MAX ({}) for wire format compatibility",
+                "pool_segment_size ({}) must round to at most u32::MAX ({}) for wire format compatibility",
                 self.pool_segment_size,
                 u32::MAX,
             ));
@@ -482,12 +460,6 @@ impl ServerIpcConfig {
         if self.max_execution_workers == 0 {
             return Err("max_execution_workers must be > 0".into());
         }
-        if self.max_execution_workers > MAX_EXECUTION_WORKERS {
-            return Err(format!(
-                "max_execution_workers ({}) must be <= {}",
-                self.max_execution_workers, MAX_EXECUTION_WORKERS
-            ));
-        }
         // Pool segment capacity and the per-message `max_payload_size` limit
         // are independent dimensions (0.7.1 design section 3): one segment
         // backs many smaller messages, so segment capacity may exceed the
@@ -584,35 +556,6 @@ mod tests {
     // ── Default validation ───────────────────────────────────────────────
 
     #[test]
-    fn override_key_catalogs_exclude_derived_and_global_fields() {
-        // The client catalog is the shared base keys plus exactly one
-        // role-specific key: the client-side idle decay window.
-        assert_eq!(
-            CLIENT_IPC_OVERRIDE_KEYS.len(),
-            BASE_IPC_OVERRIDE_KEYS.len() + 1
-        );
-        for key in BASE_IPC_OVERRIDE_KEYS {
-            assert!(CLIENT_IPC_OVERRIDE_KEYS.contains(key));
-        }
-        assert!(CLIENT_IPC_OVERRIDE_KEYS.contains(&"pool_decay_seconds"));
-        assert!(SERVER_IPC_OVERRIDE_KEYS.contains(&"max_frame_size"));
-        assert!(SERVER_IPC_OVERRIDE_KEYS.contains(&"max_execution_workers"));
-        assert!(SERVER_IPC_OVERRIDE_KEYS.contains(&"heartbeat_timeout"));
-        assert!(!CLIENT_IPC_OVERRIDE_KEYS.contains(&"max_frame_size"));
-        assert!(!CLIENT_IPC_OVERRIDE_KEYS.contains(&"heartbeat_interval"));
-
-        for keys in [
-            BASE_IPC_OVERRIDE_KEYS,
-            SERVER_IPC_OVERRIDE_KEYS,
-            CLIENT_IPC_OVERRIDE_KEYS,
-        ] {
-            assert!(!keys.contains(&"max_pool_memory"));
-            assert!(!keys.contains(&"shm_threshold"));
-        }
-        assert_eq!(FORBIDDEN_IPC_OVERRIDE_KEYS, &["shm_threshold"]);
-    }
-
-    #[test]
     fn server_default_validates() {
         assert!(ServerIpcConfig::default().validate().is_ok());
     }
@@ -636,6 +579,24 @@ mod tests {
                 .unwrap_err()
                 .contains("max_execution_workers")
         );
+    }
+
+    #[test]
+    fn explicit_execution_workers_above_default_cap_are_valid() {
+        let cfg = ServerIpcConfig {
+            max_execution_workers: MAX_EXECUTION_WORKERS + 1,
+            ..ServerIpcConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn buddy_segment_size_that_rounds_past_wire_limit_is_rejected() {
+        let cfg = BaseIpcConfig {
+            pool_segment_size: u32::MAX as u64,
+            ..BaseIpcConfig::default()
+        };
+        assert!(cfg.validate().unwrap_err().contains("pool_segment_size"));
     }
 
     #[test]
@@ -836,19 +797,6 @@ mod tests {
             ..BaseIpcConfig::default()
         };
         assert!(cfg.validate().is_ok());
-    }
-
-    #[test]
-    fn budget_override_keys_are_role_visible() {
-        for key in [
-            "shm_backing_budget_bytes",
-            "file_backing_budget_bytes",
-            "live_reassembly_budget_bytes",
-        ] {
-            assert!(BASE_IPC_OVERRIDE_KEYS.contains(&key));
-            assert!(SERVER_IPC_OVERRIDE_KEYS.contains(&key));
-            assert!(CLIENT_IPC_OVERRIDE_KEYS.contains(&key));
-        }
     }
 
     // ── Deref ────────────────────────────────────────────────────────────

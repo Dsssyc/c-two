@@ -52,7 +52,6 @@ pub struct ShutdownOutcome {
     pub relay_errors: Vec<RelayCleanupError>,
     pub server_was_started: bool,
     pub ipc_clients_drained: bool,
-    pub http_clients_drained: bool,
     pub route_close_error: Option<String>,
     pub runtime_barrier_error: Option<String>,
     /// Addresses in this Runtime's outgoing IPC client cache whose close
@@ -61,6 +60,5 @@ pub struct ShutdownOutcome {
     pub ipc_client_close_error: Option<String>,
     /// Locally closed outgoing connections without a normal disconnect ACK.
     /// These are terminal local closes, not pending client/server drain work.
-    pub ipc_clients_abnormally_closed: usize,
     pub ipc_client_close_details: Vec<IpcClientCloseDetail>,
 }

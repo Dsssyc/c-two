@@ -180,19 +180,7 @@ fn codegen(args: CodegenArgs) -> Result<()> {
 }
 
 fn admit_contract_once(payload: &[u8]) -> Result<c2_contract::ContractRelease> {
-    #[cfg(debug_assertions)]
-    let before = c2_contract::descriptor_admission_count_for_current_thread();
-    let release = c2_contract::ContractRelease::from_descriptor_json(payload);
-    #[cfg(debug_assertions)]
-    {
-        let after = c2_contract::descriptor_admission_count_for_current_thread();
-        debug_assert_eq!(
-            after.saturating_sub(before),
-            1,
-            "a CLI descriptor operation must enter ContractRelease admission exactly once"
-        );
-    }
-    release.map_err(|error| anyhow!("{error}"))
+    c2_contract::ContractRelease::from_descriptor_json(payload).map_err(|error| anyhow!("{error}"))
 }
 
 fn export(args: PythonExportArgs) -> Result<()> {

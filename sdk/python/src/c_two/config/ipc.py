@@ -1,10 +1,7 @@
 """Typed IPC override schemas backed by the Rust config resolver."""
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Any, TypedDict
-
-from .settings import C2Settings
+from typing import TypedDict
 
 __all__ = [
     'BaseIPCOverrides',
@@ -83,30 +80,3 @@ class ClientIPCOverrides(BaseIPCOverrides, total=False):
     # may be retired while the connection stays open. Zero retires idle
     # segments at the next maintenance tick; negative values are rejected.
     pool_decay_seconds: float
-
-
-def _resolve_server_ipc_config(
-    ipc_overrides: ServerIPCOverrides | Mapping[str, object] | None = None,
-    settings: C2Settings | None = None,
-) -> dict[str, Any]:
-    """Resolve server IPC config through Rust from explicit overrides only."""
-    native = _native_resolver()
-    return dict(native.resolve_server_ipc_config(
-        ipc_overrides,
-        _shm_overrides(settings),
-    ))
-
-
-def _native_resolver() -> Any:
-    from c_two import _native
-
-    return _native
-
-
-def _shm_overrides(settings: C2Settings | None) -> dict[str, object]:
-    if settings is None:
-        from .settings import settings as _settings
-        settings = _settings
-    if not isinstance(settings, C2Settings):
-        raise TypeError('settings must be a C2Settings instance')
-    return settings._shm_overrides()  # noqa: SLF001

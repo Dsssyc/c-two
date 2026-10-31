@@ -81,7 +81,7 @@ class TestRuntimeSessionLifecycleProjection:
                 61.0,
             )
         assert session.lifecycle_policy['owner_missing_grace_seconds'] == 2.0
-        session.shutdown(route_names=[], timeout_seconds=1.0)
+        session.shutdown(timeout_seconds=1.0)
 
     def test_persistent_policy_rejects_a_grace_and_unknown_policies(self) -> None:
         from c_two._native import RuntimeSession
@@ -93,7 +93,7 @@ class TestRuntimeSessionLifecycleProjection:
             session.set_lifecycle_policy('takeover', 1.0)
         with pytest.raises(ValueError, match='explicit owner_missing_grace_seconds'):
             session.set_lifecycle_policy('owner_bound', None)
-        session.shutdown(route_names=[], timeout_seconds=1.0)
+        session.shutdown(timeout_seconds=1.0)
 
     def test_host_started_reports_the_real_native_running_state(self) -> None:
         from c_two._native import RuntimeSession
@@ -113,12 +113,12 @@ class TestRuntimeSessionLifecycleProjection:
         assert snapshot['listener_closed'] is False
         # Observing the terminal state never initiates or consumes shutdown.
         assert session.native_terminal_outcome() is None
-        session.shutdown(route_names=[], timeout_seconds=5.0)
+        session.shutdown(timeout_seconds=5.0)
         # A completed shutdown releases the session's host handle.
         assert session.host_started is False
         assert session.server_credential is None
         assert session.native_lifecycle_snapshot()['terminal'] is True
-        assert session.native_terminal_outcome() == session.shutdown(route_names=[], timeout_seconds=0)
+        assert session.native_terminal_outcome() == session.shutdown(timeout_seconds=0)
 
     def test_policy_name_alone_never_creates_an_owner_bound_host(self) -> None:
         from c_two._native import RuntimeSession
@@ -131,7 +131,7 @@ class TestRuntimeSessionLifecycleProjection:
         # The refused attempt left no host and no consumed capability behind.
         assert session.native_lifecycle_snapshot() is None
         assert session.server_credential is None
-        session.shutdown(route_names=[], timeout_seconds=1.0)
+        session.shutdown(timeout_seconds=1.0)
 
 
 class TestOwnerControlCapability:
@@ -171,7 +171,7 @@ class TestOwnerControlCapability:
                 session.attach_owner_control(receiver)
         finally:
             keepalive.close()
-            session.shutdown(route_names=[], timeout_seconds=5.0)
+            session.shutdown(timeout_seconds=5.0)
 
     def test_owner_eof_reaches_a_real_terminal_outcome(self) -> None:
         from c_two._native import RuntimeSession
@@ -197,7 +197,7 @@ class TestOwnerControlCapability:
             assert outcome['runtime_barrier_error'] is None
             assert outcome['route_close_error'] is None
         finally:
-            session.shutdown(route_names=[], timeout_seconds=5.0)
+            session.shutdown(timeout_seconds=5.0)
 
 
 class TestSetServerKeywords:
@@ -324,7 +324,7 @@ def test_duplicate_and_configuration_errors_preserve_valid_receiver():
     finally:
         first_keepalive.close()
         second_keepalive.close()
-        session.shutdown(route_names=[], timeout_seconds=5)
+        session.shutdown(timeout_seconds=5)
         cc.shutdown()
 
 
@@ -339,7 +339,7 @@ def test_preclosed_owner_cannot_publish_readiness():
         session.ensure_host_started()
     assert not session.host_started
     assert session.native_lifecycle_snapshot() is None
-    session.shutdown(route_names=[], timeout_seconds=5)
+    session.shutdown(timeout_seconds=5)
 
 
 def test_failed_start_late_attach_preserves_valid_receiver():
@@ -358,7 +358,7 @@ def test_failed_start_late_attach_preserves_valid_receiver():
         assert other_receiver.is_available
     finally:
         other_keepalive.close()
-        session.shutdown(route_names=[], timeout_seconds=5)
+        session.shutdown(timeout_seconds=5)
 
 
 def test_regular_business_stdin_cannot_be_adopted():

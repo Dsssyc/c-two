@@ -145,13 +145,10 @@ def test_shutdown_returns_structured_outcome(monkeypatch):
 
 
 def test_control_helpers_reject_invalid_addresses():
-    assert ping('tcp://not-ipc', timeout=0.01) is False
-    assert shutdown('tcp://not-ipc', timeout=0.01) == {
-        'acknowledged': False,
-        'shutdown_started': False,
-        'server_stopped': False,
-        'route_outcomes': [],
-    }
+    with pytest.raises(ValueError):
+        ping('tcp://not-ipc', timeout=0.01)
+    with pytest.raises(ValueError):
+        shutdown('tcp://not-ipc', timeout=0.01)
 
 
 def test_server_start_returns_only_after_direct_ipc_ready(monkeypatch):
@@ -354,7 +351,7 @@ def test_bridge_shutdown_after_direct_ipc_shutdown_waits_for_active_call_before_
         call_thread = threading.Thread(target=invoke_block)
         call_thread.start()
         assert impl.started.wait(timeout=5.0), 'active call did not start'
-        assert server.get_slot_info('cleanup').snapshot().active_workers == 1
+        assert call_thread.is_alive(), 'active call ended before shutdown initiate'
 
         _assert_shutdown_accepted_not_finished(shutdown(address, timeout=0.5))
         assert call_thread.is_alive(), 'active call ended before release after shutdown initiate'

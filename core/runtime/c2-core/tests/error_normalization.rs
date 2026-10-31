@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
-use c2_contract::{ContractError, ContractLimitMetric, ContractLimitsProfile};
+use c2_contract::{ContractError, ContractLimitMetric};
 use c2_core::{
     AdapterFailure, AdapterFailurePhase, Error, ExternalCause, Runtime, RuntimeOptions,
     TransportPhase, external_cause_details, normalize_adapter_failure, normalize_http_error,
@@ -72,7 +72,6 @@ fn malformed_semantic_payloads_become_protocol_violations() {
 #[test]
 fn contract_limit_failures_are_distinct_from_other_contract_failures() {
     let admission = Error::from(ContractError::LimitExceeded {
-        profile: ContractLimitsProfile::V1,
         metric: ContractLimitMetric::SourceBytes,
         limit: 16,
         observed: 17,

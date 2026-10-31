@@ -193,22 +193,8 @@ pub(crate) fn lifecycle_error_to_py(error: LifecycleError) -> PyErr {
                 set_attr(value, "lifecycle_kind", "missing_route");
                 set_attr(value, "route_name", route);
             }
-            LifecycleError::RelayDuplicateRoute(route) => {
-                set_attr(value, "lifecycle_kind", "relay_duplicate_route");
-                set_attr(value, "route_name", route);
-                set_attr(value, "status_code", 409_u16);
-                set_attr(value, "relay_duplicate", true);
-            }
             LifecycleError::MissingRelayAddress => {
                 set_attr(value, "lifecycle_kind", "missing_relay_address");
-            }
-            LifecycleError::RelayHttp {
-                status_code,
-                message,
-            } => {
-                set_attr(value, "lifecycle_kind", "relay_http");
-                set_attr(value, "status_code", *status_code);
-                set_attr(value, "body", message);
             }
             LifecycleError::RegisterFailure(failure) => {
                 set_attr(value, "lifecycle_kind", "register_failure");

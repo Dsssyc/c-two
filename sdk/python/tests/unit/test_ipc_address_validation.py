@@ -86,17 +86,14 @@ def test_client_util_keeps_the_historical_call_shapes():
     }
 
 
-def test_ping_invalid_address_returns_false():
-    assert util.ping('tcp://not-ipc') is False
+def test_ping_invalid_address_raises():
+    with pytest.raises(ValueError):
+        util.ping('tcp://not-ipc')
 
 
-def test_shutdown_invalid_address_returns_false():
-    assert util.shutdown('tcp://not-ipc') == {
-        'acknowledged': False,
-        'shutdown_started': False,
-        'server_stopped': False,
-        'route_outcomes': [],
-    }
+def test_shutdown_invalid_address_raises():
+    with pytest.raises(ValueError):
+        util.shutdown('tcp://not-ipc')
 
 
 @pytest.mark.parametrize('timeout', [-1.0, float('nan'), float('inf')])

@@ -61,7 +61,7 @@ Typed overrides 为 `BaseIPCOverrides`、`ServerIPCOverrides`、`ClientIPCOverri
 | 单个服务端 frame 限额 | `set_server(ipc_overrides={'max_frame_size': ...})` | `C2_IPC_MAX_FRAME_SIZE` | 2 GiB |
 | 单条逻辑载荷限额 | `set_server(ipc_overrides={'max_payload_size': ...})` | `C2_IPC_MAX_PAYLOAD_SIZE` | 16 GiB |
 | 每连接待处理请求 | `set_server(ipc_overrides={'max_pending_requests': ...})` | `C2_IPC_MAX_PENDING_REQUESTS` | 1,024 |
-| Resource 执行线程 | `set_server(ipc_overrides={'max_execution_workers': ...})` | `C2_IPC_MAX_EXECUTION_WORKERS` | Host 并行度，限制在 4–64 |
+| Resource 执行线程 | `set_server(ipc_overrides={'max_execution_workers': ...})` | `C2_IPC_MAX_EXECUTION_WORKERS` | 默认按 Host 并行度取 4–64；显式值只要求大于 0 |
 
 显式 `address='ipc://...'` 连接直接使用本地端点。Relay anchor 负责注册和发现，HTTP 调用使用解析结果中的目标 relay URL。远程分块大小控制 C-Two 载荷批次，不等同于 TCP 包或 HTTP frame 大小。
 
@@ -99,7 +99,7 @@ Core 在首次 Host 启动尝试时冻结服务配置，失败也保持冻结；
 | `heartbeat_interval`（服务端） | `C2_IPC_HEARTBEAT_INTERVAL` | 15 秒 |
 | `heartbeat_timeout`（服务端） | `C2_IPC_HEARTBEAT_TIMEOUT` | 30 秒 |
 
-`pool_segment_size` 是池段容量，`max_payload_size` 是单条消息限额，两者独立。关闭 buddy 池仍允许 dedicated SHM、分块传输和文件溢出。Backing budget 和 live-reassembly budget 的 `0` 拒绝正数预留；`pool_decay_seconds=0` 在下一维护周期回收空闲段；`heartbeat_interval=0` 关闭心跳。
+`pool_segment_size` 是池段容量，向上取 2 的幂后须能用 u32 表示，即最大为 2 GiB；`max_payload_size` 是单条消息限额，两者独立。关闭 buddy 池仍允许 dedicated SHM、分块传输和文件溢出。Backing budget 和 live-reassembly budget 的 `0` 拒绝正数预留；`pool_decay_seconds=0` 在下一维护周期回收空闲段；`heartbeat_interval=0` 关闭心跳。
 
 `cc.observe.memory_stats()` 查看原生内存域，`cc.observe.memory_stats()["holds"]` 查看 SDK 租约，二者均为只读统计。它们不表示整个进程的 RSS。
 
@@ -130,7 +130,8 @@ C2_RELAY_IDLE_TIMEOUT=60
 | 转发保留输入 | `--call-retained-input-budget-bytes` | `C2_CALL_RETAINED_INPUT_BUDGET_BYTES` | 16 GiB / Relay |
 | 系统 HTTP proxy | — | `C2_RELAY_USE_PROXY` | `false` |
 | 反熵交换间隔 | — | `C2_RELAY_ANTI_ENTROPY_INTERVAL` | 60 秒 |
-| 客户端路由获取次数 | SDK 原生配置 | `C2_RELAY_ROUTE_MAX_ATTEMPTS` | 3，范围 1–32，`0` 按 1 |
+
+客户端路由获取固定为一次观察，加至多一次派发前刷新。
 
 预注册上游的语法为 `--upstream NAME=SERVER_ID@ADDRESS`，身份与 IPC handshake 一致。上游 budget 参数、mesh 和 dry-run 用法见 [c3 指南](../cli/README.md)。
 

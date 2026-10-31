@@ -10,7 +10,7 @@ import pytest
 
 from tests.fixtures import local_server
 
-from c_two._native import RuntimeSession
+from c_two._native import RuntimeSession, resolve_server_ipc_config
 
 import c_two as cc
 
@@ -170,14 +170,16 @@ def http_connection(start_c3_relay):
     registry = _get_default_runtime()
     identity = registry._runtime_session.ensure_server()
     relay = start_c3_relay()
-    from c_two.config.ipc import _resolve_server_ipc_config
+    max_payload_size = resolve_server_ipc_config(
+        registry._runtime_session.server_ipc_overrides,  # noqa: SLF001
+    )['max_payload_size']
     with httpx.Client(trust_env=False, timeout=5) as http:
         response = http.post(f'{relay.url}/_register', json={
             'name': name,
             'server_id': identity['server_id'],
             'server_instance_id': identity['server_instance_id'],
             'address': identity['ipc_address'],
-            'max_payload_size': _resolve_server_ipc_config()['max_payload_size'],
+            'max_payload_size': max_payload_size,
         })
         assert response.status_code == 201, response.text
     connection = cc.connect(TimedContract, name=name, address=relay.url)
@@ -317,7 +319,7 @@ def test_retired_domain_and_shutdown_report_unfinished_charges_honestly(ipc_conn
         assert retired['used_operations'] == 1
         assert retired['used_retained_bytes'] == nbytes
 
-        outcome = session.shutdown(route_names=[], relay_anchor_address=None)
+        outcome = session.shutdown()
         assert outcome['completed']
         assert outcome['ipc_clients_drained']
         if owner_kind == 'prepared':
@@ -359,7 +361,7 @@ def test_retired_domain_and_shutdown_report_unfinished_charges_honestly(ipc_conn
         if executor is not None:
             executor.shutdown(wait=True)
         cc.close(view)
-        replacement.shutdown(route_names=[], relay_anchor_address=None)
+        replacement.shutdown()
 
 
 @pytest.fixture

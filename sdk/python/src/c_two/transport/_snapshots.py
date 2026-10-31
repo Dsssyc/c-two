@@ -27,11 +27,9 @@ class ShutdownOutcome(TypedDict):
     relay_errors: list[RelayCleanupError]
     server_was_started: bool
     ipc_clients_drained: bool
-    http_clients_drained: bool
     route_close_error: str | None
     runtime_barrier_error: str | None
     ipc_client_close_error: str | None
-    ipc_clients_abnormally_closed: int
     ipc_client_close_details: list[ClientCloseDetail]
     completed: bool
 

@@ -83,10 +83,8 @@ Kubernetes, then point Python code at its relay anchor with
 registration and name resolution. Remote HTTP calls still use the resolved
 route's `relay_url` directly, and local direct IPC is selected only for a
 loopback/local anchor.
-Relay-aware clients preflight routes before the first call and re-resolve
-structured stale-route responses; set `C2_RELAY_ROUTE_MAX_ATTEMPTS` to tune the
-maximum route acquisition attempts (default `3`, valid range `1..=32`, `0` is
-treated as `1`). Ambiguous data-plane failures are not replayed.
+Relay-aware clients preflight routes before the first call and may refresh a
+stale route once. Ambiguous data-plane failures are not replayed.
 
 After the source-mode build, configure the absolute Core SDK library directory
 for Rust consumers spawned by interoperability tests. Follow the

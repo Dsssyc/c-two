@@ -55,7 +55,7 @@ def test_invalid_startup_timeout_does_not_mutate_configuration(invalid: float) -
         session.set_server_options(startup_timeout=None)
         assert session.startup_timeout is None
     finally:
-        assert session.shutdown(route_names=[])['completed']
+        assert session.shutdown()['completed']
 
 
 def test_startup_budget_survives_session_replacement_and_failed_register() -> None:
