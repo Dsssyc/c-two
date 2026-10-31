@@ -43,7 +43,7 @@ RUST_HARNESS_SOURCE = (
     REPOSITORY
     / "sdk/python/tests/fixtures/portable_interop_rust.rs"
 )
-TARGET_DIR = REPOSITORY / "core/target"
+TARGET_DIR = REPOSITORY / os.environ.get("CARGO_TARGET_DIR", "core/target")
 
 pytestmark = pytest.mark.timeout(300)
 

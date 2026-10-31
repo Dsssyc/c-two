@@ -683,7 +683,6 @@ mod native_boundary_tests {
             (128, 2, 0),
             (128, 1, 0),
             (128, 1, 129),
-            (1024, 513, 1),
         ] {
             // Zero budgets amplify an incorrect attempt to allocate invalid geometry.
             let (source, budget) = wire_admission_error(size, chunks, data_len, 0, 0);
@@ -697,6 +696,27 @@ mod native_boundary_tests {
             assert_eq!(budget.snapshot().reassembly.rejected_allocations, 0);
         }
     }
+
+    #[test]
+    fn encoded_valid_geometry_above_512_chunks_reports_budget_capacity() {
+        let (source, budget) = wire_admission_error(1024, 513, 1, 0, 0);
+        assert!(matches!(source, IpcError::Chunk(ChunkError::Capacity(_))));
+        let error = normalize_ipc_error(source, TransportPhase::DispatchUncertain);
+        let Error::Transport(transport) = error else {
+            panic!("expected reassembly capacity transport error")
+        };
+        assert_eq!(transport.phase(), TransportPhase::DispatchUncertain);
+        assert!(!transport.is_fallback_eligible());
+        let semantic = transport.semantic_error().unwrap();
+        assert_eq!(semantic.code, ErrorCode::ResourceUnavailable);
+        assert_eq!(semantic.details["stage"], "response_reassembly_admission");
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.reassembly.rejected_allocations, 1);
+        assert_eq!(snapshot.reassembly.used_bytes, 0);
+        assert_eq!(snapshot.file.used_bytes, 0);
+        assert_eq!(snapshot.shm.used_bytes, 0);
+    }
+
     #[test]
     fn local_call_rejection_keeps_semantic_code_and_no_fallback_details() {
         for code in [

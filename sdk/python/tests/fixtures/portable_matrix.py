@@ -46,7 +46,7 @@ REPOSITORY = Path(__file__).resolve().parents[4]
 RUST_HARNESS_SOURCE = (
     REPOSITORY / "sdk/python/tests/fixtures/portable_matrix_rust.rs"
 )
-TARGET_DIR = REPOSITORY / "core/target"
+TARGET_DIR = REPOSITORY / os.environ.get("CARGO_TARGET_DIR", "core/target")
 _CANDIDATE_CONTRACT_ROOT = os.environ.get(
     "C2_PORTABLE_MATRIX_CONTRACT_ROOT"
 )
@@ -155,9 +155,10 @@ def _c3_binary() -> Path:
             )
         return candidate
     name = "c3.exe" if os.name == "nt" else "c3"
+    target = REPOSITORY / os.environ.get("CARGO_TARGET_DIR", "cli/target")
     candidates = (
-        REPOSITORY / "cli/target/debug" / name,
-        REPOSITORY / "cli/target/release" / name,
+        target / "debug" / name,
+        target / "release" / name,
     )
     for candidate in candidates:
         if candidate.is_file():

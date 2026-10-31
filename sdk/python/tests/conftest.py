@@ -165,9 +165,10 @@ def c3_binary() -> Path:
         return candidate
     root = repo_root()
     name = 'c3.exe' if os.name == 'nt' else 'c3'
+    target = root / os.environ.get('CARGO_TARGET_DIR', 'cli/target')
     candidates = [
-        root / 'cli' / 'target' / 'debug' / name,
-        root / 'cli' / 'target' / 'release' / name,
+        target / 'debug' / name,
+        target / 'release' / name,
     ]
     for candidate in candidates:
         if candidate.exists():
