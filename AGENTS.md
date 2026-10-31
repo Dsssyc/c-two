@@ -510,6 +510,7 @@ Requires Python 3.10 or newer. Keep Python 3.10 compatibility intentional: downs
 
 ## Agent Working Rules
 
+- Open work and pending decisions live only in `docs/backlog.md`. Read it before starting work and update it whenever an item's status changes; remove finished items and note them in the acceptance or release record. Plans and reviews keep the details; do not keep a second todo list elsewhere.
 - Read the existing code before changing it.
 - Prefer `rg` and `rg --files` for repository searches.
 - After testing or a task finishes, promptly remove rebuildable artifacts no longer needed by ongoing work, including Cargo target directories, native libraries, dist bundles, wheels and package archives in temporary validation directories and worktrees. Confirm that no active build, test or runtime still uses them. Preserve source, Git state, test logs, receipts and explicitly retained deliverables; historical IPC directories and coordination files are not build-cleanup targets. Do not accumulate copies of build outputs across completed batches.
