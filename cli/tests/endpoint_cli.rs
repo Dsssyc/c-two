@@ -705,7 +705,7 @@ fn reap_rejects_a_non_utf8_credential_file() {
 fn reap_uses_the_native_credential_endpoint() {
     #[cfg(unix)]
     {
-        use c2_core::{EndpointInspection, inspect_endpoint, ping_direct_ipc_with_context};
+        use c2_core::{EndpointInspection, inspect_endpoint, ping_direct_ipc};
         let root = short_root();
         let address = unique_address("derive");
         let host = host_at(&address, root.path());
@@ -727,8 +727,7 @@ fn reap_uses_the_native_credential_endpoint() {
             .stdout(predicate::str::contains(r#""status":"busy""#))
             .stdout(predicate::str::contains(r#""reason":"coordinator-held""#));
         assert!(
-            ping_direct_ipc_with_context(&address, &context, std::time::Duration::from_secs(1))
-                .unwrap()
+            ping_direct_ipc(&address, Some(&context), std::time::Duration::from_secs(1)).unwrap()
         );
         let shutdown = host.shutdown();
         assert!(shutdown.runtime_barrier_error.is_none(), "{shutdown:?}");

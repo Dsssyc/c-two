@@ -18,7 +18,7 @@ fn ipc_endpoint_name(
     context: Option<&PyLocalEndpointContext>,
 ) -> PyResult<String> {
     let context = resolve_context(root, context)?;
-    let endpoint = c2_core::direct_ipc_endpoint_with_context(address, &context);
+    let endpoint = c2_core::direct_ipc_endpoint(address, Some(&context));
     endpoint
         .map(|endpoint| endpoint.os_name().to_string_lossy().into_owned())
         .map_err(|error| PyValueError::new_err(error.to_string()))
@@ -35,7 +35,7 @@ fn ipc_ping(
 ) -> PyResult<bool> {
     let timeout = timeout_duration(timeout_seconds)?;
     let context = resolve_context(root, context)?;
-    py.detach(|| c2_core::ping_direct_ipc_with_context(address, &context, timeout))
+    py.detach(|| c2_core::ping_direct_ipc(address, Some(&context), timeout))
         .map_err(|error| PyValueError::new_err(error.to_string()))
 }
 
@@ -51,7 +51,7 @@ fn ipc_shutdown<'py>(
     let timeout = timeout_duration(timeout_seconds)?;
     let context = resolve_context(root, context)?;
     let outcome = py
-        .detach(|| c2_core::shutdown_direct_ipc_with_context(address, &context, timeout))
+        .detach(|| c2_core::shutdown_direct_ipc(address, Some(&context), timeout))
         .map_err(|error| PyValueError::new_err(error.to_string()))?;
     shutdown_ack_dict(py, outcome)
 }

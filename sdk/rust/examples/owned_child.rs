@@ -3,7 +3,7 @@
 //! `C2_OWNER_HOLD_SECONDS` controls this example's demonstration duration and
 //! `C2_OWNER_RELEASE_MODE=drop` demonstrates ordinary owner destruction.
 //! Neither environment value carries a capability.
-use c_two::owner_control_pair;
+use c_two::owner::owner_control_pair;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 

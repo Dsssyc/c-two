@@ -30,12 +30,23 @@ see [connection configuration](../../docs/configuration.en.md#connection-deadlin
 
 ## Lifecycle and diagnostic APIs
 
+The crate root contains the Runtime, Host, client, registration and call types, their configuration and errors, `ContractRelease`, and `Held`. Supervisor, tooling and diagnostic APIs have one public path in these modules:
+
+| Module | Audience and contents |
+| --- | --- |
+| `c_two::endpoint` | Supervisors and maintenance tools: endpoint contexts, credentials, inspection, reaping, sweeps, direct IPC ping/shutdown and local I/O causes. |
+| `c_two::owner` | Trusted launchers: owner/bootstrap capabilities, recovery tickets, takeover and lifecycle policy. |
+| `c_two::observe` | Monitoring and diagnostics: connection events, call admission and concurrency snapshots, memory statistics, host lifecycle, paths and routes. |
+| `c_two::contract` | Contract tooling: validation errors and limits, release references and expected route contracts. |
+
+`c_two::endpoint::{direct_ipc_endpoint, ping_direct_ipc, shutdown_direct_ipc}` take the logical address followed by `Option<&LocalEndpointContext>`; ping and shutdown also take a `Duration`. Pass `Some(&context)` to use a captured local domain. `None` resolves the existing process configuration once, using platform defaults when no override is present.
+
 | Entry point | Contract |
 | --- | --- |
 | `Client::connection_observation()` / generated client method | Returns the current physical IPC observation. `snapshot()` reads its terminal record; async `wait_closed(Option<Duration>)` waits without retaining the connection. Thread-local and HTTP clients reject this operation. |
 | `Runtime::connection_events()` | Subscribes to future outgoing and accepted IPC connections without starting a host. Values expose `ConnectionSide`; async `recv(&self)` returns `Ok(None)` at end. `close()` wakes this subscriber only; lag or concurrent consumers return `ConnectionEventsError`. |
 | `Host::endpoint_credential()` | Returns `Option<EndpointCredential>` from the existing lifecycle watch. Ready/Stopping retain the listener snapshot; terminal states clear it. No inspect, filesystem I/O or gate lock; a snapshot proves neither liveness nor cleanup authority. |
-| `owner_control_pair()` | Returns `OwnerControl` and the one-use `OwnerBootstrap` for a trusted launcher. `recovery_ticket(timeout)` issues the current recovery grant; `revoke_recovery(timeout)` revokes it. |
+| `c_two::owner::owner_control_pair()` | Returns `OwnerControl` and the one-use `OwnerBootstrap` for a trusted launcher. `recovery_ticket(timeout)` issues the current recovery grant; `revoke_recovery(timeout)` revokes it. |
 | `Runtime::prepare_owner_takeover(ticket)` | Freezes the configured endpoint context. Save `successor_ticket().export()` before one `commit(timeout)`; a successful commit returns the new `OwnerControl`. `inspect(timeout)` observes state without proving commit success. |
 | `Error::local_io_cause()` | Returns `Option<LocalIoCause>` for bind/connect failures. `Bind(EndpointBindCause { error, unverified_reason })` preserves OS details or the typed binding refusal; `Connect(EndpointIoError)` keeps its OS cause. `error()` still returns the unchanged `EndpointIoError`. |
 | `Error::ProtocolVersionMismatch { local, peer }` | A complete fixed RPC preamble reported a different nonzero `u32` version. Terminal before metadata or dispatch; no retry or relay fallback. |
@@ -54,7 +65,8 @@ Unix credentials are rejected. Windows credentials retain schema 1.
 Portable payloads keep their owner-qualified name:
 
 ```rust
-use c_two::{Connect, ContractLimits, ContractRelease, Runtime};
+use c_two::{Connect, ContractRelease, Runtime};
+use c_two::contract::{ContractLimits};
 use fastdb::Payload;
 ```
 

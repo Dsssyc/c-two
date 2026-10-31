@@ -577,7 +577,7 @@ mod unix {
                 endpoint.context().clone()
             );
             assert_eq!(
-                c2_core::direct_ipc_endpoint("ipc://same-server").unwrap(),
+                c2_core::direct_ipc_endpoint("ipc://same-server", None).unwrap(),
                 host_b.local_endpoint().clone()
             );
         }

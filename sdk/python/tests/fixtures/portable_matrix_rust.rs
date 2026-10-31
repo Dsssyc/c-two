@@ -1,4 +1,5 @@
-use c_two::{Connect, Error as CTwoError, HostOptions, ObservedPath, Runtime, RuntimeOptions};
+use c_two::observe::ObservedPath;
+use c_two::{Connect, Error as CTwoError, HostOptions, Runtime, RuntimeOptions};
 use fastdb::{
     BuildPolicy, Builder, CompiledSpec, GraphIdentity, Payload, PayloadError, View, ViewKind,
 };

@@ -30,8 +30,7 @@ pub use client::{
 pub use connect_deadline::{ConnectAttempt, connect_deadline_error};
 pub use control::{
     DirectIpcShutdownOutcome, DirectIpcShutdownRouteOutcome, direct_ipc_endpoint,
-    direct_ipc_endpoint_with_context, ping_direct_ipc, ping_direct_ipc_with_context,
-    shutdown_direct_ipc, shutdown_direct_ipc_with_context,
+    ping_direct_ipc, shutdown_direct_ipc,
 };
 pub use error::{
     AdapterFailure, AdapterFailurePhase, Error, ExternalCause, LifecycleError, LocalIoCause,
