@@ -9,13 +9,17 @@
   - 状态：已在分支 `socu/interface-slimming` 实施并验收；macOS 上与 FastDB 0.2.4 并排验证通过，fork 全量 CI [41173746331](https://github.com/Dsssyc/c-two/actions/runs/41173746331)（`f0f9efaa`）在 Linux、macOS、Windows x64 与 ARM64 上全部通过。
   - 之后：向上游的 PR 暂缓，等后面几批一起开（用户 2026-10-31）。
 
+- **过度防御复审的真缺陷与死代码两批**
+  - 范围与分工：见[执行计划](plans/2026-10-31-defect-and-dead-code-batches.md)。按 crate 分成四个微任务：内存、wire 与服务端；IPC 与本地端点；Core、配置与 Python；relay、代码生成与 CLI。
+  - 状态：已开工（用户 2026-10-31）。
+  - 之后：集成后在 fork 上跑全量 CI。
+
 ## 顺序（Host 建议，待用户确认）
 
-1. 过度防御复审的真缺陷与死代码，两批并行。
-2. 重复校验；tmpfiles 先在 Linux 上复现。
-3. 结构调整，先出方案。
-4. 协议批，先出详细设计，附一份流式 RPC 草图。
-5. 配置收敛（逐项表定下之后）、AGENTS.md 重组、错误类型、流式 RPC。
+1. 重复校验；tmpfiles 先在 Linux 上复现。
+2. 结构调整，先出方案。
+3. 协议批，先出详细设计，附一份流式 RPC 草图。
+4. 配置收敛（逐项表定下之后）、AGENTS.md 重组、错误类型、流式 RPC。
 
 ## 过度防御复审
 
