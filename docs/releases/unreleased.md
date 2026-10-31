@@ -94,4 +94,4 @@ Rust `MemPool` constructors now return `Result` instead of panicking on an inval
 
 ### Validation
 
-Local macOS validation passed on the integrated candidate, with C-Two and FastDB 0.2.4 checked out side by side. The first full fork CI run [41188223489](https://github.com/Dsssyc/c-two/actions/runs/41188223489) on `8b756c74` failed two Core tests that the batches left stale: a relay test that still depended on the removed client-owner limit, on every platform, and a timing race in a c2-local Drop test, on macOS only. Every other gate passed on Linux, macOS, Windows x64 and Windows ARM64. Validation remains pending until a full run passes on the corrected candidate.
+Local macOS validation passed on the integrated candidate, with C-Two and FastDB 0.2.4 checked out side by side, and the full fork CI run [41192397960](https://github.com/Dsssyc/c-two/actions/runs/41192397960) on `e1630cf1` passed on Linux, macOS, Windows x64 and Windows ARM64. An earlier run on `8b756c74` found two Core tests that the batches had left stale; both were corrected before this run.

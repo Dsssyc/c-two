@@ -1,6 +1,6 @@
 # 真缺陷与死代码两批的执行计划
 
-日期：2026-10-31。输入：分支 `socu/interface-slimming`（接口精简第一批已验收）。依据：[过度防御复审](2026-10-31-over-defense-review.md)第一、二节；用户 2026-10-31 同意先做这两批。状态：实施中，进度见[待办清单](../backlog.md)。
+日期：2026-10-31。输入：分支 `socu/interface-slimming`（接口精简第一批已验收）。依据：[过度防御复审](2026-10-31-over-defense-review.md)第一、二节；用户 2026-10-31 同意先做这两批。状态：已实施并验收，fork 全量 CI [41192397960](https://github.com/Dsssyc/c-two/actions/runs/41192397960)（`e1630cf1`）在四个平台上通过；余项见[待办清单](../backlog.md)。
 
 ## 范围
 

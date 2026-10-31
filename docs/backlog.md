@@ -11,9 +11,9 @@
 
 - **过度防御复审的真缺陷与死代码两批**
   - 范围与分工：见[执行计划](plans/2026-10-31-defect-and-dead-code-batches.md)。按 crate 分成四个微任务：内存、wire 与服务端；IPC 与本地端点；Core、配置与 Python；relay、代码生成与 CLI。
-  - 状态：五个微任务都已集成到分支 `socu/over-defense-batches`。M1 至 M4 按 crate 并行；M5 迁移跨范围调用点，并补做 C1、C3、C8 零碎与 H13。macOS 上与 FastDB 0.2.4 并排验证通过：Python 1375 项、代码生成 33 项、Rust SDK 23 项、CLI 78 项、c2-core 145 项、native 16 项、`tests/repo` 612 项。
-  - CI：fork 全量 CI [41188223489](https://github.com/Dsssyc/c-two/actions/runs/41188223489)（`8b756c74`）的 core-test 里有两个测试失败，其余各步在四个平台上都通过。relay 的 `watch_capacity_recovers_or_shutdown_drains` 还依赖 F9 删掉的 1024 上限，四个平台都失败，已打回 M4；c2-local 的 `managed_drop_without_gate_leaves_metadata_for_the_reaper` 与 Drop 的后台退役线程有时序竞争，只在 macOS 上失败，已打回 M2。
-  - 之后：两处修正合入后重跑 fork 全量 CI；通过后，在看板上验收这五个微任务。
+  - 状态：已在分支 `socu/over-defense-batches` 实施并验收。M1 至 M4 按 crate 并行；M5 迁移跨范围调用点，并补做 C1、C3、C8 零碎与 H13。macOS 上与 FastDB 0.2.4 并排验证通过：Python 1375 项、代码生成 33 项、Rust SDK 23 项、CLI 78 项、c2-core 145 项、native 16 项、`tests/repo` 612 项。
+  - CI：首轮 fork 全量 CI（`8b756c74`）暴露两个遗留测试：relay 的容量测试还依赖 F9 删掉的 1024 上限，c2-local 的一个 Drop 测试与后台退役线程有时序竞争。打回 M4、M2 修正后，fork 全量 CI [41192397960](https://github.com/Dsssyc/c-two/actions/runs/41192397960)（`e1630cf1`）在 Linux、macOS、Windows x64 与 ARM64 上全部通过。五个微任务已在看板上验收。
+  - 之后：向上游的 PR 暂缓，与接口精简第一批一起开（用户 2026-10-31）。
 
 ## 顺序（Host 建议，待用户确认）
 
@@ -24,11 +24,10 @@
 
 ## 过度防御复审
 
-[复审](plans/2026-10-31-over-defense-review.md)第八节列出的批次。真缺陷与死代码已开工（见上），其余还没有开始：
+[复审](plans/2026-10-31-over-defense-review.md)第八节列出的批次。真缺陷与死代码两批已完成（见上），只剩下面写明的余项；其余还没有开始：
 
-- **真缺陷**（第一节，不涉及协议）：B8、D-drop、D4、A8、H3、H10、H11、H12、G4、B10、C8、F5c、F6、D9、F9。E-host 归入结构调整。
+- **真缺陷与死代码的余项**：E-host 归入结构调整，B1 归入协议批；F7 中的 `/_admin/unregister` 与注销状态码的区分、G2、G8 等用户决定；各区零碎里属于重复校验的部分归入重复校验。
 - **tmpfiles**（D-tmp）：先在 Linux 上复现 systemd-tmpfiles 清掉 gate 与 marker 的情形，再实施目录 flock。本机与 Windows 测试机都不是 Linux。
-- **死代码**（第二节）：C1、B1、F1、F7、G1、C3、A3、G6、A2、E3/E6/E7、H2/H5、G-slot，以及零碎各项。F7 与 G2 牵涉的几项，等用户的决定。
 - **重复校验**（第三节）：按区域进行。
 - **结构调整**（第四节，先出方案）：
   - Core 生命周期：E1、E2、E4、E-host；
@@ -36,7 +35,7 @@
   - 分片与池锁：B2；
   - relay：F2、F3、F6。
 - **协议批**（第五节）：
-  - 核心：[单一属主释放](plans/2026-10-31-single-owner-release-evaluation.md)，即握手 15、SHM 格式 4、C ABI 7，A9 也在其中。
+  - 核心：[单一属主释放](plans/2026-10-31-single-owner-release-evaluation.md)，即握手 15、SHM 格式 4、C ABI 7，A9 与 B1 也在其中。
   - 先写详细设计，包括消息格式、借出表、两个方向的发送时机、各条关闭路径与端到端基准；附一份流式 RPC 草图。经用户批准后再实施。
 - **测试**：随各批一起删除。
 
@@ -73,6 +72,7 @@
 
 - 本地直接跑 pytest 时，TypeScript 测试要先构建 c2-mem-ffi 的 Node 绑定（`core/foundation/c2-mem-ffi/bindings/typescript` 下 `npm ci && npm run build`）。没构建时，有 2 项报错、约 30 项被跳过，看上去像回归。可以让夹具缺这个绑定时直接报出来，或者在开发文档里写明这一步。
 
+- c2-local 的 Drop 在门锁短暂争用后由后台线程完成退役，这条正向路径已没有确定性的测试守住：`managed_drop_after_gate_contention_settles_ownership` 两种终态都接受。要守住，需要一个能观察后台重试的点。
 - `direct_ipc_endpoint`、`ping_direct_ipc`、`shutdown_direct_ipc` 收到上下文时每次都克隆一份，可以直接借用（`core/runtime/c2-core/src/control.rs`）。
 - `register` 的签名直接写 `Literal['materialized', 'borrowed']`，服务端桥里却另有一个私有别名 `_InputLifetime`。统一成一处。
 - 直接用 pytest 跑 Python 套件时，`test_typescript_persistent_ipc.py` 依赖别的测试先构建好 fastdb4ts；运行顺序不同就会报"尚未构建"。CI 的运行器会预先构建，所以只在本地出现。
