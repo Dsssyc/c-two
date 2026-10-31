@@ -18,7 +18,8 @@
 - **文档与 AGENTS.md 重组**
   - 范围：[执行计划](2026-10-31-docs-and-agents-restructure.md)。
   - 状态：第一步已完成并验收，合入分支 `socu/docs-restructure`（`a86403af`）。根 AGENTS.md 从 64,905 字节瘦到 21,934 字节，机制细节移入 `docs/reference/`；文档卫生检查守住 32 KiB、相对链接与中英两版的互链；独立审查确认旧 AGENTS.md 的规则都有着落。
-  - 状态续记（2026-10-31）：用户已批准执行计划第八节清退清单；D2 已按清单移动、合并与清退文档，迁移链接并扩展文档卫生检查，检查与交接见执行计划。Host 继续完成 `docs/README.md` 与 `CONTEXT.md`，本项待整体审查与验收。
+  - 第二步：用户 2026-10-31 批准执行计划第八节的清退清单，已实施并验收，合入为 `143c11e3`。`docs/` 只剩 reference、design、acceptance、research、releases、assets 六个目录；删除 151 份，另有 15 份在核对代码、挪出仍然成立的内容后删除；链接全部迁移。文档卫生检查改用 markdown-it-py，覆盖全部 Markdown，并拒绝本机的主目录与工作目录布局（hosted CI 上跳过）。
+  - 之后：`CONTEXT.md` 术语表待用户确认词条；然后跑一次 fork 全量 CI，向上游的 PR 在代码批次之后单独开。
 
 ## 顺序（Host 建议，待用户确认）
 
@@ -68,20 +69,19 @@
 - **内存：** buddy 中间空洞的复用；探针退出后客户端 backing 仍能打开，这一现象待核实；逐处复制字节的归因测量（`plans/2026-09-26-memory-policy.md` 的遗留项）。
 - **发版敏捷性方案 B：** B1 候选重整、B2 删除约 8 千行（`tools/local_rc` 与 `local-endpoint-validation.yml` 仍在）、B3 FastDB 版本只写一处、B5 精简各条线的 gate、B6 修 `PROBE_BUDGET` 的偶发失败；决定 3、7 待定（`plans/2026-10-30-release-agility-review.md` 第三、四节）。
 - **瘦身账本条目边界表里的余项：** R17 的 gate/context 与目录 pin 的错误分类；R06 回调重入导致自锁的风险；R13 写锁前取消时保留未发布的分配；R16 完整的 Node→Core 投影迁移；R29、R32、R33 的剩余，含孤立的 `wrap_error`；两份控制会话重构；C04；R14 与 C03 的剩余；R07：`abandoned_releases` 出现非零时重新评估。与复审重叠的部分按复审第七节处理。
-- **要核实的保证：** 旧 Python 服务端用写屏障保证同一连接内先写后读的顺序，当时的规格说 Rust 有等价机制，但现行文档没写，`c2-server` 里也没找到。查清楚之后，要么写进文档，要么确认已经不再保证。
-- **契约延后能力补记：** 对照[延后能力表](contract-release-deferred-capabilities.md)与本节已有项目补齐：Python portable 参数形状扩展与 Python-only pickle 的去留；原始 `unsafe_buffer` 衍生别名的可撤销访问边界；产物的可执行位、符号链接等非普通文件元数据；C-Two C++ SDK/codegen。范围与退出条件先按延后能力表评估，尚未授权实现。
-- **下游契约接入：** descriptor 的 digest resolver/storage、发布者签名与信任/撤销由 catalog/Authority 持有；Toodle 的 canonical ref、官方包固定与窄适配器消费证明仍待下游完成。它们未列入当前 C-Two 路线图，边界与退出条件保留在[延后能力表](contract-release-deferred-capabilities.md)。
+- **要核实的保证：** 旧 Python 服务端用写屏障保证同一连接内先写后读的顺序，当时的规格说 Rust 有等价机制，但现行文档没写，`c2-server` 里也没找到；执行准入规格的不变量 I14（连接屏障）同样没有实现。查清楚之后，要么写进文档，要么确认已经不再保证。
+- **契约发布的延后能力：** [延后能力表](contract-release-deferred-capabilities.md)里仍开着、但目前没有使用者的几项（Python portable 参数形状的扩展、原始 `unsafe_buffer` 别名的访问边界、产物里的非普通文件、C++ SDK，以及 descriptor 存储、签名与信任这类下游 catalog 的事）不排期；有了使用者再登记成具体条目。
 
 
 ## 将来
 
+- **多副本一致性**（relay mesh 原先设想的第二、三阶段）：2026-07 的草稿设想过同一资源在多个节点上的副本：路由带版本号，写成功后经 gossip 通知其他副本过期，写之前广播意图做跨节点写锁，读到过期副本时按策略处理，并提供内置的刷新方式与一致性级别。这些从没实现，现在不同节点上的同名路由彼此不知道对方。用户 2026-10-31 认为那套做法不一定是最佳策略，留作蓝图：协议批与流式 RPC 落地之后，或者有下游需要同一资源的多个副本时，再从头讨论设计。原文见上游的[固定版本](https://github.com/world-in-progress/c-two/blob/606b8f13290c15ebff3a04a02e2ac5c6463afa7c/docs/superpowers/specs/2026-07-20-relay-mesh-resource-discovery-design.md)第二、三阶段。
 - **流式 RPC**（[路线图](roadmap.zh-CN.md)第 7 项）：用户确认这是必备能力。排在协议批之后；设计要回答单一属主评估"与流式 RPC 的关系"一节列出的八个问题。
 
 ## 待用户决定
 
 - 配置项的逐项表。
 - `CONTEXT.md` 的词条（文档清退清单已于 2026-10-31 批准）。
-- 706 `WriteConflict`：错误码已登记，但生产代码从不产生。原计划中的 relay 副本写协调未实现，路线图里也没有；待决定将它纳入路线图还是删掉这个码。
 - 所有者子系统是否删除。
 - relay 轮询的间隔。
 - `/_admin/unregister` 有没有人手动使用（F7）。
@@ -92,6 +92,8 @@
 ## 顺带项
 
 下一批碰到同一块代码时顺带做掉：
+
+- 删除从没产生过的错误码 706 `WriteConflict`，连同 Python 的错误类、映射与相关测试（用户 2026-10-31 同意）。它原本属于上面"多副本一致性"的写锁设想；以后真要做，按新设计重新登记。704 是还在使用的 `RouteStale`，不动。
 
 - 本地直接跑 pytest 时，TypeScript 测试要先构建 c2-mem-ffi 的 Node 绑定（`core/foundation/c2-mem-ffi/bindings/typescript` 下 `npm ci && npm run build`）。没构建时，有 2 项报错、约 30 项被跳过，看上去像回归。可以让夹具缺这个绑定时直接报出来，或者在开发文档里写明这一步。
 
