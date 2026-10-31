@@ -11,8 +11,8 @@
 
 - **过度防御复审的真缺陷与死代码两批**
   - 范围与分工：见[执行计划](plans/2026-10-31-defect-and-dead-code-batches.md)。按 crate 分成四个微任务：内存、wire 与服务端；IPC 与本地端点；Core、配置与 Python；relay、代码生成与 CLI。
-  - 状态：已开工（用户 2026-10-31）。
-  - 之后：集成后在 fork 上跑全量 CI。
+  - 状态：五个微任务都已集成到分支 `socu/over-defense-batches`。M1 至 M4 按 crate 并行；M5 迁移跨范围调用点，并补做 C1、C3、C8 零碎与 H13。macOS 上与 FastDB 0.2.4 并排验证通过：Python 1375 项、代码生成 33 项、Rust SDK 23 项、CLI 78 项、c2-core 145 项、native 16 项、`tests/repo` 612 项。
+  - 之后：完整的 Core relay 测试套件要在干净的 runner 上跑，交给 fork 全量 CI；CI 通过后，在看板上验收这五个微任务。
 
 ## 顺序（Host 建议，待用户确认）
 
@@ -69,6 +69,8 @@
 ## 顺带项
 
 下一批碰到同一块代码时顺带做掉：
+
+- 本地直接跑 pytest 时，TypeScript 测试要先构建 c2-mem-ffi 的 Node 绑定（`core/foundation/c2-mem-ffi/bindings/typescript` 下 `npm ci && npm run build`）。没构建时，有 2 项报错、约 30 项被跳过，看上去像回归。可以让夹具缺这个绑定时直接报出来，或者在开发文档里写明这一步。
 
 - `direct_ipc_endpoint`、`ping_direct_ipc`、`shutdown_direct_ipc` 收到上下文时每次都克隆一份，可以直接借用（`core/runtime/c2-core/src/control.rs`）。
 - `register` 的签名直接写 `Literal['materialized', 'borrowed']`，服务端桥里却另有一个私有别名 `_InputLifetime`。统一成一处。
