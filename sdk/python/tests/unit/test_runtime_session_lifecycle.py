@@ -17,6 +17,12 @@ import sys
 import pytest
 
 import c_two as cc
+
+import c_two.owner
+
+import c_two.endpoint
+
+import c_two.observe
 from c_two.config.lifecycle import (
     LifecycleConfig,
 )
@@ -99,7 +105,7 @@ class TestRuntimeSessionLifecycleProjection:
         session.ensure_host_started()
         assert session.host_started is True
         credential = session.server_credential
-        assert type(credential) is cc.EndpointCredential  # No route was registered.
+        assert type(credential) is cc.endpoint.EndpointCredential  # No route was registered.
         assert credential.address == session.server_address
         snapshot = session.native_lifecycle_snapshot()
         assert snapshot['phase'] == 'persistent'
@@ -130,7 +136,7 @@ class TestRuntimeSessionLifecycleProjection:
 
 class TestOwnerControlCapability:
     def test_receiver_is_opaque_one_shot_and_never_renders_an_endpoint(self) -> None:
-        keepalive, receiver = cc.owner_control_pair()
+        keepalive, receiver = cc.owner.owner_control_pair()
         assert receiver.is_available is True
         assert 'opaque owner capability' in repr(receiver)
         assert 'opaque owner capability' in repr(keepalive)
@@ -138,16 +144,16 @@ class TestOwnerControlCapability:
         text = f'{receiver!r} {keepalive!r}'
         for forbidden in ('fd', 'handle', 'pipe', 'tmp', 'token', '/'):
             assert forbidden not in text
-        assert isinstance(keepalive, cc.OwnerControl)
+        assert isinstance(keepalive, cc.owner.OwnerControl)
         keepalive.close()
-        with pytest.raises(cc.OwnerControlError) as closed:
+        with pytest.raises(cc.owner.OwnerControlError) as closed:
             keepalive.recovery_ticket(timeout=0)
         assert closed.value.kind == 'not_sent'
 
     def test_capability_is_consumed_exactly_once(self) -> None:
         from c_two._native import RuntimeSession
 
-        keepalive, receiver = cc.owner_control_pair()
+        keepalive, receiver = cc.owner.owner_control_pair()
         session = RuntimeSession(server_id='unit-consume-once')
         try:
             session.set_lifecycle_policy('owner_bound', 1.0)
@@ -170,7 +176,7 @@ class TestOwnerControlCapability:
     def test_owner_eof_reaches_a_real_terminal_outcome(self) -> None:
         from c_two._native import RuntimeSession
 
-        keepalive, receiver = cc.owner_control_pair()
+        keepalive, receiver = cc.owner.owner_control_pair()
         session = RuntimeSession(server_id='unit-owner-eof')
         try:
             session.set_lifecycle_policy('owner_bound', 0.1)
@@ -199,11 +205,11 @@ class TestSetServerKeywords:
         cc.shutdown()
 
     def test_owner_control_requires_the_owner_bound_policy(self) -> None:
-        keepalive, receiver = cc.owner_control_pair()
+        keepalive, receiver = cc.owner.owner_control_pair()
         try:
             with pytest.raises(ValueError, match='requires the owner_bound'):
                 cc.set_server(
-                    lifecycle=cc.LifecycleConfig.persistent(),
+                    lifecycle=cc.owner.LifecycleConfig.persistent(),
                     owner_control=receiver,
                 )
         finally:
@@ -217,11 +223,11 @@ class TestSetServerKeywords:
     def test_owner_bound_set_server_arms_a_real_running_host(self) -> None:
         from c_two.transport.registry import _get_default_runtime
 
-        keepalive, receiver = cc.owner_control_pair()
+        keepalive, receiver = cc.owner.owner_control_pair()
         try:
             cc.set_server(
                 server_id='unit-set-server-owner',
-                lifecycle=cc.LifecycleConfig.owner_bound(0.2),
+                lifecycle=cc.owner.LifecycleConfig.owner_bound(0.2),
                 owner_control=receiver,
             )
             session = _get_default_runtime()._runtime_session  # noqa: SLF001
@@ -241,16 +247,16 @@ class TestSetServerKeywords:
             server = _get_default_runtime()._server  # noqa: SLF001
             assert server.is_started() is True
             assert session.owner_control_attached is False
-            assert server.native_lifecycle_snapshot()['phase'] == 'armed'
-            assert server.native_terminal_outcome() is None
+            assert server.lifecycle_snapshot()['phase'] == 'armed'
+            assert server.shutdown_outcome() is None
 
             keepalive.close()
             deadline = time.monotonic() + 10.0
-            while server.native_terminal_outcome() is None:
+            while server.shutdown_outcome() is None:
                 assert time.monotonic() < deadline, 'owner EOF never became terminal'
                 time.sleep(0.02)
             assert server.is_started() is False
-            assert server.native_lifecycle_snapshot()['phase'] == 'finished'
+            assert server.lifecycle_snapshot()['phase'] == 'finished'
         finally:
             keepalive.close()
             cc.shutdown()
@@ -258,12 +264,12 @@ class TestSetServerKeywords:
     def test_ordinary_business_clients_never_end_an_owner_bound_server(self) -> None:
         from c_two.transport.registry import _get_default_runtime
 
-        keepalive, receiver = cc.owner_control_pair()
+        keepalive, receiver = cc.owner.owner_control_pair()
         proxy = None
         try:
             cc.set_server(
                 server_id='unit-owner-business',
-                lifecycle=cc.LifecycleConfig.owner_bound(0.2),
+                lifecycle=cc.owner.LifecycleConfig.owner_bound(0.2),
                 owner_control=receiver,
             )
 
@@ -286,7 +292,7 @@ class TestSetServerKeywords:
             # The server is armed and idle; its slot is still registered.
             server = _get_default_runtime()._server  # noqa: SLF001
             assert 'owner-business' in server.names
-            assert server.native_lifecycle_snapshot()['phase'] == 'armed'
+            assert server.lifecycle_snapshot()['phase'] == 'armed'
         finally:
             if proxy is not None:
                 cc.close(proxy)
@@ -296,8 +302,8 @@ class TestSetServerKeywords:
 
 def test_duplicate_and_configuration_errors_preserve_valid_receiver():
     from c_two._native import RuntimeSession
-    first_keepalive, first = cc.owner_control_pair()
-    second_keepalive, second = cc.owner_control_pair()
+    first_keepalive, first = cc.owner.owner_control_pair()
+    second_keepalive, second = cc.owner.owner_control_pair()
     session = RuntimeSession()
     try:
         session.set_lifecycle_policy('owner_bound', 0)
@@ -324,7 +330,7 @@ def test_duplicate_and_configuration_errors_preserve_valid_receiver():
 
 def test_preclosed_owner_cannot_publish_readiness():
     from c_two._native import RuntimeSession
-    keepalive, receiver = cc.owner_control_pair()
+    keepalive, receiver = cc.owner.owner_control_pair()
     session = RuntimeSession()
     session.set_lifecycle_policy('owner_bound', 0)
     session.attach_owner_control(receiver)
@@ -338,14 +344,14 @@ def test_preclosed_owner_cannot_publish_readiness():
 
 def test_failed_start_late_attach_preserves_valid_receiver():
     from c_two._native import RuntimeSession
-    keepalive, receiver = cc.owner_control_pair()
+    keepalive, receiver = cc.owner.owner_control_pair()
     session = RuntimeSession()
     session.set_lifecycle_policy('owner_bound', 0)
     session.attach_owner_control(receiver)
     keepalive.close()
     with pytest.raises(Exception):
         session.ensure_host_started()
-    other_keepalive, other_receiver = cc.owner_control_pair()
+    other_keepalive, other_receiver = cc.owner.owner_control_pair()
     try:
         with pytest.raises(Exception, match='before the Core host starts'):
             session.attach_owner_control(other_receiver)
@@ -359,7 +365,7 @@ def test_regular_business_stdin_cannot_be_adopted():
     import os
     import subprocess
     import sys
-    script = "import c_two as cc; cc.adopt_owner_stdin(); print('UNEXPECTED_READY')"
+    script = "import c_two as cc; import c_two.owner; import c_two.endpoint; import c_two.observe; cc.owner.OwnerBootstrap.adopt_owner_stdin(); print('UNEXPECTED_READY')"
     result = subprocess.run([sys.executable, '-c', script], stdin=subprocess.DEVNULL,
                             capture_output=True, text=True, timeout=10)
     assert result.returncode != 0
@@ -367,13 +373,13 @@ def test_regular_business_stdin_cannot_be_adopted():
 
 
 def test_failed_spawn_consumes_the_transferred_receiver():
-    keepalive, receiver = cc.owner_control_pair()
+    keepalive, receiver = cc.owner.owner_control_pair()
     try:
         with pytest.raises(ValueError, match='spawn failed'):
-            cc.spawn_owned_child(receiver, '/nonexistent-c2-owner-test-program')
+            cc.owner.spawn_owned_child(receiver, '/nonexistent-c2-owner-test-program')
         assert not receiver.is_available
         with pytest.raises(RuntimeError, match='already consumed'):
-            cc.spawn_owned_child(receiver, '/nonexistent-c2-owner-test-program')
+            cc.owner.spawn_owned_child(receiver, '/nonexistent-c2-owner-test-program')
     finally:
         keepalive.close()
 
@@ -384,8 +390,8 @@ def test_takeover_tickets_and_real_thread_guard_survive_pause_resume(monkeypatch
             # This test expects a server refusal, so unrelated xdist workers
             # must not contend for its nonblocking namespace identity gate.
             root = scope.enter_context(tempfile.TemporaryDirectory(prefix='c2-owner-', dir='/tmp'))
-            cc.set_local_endpoint(root=root)
-            scope.callback(cc.set_local_endpoint)
+            cc.endpoint.set_local_endpoint(root=root)
+            scope.callback(cc.endpoint.set_local_endpoint)
         from c_two.error import ResourceUnavailable
 
         @cc.crm(namespace='test.owner.takeover', version='1.0.0')
@@ -399,7 +405,7 @@ def test_takeover_tickets_and_real_thread_guard_survive_pause_resume(monkeypatch
                 self.calls += 1
                 return value
 
-        owner, bootstrap = cc.owner_control_pair()
+        owner, bootstrap = cc.owner.owner_control_pair()
         successor = None
         proxy = None
         address = None
@@ -422,7 +428,7 @@ def test_takeover_tickets_and_real_thread_guard_survive_pause_resume(monkeypatch
             owner.revoke_recovery(timeout=3)
             current = owner.recovery_ticket(timeout=3)
             assert current.export() != first.export()
-            prepared = cc.prepare_owner_takeover(cc.OwnerRecoveryTicket.from_bytes(current.export()))
+            prepared = cc.owner.prepare_owner_takeover(cc.owner.OwnerRecoveryTicket.from_bytes(current.export()))
             assert prepared.inspect(timeout=3).phase == 'armed'
             saved = prepared.successor_ticket.export()
             # Hold the actual native guard before EOF; it must not cross the whole
@@ -430,11 +436,11 @@ def test_takeover_tickets_and_real_thread_guard_survive_pause_resume(monkeypatch
             old_guard = scheduler.execution_guard(scheduler.method_idx('echo'))
             owner.close()
             deadline = time.monotonic() + 3
-            while cc.native_lifecycle_snapshot()['phase'] != 'owner_missing':
+            while cc.observe.lifecycle_snapshot()['phase'] != 'owner_missing':
                 assert time.monotonic() < deadline
                 time.sleep(.005)
-            with pytest.raises(cc.OwnerControlError) as revoked:
-                cc.prepare_owner_takeover(first).commit(timeout=3)
+            with pytest.raises(cc.owner.OwnerControlError) as revoked:
+                cc.owner.prepare_owner_takeover(first).commit(timeout=3)
             assert revoked.value.kind == 'invalid_grant'
             successor = prepared.commit(timeout=3)
             assert successor.recovery_ticket(timeout=3).export() == saved
@@ -446,7 +452,7 @@ def test_takeover_tickets_and_real_thread_guard_survive_pause_resume(monkeypatch
             assert scheduler.snapshot().pending == 0
             assert proxy.echo(23) == 23
             assert resource.calls == 1
-            with pytest.raises(cc.OwnerControlError) as replay:
+            with pytest.raises(cc.owner.OwnerControlError) as replay:
                 prepared.commit(timeout=3)
             assert replay.value.kind == 'not_sent'
             successor.request_shutdown(timeout=3)
@@ -460,7 +466,7 @@ def test_takeover_tickets_and_real_thread_guard_survive_pause_resume(monkeypatch
             if successor is not None:
                 successor.close()
             if address is not None:
-                inspected = cc.inspect_endpoint(address)
+                inspected = cc.endpoint.inspect_endpoint(address)
                 if sys.platform == 'win32':
                     from c_two.transport.client.util import ping
                     assert inspected['status'] == 'not-applicable'

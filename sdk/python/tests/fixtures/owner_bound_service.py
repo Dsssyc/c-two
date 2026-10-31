@@ -22,6 +22,8 @@ import sys
 
 import c_two as cc
 
+import c_two.owner
+
 READY_MARKER = 'OWNER_BOUND_READY'
 FINISHED_MARKER = 'OWNER_BOUND_FINISHED'
 HOLD_MARKER = 'OWNER_BOUND_HOLDING'
@@ -64,11 +66,11 @@ def _service() -> int:
     if marker and os.path.exists(marker):
         os.unlink(marker)
 
-    receiver = cc.adopt_owner_stdin()
+    receiver = cc.owner.OwnerBootstrap.adopt_owner_stdin()
     grace = float(os.environ.get('C2_OWNER_GRACE_SECONDS', '0.5'))
     cc.set_server(
         server_id=os.environ.get('C2_OWNER_SERVER_ID', 'owner-bound-fixture'),
-        lifecycle=cc.LifecycleConfig.owner_bound(grace),
+        lifecycle=cc.owner.LifecycleConfig.owner_bound(grace),
         owner_control=receiver,
     )
     cc.register(OwnerBoundEcho, OwnerBoundEchoResource(), name='owned-echo')

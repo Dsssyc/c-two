@@ -12,6 +12,8 @@ import uuid
 import pytest
 
 import c_two as cc
+
+import c_two.endpoint
 from c_two.transport import registry as registry_module
 from tests.fixtures.process_control import (
     interrupt_python_process,
@@ -29,6 +31,7 @@ class Echo:
 _RESOURCE = """
 import os
 import c_two as cc
+import c_two.endpoint
 
 @cc.crm(namespace='test.frozen-peer-shutdown', version='0.1.0')
 class Echo:
@@ -62,7 +65,7 @@ def test_client_shutdown_with_live_proxy(monkeypatch, freeze: bool, hosted: bool
             # of any process session used by earlier tests.
             environment.setattr(registry_module, '_default_runtime', None)
             cc.shutdown()
-            context = cc.local_endpoint_context()
+            context = cc.endpoint.local_endpoint_context()
             child_env = os.environ.copy()
             child_env['C2_TEST_FROZEN_SERVER_ID'] = f'frozen-peer-{uuid.uuid4().hex}'
             process = subprocess.Popen(
@@ -78,7 +81,7 @@ def test_client_shutdown_with_live_proxy(monkeypatch, freeze: bool, hosted: bool
                 address = readline_with_timeout(process.stdout, 5).strip()
                 assert address.startswith('ipc://'), address
                 if os.name != 'nt':
-                    observed = cc.inspect_endpoint(address, context=context)
+                    observed = cc.endpoint.inspect_endpoint(address, context=context)
                     assert observed['status'] == 'present', observed
                     credential = observed['credential']
                     assert credential is not None
@@ -132,5 +135,5 @@ def test_client_shutdown_with_live_proxy(monkeypatch, freeze: bool, hosted: bool
                         process.communicate(timeout=5)
                     assert process.returncode is not None
                     if address is not None and credential is not None:
-                        reaped = cc.reap_endpoint(address, credential, context=context)
+                        reaped = cc.endpoint.reap_endpoint(address, credential, context=context)
                         assert reaped['status'] in {'reaped', 'already-absent'}, reaped

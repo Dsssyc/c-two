@@ -9,6 +9,8 @@ import pytest
 
 import c_two as cc
 
+import c_two.contract
+
 
 def _contract_hashes(crm_class: type) -> tuple[str, str]:
     from c_two.crm.descriptor import build_contract_fingerprints
@@ -122,7 +124,7 @@ def test_non_portable_descriptor_allows_pickle_fallback_for_plain_python_payload
     }
     assert _contract_hashes(PickleFallback)
     with pytest.raises(ValueError, match='python-pickle-default'):
-        cc.export_contract_descriptor(PickleFallback)
+        cc.contract.export_descriptor(PickleFallback)
 
 
 @pytest.mark.parametrize(
@@ -173,7 +175,7 @@ def test_plain_python_annotations_are_python_pickle_fallback_not_payload_plan():
         'name': 'PlainPayload',
     }
     with pytest.raises(ValueError, match='python-pickle-default'):
-        cc.export_contract_descriptor(PythonOnlyContract)
+        cc.contract.export_descriptor(PythonOnlyContract)
 
 
 def test_remote_surface_transferables_do_not_use_implicit_abi_declarations():

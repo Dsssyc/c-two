@@ -72,7 +72,7 @@ c3 contract codegen typescript echo.contract.json --out-dir generated-typescript
 
 The output contains C-Two contract/release/composition metadata, the target-specific C-Two adapter, and FastDB Core-owned payload modules. Generation is fail-closed: invalid or colliding paths, hash mismatches, FastDB errors, and existing destinations produce no partial winning tree. There is no separate payload sidecar input.
 
-`c3 contract diagnose` and `c3 contract infer ... --diagnose` report methods that remain Python-only. Portable payload structure is authored explicitly with `@cc.transfer(...)`; inference does not synthesize it from domain annotations.
+`c3 contract diagnose` reports methods that remain Python-only. Portable payload structure is authored explicitly with `@cc.transfer(...)`.
 
 ## Configuration
 

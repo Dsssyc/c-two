@@ -12,6 +12,10 @@ import uuid
 import pytest
 
 import c_two as cc
+
+import c_two.endpoint
+
+import c_two.observe
 from c_two._native import RuntimeSession
 from c_two.config.settings import C2Settings, settings
 from c_two.transport import registry
@@ -122,8 +126,8 @@ def test_empty_start_uses_native_readiness_and_leaves_directory_owned_by_caller(
         runtime.set_server(startup_timeout=5.0)
         runtime.start()
         assert runtime.names == []
-        assert runtime.native_lifecycle_snapshot()['listener_closed'] is False
-        assert runtime.native_terminal_outcome() is None
+        assert runtime.lifecycle_snapshot()['listener_closed'] is False
+        assert runtime.shutdown_outcome() is None
         credential = runtime.server_credential()
         assert credential.address == runtime.server_address()
         assert registry._default_runtime is None
@@ -146,7 +150,7 @@ def test_two_runtime_names_connections_and_shutdown_are_independent(runtimes):
         assert direct.echo('local') == 'first:local'
     with second.connect(Echo, name='same', address=second.server_address()) as remote:
         assert remote.client.observed_path == 'direct_ipc'
-        observation = cc.connection_observation(remote)
+        observation = cc.observe.connection_observation(remote)
         assert first.shutdown()['completed']
         assert resources[0].stopped == 1
         assert resources[1].stopped == 0
@@ -169,7 +173,7 @@ def test_explicit_instances_communicate_through_real_ipc(runtimes):
     try:
         with client.connect(Echo, name='echo', address=server.server_address()) as proxy:
             assert proxy.echo('ok') == 'remote:ok'
-            observation = cc.connection_observation(proxy)
+            observation = cc.observe.connection_observation(proxy)
             opened = events.recv(timeout=1.0)
             assert opened.kind == 'opened' and opened.side == 'client'
             assert opened.connection_id == observation.connection_id
@@ -188,7 +192,7 @@ def test_start_then_failed_registration_preserves_host(runtimes):
     with pytest.raises((ValueError, cc.error.CoreError)):
         runtime.register(Echo, EchoResource('bad:'), name='')
     assert runtime.server_credential().to_json() == credential
-    assert runtime.native_lifecycle_snapshot()['listener_closed'] is False
+    assert runtime.lifecycle_snapshot()['listener_closed'] is False
     runtime.register(Echo, EchoResource('ok:'), name='valid')
     with runtime.connect(Echo, name='valid', address=runtime.server_address()) as proxy:
         assert proxy.echo('after') == 'ok:after'
@@ -214,7 +218,7 @@ def test_default_api_and_explicit_runtime_keep_separate_owners(runtimes):
     runtime = runtimes[0]
     context = runtime.local_endpoint_context()
     if context.root is not None:
-        cc.set_local_endpoint(root=context.root)
+        cc.endpoint.set_local_endpoint(root=context.root)
     cc.set_transport_policy(shm_threshold=16384)
     cc.register(Echo, EchoResource('default:'), name='same')
     runtime.register(Echo, EchoResource('explicit:'), name='same')
@@ -233,6 +237,8 @@ def test_start_error_projection_allows_native_lifecycle_observation(tmp_path):
     script = textwrap.dedent('''
         import os, sys
         import c_two as cc
+        import c_two.endpoint
+        import c_two.observe
         from c_two._native import RuntimeSession
         session = RuntimeSession(startup_timeout=0, use_process_relay_anchor=False)
         if os.name != 'nt':
@@ -301,6 +307,8 @@ def test_public_start_preserves_native_bind_denial_and_cleanup(tmp_path):
         import os, sys
         from pathlib import Path
         import c_two as cc
+        import c_two.endpoint
+        import c_two.observe
         root = Path(sys.argv[1])
         runtime = cc.Runtime()
         runtime.set_local_endpoint(root=str(root))

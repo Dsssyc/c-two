@@ -101,7 +101,7 @@ Core 在首次 Host 启动尝试时冻结服务配置，失败也保持冻结；
 
 `pool_segment_size` 是池段容量，`max_payload_size` 是单条消息限额，两者独立。关闭 buddy 池仍允许 dedicated SHM、分块传输和文件溢出。Backing budget 和 live-reassembly budget 的 `0` 拒绝正数预留；`pool_decay_seconds=0` 在下一维护周期回收空闲段；`heartbeat_interval=0` 关闭心跳。
 
-`cc.memory_stats()` 查看原生内存域，`cc.hold_stats()` 查看 SDK 租约，二者均为只读统计。它们不表示整个进程的 RSS。
+`cc.observe.memory_stats()` 查看原生内存域，`cc.observe.memory_stats()["holds"]` 查看 SDK 租约，二者均为只读统计。它们不表示整个进程的 RSS。
 
 ## Relay 与 c3
 
@@ -144,7 +144,7 @@ HTTP 调用方断开后，已经派发的转发仍持有其输入和上游连接
 
 | 平台 | 端点 | 位置配置 |
 | --- | --- | --- |
-| Unix | 配置目录内的 UDS | 代码 `cc.set_local_endpoint(root=...)`、环境 `C2_IPC_ROOT`、c3 `--ipc-root`，默认 `/tmp/c2-v3-<uidhex>` |
+| Unix | 配置目录内的 UDS | 代码 `cc.endpoint.set_local_endpoint(root=...)`、环境 `C2_IPC_ROOT`、c3 `--ipc-root`，默认 `/tmp/c2-v3-<uidhex>` |
 | Windows | 当前用户 TokenUser SID 下的 Named Pipe | 自动选择；Unix root 配置不适用 |
 
 Unix root 是最终端点目录，实际 socket 位于 `<root>/<32 字符标识>`。自定义目录由应用预建，允许 `0755`：当前用户持有目录，具备读、写、遍历权限，组和其他用户没有写权限。默认目录由 C-Two 创建为 `0700`。Socket 在开始监听前设置并核实为 `0600`。路径允许中文和空格，绑定、连接与探测通过目录句柄定位短名称，目录长度受文件系统限制。C-Two 只管理自身端点、租约及协调文件，不修改已有目录权限、不递归创建父目录、不删除应用目录或无关文件。共享本地域的资源进程、客户端和 relay 使用相同 root；root 不改变 SHM 或 file-spill 的位置。配置在首次本地 I/O 尝试时冻结，包括失败的尝试。
@@ -156,10 +156,11 @@ macOS 会额外拒绝允许修改目录内容、属性或权限的扩展 ACL 条
 ```python
 from pathlib import Path
 import c_two as cc
+import c_two.endpoint
 
 ipc_dir = Path.home() / 'my-app' / 'ipc'
 ipc_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-cc.set_local_endpoint(root=str(ipc_dir))
+cc.endpoint.set_local_endpoint(root=str(ipc_dir))
 ```
 
 端点凭据保留其原生 scope。控制器在确认子进程退出后使用精确凭据清理；完整规则与 SDK/CLI 示例见[生命周期指南](local-endpoint-lifecycle.md)。
@@ -181,10 +182,10 @@ cc.set_local_endpoint(root=str(ipc_dir))
 
 直连 IPC 默认无限等待；HTTP 的预算覆盖一个逻辑调用和其内的路由重取。`timeout=None` 显式无限，`0` 在派发前到期，负数和非有限值在入口拒绝。同进程同步调用只接受继承或无限策略。
 
-期限结束调用方等待，已派发的原生事务仍持有输入直到真正完成。有限调用的数量上限 `0` 拒绝所有新有限调用，字节预算 `0` 只拒绝正数输入；无限调用不受这两项准入限额约束。`cc.call_execution_snapshot()` 查看当前及退休域的真实计费。示例与错误阶段见[调用期限指南](releases/0.7.1.md#per-call-deadlines-for-remote-calls)。
+期限结束调用方等待，已派发的原生事务仍持有输入直到真正完成。有限调用的数量上限 `0` 拒绝所有新有限调用，字节预算 `0` 只拒绝正数输入；无限调用不受这两项准入限额约束。`cc.observe.call_execution_snapshot()` 查看当前及退休域的真实计费。示例与错误阶段见[调用期限指南](releases/0.7.1.md#per-call-deadlines-for-remote-calls)。
 
 ## 并发与资源生命周期
 
 `@cc.read`、`@cc.write` 声明方法访问方式，未标注方法采用写访问。注册时的 `cc.ConcurrencyConfig` 设置路由 mode、`max_pending` 和 `max_workers`；Native route handle 同时约束同进程直调和远程派发。配置样例见 [Python SDK 指南](python-usage.md)。
 
-`cc.LifecycleConfig` 选择默认 `Persistent` 或显式 `OwnerBound`。后者使用控制器预先准备的私有 owner capability。`cc.shutdown(timeout=...)` 在取得 Python 实例锁后，用一个期限约束 Native owner/Core/pool 锁等待和本次关闭观察；Python 实例锁等待不计入该期限，已启动的原生收尾不会被等待超时取消；监听关闭、工作排空和 held lease 释放分别报告。完整接入方式见[生命周期指南](local-endpoint-lifecycle.md)。
+`cc.owner.LifecycleConfig` 选择默认 `Persistent` 或显式 `OwnerBound`。后者使用控制器预先准备的私有 owner capability。`cc.shutdown(timeout=...)` 在取得 Python 实例锁后，用一个期限约束 Native owner/Core/pool 锁等待和本次关闭观察；Python 实例锁等待不计入该期限，已启动的原生收尾不会被等待超时取消；监听关闭、工作排空和 held lease 释放分别报告。完整接入方式见[生命周期指南](local-endpoint-lifecycle.md)。

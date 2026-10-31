@@ -19,7 +19,7 @@ Typical usage::
     pool.free(alloc)
     pool.destroy()
 
-This module also carries the typed shape of :func:`c_two.memory_stats`.
+This module also carries the typed shape of :func:`c_two.observe.memory_stats`.
 Those counters describe C-Two-owned IPC backing and live reassembly
 accounting. They are independent scopes, not process RSS, and must never be
 summed and presented as physical memory usage.
@@ -84,13 +84,12 @@ class RetiredScopeStats(MemoryScopeStats):
 
 
 class MemoryStats(TypedDict):
-    """Result shape of :func:`c_two.memory_stats`."""
+    """Result shape of :func:`c_two.observe.memory_stats`."""
 
     runtime_outgoing: MemoryScopeStats | None
     server: MemoryScopeStats | None
     retired: list[RetiredScopeStats]
     holds: dict
-    budget_cells_note: str
 
 
 __all__ = [

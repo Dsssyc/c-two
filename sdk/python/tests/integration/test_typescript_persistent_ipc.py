@@ -20,6 +20,10 @@ import pytest
 from tests.fixtures import local_server
 
 import c_two as cc
+
+import c_two.endpoint
+
+import c_two.contract
 from c_two.transport.server import Server
 from tests.fixtures.process_control import portable_command, readline_with_timeout
 
@@ -123,8 +127,8 @@ def persistent_node_project() -> Iterator[tuple[Path, str]]:
     tsc = compiler / "bin/tsc"
     assert tsc.is_file(), f"pinned TS compiler missing: {tsc}"
     for name, crm in (("manager", Manager), ("builder", Builder)):
-        artifacts = cc.compile_contract_artifacts(
-            cc.export_contract_descriptor(crm).encode(), target="typescript",
+        artifacts = cc.contract.compile_artifacts(
+            cc.contract.export_descriptor(crm).encode(), target="typescript",
         )
         for artifact in artifacts.artifacts:
             destination = root / "generated" / name / artifact.relative_path
@@ -290,7 +294,7 @@ def test_generated_node_early_chunk_rejection_stops_upload_and_reconnects_once(
                     node.stop()
             finally:
                 assert server.shutdown()["completed"]
-                inspection = cc.inspect_endpoint(
+                inspection = cc.endpoint.inspect_endpoint(
                     unique_ipc_address, context=server._runtime_session.local_endpoint_context(),
                 )
                 assert inspection["status"] in ("absent", "not-applicable"), inspection
@@ -377,5 +381,5 @@ def test_generated_node_persistent_dynamic_acquire_and_identity_fences(
                 node.stop()
         finally:
             assert server.shutdown()["completed"]
-    inspection = cc.inspect_endpoint(unique_ipc_address)
+    inspection = cc.endpoint.inspect_endpoint(unique_ipc_address)
     assert inspection["status"] in ("absent", "not-applicable"), inspection

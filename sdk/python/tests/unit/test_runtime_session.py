@@ -39,6 +39,7 @@ def test_native_shutdown_accepts_zero_and_normal_timeout(timeout: float) -> None
 
 def test_invalid_native_shutdown_preserves_registered_host_and_shutdown_hook() -> None:
     import c_two as cc
+    import c_two.endpoint
     from c_two.transport.registry import _get_default_runtime
 
     @cc.crm(namespace='test.shutdown-timeout-boundary', version='0.1.0')
@@ -61,13 +62,13 @@ def test_invalid_native_shutdown_preserves_registered_host_and_shutdown_hook() -
 
     cc.shutdown()
     resource = AliveResource()
-    assert cc.server_credential() is None
+    assert cc.endpoint.server_credential() is None
     proxy = None
     try:
         cc.register(Alive, resource, name='timeout-alive')
         session = _get_default_runtime()._runtime_session  # noqa: SLF001
         identity = (session.server_id, session.server_address)
-        credential = cc.server_credential()
+        credential = cc.endpoint.server_credential()
         assert credential.address == identity[1]
         assert credential.to_json() == session.server_credential.to_json()
         proxy = cc.connect(Alive, name='timeout-alive', address=cc.server_address())
@@ -76,11 +77,11 @@ def test_invalid_native_shutdown_preserves_registered_host_and_shutdown_hook() -
             with pytest.raises(ValueError, match='timeout_seconds'):
                 session.shutdown(route_names=['timeout-alive'], timeout_seconds=timeout)
             assert (session.server_id, session.server_address) == identity
-            assert cc.server_credential().to_json() == credential.to_json()
+            assert cc.endpoint.server_credential().to_json() == credential.to_json()
             assert proxy.ping() == 'pong'
             assert resource.shutdown_calls == 0
         cc.shutdown()
-        assert cc.server_credential() is None
+        assert cc.endpoint.server_credential() is None
         assert resource.shutdown_calls == 1
         cc.shutdown()
         assert resource.shutdown_calls == 1
@@ -183,6 +184,7 @@ def test_runtime_session_bridge_preflight_preserves_errors_and_owner(monkeypatch
 
 def test_failed_server_construction_does_not_publish_identity() -> None:
     import c_two as cc
+    import c_two.endpoint
 
     @cc.crm(namespace='cc.test.runtime_session', version='0.1.0')
     class BrokenConfigCRM:
@@ -198,7 +200,7 @@ def test_failed_server_construction_does_not_publish_identity() -> None:
     try:
         with pytest.raises(ValueError):
             cc.register(BrokenConfigCRM, BrokenConfigImpl(), name='broken-config')
-        assert cc.server_id() is None
+        assert cc.endpoint.server_id() is None
         assert cc.server_address() is None
     finally:
         cc.shutdown()
@@ -206,6 +208,7 @@ def test_failed_server_construction_does_not_publish_identity() -> None:
 
 def test_explicit_ipc_connect_ignores_bad_relay_after_native_identity() -> None:
     import c_two as cc
+    import c_two.endpoint
     from c_two.config import settings
 
     @cc.crm(namespace='cc.test.runtime_session_bad_relay', version='0.1.0')
@@ -238,6 +241,7 @@ def test_explicit_ipc_connect_ignores_bad_relay_after_native_identity() -> None:
 
 def test_name_only_connect_without_relay_ignores_bad_relay_proxy_env(monkeypatch) -> None:
     import c_two as cc
+    import c_two.endpoint
     from c_two.config import settings
 
     @cc.crm(namespace='cc.test.runtime_session_no_relay_bad_proxy', version='0.1.0')
@@ -261,6 +265,7 @@ def test_name_only_connect_without_relay_ignores_bad_relay_proxy_env(monkeypatch
 
 def test_no_relay_register_unregister_ignores_bad_relay_proxy_env(monkeypatch) -> None:
     import c_two as cc
+    import c_two.endpoint
     from c_two.config import settings
 
     @cc.crm(namespace='cc.test.runtime_session_bad_proxy_env', version='0.1.0')
@@ -300,6 +305,7 @@ def test_shutdown_ignores_late_bad_relay_env_file_and_closes_server(
     tmp_path,
 ) -> None:
     import c_two as cc
+    import c_two.endpoint
     from c_two.config import settings
 
     @cc.crm(namespace='cc.test.runtime_session_bad_shutdown_env', version='0.1.0')
@@ -334,6 +340,7 @@ def test_shutdown_ignores_late_bad_relay_proxy_env_and_closes_server(
     monkeypatch,
 ) -> None:
     import c_two as cc
+    import c_two.endpoint
     from c_two.config import settings
 
     @cc.crm(namespace='cc.test.runtime_session_bad_shutdown_proxy', version='0.1.0')
@@ -366,6 +373,7 @@ def test_shutdown_ignores_late_bad_relay_proxy_env_and_closes_server(
 
 def test_failed_first_route_registration_clears_native_identity(monkeypatch) -> None:
     import c_two as cc
+    import c_two.endpoint
     from c_two.transport.server.native import NativeServerBridge
 
     @cc.crm(namespace='cc.test.runtime_session_register_fail', version='0.1.0')
@@ -385,7 +393,7 @@ def test_failed_first_route_registration_clears_native_identity(monkeypatch) -> 
     try:
         with pytest.raises(RuntimeError, match='synthetic register failure'):
             cc.register(FailingRegisterCRM, FailingRegisterImpl(), name='fail-register')
-        assert cc.server_id() is None
+        assert cc.endpoint.server_id() is None
         assert cc.server_address() is None
     finally:
         cc.shutdown()
@@ -393,6 +401,7 @@ def test_failed_first_route_registration_clears_native_identity(monkeypatch) -> 
 
 def test_failed_server_bridge_construction_clears_native_identity(monkeypatch) -> None:
     import c_two as cc
+    import c_two.endpoint
     from c_two.transport.server import native as server_native
 
     @cc.crm(namespace='cc.test.runtime_session_bridge_fail', version='0.1.0')
@@ -413,7 +422,7 @@ def test_failed_server_bridge_construction_clears_native_identity(monkeypatch) -
     try:
         with pytest.raises(RuntimeError, match='synthetic bridge construction failure'):
             cc.register(FailingBridgeCRM, FailingBridgeImpl(), name='fail-bridge')
-        assert cc.server_id() is None
+        assert cc.endpoint.server_id() is None
         assert cc.server_address() is None
     finally:
         cc.shutdown()
@@ -466,6 +475,7 @@ def test_phase3_removes_python_registration_rollback_authority() -> None:
 
 def test_failed_native_registration_leaves_existing_route_usable(monkeypatch) -> None:
     import c_two as cc
+    import c_two.endpoint
     from c_two.transport.server.native import NativeServerBridge
 
     @cc.crm(namespace='cc.test.runtime_session_phase3', version='0.1.0')
@@ -516,6 +526,7 @@ def test_failed_native_registration_leaves_existing_route_usable(monkeypatch) ->
 
 def test_failed_native_registration_leaves_no_route_or_identity(monkeypatch) -> None:
     import c_two as cc
+    import c_two.endpoint
     from c_two.transport.server.native import NativeServerBridge
     from c_two.transport.registry import _get_default_runtime
 
@@ -552,6 +563,8 @@ def test_direct_ipc_acquire_waits_for_dynamic_route_publication() -> None:
     import time
 
     import c_two as cc
+
+    import c_two.endpoint
     from c_two.transport.registry import Runtime
 
     @cc.crm(namespace='cc.test.runtime_session_dynamic_route', version='0.1.0')
@@ -615,6 +628,7 @@ def test_native_runtime_session_resolves_client_ipc_config(monkeypatch) -> None:
 
 def test_set_client_preserves_pending_server_id_override() -> None:
     import c_two as cc
+    import c_two.endpoint
 
     @cc.crm(namespace='cc.test.runtime_session_client_preserve', version='0.1.0')
     class PreserveCRM:
@@ -630,7 +644,7 @@ def test_set_client_preserves_pending_server_id_override() -> None:
         cc.set_server(server_id='unit-preserve-server')
         cc.set_client(ipc_overrides={'reassembly_segment_size': 16 * 1024 * 1024})
         cc.register(PreserveCRM, PreserveImpl(), name='preserve-route')
-        assert cc.server_id() == 'unit-preserve-server'
+        assert cc.endpoint.server_id() == 'unit-preserve-server'
         assert cc.server_address() == 'ipc://unit-preserve-server'
     finally:
         cc.shutdown()
@@ -638,6 +652,7 @@ def test_set_client_preserves_pending_server_id_override() -> None:
 
 def test_set_server_preserves_pending_client_overrides() -> None:
     import c_two as cc
+    import c_two.endpoint
     from c_two.transport.registry import _get_default_runtime
 
     cc.shutdown()
@@ -653,6 +668,7 @@ def test_set_server_preserves_pending_client_overrides() -> None:
 def test_set_client_after_direct_ipc_connect_warns() -> None:
     import pytest
     import c_two as cc
+    import c_two.endpoint
 
     @cc.crm(namespace='cc.test.runtime_session_client_freeze', version='0.1.0')
     class FreezeCRM:
@@ -679,6 +695,7 @@ def test_set_client_after_direct_ipc_connect_warns() -> None:
 
 def test_set_client_after_register_preserves_server_identity() -> None:
     import c_two as cc
+    import c_two.endpoint
 
     @cc.crm(namespace='cc.test.runtime_session_client_after_register', version='0.1.0')
     class AfterRegisterCRM:
@@ -694,7 +711,7 @@ def test_set_client_after_register_preserves_server_identity() -> None:
         cc.set_server(server_id='unit-after-register')
         cc.register(AfterRegisterCRM, AfterRegisterImpl(), name='after-register-route')
         cc.set_client(ipc_overrides={'reassembly_segment_size': 16 * 1024 * 1024})
-        assert cc.server_id() == 'unit-after-register'
+        assert cc.endpoint.server_id() == 'unit-after-register'
         assert cc.server_address() == 'ipc://unit-after-register'
         crm = cc.connect(
             AfterRegisterCRM,
@@ -711,6 +728,7 @@ def test_set_client_after_register_preserves_server_identity() -> None:
 
 def test_runtime_session_client_config_respects_transport_policy() -> None:
     import c_two as cc
+    import c_two.endpoint
     from c_two.transport.registry import _get_default_runtime
 
     cc.shutdown()
@@ -725,6 +743,7 @@ def test_runtime_session_client_config_respects_transport_policy() -> None:
 def test_set_transport_policy_after_direct_ipc_connect_warns() -> None:
     import pytest
     import c_two as cc
+    import c_two.endpoint
 
     @cc.crm(namespace='cc.test.runtime_session_policy_freeze', version='0.1.0')
     class PolicyCRM:
@@ -752,6 +771,7 @@ def test_set_transport_policy_after_direct_ipc_connect_warns() -> None:
 def test_set_transport_policy_after_client_only_ipc_connect_warns() -> None:
     import pytest
     import c_two as cc
+    import c_two.endpoint
     from c_two.transport import Server
 
     @cc.crm(namespace='cc.test.runtime_session_policy_client_only', version='0.1.0')
@@ -783,6 +803,7 @@ def test_set_transport_policy_after_client_only_ipc_connect_warns() -> None:
 def test_set_server_after_client_only_connect_preserves_client_freeze() -> None:
     import pytest
     import c_two as cc
+    import c_two.endpoint
     from c_two.transport import Server
 
     @cc.crm(namespace='cc.test.runtime_session_server_after_client', version='0.1.0')

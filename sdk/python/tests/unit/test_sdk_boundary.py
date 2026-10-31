@@ -146,53 +146,34 @@ def test_import_does_not_expose_logo_banner():
 
 def test_top_level_exposes_register_concurrency_facade():
     import c_two as cc
-    from c_two.transport.server.scheduler import ConcurrencyConfig, ConcurrencyMode
+    import c_two.contract
+    from c_two.transport.server.scheduler import ConcurrencyConfig
 
     assert cc.ConcurrencyConfig is ConcurrencyConfig
-    assert cc.ConcurrencyMode is ConcurrencyMode
-    assert {'ConcurrencyConfig', 'ConcurrencyMode'} <= set(cc.__all__)
+    assert 'ConcurrencyConfig' in cc.__all__
 
-    cfg = cc.ConcurrencyConfig(mode=cc.ConcurrencyMode.PARALLEL)
-    assert cfg.mode is cc.ConcurrencyMode.PARALLEL
+    cfg = cc.ConcurrencyConfig(mode='parallel')
+    assert cfg.mode == 'parallel'
 
 
-def test_top_level_exposes_public_override_schemas():
+
+def test_contract_module_exposes_projection_tools():
     import c_two as cc
-    from c_two.config import (
-        BaseIPCOverrides,
-        ClientIPCOverrides,
-        ServerIPCOverrides,
-    )
-
-    assert cc.BaseIPCOverrides is BaseIPCOverrides
-    assert cc.ServerIPCOverrides is ServerIPCOverrides
-    assert cc.ClientIPCOverrides is ClientIPCOverrides
-    assert {
-        'BaseIPCOverrides',
-        'ServerIPCOverrides',
-        'ClientIPCOverrides',
-    } <= set(cc.__all__)
-
-
-def test_top_level_exposes_contract_projection_tools():
-    import c_two as cc
+    import c_two.contract
     from c_two.crm.descriptor import (
-        contract_descriptor_diagnostics,
-        export_contract_descriptor,
-        export_contract_release_ref,
+        diagnostics,
+        export_descriptor,
+        release_ref,
     )
-    from c_two.crm.infer import infer_crm_from_resource
 
-    assert cc.contract_descriptor_diagnostics is contract_descriptor_diagnostics
-    assert cc.export_contract_descriptor is export_contract_descriptor
-    assert cc.export_contract_release_ref is export_contract_release_ref
-    assert cc.infer_crm_from_resource is infer_crm_from_resource
+    assert cc.contract.diagnostics is diagnostics
+    assert cc.contract.export_descriptor is export_descriptor
+    assert cc.contract.release_ref is release_ref
     assert {
-        'contract_descriptor_diagnostics',
-        'export_contract_descriptor',
-        'export_contract_release_ref',
-        'infer_crm_from_resource',
-    } <= set(cc.__all__)
+        'diagnostics',
+        'export_descriptor',
+        'release_ref',
+    } <= set(cc.contract.__all__)
 
 
 def test_contract_release_identity_is_not_reimplemented_in_python():
@@ -208,7 +189,7 @@ def test_contract_release_identity_is_not_reimplemented_in_python():
         node
         for node in tree.body
         if isinstance(node, ast.FunctionDef)
-        and node.name == 'export_contract_release_ref'
+        and node.name == 'release_ref'
     )
 
     native_imports = {
@@ -250,6 +231,8 @@ def test_payload_abi_internals_are_not_public_sdk_surface():
     import importlib.util
 
     import c_two as cc
+
+    import c_two.contract
 
     forbidden = {
         'CodecBinding',

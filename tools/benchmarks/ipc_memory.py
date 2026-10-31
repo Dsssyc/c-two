@@ -39,9 +39,9 @@ RSS is a process high-water mark, including Python and serialization; it is
 not an allocator byte counter and never a backing-capacity measurement, so
 the report keeps OS RSS, configured backing budgets, and held-buffer counts
 in separate fields. Windows reports null when resource is absent. Runtime
-memory snapshots use the public cc.memory_stats when present; when the API
-is absent the snapshot is recorded as unavailable, and --require-memory-stats
-fails instead of fabricating zero values. In require mode every advertised
+memory snapshots use the public c_two.observe.memory_stats API; snapshot errors
+are recorded, and --require-memory-stats fails instead of fabricating zero
+values. In require mode every advertised
 snapshot point is enforced, including after cleanup. Post-shutdown
 unavailability can only be exempted explicitly through
 --allow-unavailable-stats-after-shutdown, which records the exemption inside
@@ -207,12 +207,12 @@ def configure(cc, args: argparse.Namespace) -> dict:
     return overrides
 
 
-def snapshot_memory_stats(cc) -> dict:
-    """One runtime snapshot through the public API, or an explicit unavailable record."""
-    if not hasattr(cc, 'memory_stats'):
-        return {'available': False, 'reason': 'installed c_two exposes no public cc.memory_stats'}
+def snapshot_memory_stats() -> dict:
+    """One runtime snapshot through the public API, or an explicit error record."""
+    from c_two.observe import memory_stats
+
     try:
-        return {'available': True, 'stats': dict(cc.memory_stats())}
+        return {'available': True, 'stats': dict(memory_stats())}
     except Exception as exc:  # recorded honestly, never replaced with zeros
         return {'available': True, 'error': f'{type(exc).__name__}: {exc}'}
 
@@ -250,6 +250,7 @@ def measure(args: argparse.Namespace) -> dict:
     os.environ['C2_ENV_FILE'] = ''
     os.environ['C2_RELAY_ANCHOR_ADDRESS'] = ''
     import c_two as cc
+    from c_two import observe
     from c_two import _native
 
     failures: list[str] = []
@@ -260,7 +261,7 @@ def measure(args: argparse.Namespace) -> dict:
     stats_enabled = args.memory_stats or args.require_memory_stats
     memory_stats: dict[str, dict] = {}
     if stats_enabled:
-        memory_stats['before_connect'] = snapshot_memory_stats(cc)
+        memory_stats['before_connect'] = snapshot_memory_stats()
         if args.require_memory_stats:
             require_snapshot(memory_stats['before_connect'], 'before_connect (worker)', failures)
 
@@ -352,10 +353,10 @@ def measure(args: argparse.Namespace) -> dict:
                 try:
                     if held.value != payload:
                         raise RuntimeError('held IPC payload mismatch')
-                    held_stats = cc.hold_stats()
+                    held_stats = observe.memory_stats()["holds"]
                 finally:
                     held.release()
-                after_release = cc.hold_stats()
+                after_release = observe.memory_stats()["holds"]
                 if after_release['active_holds'] != 0:
                     raise RuntimeError('benchmark retained a transport hold')
         except Exception as exc:
@@ -363,7 +364,7 @@ def measure(args: argparse.Namespace) -> dict:
             # latency, and RSS evidence for the failing run.
             failures.append(f'{type(exc).__name__}: {exc}')
         if stats_enabled:
-            memory_stats['after_calls'] = snapshot_memory_stats(cc)
+            memory_stats['after_calls'] = snapshot_memory_stats()
             if args.require_memory_stats:
                 require_snapshot(memory_stats['after_calls'], 'after_calls (worker)', failures)
     finally:
@@ -381,7 +382,7 @@ def measure(args: argparse.Namespace) -> dict:
             cleanup['shutdown'] = f'{type(exc).__name__}: {exc}'
             failures.append('cc.shutdown failed after the run')
         if stats_enabled:
-            memory_stats['after_cleanup'] = snapshot_memory_stats(cc)
+            memory_stats['after_cleanup'] = snapshot_memory_stats()
             if args.require_memory_stats:
                 require_snapshot(
                     memory_stats['after_cleanup'], 'after_cleanup (worker, after shutdown)', failures,
@@ -539,7 +540,7 @@ def run_controller(args: argparse.Namespace) -> dict:
                 'native_repo': server_provenance['repo'],
             }
             if stats_enabled:
-                server_memory_stats['after_register'] = snapshot_memory_stats(server_cc)
+                server_memory_stats['after_register'] = snapshot_memory_stats()
                 if args.require_memory_stats:
                     require_snapshot(server_memory_stats['after_register'], 'after_register (server)', failures)
         for _ in range(args.workers):
@@ -589,7 +590,7 @@ def run_controller(args: argparse.Namespace) -> dict:
         if server_stats is not None:
             server_stats['rss_after_calls_high_water_bytes'] = peak_rss_bytes()
             if stats_enabled:
-                server_memory_stats['after_workers'] = snapshot_memory_stats(server_cc)
+                server_memory_stats['after_workers'] = snapshot_memory_stats()
                 if args.require_memory_stats:
                     require_snapshot(server_memory_stats['after_workers'], 'after_workers (server)', failures)
     finally:
@@ -615,7 +616,7 @@ def run_controller(args: argparse.Namespace) -> dict:
                 cleanup['server_shutdown'] = f'{type(exc).__name__}: {exc}'
                 failures.append('controller server shutdown failed after the run')
             if stats_enabled:
-                server_memory_stats['after_cleanup'] = snapshot_memory_stats(server_cc)
+                server_memory_stats['after_cleanup'] = snapshot_memory_stats()
                 if args.require_memory_stats:
                     require_snapshot(
                         server_memory_stats['after_cleanup'], 'after_cleanup (server, after shutdown)', failures,
@@ -923,7 +924,7 @@ def run_matrix(args: argparse.Namespace) -> int:
             'no throughput improvement claims. Forced-budget rows encode post-wiring '
             'expectations and are recorded honestly on candidates without Runtime budget '
             'wiring; their checks are never weakened. RSS stays separate from backing '
-            'capacities; cc.memory_stats snapshots are recorded as unavailable when absent.'
+            'capacities; c_two.observe.memory_stats snapshot errors are recorded.'
         ),
         'generated_at_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(started_wall)),
         'source_commit': source_commit(),
@@ -1108,12 +1109,12 @@ def main() -> None:
     )
     parser.add_argument(
         '--memory-stats', action='store_true',
-        help='Capture optional cc.memory_stats snapshots before/after calls and shutdown; '
-             'recorded as unavailable when the public API is absent',
+        help='Capture optional c_two.observe.memory_stats snapshots before/after calls and shutdown; '
+             'record snapshot errors without fabricating counters',
     )
     parser.add_argument(
         '--require-memory-stats', action='store_true',
-        help='Fail when any advertised cc.memory_stats snapshot point, including after cleanup, '
+        help='Fail when any advertised c_two.observe.memory_stats snapshot point, including after cleanup, '
              'is unavailable instead of fabricating zeros',
     )
     parser.add_argument(

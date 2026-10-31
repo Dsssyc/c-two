@@ -28,7 +28,7 @@ C-Two is a resource-oriented RPC runtime for distributed scientific computation.
 
 A **CRM contract** declares the callable methods and their namespace/version. A **resource** is a plain class that implements those methods and holds state. A **client** uses `cc.connect(...)` to obtain a typed proxy. A process can host several resources and connect to other resources at the same time.
 
-**C-Two 0.10.1** supports Python 3.10+. Ordinary calls have no Python runtime dependencies; FastDB payloads use `c-two[fastdb]` (`fastdb4py==0.2.4`). IPC handshake 14 reports a version mismatch as a typed error, Unix endpoints use namespace format 3 with versioned default directories, and Python adds independent `cc.Runtime()` instances and `cc.server_credential()`. A failed memory release stays with its owner for retry, or is abandoned conservatively and counted when it can no longer be returned. See the [0.10.0 release notes](docs/releases/0.10.0.md); 0.10.1 keeps `cc.serve()` running when stdout cannot encode its messages ([notes](docs/releases/0.10.1.md)).
+**C-Two 0.10.1** supports Python 3.10+. Ordinary calls have no Python runtime dependencies; FastDB payloads use `c-two[fastdb]` (`fastdb4py==0.2.4`). IPC handshake 14 reports a version mismatch as a typed error, Unix endpoints use namespace format 3 with versioned default directories, and Python adds independent `cc.Runtime()` instances and `cc.endpoint.server_credential()`. A failed memory release stays with its owner for retry, or is abandoned conservatively and counted when it can no longer be returned. See the [0.10.0 release notes](docs/releases/0.10.0.md); 0.10.1 keeps `cc.serve()` running when stdout cannot encode its messages ([notes](docs/releases/0.10.1.md)).
 
 ## Features
 
@@ -38,7 +38,7 @@ A **CRM contract** declares the callable methods and their namespace/version. A 
 - **Contract-scoped routing:** clients match the route name, CRM identity and contract hashes. Relay discovery selects a verified local IPC path or an HTTP target; `c3` runs the relay and supports relay meshes.
 - **Native memory transport:** IPC uses lazy buddy pools, dedicated shared memory, checked chunk transfer and file spill. Budgets and idle reclamation control memory and file usage for large payloads. See [memory policy](docs/memory-policy.en.md).
 - **Explicit payload lifetimes:** `cc.hold()` retains response leases, while registration can select borrowed input lifetimes. Release invalidates FastDB owners and checked views before releasing transport storage. See [Python payload usage](docs/python-usage.md).
-- **Connection observations:** `cc.connection_events()` aggregates outgoing and accepted physical IPC connections; one cancellable consumer replaces per-connection blocking waits. Reasons describe transport facts, not proof of process death.
+- **Connection observations:** `cc.observe.connection_events()` aggregates outgoing and accepted physical IPC connections; one cancellable consumer replaces per-connection blocking waits. Reasons describe transport facts, not proof of process death.
 - **Resource lifecycle management:** Resources use `Persistent` or controller-owned `OwnerBound` lifecycles; native shutdown drains work, and scoped endpoint maintenance cleans up confirmed exits. See [lifecycle integration](docs/local-endpoint-lifecycle.en.md).
 - **Shared Rust core:** Python and Rust use the same routing, transport, memory, error and lifecycle mechanisms. The native c3 CLI handles relay, contract tools and endpoint maintenance on Linux, macOS and Windows x64 and ARM64.
 
@@ -91,7 +91,7 @@ finally:
 
 Run with `python counter.py`. This example uses the same-process path; keep `C2_RELAY_ANCHOR_ADDRESS` unset for local registration.
 
-For another process on the same host, pass the resource process's `cc.server_address()` as the client's `address`; the [IPC example](examples/python/ipc_resource.py) shows this connection. The resource process can also capture `credential = cc.server_credential()` after registration and pass it to its controller for later exact cleanup, as described in the [lifecycle guide](docs/local-endpoint-lifecycle.en.md#exact-cleanup-and-bounded-sweeps).
+For another process on the same host, pass the resource process's `cc.server_address()` as the client's `address`; the [IPC example](examples/python/ipc_resource.py) shows this connection. The resource process can also capture `credential = cc.endpoint.server_credential()` after registration and pass it to its controller for later exact cleanup, as described in the [lifecycle guide](docs/local-endpoint-lifecycle.en.md#exact-cleanup-and-bounded-sweeps).
 
 `runtime = cc.Runtime()` creates an application-owned Python runtime with its own configuration, routes and native session. Configure it through `runtime.set_*()`, then use `runtime.start()` for an empty Host readiness check or `runtime.register()` for resources. The module functions continue to use the default runtime; `cc.serve()` owns its process signal handling and has no instance equivalent. Call `runtime.shutdown()` and inspect its structured outcome when the application is done; if it returns pending, call shutdown again to observe completion and replace the session. See the [independent runtime example](examples/python/independent_runtime.py) and [Python API guide](docs/python-usage.md#independent-python-runtimes).
 

@@ -19,6 +19,7 @@ from typing import Any
 from urllib.parse import quote, urlencode
 from urllib.request import ProxyHandler, Request, build_opener
 
+from typing import Literal
 import c_two as cc
 from tests.fixtures.process_control import portable_command, readline_with_timeout
 from c_two.config.settings import settings
@@ -822,10 +823,10 @@ def resource_for(payload: str) -> NoPayloadResource | RecordResource | ObjectGra
     raise AssertionError(f"unknown payload profile: {payload}")
 
 
-def input_lifetime_for(payload: str) -> dict[str, cc.InputLifetime]:
+def input_lifetime_for(payload: str) -> dict[str, Literal['materialized', 'borrowed']]:
     if payload == "no-payload":
         return {}
-    return {"roundtrip": cc.InputLifetime.BORROWED}
+    return {"roundtrip": 'borrowed'}
 
 
 def invoke_generated_python(

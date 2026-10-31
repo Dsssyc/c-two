@@ -18,7 +18,7 @@ def test_register_zero_startup_budget_has_structured_timeout() -> None:
 from pathlib import Path
 root = Path({root!r})
 if {sys.platform!r} != 'win32':
-    cc.set_local_endpoint(root=str(root))
+    cc.endpoint.set_local_endpoint(root=str(root))
 error = None
 try:
     cc.set_server(startup_timeout=0)
@@ -65,7 +65,7 @@ from pathlib import Path
 from c_two.transport.registry import Runtime, _get_default_runtime
 root = Path({root!r})
 if {sys.platform!r} != 'win32':
-    cc.set_local_endpoint(root=str(root))
+    cc.endpoint.set_local_endpoint(root=str(root))
 try:
     cc.set_server(startup_timeout=0)
     old = _get_default_runtime()._runtime_session
@@ -91,7 +91,7 @@ finally:
     assert cc.shutdown(timeout=3)['completed']
 # A full shutdown creates a fresh session that can choose another budget.
 if {sys.platform!r} != 'win32':
-    cc.set_local_endpoint(root=str(root))
+    cc.endpoint.set_local_endpoint(root=str(root))
 try:
     cc.set_server(startup_timeout=30)
     cc.register(Echo, Resource(), name='startup')

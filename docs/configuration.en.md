@@ -94,7 +94,7 @@ Set the following fields through the appropriate endpoint's `ipc_overrides`. All
 
 Pool segment capacity and the per-message payload limit are independent. Disabling the buddy pool still permits dedicated SHM, checked chunk transfer and file spill. A zero backing or reassembly budget rejects positive reservations; `pool_decay_seconds=0` reclaims idle segments on the next maintenance pass; `heartbeat_interval=0` disables heartbeat.
 
-`cc.memory_stats()` observes native memory domains, and `cc.hold_stats()` observes SDK leases. These are accounting snapshots, without measuring total process RSS.
+`cc.observe.memory_stats()` observes native memory domains, and `cc.observe.memory_stats()["holds"]` observes SDK leases. These are accounting snapshots, without measuring total process RSS.
 
 ## Relay and c3
 
@@ -135,7 +135,7 @@ After an HTTP caller disconnects, an already-dispatched forward retains its inpu
 
 | Platform | Endpoint | Location configuration |
 | --- | --- | --- |
-| Unix | UDS in the final owner-controlled directory | `cc.set_local_endpoint(root=...)`, `C2_IPC_ROOT`, c3 `--ipc-root`; default `/tmp/c2-v3-<uidhex>` |
+| Unix | UDS in the final owner-controlled directory | `cc.endpoint.set_local_endpoint(root=...)`, `C2_IPC_ROOT`, c3 `--ipc-root`; default `/tmp/c2-v3-<uidhex>` |
 | Windows | Named Pipe scoped to the current TokenUser SID | Automatic; Unix root overrides are rejected |
 
 On Unix, the socket is `<root>/<32-character id>`. Applications provision custom directories. Mode `0755` is accepted when the current user owns the directory and has read, write and traversal access, with no group or other write permission. C-Two creates its default directory with mode `0700` and sets and verifies each socket as `0600` before listening. Spaces and Unicode are preserved. Bind, connect and liveness probes address the short name through an open directory descriptor, so filesystem directory-opening limits govern the configured path. C-Two manages its endpoint, lease and coordinator files, preserves unrelated files and directories, and does not change existing permissions or recursively create parents.
@@ -147,10 +147,11 @@ macOS also rejects extended ACL allow entries that can change directory contents
 ```python
 from pathlib import Path
 import c_two as cc
+import c_two.endpoint
 
 ipc_dir = Path.home() / 'my-app' / 'ipc'
 ipc_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-cc.set_local_endpoint(root=str(ipc_dir))
+cc.endpoint.set_local_endpoint(root=str(ipc_dir))
 ```
 
 Resources, clients and relay upstreams sharing a local domain use the same directory. Root selection does not move SHM or file spill. The first local I/O attempt freezes this context, including a failed attempt. Credentials preserve their captured scope; controllers use exact credentials after confirming process exit. See the [lifecycle guide](local-endpoint-lifecycle.en.md) and [0.7.4 guide](releases/0.7.4.md).
@@ -172,10 +173,10 @@ Expiration returns `CallDeadlineExceeded` with `operation=connect`, `transport_p
 
 Direct IPC waits indefinitely by default; an HTTP budget covers one logical call and its route reacquisition. `timeout=None` explicitly waits indefinitely; `0` expires before dispatch. Negative and non-finite values are rejected. Same-process synchronous calls accept inherited or unlimited waiting only.
 
-An expired deadline ends caller waiting while the dispatched native transaction retains input until actual completion. A zero finite-call count rejects finite calls; a zero byte budget rejects positive input. Unlimited calls are outside these two finite-call admission limits. `cc.call_execution_snapshot()` observes active and retired domains. Examples and error phases are in the [deadline guide](releases/0.7.1.md#per-call-deadlines-for-remote-calls).
+An expired deadline ends caller waiting while the dispatched native transaction retains input until actual completion. A zero finite-call count rejects finite calls; a zero byte budget rejects positive input. Unlimited calls are outside these two finite-call admission limits. `cc.observe.call_execution_snapshot()` observes active and retired domains. Examples and error phases are in the [deadline guide](releases/0.7.1.md#per-call-deadlines-for-remote-calls).
 
 ## Concurrency and lifecycle
 
 `@cc.read` and `@cc.write` declare access semantics; writes are the default. Registration's `cc.ConcurrencyConfig` sets the route mode, `max_pending` and `max_workers`. The native route handle governs both same-process calls and remote dispatch. See the [Python SDK guide](python-usage.md).
 
-`cc.LifecycleConfig` selects default `Persistent` or explicit `OwnerBound`. OwnerBound uses a private receiver capability prepared by the controller before readiness. After acquiring the Python instance lock, `cc.shutdown(timeout=...)` uses one deadline for Native owner/Core/pool lock waits and drain observation. The instance-lock wait is outside that deadline; expiry does not cancel an already-started native drain. Listener closure, work drain and held leases are separate observations; see the [lifecycle guide](local-endpoint-lifecycle.en.md).
+`cc.owner.LifecycleConfig` selects default `Persistent` or explicit `OwnerBound`. OwnerBound uses a private receiver capability prepared by the controller before readiness. After acquiring the Python instance lock, `cc.shutdown(timeout=...)` uses one deadline for Native owner/Core/pool lock waits and drain observation. The instance-lock wait is outside that deadline; expiry does not cancel an already-started native drain. Listener closure, work drain and held leases are separate observations; see the [lifecycle guide](local-endpoint-lifecycle.en.md).

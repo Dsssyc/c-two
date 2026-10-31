@@ -4,6 +4,7 @@ import pickle
 
 import pytest
 import c_two as cc
+import c_two.endpoint
 from c_two.config.settings import settings
 from c_two.error import CoreError, ProtocolViolation
 from c_two.transport.registry import _reset_default_runtime
@@ -35,7 +36,7 @@ def _clean_runtime():
 ])
 def test_connect_fixed_version_peer(ipc_version_peer_binary, reply, peer_version):
     with running_version_peer(ipc_version_peer_binary, reply) as (address, context):
-        cc.set_local_endpoint(root=context.root)
+        cc.endpoint.set_local_endpoint(root=context.root)
         with pytest.raises(CoreError if peer_version is not None else ProtocolViolation) as failure:
             cc.connect(VersionContract, name="version", address=address, timeout=3)
         # Malformed handshakes retain the public semantic ProtocolViolation.

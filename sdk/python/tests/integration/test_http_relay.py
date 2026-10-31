@@ -16,6 +16,8 @@ import pytest
 import httpx
 
 import c_two as cc
+
+import c_two.endpoint
 from c_two.config.settings import settings
 from c_two.config.ipc import _resolve_server_ipc_config
 from c_two.error import ResourceNotFound
@@ -97,7 +99,7 @@ def relay_stack(start_c3_relay):
     cc.register(Hello, HelloImpl(), name='hello')
     cc.register(Counter, CounterImpl(), name='counter')
     ipc_addr = cc.server_address()
-    server_id = cc.server_id()
+    server_id = cc.endpoint.server_id()
     server_instance_id = _server_instance_id_for(_get_default_runtime(), ipc_addr)
 
     relay = start_c3_relay()
@@ -266,7 +268,7 @@ class TestCcConnectHttp:
 
     def test_connect_http_call_route_not_found_raises_cc_error(self, relay_stack):
         relay_url, _ = relay_stack
-        server_id = cc.server_id()
+        server_id = cc.endpoint.server_id()
 
         crm = cc.connect(Hello, name='hello', address=relay_url)
         try:
@@ -321,7 +323,7 @@ class TestCcConnectHttp:
         slashed_name = 'toodle/grid/0'
         cc.register(Hello, HelloImpl(), name=slashed_name)
         ipc_addr = cc.server_address()
-        server_id = cc.server_id()
+        server_id = cc.endpoint.server_id()
         server_instance_id = _server_instance_id_for(
             _get_default_runtime(),
             ipc_addr,
@@ -543,7 +545,7 @@ class TestRelayControlPlane:
         """POST /_register adds an upstream and allows calls."""
         cc.register(Hello, HelloImpl(), name='hello')
         ipc_addr = cc.server_address()
-        server_id = cc.server_id()
+        server_id = cc.endpoint.server_id()
         server_instance_id = _server_instance_id_for(_get_default_runtime(), ipc_addr)
 
         relay = start_c3_relay()
@@ -585,7 +587,7 @@ class TestRelayControlPlane:
         """POST /_register with same name upserts (returns 201)."""
         cc.register(Hello, HelloImpl(), name='hello')
         ipc_addr = cc.server_address()
-        server_id = cc.server_id()
+        server_id = cc.endpoint.server_id()
         server_instance_id = _server_instance_id_for(_get_default_runtime(), ipc_addr)
 
         relay = start_c3_relay()
@@ -621,7 +623,7 @@ class TestRelayControlPlane:
         """POST /_unregister removes the route; calls return 404."""
         cc.register(Hello, HelloImpl(), name='hello')
         ipc_addr = cc.server_address()
-        server_id = cc.server_id()
+        server_id = cc.endpoint.server_id()
         server_instance_id = _server_instance_id_for(_get_default_runtime(), ipc_addr)
 
         relay = start_c3_relay()
@@ -700,7 +702,7 @@ class TestRelayControlPlane:
         cc.register(Hello, HelloImpl(), name='hello')
         cc.register(Counter, CounterImpl(), name='counter')
         ipc_addr = cc.server_address()
-        server_id = cc.server_id()
+        server_id = cc.endpoint.server_id()
         server_instance_id = _server_instance_id_for(_get_default_runtime(), ipc_addr)
 
         relay = start_c3_relay()

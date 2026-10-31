@@ -6,7 +6,7 @@
 
 本地端点由 Rust `c2-config` 统一派生，SDK、relay 和 c3 使用同一上下文。Unix 默认路径为 `/tmp/c2-v3-<uidhex>/<32 字符标识>`，协调记录包含 nonce gate/marker 与可退休的监听租约；原 gate inode 保持固定直到监听租约释放。Windows 使用当前用户 TokenUser SID 的 Named Pipe 和不可继承的内核监听租约。调用方传逻辑 `ipc://` 地址，系统自动选择后端；凭据中的 `managed-v2` / `named-pipe` 表示后端。
 
-Unix 的最终端点目录由显式代码 `cc.set_local_endpoint(root=...)`、CLI `--ipc-root` 或环境变量 `C2_IPC_ROOT` 覆盖；代码/CLI 优先于进程环境，进程环境优先于 `.env`，默认 `/tmp/c2-v3-<uidhex>`。端点路径为 `<root>/<32 字符标识>`，没有额外子目录或 `.sock` 后缀；默认 root 的 `v3` 与 namespace 磁盘格式版本相同，自定义 root 不追加版本名。自定义目录由应用预建，允许 `0755`：当前用户持有并具备读、写、遍历权限，组和其他用户不可写。默认目录创建为 `0700`；socket 在 listen 前设置并核实为 `0600`。Linux/macOS 的 bind、connect 和探测均通过目录句柄访问短名称，支持包含中文和空格的长目录，实际目录打开能力仍由文件系统决定。回收保留应用目录和无关文件。root 不移动 SHM、file spill 或配置文件。Runtime 在第一次本地 bind/connect 或准备 owner 接管时冻结上下文，失败尝试同样冻结；之后修改 root 返回配置已冻结错误。纯上下文查询不产生文件系统 IO。同一逻辑地址在不同 root 中使用独立上下文，实际连接仍验证 server id、instance id 与路由契约。Windows 自动使用当前用户 TokenUser SID 的 Named Pipe，明确拒绝 Unix root 配置。
+Unix 的最终端点目录由显式代码 `cc.endpoint.set_local_endpoint(root=...)`、CLI `--ipc-root` 或环境变量 `C2_IPC_ROOT` 覆盖；代码/CLI 优先于进程环境，进程环境优先于 `.env`，默认 `/tmp/c2-v3-<uidhex>`。端点路径为 `<root>/<32 字符标识>`，没有额外子目录或 `.sock` 后缀；默认 root 的 `v3` 与 namespace 磁盘格式版本相同，自定义 root 不追加版本名。自定义目录由应用预建，允许 `0755`：当前用户持有并具备读、写、遍历权限，组和其他用户不可写。默认目录创建为 `0700`；socket 在 listen 前设置并核实为 `0600`。Linux/macOS 的 bind、connect 和探测均通过目录句柄访问短名称，支持包含中文和空格的长目录，实际目录打开能力仍由文件系统决定。回收保留应用目录和无关文件。root 不移动 SHM、file spill 或配置文件。Runtime 在第一次本地 bind/connect 或准备 owner 接管时冻结上下文，失败尝试同样冻结；之后修改 root 返回配置已冻结错误。纯上下文查询不产生文件系统 IO。同一逻辑地址在不同 root 中使用独立上下文，实际连接仍验证 server id、instance id 与路由契约。Windows 自动使用当前用户 TokenUser SID 的 Named Pipe，明确拒绝 Unix root 配置。
 
 Python 的 `runtime = cc.Runtime()` 分别拥有自己的端点上下文、路由和原生会话。在 `runtime.start()` 或 `runtime.register()` 前调用 `runtime.set_local_endpoint(root=...)`；维护该实例的自定义 Unix root 时，将 `runtime.local_endpoint_context()` 传给现有 inspect/reap/sweep helper。显式 Runtime 不删除调用方创建的目录。Windows 使用原有用户范围的管道命名空间并拒绝 Unix root。[应用自有目录预检示例](../examples/python/independent_runtime.py)仅在确认关闭完成且排空无错误后删除新建的私有 Unix 目录。
 
@@ -24,7 +24,7 @@ Unix bind 初始化失败时，只撤回本次新建且仍由原目录、gate �
 
 Unix 凭据使用 schema 4，记录最终 root、namespace id、incarnation 及 socket 的 inode、ctime，不存储 device；schema 3 一律拒绝。编码、解码和 CLI 读取共用 32 KiB 上限。Windows 保持 kernel-managed schema 1，inspect 为 not-applicable，reap 为 NotApplicable。inspect/reap/sweep 使用凭据捕获的上下文，显式传入不一致的 root 在访问目标前被拒绝。凭据中的 socket 完整路径由原生配置派生，不作为输入字段；凭据自身不授予删除权限。
 
-以下 owner 接口和 grace 语义自 C-Two 0.8.0 起提供，引入时的升级范围见[发布与迁移说明](releases/0.8.0.md)。默认生命周期为 `Persistent`，常驻服务直到显式关闭；普通业务连接断开、idle 驱逐、relay 重连不结束服务。只为一个控制器独占管理整个 Runtime 的专用子进程选择 `OwnerBound`。`control, receiver = cc.owner_control_pair()` 返回 `OwnerControl` 和一次性 `NativeOwnerBootstrap`；Rust 对应 `OwnerControl` 和 `OwnerBootstrap`。控制器保存 control，用 `cc.spawn_owned_child(receiver, program, args)` 只向目标子进程转移 bootstrap；`receiver` 是保留的参数名。子进程显式调用 `bootstrap = cc.adopt_owner_stdin()`，并在 `register()` 前设置 `cc.set_server(lifecycle=cc.LifecycleConfig.owner_bound(owner_missing_grace_seconds=3.0), owner_control=bootstrap)`。
+以下 owner 接口和 grace 语义自 C-Two 0.8.0 起提供，引入时的升级范围见[发布与迁移说明](releases/0.8.0.md)。默认生命周期为 `Persistent`，常驻服务直到显式关闭；普通业务连接断开、idle 驱逐、relay 重连不结束服务。只为一个控制器独占管理整个 Runtime 的专用子进程选择 `OwnerBound`。`control, receiver = cc.owner.owner_control_pair()` 返回 `OwnerControl` 和一次性 `OwnerBootstrap`；Rust 对应 `OwnerControl` 和 `OwnerBootstrap`。控制器保存 control，用 `cc.owner.spawn_owned_child(receiver, program, args)` 只向目标子进程转移 bootstrap；`receiver` 是保留的参数名。子进程显式调用 `bootstrap = cc.owner.OwnerBootstrap.adopt_owner_stdin()`，并在 `register()` 前设置 `cc.set_server(lifecycle=cc.owner.LifecycleConfig.owner_bound(owner_missing_grace_seconds=3.0), owner_control=bootstrap)`。
 
 初始关系使用私有双向通道，由 Core 在 readiness 前 arm；Unix 为非阻塞 CLOEXEC socketpair，Windows 为当前用户 TokenUser SID 的本地双向 byte-mode Named Pipe，bootstrap 转交子进程后才注册 reactor/IOCP。继承来源由可信 launcher 保证，不能将普通业务 stdin 或任意句柄升级为 owner 能力。启动后不能通过再次 attach bootstrap 绕过票据；终态后重新启动 OwnerBound 主机需要新的 Runtime 和 bootstrap，旧票据不能为新 server instance 续权。readiness 前的票据请求只能在原请求预算内等到端点就绪后发行。
 
@@ -34,29 +34,30 @@ Unix 凭据使用 schema 4，记录最终 root、namespace id、incarnation 及 
 
 接管必须在 `OwnerMissing` 且单调时钟 `now < 原 grace deadline` 时提交；达到 deadline 后即使 timer 尚未调度也会拒绝并进入原生排空。错票据、半包、竞争失败或 inspect 都不延长该期限。成功提交原子消费旧 grant、安装 successor grant、提升 owner epoch 并转移监督通道；同票据竞争最多一个赢家，旧票据、旧 epoch 的命令、EOF 和 timer 不再有权影响新 owner。`WatcherIoError`、`Draining` 和 `Finished` 不可通过接管恢复。
 
-仅当前有效 session/epoch 可调用 `control.recovery_ticket(timeout=...)` 发行票据，或用 `control.revoke_recovery(timeout=...)` 幂等撤销当前 grant。重复取票返回同一当前 grant，撤销后再次发行才生成新 secret。`OwnerRecoveryTicket` 是 repr 脱敏、不隐式 pickle 的能力；显式 `ticket.export()` 导出包含 secret 的字节，Rust 用 `OwnerRecoveryTicket::import(&bytes)`、Python 用 `cc.OwnerRecoveryTicket.from_bytes(data)` 导入。应用负责将票据保存到控制器之外的可靠存储并保护这些字节，C-Two 不代建 secret 文件或后台恢复器。
+仅当前有效 session/epoch 可调用 `control.recovery_ticket(timeout=...)` 发行票据，或用 `control.revoke_recovery(timeout=...)` 幂等撤销当前 grant。重复取票返回同一当前 grant，撤销后再次发行才生成新 secret。`OwnerRecoveryTicket` 是 repr 脱敏、不隐式 pickle 的能力；显式 `ticket.export()` 导出包含 secret 的字节，Rust 用 `OwnerRecoveryTicket::import(&bytes)`、Python 用 `cc.owner.OwnerRecoveryTicket.from_bytes(data)` 导入。应用负责将票据保存到控制器之外的可靠存储并保护这些字节，C-Two 不代建 secret 文件或后台恢复器。
 
-恢复者先按既有方式配置 endpoint，再调用 `cc.prepare_owner_takeover(ticket)`；Rust 使用 `Runtime::prepare_owner_takeover(ticket)`。prepare 会冻结当前 Runtime 的 endpoint 配置并捕获原生目录身份，即使准备失败也不能改 root；它不启动主机或从票据采用目录。票据绑定逻辑地址、server instance、owner epoch 和原生 endpoint context 身份；同一目录的路径别名按原生 identity 验证，不以路径字符串替代。错 root/instance 或目录替换会被拒绝，inspect/commit 继续核验原身份；不自动切换默认 root。恢复票据与端点凭据都不是采用旧目录或替换目录的指令。
+恢复者先按既有方式配置 endpoint，再调用 `cc.owner.prepare_owner_takeover(ticket)`；Rust 使用 `Runtime::prepare_owner_takeover(ticket)`。prepare 会冻结当前 Runtime 的 endpoint 配置并捕获原生目录身份，即使准备失败也不能改 root；它不启动主机或从票据采用目录。票据绑定逻辑地址、server instance、owner epoch 和原生 endpoint context 身份；同一目录的路径别名按原生 identity 验证，不以路径字符串替代。错 root/instance 或目录替换会被拒绝，inspect/commit 继续核验原身份；不自动切换默认 root。恢复票据与端点凭据都不是采用旧目录或替换目录的指令。
 
 按 prepare、可选的 `prepared.inspect(timeout=...)`、保存 `prepared.successor_ticket.export()`、一次 `prepared.commit(timeout=...)` 的顺序接入。inspect 仅观察当前 identity/epoch/phase，不是授权或本次事务成功收据；commit 会重新验证并在成功时返回新的 `OwnerControl`。Python 的 `successor_ticket`、`recovery_ticket` 是属性，Rust 使用同名方法；successor 在服务端原子安装前无效，准备对象在任何结果后仍可导出两份票据。下面的 `save_ticket(name, data)` 与 `load_ticket(name)` 由应用实现，键名只示意一次恢复；原票据与 successor 必须分开保留，提交前的保存必须完成且能在控制器退出后读取。后续尝试使用独立记录，不覆盖仍可能有效的已保存票据。
 
 ```python
-# 原控制器：子进程已 Ready，control 来自 cc.owner_control_pair()。
+# 原控制器：子进程已 Ready，control 来自 cc.owner.owner_control_pair()。
 save_ticket("current", control.recovery_ticket(timeout=1.0).export())
 ```
 
 ```python
 import c_two as cc
+import c_two.owner
 
 # 恢复控制器：已完成与原主机一致的 endpoint 配置。
-ticket = cc.OwnerRecoveryTicket.from_bytes(load_ticket("current"))
-prepared = cc.prepare_owner_takeover(ticket)
+ticket = cc.owner.OwnerRecoveryTicket.from_bytes(load_ticket("current"))
+prepared = cc.owner.prepare_owner_takeover(ticket)
 status = prepared.inspect(timeout=1.0)  # 仅观察，不能据此认定接管成功。
 save_ticket("successor", prepared.successor_ticket.export())
 control = prepared.commit(timeout=1.0)  # 每个准备对象只提交一次；保留返回的 control。
 ```
 
-这些控制方法失败时抛出 `cc.OwnerControlError`；Python 的 `error.kind` / `error.cause_kind` 对应 Rust 的 `kind()` / `cause_kind()`。`NotSent`（`not_sent`）说明变更请求尚未开始发送；`Indeterminate`（`indeterminate`）说明发送已开始但没有有效确认或明确拒绝，候选会话会关闭，不能推断成功或未执行。完整的拒绝仍给出确定分类，例如 `owner_present`、`invalid_grant`、`grace_expired`、`identity_mismatch`、`shutting_down`。上例直接传播错误，每个准备对象无论结果都只允许调用一次 commit，NotSent 后重试也须重新 prepare；应用必须保留两份票据及对应的 epoch 信息。在不确定结果后，可用 inspect 观察当前 epoch/phase，再由应用显式选择已保存的原票据或 successor 创建新的准备对象；原 grant 未消费才仍有效，若已消费则只有已授权的 successor 有效，竞争者获胜或撤销也可能令自己的票据失效。不得自动依次尝试 old/new key，也不得从 epoch 变化认定自己的事务获胜。
+这些控制方法失败时抛出 `cc.owner.OwnerControlError`；Python 的 `error.kind` / `error.cause_kind` 对应 Rust 的 `kind()` / `cause_kind()`。`NotSent`（`not_sent`）说明变更请求尚未开始发送；`Indeterminate`（`indeterminate`）说明发送已开始但没有有效确认或明确拒绝，候选会话会关闭，不能推断成功或未执行。完整的拒绝仍给出确定分类，例如 `owner_present`、`invalid_grant`、`grace_expired`、`identity_mismatch`、`shutting_down`。上例直接传播错误，每个准备对象无论结果都只允许调用一次 commit，NotSent 后重试也须重新 prepare；应用必须保留两份票据及对应的 epoch 信息。在不确定结果后，可用 inspect 观察当前 epoch/phase，再由应用显式选择已保存的原票据或 successor 创建新的准备对象；原 grant 未消费才仍有效，若已消费则只有已授权的 successor 有效，竞争者获胜或撤销也可能令自己的票据失效。不得自动依次尝试 old/new key，也不得从 epoch 变化认定自己的事务获胜。
 
 原生对端身份拒绝在 inspect 时保留 `kind="identity_mismatch"`；commit 尚未发送请求时保留 `kind="not_sent"` 和 `cause_kind="identity_mismatch"`。普通 OS 访问失败不推断为身份不符。
 
@@ -74,18 +75,19 @@ SDK 将原始 connect deadline 用于最终发布检查；若期限先到，conn
 
 Persistent 的直连 IPC admin shutdown 只在尚未尝试写入控制请求时重试暂时连接失败。开始写入后，写入失败、ACK 丢失或超时均返回现有未确认结果，不再重连重发；未确认不证明服务端没有执行。这样同地址重新绑定的新实例不会收到本次调用的重发。ping 继续保留探测重试，首次观察到端点不存在的处理与原总预算保持。
 
-服务进程可在监听 Ready 后直接调用 `cc.server_credential() -> EndpointCredential | None` 并把凭据交给控制器；此查询读取现有生命周期 watch 中由 listener 发布的值，不调用 inspect、不做文件 I/O、不取 namespace gate，也不等待 readiness。Ready 和仍持有 listener 的 Stopping 阶段有值；启动前、绑定失败及 Stopped/Failed 终态返回 None。run 取消到现有 finalize 发布终态之间允许返回旧快照。控制器也可在协调 gate 空闲时调用 `cc.inspect_endpoint(address)` 取得 present 凭据；present 和 getter 快照均不证明存活或授予删除、owner 权限，WouldBlock 表示协调争用。子进程正常退出或 kill()+wait() 确认退出后，再用 `cc.reap_endpoint(address, credential)` 精确收尾；旧凭据不能删除新 incarnation。Windows getter 返回 kernel-managed schema 1 凭据，但 reap 为 NotApplicable。
+服务进程可在监听 Ready 后直接调用 `cc.endpoint.server_credential() -> EndpointCredential | None` 并把凭据交给控制器；此查询读取现有生命周期 watch 中由 listener 发布的值，不调用 inspect、不做文件 I/O、不取 namespace gate，也不等待 readiness。Ready 和仍持有 listener 的 Stopping 阶段有值；启动前、绑定失败及 Stopped/Failed 终态返回 None。run 取消到现有 finalize 发布终态之间允许返回旧快照。控制器也可在协调 gate 空闲时调用 `cc.endpoint.inspect_endpoint(address)` 取得 present 凭据；present 和 getter 快照均不证明存活或授予删除、owner 权限，WouldBlock 表示协调争用。子进程正常退出或 kill()+wait() 确认退出后，再用 `cc.endpoint.reap_endpoint(address, credential)` 精确收尾；旧凭据不能删除新 incarnation。Windows getter 返回 kernel-managed schema 1 凭据，但 reap 为 NotApplicable。
 
-`cc.EndpointCredential` 是不可变原生对象；server_credential 与 inspect 交付同一类型，reap 接收该对象。需要保存或跨进程传递时显式使用 `credential.to_json()` 与 `cc.EndpointCredential.from_json(document=...)`，两者继续执行唯一 Rust codec 的严格校验和 32 KiB 限制；inspect 本身不保证 JSON 导出成功。凭据不能手工构造、继承、修改或浅复制，同进程可共享其引用。Python 包装壳、`_native` 槽和旧 `_native.PyEndpointCredential` 导出已退出，见 [0.9.0 更新说明](releases/0.9.0.md)。
+`cc.endpoint.EndpointCredential` 是不可变原生对象；server_credential 与 inspect 交付同一类型，reap 接收该对象。需要保存或跨进程传递时显式使用 `credential.to_json()` 与 `cc.endpoint.EndpointCredential.from_json(document=...)`，两者继续执行唯一 Rust codec 的严格校验和 32 KiB 限制；inspect 本身不保证 JSON 导出成功。凭据不能手工构造、继承、修改或浅复制，同进程可共享其引用。Python 包装壳、`_native` 槽和旧 `_native.PyEndpointCredential` 导出已退出，见 [0.9.0 更新说明](releases/0.9.0.md)。
 
 ```python
 import c_two as cc
+import c_two.endpoint
 
 cc.register(Grid, GridResource(), name="grid")
-credential = cc.server_credential()  # Listener 已就绪；可交给控制器保存。
+credential = cc.endpoint.server_credential()  # Listener 已就绪；可交给控制器保存。
 ```
 
-需要续扫时使用 cc.sweep_endpoints(addresses=[本次运行的逻辑地址], max_entries=64, max_ms=10) 的 context manager 和 next_batch()；只在原生报告 round_complete 时记为本轮完成，中断或命名空间变化单独处理。c3 endpoint inspect/reap/sweep 调用同一原生机制，sweep 可重复传 --address，需要非默认 root 时传 --ipc-root（或环境变量 C2_IPC_ROOT）。运行器不拼 OS 路径，不直接 unlink。
+需要续扫时使用 cc.endpoint.sweep_endpoints(addresses=[本次运行的逻辑地址], max_entries=64, max_ms=10) 的 context manager 和 next_batch()；只在原生报告 round_complete 时记为本轮完成，中断或命名空间变化单独处理。c3 endpoint inspect/reap/sweep 调用同一原生机制，sweep 可重复传 --address，需要非默认 root 时传 --ipc-root（或环境变量 C2_IPC_ROOT）。运行器不拼 OS 路径，不直接 unlink。
 
 Relay 发现跨 root 的行为：独立 relay 在启动时解析并冻结自己的本地上游域上下文，一个 relay 本地域对应一个 root，上游资源与它使用一致配置；不同 root 可运行不同 relay。客户端在发现请求中携带 Core 派生的本地 namespace 标识（不含原始路径，不是授权凭据）。`/_resolve` 响应的 `x-c2-local-namespace` 头是整批路由的唯一 namespace 来源，JSON 路由不再附加该字段。Rust/Core 客户端只在 anchor 为本机、响应头与本地上下文匹配且握手身份、契约与代际检查均通过时接受 IPC。缺头或不匹配时使用 HTTP，不推定默认 root，也不从旧 JSON 字段恢复 namespace；重复或非法响应头仍拒绝。HTTP 路由不会因 namespace 不匹配被撤销，HTTP-only 调用不要求本地端点能力。Windows 标识由 backend 与当前用户作用域 构成，实际权限仍由 OS DACL、握手身份与完整路由契约检查。
 
@@ -128,12 +130,12 @@ except CoreError as exc:
 
 ## 观察 IPC 连接结束
 
-在连接客户端或启动监听之前调用 `cc.connection_events()`，订阅本 Runtime 的受管理 outgoing IPC 连接以及服务端接受的连接；Rust 对应 `Runtime::connection_events()`。同一事件流通过 `event.side` 的 `client` / `server` 区分双方。订阅不启动主机、创建身份或冻结配置，预使用阶段的合法配置变更保留既有订阅。
+在连接客户端或启动监听之前调用 `cc.observe.connection_events()`，订阅本 Runtime 的受管理 outgoing IPC 连接以及服务端接受的连接；Rust 对应 `Runtime::connection_events()`。同一事件流通过 `event.side` 的 `client` / `server` 区分双方。订阅不启动主机、创建身份或冻结配置，预使用阶段的合法配置变更保留既有订阅。
 
-Python `events.recv(timeout=None)` 返回 `ConnectionEvent`：`kind='opened'` 的 `value` 是 `ConnectionObservation`，`kind='closed'` 的 `value` 是 `ConnectionClosed`。两者都有 `connection_id` 和 `side`；客户端 ID 与 `cc.connection_observation(proxy).connection_id` 一致。opened 只证明 OS 物理连接建立或接受，不证明握手、合同或业务就绪。多代理可共享同一连接，逻辑代理 close 不单独产生物理关闭；重连分配新 ID。
+Python `events.recv(timeout=None)` 返回 `ConnectionEvent`：`kind='opened'` 的 `value` 是 `ConnectionObservation`，`kind='closed'` 的 `value` 是 `ConnectionClosed`。两者都有 `connection_id` 和 `side`；客户端 ID 与 `cc.observe.connection_observation(proxy).connection_id` 一致。opened 只证明 OS 物理连接建立或接受，不证明握手、合同或业务就绪。多代理可共享同一连接，逻辑代理 close 不单独产生物理关闭；重连分配新 ID。
 
 ```python
-events = cc.connection_events()  # 在连接之前订阅
+events = cc.observe.connection_events()  # 在连接之前订阅
 try:
     peers = [cc.connect(Grid, name='grid', address=address) for address in addresses]
     for event in events:
@@ -147,9 +149,9 @@ finally:
 
 事件不回放历史，晚订阅可能只收到旧连接此后的关闭。队列首次订阅时分配，固定容量 1024；溢出抛 `ConnectionEventsLagged`，`missed` 表示遗漏数，并永久结束该订阅。Rust 的异步 `recv(&self)` 在结束时返回 `Ok(None)`，溢出为 `ConnectionEventsError::Lagged`，并发接收为 `ConcurrentReceive`。事件和订阅仅保留元数据，不保活 Runtime、transport、resource 或 payload lease。
 
-`cc.connection_observation(proxy)` 保留当前物理连接的只读元数据；`snapshot()` 立即返回终态或 `None`，thread-local 和 HTTP 代理拒绝该查询。Python 的 `ConnectionObservation.wait_closed()` 和专用 Core 同步桥 `wait_connection_closed()` 已退役，等待统一走事件流，迟到查询使用 snapshot。底层 Rust 异步 `ConnectionObservation::wait_closed(Option<Duration>)` 仍用于原生关闭屏障和可取消的单连接 future，与汇总流读取同一终态权威。
+`cc.observe.connection_observation(proxy)` 保留当前物理连接的只读元数据；`snapshot()` 立即返回终态或 `None`，thread-local 和 HTTP 代理拒绝该查询。Python 的 `ConnectionObservation.wait_closed()` 和专用 Core 同步桥 `wait_connection_closed()` 已退役，等待统一走事件流，迟到查询使用 snapshot。底层 Rust 异步 `ConnectionObservation::wait_closed(Option<Duration>)` 仍用于原生关闭屏障和可取消的单连接 future，与汇总流读取同一终态权威。
 
-原因仅为 `local_close`、`peer_close_message`、`peer_eof`、`connection_reset`、`heartbeat_timeout`、`protocol_error`、`io_error`。只有收到 DISCONNECT 才报告 `peer_close_message`；EOF/reset 不证明对端进程死亡，心跳超时也不证明死亡。两端的原因可以不同，首个终态保持不变。通知复用 Linux/macOS UDS 和 Windows Named Pipe 的接收事件及现有心跳，不依赖在途调用；通知先于工作排空和内存释放。仍须通过原生 shutdown/close 完成结果确认收尾，通过 OS wait 确认进程退出，再按凭据精确 reap。通知不会释放 Held，也不会把普通断连变成 OwnerBound 所有者丢失。
+原因仅为 `local_close`、`peer_close_message`、`peer_eof`、`connection_reset`、`heartbeat_timeout`、`protocol_error`、`io_error`。只有收到 DISCONNECT 才报告 `peer_close_message`；EOF/reset 不证明对端进程死亡，心跳超时也不证明死亡。两端的原因可以不同，首个终态保持不变。通知复用 Linux/macOS UDS 和 Windows Named Pipe 的接收事件及现有心跳，不依赖在途调用；通知先于工作排空和内存释放。仍须通过原生 shutdown/close 完成结果确认收尾，通过 OS wait 确认进程退出，再按凭据精确 reap。通知不会释放 HeldResult，也不会把普通断连变成 OwnerBound 所有者丢失。
 
 对象替换、未知端点、损坏记录与部分初始化报告 unverified，不能凭年龄、PID 或连接失败删除。同一通信组使用相同构建及对应的最终目录配置；路径调整直接替换旧布局，旧凭据和旧进程端点不做自动迁移。升级不清扫旧目录中的历史数据。Windows 端点回收报告内核管理或 not-applicable。初始登记任意位置崩溃后的自动恢复不在保证范围内。平台验证范围见对应的验收记录。
 

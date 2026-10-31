@@ -1,6 +1,6 @@
 # Python SDK usage
 
-This guide describes the Python APIs of C-Two 0.10.1 / c3 0.6.0; the [0.10.0 release notes](releases/0.10.0.md) describe the migration from 0.9.x, including `cc.Runtime()`, `cc.server_credential()`, Unix schema 4 and the additional binding reason. CRM contracts expose stateful resources over same-process calls, local IPC and HTTP relay; portable Python payloads use the optional FastDB 0.2.4 extra. For installation and a runnable introduction, see the [quickstart](../README.md#quickstart).
+This guide describes the Python APIs of C-Two 0.10.1 / c3 0.6.0; the [0.10.0 release notes](releases/0.10.0.md) describe the migration from 0.9.x, including `cc.Runtime()`, `cc.endpoint.server_credential()`, Unix schema 4 and the additional binding reason. CRM contracts expose stateful resources over same-process calls, local IPC and HTTP relay; portable Python payloads use the optional FastDB 0.2.4 extra. For installation and a runnable introduction, see the [quickstart](../README.md#quickstart).
 
 ## Portable payloads (FastDB)
 
@@ -65,7 +65,7 @@ A portable method carries zero or one `Payload` envelope in each direction; C-Tw
 
 `cc.hold(echo.echo)(source)` retains a response as `HeldResult`. Explicit `release()` first attempts FastDB invalidation once, then releases native storage. When native cleanup fails, the original response stays with the result for another `release()` call; invalidation does not replay and the value stays inaccessible. Release an additional exported memoryview before retrying an export rejection, which occurs before invalidation. Manually constructed `HeldResult(release_cb=...)` callbacks still run once. Use `with cc.hold(...) as held` for normal scopes and materialize values that must outlive them.
 
-`cc.memory_stats()` includes `abandoned_releases` in each native memory scope. Final consuming cleanup failures retain unreturned charges and count one abandoned obligation, with the error returned or logged by its native carrier. No background recovery runs. The counter includes uncertain published SHM outcomes that a peer may later release. An abnormal same-user SHM peer can assert invalid, replayed or stale allocation coordinates; unreleaseable asserted references also count and can make this counter exceed actual unreleased allocations. See [memory policy](memory-policy.en.md#statistics-and-payload-lifetime) for its accounting limits.
+`cc.observe.memory_stats()` includes `abandoned_releases` in each native memory scope. Final consuming cleanup failures retain unreturned charges and count one abandoned obligation, with the error returned or logged by its native carrier. No background recovery runs. The counter includes uncertain published SHM outcomes that a peer may later release. An abnormal same-user SHM peer can assert invalid, replayed or stale allocation coordinates; unreleaseable asserted references also count and can make this counter exceed actual unreleased allocations. See [memory policy](memory-policy.en.md#statistics-and-payload-lifetime) for its accounting limits.
 
 ## Remote connections and deadlines
 
@@ -86,7 +86,7 @@ Connection `timeout` is one budget in seconds across pool waiting, OS connection
 
 Business-call waiting is independent. `cc.with_call_options` returns a view of an existing connection; its timeout does not become a resource method argument. A call deadline can end caller waiting after dispatch while native work still holds the input until completion. It does not cancel a running resource method or authorize replay. Direct IPC waits indefinitely by default; HTTP uses the configured logical-call budget. Same-process synchronous calls accept inherited or unlimited waiting. See [configuration](configuration.en.md#call-deadlines-and-admission) for defaults and finite-call admission limits.
 
-Unix processes sharing an IPC domain use the same configured root (`cc.set_local_endpoint(root=...)` or `C2_IPC_ROOT`). The application provisions custom roots; `0755` is accepted with verified ownership and protection from other-user mutation. The default is `0700`, and sockets are `0600`. Windows uses TokenUser-scoped Named Pipes across logons and rejects Unix root overrides. Native connections require the same user and a server integrity of at least Medium; cross-session payloads automatically avoid inaccessible Local mappings. C-Two 0.10.0 moves the RPC handshake from 13 to 14 behind a permanent fixed version preamble, so upgrade communicating peers together. Different versions that both implement the fixed preamble raise `CoreError` with `category='protocol_version_mismatch'` and nonzero `local_protocol_version` / `peer_protocol_version` (`None` on every other error); mixing with 0.9.x still yields a generic connection/protocol failure. See the [0.10.0 migration](releases/0.10.0.md) and the [handshake spec](ipc-handshake.md). See [endpoint configuration](configuration.en.md#local-endpoint-directories) and [lifecycle management](local-endpoint-lifecycle.en.md).
+Unix processes sharing an IPC domain use the same configured root (`cc.endpoint.set_local_endpoint(root=...)` or `C2_IPC_ROOT`). The application provisions custom roots; `0755` is accepted with verified ownership and protection from other-user mutation. The default is `0700`, and sockets are `0600`. Windows uses TokenUser-scoped Named Pipes across logons and rejects Unix root overrides. Native connections require the same user and a server integrity of at least Medium; cross-session payloads automatically avoid inaccessible Local mappings. C-Two 0.10.0 moves the RPC handshake from 13 to 14 behind a permanent fixed version preamble, so upgrade communicating peers together. Different versions that both implement the fixed preamble raise `CoreError` with `category='protocol_version_mismatch'` and nonzero `local_protocol_version` / `peer_protocol_version` (`None` on every other error); mixing with 0.9.x still yields a generic connection/protocol failure. See the [0.10.0 migration](releases/0.10.0.md) and the [handshake spec](ipc-handshake.md). See [endpoint configuration](configuration.en.md#local-endpoint-directories) and [lifecycle management](local-endpoint-lifecycle.en.md).
 
 ## Low-level server bridge
 
@@ -112,11 +112,11 @@ with cc.hold(echo.echo)(source) as held:
 # leaving the block (or held.release()) invalidates owner and views, then frees the lease
 ```
 
-Release is layered: explicit `.release()`, the `with` context manager, and a `__del__` fallback that warns if you forget both. `cc.hold_stats()` reports active holds for monitoring.
+Release is layered: explicit `.release()`, the `with` context manager, and a `__del__` fallback that warns if you forget both. `cc.observe.memory_stats()["holds"]` reports active holds for monitoring.
 
 `held.unsafe_buffer` exposes the retained raw wire buffer as a `memoryview` escape hatch. Raw NumPy arrays or pointers derived from it bypass FastDB's checked owner/view model and **cannot be revoked mechanically** — materialize values through FastDB before storing them beyond the hold scope.
 
-On the server side, portable inputs are owned by default. Registering with `cc.register(..., input_lifetime={...: cc.InputLifetime.BORROWED})` opts specific methods into call-scoped borrowed inputs: C-Two invalidates the payload and its checked views before releasing the request lease when the call returns or raises. Do not retain a borrowed payload or view after the method returns.
+On the server side, portable inputs are owned by default. Registering with `cc.register(..., input_lifetime={...: 'borrowed'})` opts specific methods into call-scoped borrowed inputs: C-Two invalidates the payload and its checked views before releasing the request lease when the call returns or raises. Do not retain a borrowed payload or view after the method returns.
 
 `cc.transfer` accepts only `input` and `output`. The former `buffer` keyword is removed, including `None` and `"view"`; passing it raises `TypeError`. Remove that keyword and select borrowed inputs through registration-level `input_lifetime`. The module-level `auto_transfer` follows the same rule.
 
@@ -126,20 +126,28 @@ On the server side, portable inputs are owned by default. Registering with `cc.r
 
 The main user surface, shown throughout the guides. The top-level `cc` namespace groups:
 
-- Authoring: `@cc.crm`, `@cc.read`, `@cc.write`, `@cc.on_shutdown`, `@cc.transfer`, `cc.hold`, `cc.InputLifetime`
+Applications start with `import c_two as cc`. Import the specialized modules when needed:
+
+```python
+from c_two import owner, endpoint, observe, contract
+```
+
+Owner supervision lives in `c_two.owner`, local endpoint administration in `c_two.endpoint`, diagnostics in `c_two.observe`, and contract tooling in `c_two.contract`. Module functions use the default Runtime; the same methods on `cc.Runtime()` use that explicit instance. Contract export and owner capability construction do not select a Runtime. Both `namespace` and `version` are required by `@cc.crm`. Concurrency modes are `'parallel'`, `'exclusive'`, and `'read_parallel'`; registration input lifetimes are `'materialized'` and `'borrowed'`.
+
+- Authoring: `@cc.crm`, `@cc.read`, `@cc.write`, `@cc.on_shutdown`, `@cc.transfer`, `cc.hold`
 - Calls: `cc.with_call_options` (per-call deadline views, see [remote connections and deadlines](#remote-connections-and-deadlines))
-- Runtime: `cc.Runtime`, whose instance methods include `set_local_endpoint`, `set_server`, `set_client`, `set_transport_policy`, `set_relay_anchor`, `set_call_execution_limits`, `register`, `connect`, `unregister`, `start`, `server_id`, `server_address`, `server_credential`, `local_endpoint_context`, `shutdown`, `connection_events`, `native_lifecycle_snapshot`, `native_terminal_outcome`, `memory_stats`, `hold_stats`, `call_execution_snapshot` and `prepare_owner_takeover`
-- Default Runtime: `cc.register`, `cc.connect`, `cc.unregister`, `cc.serve`, `cc.shutdown`, `cc.server_address`, `cc.server_credential`, `cc.set_server`, `cc.set_client`, `cc.set_relay_anchor`, `cc.set_transport_policy`, `cc.set_local_endpoint`; `cc.close(proxy)` follows the proxy's own connection
-- Contracts: `cc.export_contract_descriptor`, `cc.export_contract_release_ref`, `cc.compile_contract_artifacts`, `cc.infer_crm_from_resource`
-- Lifecycle and ownership: `cc.LifecycleConfig`, `cc.owner_control_pair`, `cc.spawn_owned_child`, `cc.adopt_owner_stdin`, `cc.OwnerControl`, `cc.OwnerRecoveryTicket`, `cc.prepare_owner_takeover`, `cc.PreparedOwnerTakeover`, `cc.OwnerStatus`, `cc.OwnerControlError`
-- Endpoint maintenance: `cc.inspect_endpoint`, `cc.reap_endpoint`, `cc.sweep_endpoints`, `cc.EndpointCredential` (immutable native value; explicit JSON import/export)
-- Connection observations: `cc.connection_observation`, `cc.connection_events`, `cc.ConnectionObservation`, `cc.ConnectionClosed`, `cc.ConnectionEvent`, `cc.ConnectionEvents`, `cc.ConnectionEventsLagged`
+- Runtime: `cc.Runtime`, whose instance methods include `set_local_endpoint`, `set_server`, `set_client`, `set_transport_policy`, `set_relay_anchor`, `set_call_execution_limits`, `register`, `connect`, `unregister`, `start`, `server_id`, `server_address`, `server_credential`, `local_endpoint_context`, `shutdown`, `connection_events`, `lifecycle_snapshot`, `shutdown_outcome`, `memory_stats`, `call_execution_snapshot` and `prepare_owner_takeover`
+- Default Runtime: `cc.register`, `cc.connect`, `cc.unregister`, `cc.serve`, `cc.shutdown`, `cc.server_address`, `cc.endpoint.server_credential`, `cc.set_server`, `cc.set_client`, `cc.set_relay_anchor`, `cc.set_transport_policy`, `cc.endpoint.set_local_endpoint`; `cc.close(proxy)` follows the proxy's own connection
+- Contracts: `cc.contract.export_descriptor`, `cc.contract.release_ref`, `cc.contract.compile_artifacts`, `cc.contract.diagnostics`
+- Lifecycle and ownership: `cc.owner.LifecycleConfig`, `cc.owner.owner_control_pair`, `cc.owner.spawn_owned_child`, `cc.owner.OwnerBootstrap.adopt_owner_stdin`, `cc.owner.OwnerControl`, `cc.owner.OwnerRecoveryTicket`, `cc.owner.prepare_owner_takeover`, `cc.owner.PreparedOwnerTakeover`, `cc.owner.OwnerStatus`, `cc.owner.OwnerControlError`
+- Endpoint maintenance: `cc.endpoint.inspect_endpoint`, `cc.endpoint.reap_endpoint`, `cc.endpoint.sweep_endpoints`, `cc.endpoint.EndpointCredential` (immutable native value; explicit JSON import/export)
+- Connection observations: `cc.observe.connection_observation`, `cc.observe.connection_events`, `cc.observe.ConnectionObservation`, `cc.observe.ConnectionClosed`, `cc.observe.ConnectionEvent`, `cc.observe.ConnectionEvents`, `cc.observe.ConnectionEventsLagged`
 - Errors: `cc.error.CoreError` (structured local/Core errors), `cc.error.CCError` (semantic errors), with common `cc.error.CCBaseError`
-- Monitoring: `cc.hold_stats`, `cc.memory_stats`, `cc.call_execution_snapshot`, `cc.native_lifecycle_snapshot`, `cc.native_terminal_outcome` (read-only)
+- Monitoring: `cc.observe.memory_stats`, `cc.observe.call_execution_snapshot`, `cc.observe.lifecycle_snapshot`, `cc.observe.shutdown_outcome` (read-only)
 
 Use `cc.set_server(startup_timeout=...)` before registration to choose a native startup wait. Startup expiry has `CoreError.lifecycle_kind == 'startup_timeout'`, `startup_stage` and `timeout_seconds`; see [startup configuration and errors](configuration.en.md#server-startup-deadlines).
 
-After a listener reaches Ready, `cc.server_credential() -> cc.EndpointCredential | None` returns its native credential from the existing lifecycle watch without inspection or filesystem I/O. It returns `None` before start and after terminal shutdown; a snapshot is not proof of liveness or cleanup authority. See the [lifecycle guide](local-endpoint-lifecycle.en.md#exact-cleanup-and-bounded-sweeps).
+After a listener reaches Ready, `cc.endpoint.server_credential() -> cc.endpoint.EndpointCredential | None` returns its native credential from the existing lifecycle watch without inspection or filesystem I/O. It returns `None` before start and after terminal shutdown; a snapshot is not proof of liveness or cleanup authority. See the [lifecycle guide](local-endpoint-lifecycle.en.md#exact-cleanup-and-bounded-sweeps).
 
 Runtime-scoped IPC policy, call admission limits and relay settings are documented in the [configuration guide](configuration.en.md).
 

@@ -11,6 +11,8 @@ import pytest
 
 import c_two as cc
 
+import c_two.contract
+
 
 FIXTURE = (
     Path(__file__).parents[4]
@@ -21,10 +23,17 @@ FIXTURE = (
 )
 
 
+def test_codegen_error_uses_its_public_native_name() -> None:
+    from c_two import _native
+
+    assert cc.contract.CodegenError is _native.CodegenError
+    assert cc.contract.CodegenError.__name__ == 'CodegenError'
+
+
 def test_python_codegen_projects_the_shared_rust_artifact_set() -> None:
     descriptor = FIXTURE.read_bytes()
-    first = cc.compile_contract_artifacts(descriptor, target="python")
-    second = cc.compile_contract_artifacts(descriptor, target="python")
+    first = cc.contract.compile_artifacts(descriptor, target="python")
+    second = cc.contract.compile_artifacts(descriptor, target="python")
 
     assert first == second
     assert first.total_bytes == sum(len(artifact.bytes) for artifact in first.artifacts)
@@ -49,8 +58,8 @@ def test_python_codegen_preserves_structured_fastdb_error_fields() -> None:
     descriptor["fingerprints"]["abi_hash"] = abi_hash
     descriptor["fingerprints"]["signature_hash"] = signature_hash
 
-    with pytest.raises(cc.ContractCodegenError) as caught:
-        cc.compile_contract_artifacts(
+    with pytest.raises(cc.contract.CodegenError) as caught:
+        cc.contract.compile_artifacts(
             json.dumps(descriptor, separators=(",", ":")).encode(),
             target="python",
         )
@@ -69,8 +78,8 @@ def test_python_codegen_preserves_structured_fastdb_error_fields() -> None:
 
 
 def test_python_codegen_non_fastdb_errors_have_explicit_empty_cause_fields() -> None:
-    with pytest.raises(cc.ContractCodegenError) as caught:
-        cc.compile_contract_artifacts(FIXTURE.read_bytes(), target="cpp")
+    with pytest.raises(cc.contract.CodegenError) as caught:
+        cc.contract.compile_artifacts(FIXTURE.read_bytes(), target="cpp")
 
     error = caught.value
     assert error.binding_path is None
@@ -94,8 +103,8 @@ def test_python_codegen_projects_typed_contract_admission_fields() -> None:
         for index in range(257)
     ]
 
-    with pytest.raises(cc.ContractCodegenError) as caught:
-        cc.compile_contract_artifacts(
+    with pytest.raises(cc.contract.CodegenError) as caught:
+        cc.contract.compile_artifacts(
             json.dumps(descriptor, separators=(",", ":")).encode(),
             target="python",
         )
@@ -116,7 +125,7 @@ def test_python_codegen_projects_typed_contract_admission_fields() -> None:
 def test_generated_python_project_imports_with_installed_fastdb_projection(
     tmp_path: Path,
 ) -> None:
-    generated = cc.compile_contract_artifacts(FIXTURE.read_bytes(), target="python")
+    generated = cc.contract.compile_artifacts(FIXTURE.read_bytes(), target="python")
     for artifact in generated.artifacts:
         output = tmp_path / artifact.relative_path
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -147,7 +156,7 @@ def test_generated_python_project_imports_with_installed_fastdb_projection(
 def test_generated_python_decoder_closes_owner_and_preserves_digest_error(
     tmp_path: Path,
 ) -> None:
-    generated = cc.compile_contract_artifacts(FIXTURE.read_bytes(), target="python")
+    generated = cc.contract.compile_artifacts(FIXTURE.read_bytes(), target="python")
     for artifact in generated.artifacts:
         output = tmp_path / artifact.relative_path
         output.parent.mkdir(parents=True, exist_ok=True)

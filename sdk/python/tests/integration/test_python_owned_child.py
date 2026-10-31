@@ -6,12 +6,15 @@ import time
 
 import c_two as cc
 
+import c_two.owner
+
 
 def test_python_controller_policy_configuration_then_owner_eof_reaps_child(tmp_path):
     ready = tmp_path / 'ready'
     finished = tmp_path / 'finished'
     script = '''
 import c_two as cc
+import c_two.owner
 from pathlib import Path
 import sys
 @cc.crm(namespace='test.python.controller', version='0.1.0')
@@ -22,15 +25,15 @@ class Echo:
 class Resource:
     def ping(self): return 'pong'
     def done(self): Path(sys.argv[2]).write_text('one hook')
-receiver = cc.adopt_owner_stdin()
-cc.set_server(lifecycle=cc.LifecycleConfig.owner_bound(0), owner_control=receiver)
+receiver = cc.owner.OwnerBootstrap.adopt_owner_stdin()
+cc.set_server(lifecycle=cc.owner.LifecycleConfig.owner_bound(0), owner_control=receiver)
 cc.set_transport_policy(shm_threshold=8192)
 cc.register(Echo, Resource(), name='child-echo')
 Path(sys.argv[1]).write_text(cc.server_address())
 cc.serve()
 '''
-    keepalive, receiver = cc.owner_control_pair()
-    child = cc.spawn_owned_child(receiver, sys.executable, ['-c', script, str(ready), str(finished)])
+    keepalive, receiver = cc.owner.owner_control_pair()
+    child = cc.owner.spawn_owned_child(receiver, sys.executable, ['-c', script, str(ready), str(finished)])
     try:
         assert not receiver.is_available
         deadline = time.monotonic() + 10

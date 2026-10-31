@@ -4,7 +4,7 @@ The native Windows backend uses byte-mode Named Pipes for `ipc://` control traff
 
 This guide covers Python C-Two **0.10.1**, c3 **0.6.0** and FastDB **0.2.4** on Windows x64 and ARM64. Install the matching Python and c3 versions together; see the [0.10.0 migration notes](releases/0.10.0.md) and [lifecycle guide](local-endpoint-lifecycle.en.md) for endpoint behavior.
 
-Unix root overrides (`cc.set_local_endpoint(root=...)`, `C2_IPC_ROOT`, `--ipc-root`) are rejected on Windows. Pipe names derive from the logical address and current TokenUser SID.
+Unix root overrides (`cc.endpoint.set_local_endpoint(root=...)`, `C2_IPC_ROOT`, `--ipc-root`) are rejected on Windows. Pipe names derive from the logical address and current TokenUser SID.
 
 ## Install Python and c3
 

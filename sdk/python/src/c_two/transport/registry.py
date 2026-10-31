@@ -40,15 +40,14 @@ import threading
 from inspect import getattr_static
 from collections.abc import Mapping
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Literal, TypeVar
 
-from c_two.crm.bridge import ResourceBridge, normalize_bridge_map
 from c_two.crm.contract import CRMContract, crm_contract, crm_contract_identity
 from c_two.crm.conformance import validate_resource_conformance
-from c_two.crm.methods import rpc_method_names
 from c_two.crm.meta import _SHUTDOWN_ATTR, get_shutdown_method
 from c_two.config.ipc import ClientIPCOverrides, ServerIPCOverrides
 from c_two.config.lifecycle import LifecycleConfig
+from c_two.mem import MemoryStats
 from c_two.config.settings import C2Settings, _clean_optional_str, settings
 from c_two.error import (
     CCError,
@@ -58,17 +57,12 @@ from c_two.error import (
     RegistryUnavailable,
 )
 from .client.proxy import CRMProxy
-from .input_lifetime import (
-    InputLifetimeLike,
-    normalize_input_lifetime_map,
-    validate_input_lifetime_resource_contract,
-)
+from ._snapshots import CallExecutionSnapshot, LifecycleSnapshot, ShutdownOutcome
 from .server.scheduler import ConcurrencyConfig
 from .server.native import NativeServerBridge as Server
 
 if TYPE_CHECKING:
-    from c_two._native import NativeOwnerBootstrap, OwnedChild
-    from c_two.mem import MemoryStats
+    from c_two.owner import OwnerBootstrap, OwnedChild
     from .endpoint import EndpointCredential
 
 CRM = TypeVar('CRM')
@@ -342,7 +336,7 @@ class Runtime:
         server_id: str | None = None,
         ipc_overrides: ServerIPCOverrides | Mapping[str, object] | None = None,
         lifecycle: LifecycleConfig | None = None,
-        owner_control: NativeOwnerBootstrap | None = None,
+        owner_control: OwnerBootstrap | None = None,
         startup_timeout: float | None = None,
     ) -> None:
         """Configure IPC server and its native lifecycle. Call before register().
@@ -364,7 +358,7 @@ class Runtime:
             control capability must also be attached through *owner_control*.
         owner_control:
             The controller-held opaque
-            :class:`c_two.NativeOwnerBootstrap`. It is consumed exactly once and
+            :class:`c_two.owner.OwnerBootstrap`. It is consumed exactly once and
             is deliberately kept outside the IPC override mapping and every
             other cloneable configuration path.
         """
@@ -458,13 +452,17 @@ class Runtime:
         """Prepare takeover in this instance's existing endpoint context."""
         return self._runtime_session.prepare_owner_takeover(ticket)
 
-    def hold_stats(self) -> dict:
-        return dict(self._runtime_session.hold_stats())
-
     def memory_stats(self) -> MemoryStats:
-        return dict(self._runtime_session.memory_stats())
+        """Observe C-Two-owned IPC backing and live reassembly charges, not RSS.
 
-    def call_execution_snapshot(self) -> dict:
+        The shm, file and reassembly budget cells are independent accounting
+        scopes and must never be summed as physical memory usage.
+        """
+        snapshot = dict(self._runtime_session.memory_stats())
+        del snapshot['budget_cells_note']
+        return snapshot
+
+    def call_execution_snapshot(self) -> CallExecutionSnapshot:
         return dict(self._runtime_session.call_execution_snapshot())
 
     def register(
@@ -474,8 +472,7 @@ class Runtime:
         *,
         name: str,
         concurrency: ConcurrencyConfig | None = None,
-        bridge: dict[str, ResourceBridge] | None = None,
-        input_lifetime: Mapping[str, InputLifetimeLike] | None = None,
+        input_lifetime: Mapping[str, Literal['materialized', 'borrowed']] | None = None,
     ) -> str:
         """Register a CRM, making it available via :func:`connect`.
 
@@ -503,19 +500,9 @@ class Runtime:
             The *name* string (echoed back for convenience).
         """
         crm_contract_identity(crm_class)
-        method_names = rpc_method_names(crm_class)
-        method_bridge_map = normalize_bridge_map(
-            bridge,
-            method_names=method_names,
-        )
-        input_lifetime_map = normalize_input_lifetime_map(
-            input_lifetime,
-            method_names=method_names,
-        )
         validate_resource_conformance(
             crm_class,
             crm_instance,
-            bridge=method_bridge_map,
         )
         shutdown_method = get_shutdown_method(crm_class)
         resource_type = type(crm_instance)
@@ -535,12 +522,6 @@ class Runtime:
                     f'{type(crm_instance).__name__}.{method_name} must be '
                     f'declared with @cc.on_shutdown on CRM {crm_class.__name__}.',
                 )
-        validate_input_lifetime_resource_contract(
-            crm_class,
-            crm_instance,
-            input_lifetime_map,
-            bridge=method_bridge_map,
-        )
         with self._active_binding():
             created_server = False
             try:
@@ -558,8 +539,7 @@ class Runtime:
                     crm_instance,
                     concurrency,
                     name=name,
-                    bridge=method_bridge_map,
-                    input_lifetime=input_lifetime_map,
+                    input_lifetime=input_lifetime,
                 )
 
                 # Start server if not yet running.
@@ -805,7 +785,7 @@ class Runtime:
             server = self._server
         return server.names if server is not None else []
 
-    def shutdown(self, *, timeout: float = 30.0) -> dict:
+    def shutdown(self, *, timeout: float = 30.0) -> ShutdownOutcome:
         """Consume native shutdown; retain the session until Core proves completion."""
         from c_two._native import RuntimeSession
 
@@ -958,7 +938,7 @@ class Runtime:
             server = self._server
         if server is None:
             return False
-        return bool(server.native_terminal_outcome() is not None)
+        return bool(server.shutdown_outcome() is not None)
 
     @staticmethod
     def _print_serve_banner(
@@ -987,11 +967,11 @@ class Runtime:
     def _server_started(self) -> bool:
         return self._server is not None and self._server.is_started()
 
-    def native_lifecycle_snapshot(self) -> dict | None:
+    def lifecycle_snapshot(self) -> LifecycleSnapshot | None:
         """Read the current native Host lifecycle, if any."""
         return self._runtime_session.native_lifecycle_snapshot()
 
-    def native_terminal_outcome(self) -> dict | None:
+    def shutdown_outcome(self) -> ShutdownOutcome | None:
         """Read the current native Host terminal outcome, if any."""
         return self._runtime_session.native_terminal_outcome()
 
@@ -1064,7 +1044,7 @@ def set_server(
     server_id: str | None = None,
     ipc_overrides: ServerIPCOverrides | Mapping[str, object] | None = None,
     lifecycle: LifecycleConfig | None = None,
-    owner_control: NativeOwnerBootstrap | None = None,
+    owner_control: OwnerBootstrap | None = None,
     startup_timeout: float | None = None,
 ) -> None:
     """Configure IPC server and its native lifecycle. Call before register().
@@ -1081,10 +1061,10 @@ def set_server(
 
 
 def owner_control_pair():
-    """Create ``(OwnerControl, NativeOwnerBootstrap)`` for explicit inheritance.
+    """Create ``(OwnerControl, OwnerBootstrap)`` for explicit inheritance.
 
     The controller keeps the keepalive private and hands the opaque receiver to
-    exactly one target child through :func:`c_two.spawn_owned_child`. Neither value ever exposes an OS
+    exactly one target child through :func:`c_two.owner.spawn_owned_child`. Neither value ever exposes an OS
     descriptor, handle, endpoint name, or token.
     """
     from c_two._native import owner_control_pair as _owner_control_pair
@@ -1101,20 +1081,8 @@ def prepare_owner_takeover(ticket):
     return _get_default_runtime().prepare_owner_takeover(ticket)
 
 
-def adopt_owner_stdin():
-    """Adopt the owner control receiver inherited as this process's stdin.
-
-    This is deliberately explicit and only for a trusted launcher's child that
-    was started with the receiver endpoint as its stdio. Ordinary business
-    stdin is never adopted automatically.
-    """
-    from c_two._native import NativeOwnerBootstrap
-
-    return NativeOwnerBootstrap.adopt_owner_stdin()
-
-
 def spawn_owned_child(receiver, program, args=None, cwd=None) -> OwnedChild:
-    """Start one child and return an opaque :class:`c_two.OwnedChild`.
+    """Start one child and return an opaque :class:`c_two.owner.OwnedChild`.
 
     ``child.id`` identifies the process; ``poll()`` observes its exit code and
     ``wait(timeout=30)`` waits with a finite deadline, raising ``TimeoutError``
@@ -1151,8 +1119,7 @@ def register(
     *,
     name: str,
     concurrency: ConcurrencyConfig | None = None,
-    bridge: dict[str, ResourceBridge] | None = None,
-    input_lifetime: Mapping[str, InputLifetimeLike] | None = None,
+    input_lifetime: Mapping[str, Literal['materialized', 'borrowed']] | None = None,
 ) -> str:
     """Register a CRM in the current process.
 
@@ -1163,7 +1130,6 @@ def register(
         crm_instance,
         name=name,
         concurrency=concurrency,
-        bridge=bridge,
         input_lifetime=input_lifetime,
     )
 
@@ -1221,7 +1187,7 @@ def server_credential() -> EndpointCredential | None:
     return _get_default_runtime().server_credential()
 
 
-def shutdown(*, timeout: float = 30.0) -> dict:
+def shutdown(*, timeout: float = 30.0) -> ShutdownOutcome:
     """Full cleanup — shuts down server and pooled clients.
 
     See :meth:`Runtime.shutdown`.
@@ -1234,14 +1200,14 @@ def connection_events():
     return _get_default_runtime().connection_events()
 
 
-def native_lifecycle_snapshot() -> dict | None:
+def lifecycle_snapshot() -> LifecycleSnapshot | None:
     """Thin read-only Core host lifecycle observation, or ``None``."""
-    return _get_default_runtime().native_lifecycle_snapshot()
+    return _get_default_runtime().lifecycle_snapshot()
 
 
-def native_terminal_outcome() -> dict | None:
+def shutdown_outcome() -> ShutdownOutcome | None:
     """Terminal native shutdown outcome, or ``None`` while not terminal."""
-    return _get_default_runtime().native_terminal_outcome()
+    return _get_default_runtime().shutdown_outcome()
 
 
 def serve(blocking: bool = True) -> None:
@@ -1254,18 +1220,6 @@ def serve(blocking: bool = True) -> None:
     Explicit Runtime instances use ``start`` and let their application own signals.
     """
     _get_default_runtime()._serve(blocking=blocking)
-
-
-def hold_stats() -> dict:
-    """Return retained runtime buffer tracking statistics.
-
-    Returns dict with:
-    - active_holds: number of currently retained runtime buffers
-    - total_held_bytes: total retained runtime buffer bytes
-    - oldest_hold_seconds: age of oldest active hold
-    - by_storage: retained counts by inline, SHM, handle, and file-spill storage
-    """
-    return _get_default_runtime().hold_stats()
 
 
 def set_call_execution_limits(
@@ -1286,7 +1240,7 @@ def set_call_execution_limits(
     )
 
 
-def call_execution_snapshot() -> dict:
+def call_execution_snapshot() -> CallExecutionSnapshot:
     """Observe Core finite input charges without freezing admission policy.
 
     Includes unfinished continuations after caller expiry. ``retired`` reports
@@ -1327,10 +1281,10 @@ def memory_stats() -> MemoryStats:
     proxy stays visible. Observing them never retains the retired Runtime,
     cache, pools, callbacks, or payloads.
 
-    ``holds`` carries the same Rust-owned retained-buffer counters as
-    :func:`hold_stats`, composed across the live and retired lease trackers.
-    The three cells are C-Two-owned backing/reassembly accounting, not process
-    RSS: never sum or present them as RAM usage.
+    ``holds`` carries Rust-owned retained-buffer counters, composed across
+    the live and retired lease trackers.
+    These are C-Two-owned IPC backing and live reassembly charges; not process RSS.
+    Never sum or present the three cells as RAM usage.
     """
     return _get_default_runtime().memory_stats()
 

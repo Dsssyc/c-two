@@ -219,7 +219,7 @@ impl PyPreparedOwnerTakeover {
 /// intended child with this endpoint as that child's stdin, and the child
 /// adopts it with [`adopt_owner_stdin`](Self::adopt_owner_stdin). Ordinary
 /// business stdin is deliberately not adopted.
-#[pyclass(name = "NativeOwnerBootstrap", module = "c_two._native", frozen)]
+#[pyclass(name = "OwnerBootstrap", module = "c_two._native", frozen)]
 pub struct PyNativeOwnerBootstrap {
     inner: parking_lot::Mutex<Option<OwnerBootstrap>>,
 }
@@ -273,7 +273,7 @@ impl PyNativeOwnerBootstrap {
 
     fn __repr__(&self) -> &'static str {
         // Never render a descriptor, handle, endpoint path, or token.
-        "<c_two._native.NativeOwnerBootstrap (opaque owner capability)>"
+        "<c_two._native.OwnerBootstrap (opaque owner capability)>"
     }
 }
 

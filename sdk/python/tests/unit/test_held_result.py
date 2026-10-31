@@ -9,8 +9,7 @@ class TestHeldResultBasic:
     """HeldResult lifecycle: access, release, double-release."""
 
     def test_access_value(self):
-        from c_two.crm.transferable import Held, HeldResult
-        assert Held is HeldResult
+        from c_two.crm.transferable import HeldResult
         hr = HeldResult(42, release_cb=None)
         assert hr.value == 42
 

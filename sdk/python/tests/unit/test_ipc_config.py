@@ -9,6 +9,8 @@ from typing import get_type_hints
 import pytest
 
 import c_two as cc
+
+import c_two.endpoint
 import c_two.config as config
 import c_two.config.ipc as ipc_config
 from c_two.config.settings import settings
@@ -580,7 +582,7 @@ def test_server_id_override_drives_auto_address():
     cc.set_server(server_id='unit-server')
     cc.register(IUnitConfigCRM, UnitConfigCRM(), name='unit-route')
     try:
-        assert cc.server_id() == 'unit-server'
+        assert cc.endpoint.server_id() == 'unit-server'
         assert cc.server_address() == 'ipc://unit-server'
     finally:
         cc.unregister('unit-route')
@@ -653,7 +655,7 @@ class _FakeRuntimeSession:
     def call_execution_limits_overrides(self) -> dict[str, int]:
         return dict(self._limits)
 
-    def local_endpoint_context(self) -> cc.LocalEndpointContext:
+    def local_endpoint_context(self) -> cc.endpoint.LocalEndpointContext:
         return self._context
 
     def inherit_local_endpoint_selection(self, previous: _FakeRuntimeSession) -> None:

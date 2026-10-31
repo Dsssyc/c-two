@@ -6,6 +6,8 @@ from pathlib import Path
 import pytest
 
 import c_two as cc
+
+import c_two.contract
 from c_two import error
 from c_two.crm.payload_plan import PayloadBinding, PayloadPlanKind, no_payload_binding
 from c_two.crm.transferable import _build_transfer_wrapper
@@ -77,8 +79,8 @@ def test_explicit_payload_binding_exports_rust_validated_v2_descriptor() -> None
         def echo(self, payload: Payload) -> Payload:
             ...
 
-    descriptor = json.loads(cc.export_contract_descriptor(Echo))
-    reference = json.loads(cc.export_contract_release_ref(Echo))
+    descriptor = json.loads(cc.contract.export_descriptor(Echo))
+    reference = json.loads(cc.contract.release_ref(Echo))
     from c_two.crm.contract import crm_contract
 
     route_contract = crm_contract(Echo)
@@ -177,7 +179,7 @@ def test_python_pickle_remains_runtime_only_and_portable_export_rejects_it() -> 
             ...
 
     with pytest.raises(ValueError, match="python-pickle-default"):
-        cc.export_contract_descriptor(PythonOnly)
+        cc.contract.export_descriptor(PythonOnly)
 
 
 def test_malformed_nested_spec_is_rejected_by_fastdb_core() -> None:
@@ -203,7 +205,7 @@ def test_binding_clones_compiled_spec_and_accepts_json_text_and_bytes() -> None:
             ...
 
     source_spec.close()
-    descriptor = json.loads(cc.export_contract_descriptor(Echo))
+    descriptor = json.loads(cc.contract.export_descriptor(Echo))
     binding = Echo.echo._input_payload_binding
     original = build_payload(RECORD_SPEC)
     opened = binding.deserialize(binding.serialize(original))
@@ -226,11 +228,11 @@ def test_exported_descriptor_and_authoring_source_do_not_alias_binding_spec() ->
             ...
 
     authoring_spec["entries"][0]["id"] = "mutated-authoring-source"
-    exported = json.loads(cc.export_contract_descriptor(Echo))
+    exported = json.loads(cc.contract.export_descriptor(Echo))
     exported["methods"][0]["bindings"]["input"]["spec"]["entries"][0][
         "id"
     ] = "mutated-export"
-    exported_again = json.loads(cc.export_contract_descriptor(Echo))
+    exported_again = json.loads(cc.contract.export_descriptor(Echo))
 
     assert exported_again["methods"][0]["bindings"]["input"]["spec"] == RECORD_SPEC
 

@@ -169,6 +169,8 @@ def _business_call(
         import sys
         sys.path.insert(0, {str(FIXTURE.parent)!r})
         import c_two as cc
+        import c_two.owner
+        import c_two.observe
         from owner_bound_service import OwnerBoundEcho
 
         proxy = cc.connect(OwnerBoundEcho, name='owned-echo', address={address!r})
@@ -284,6 +286,8 @@ class TestOwnerBoundNativeSurface:
             """
             import time
             import c_two as cc
+            import c_two.owner
+            import c_two.observe
 
             @cc.crm(namespace='cc.test.owner_observation', version='0.1.0')
             class Echo:
@@ -294,20 +298,20 @@ class TestOwnerBoundNativeSurface:
                 def ping(self) -> str:
                     return 'pong'
 
-            keepalive, receiver = cc.owner_control_pair()
+            keepalive, receiver = cc.owner.owner_control_pair()
             cc.set_server(
                 server_id='observation-controller',
-                lifecycle=cc.LifecycleConfig.owner_bound(0.3),
+                lifecycle=cc.owner.LifecycleConfig.owner_bound(0.3),
                 owner_control=receiver,
             )
             cc.register(Echo, EchoResource(), name='observed-echo')
-            print('NATIVE_ARMED', cc.native_lifecycle_snapshot()['phase'], flush=True)
+            print('NATIVE_ARMED', cc.observe.lifecycle_snapshot()['phase'], flush=True)
             keepalive.close()
             deadline = time.monotonic() + 30
-            while cc.native_terminal_outcome() is None:
+            while cc.observe.shutdown_outcome() is None:
                 assert time.monotonic() < deadline
                 time.sleep(0.05)
-            snapshot = cc.native_lifecycle_snapshot()
+            snapshot = cc.observe.lifecycle_snapshot()
             print('NATIVE_TERMINAL', snapshot['phase'], snapshot['terminal'], flush=True)
             cc.shutdown()
             print('NATIVE_DONE', flush=True)
@@ -325,12 +329,14 @@ class TestOwnerBoundNativeSurface:
         assert 'NATIVE_ARMED armed' in result.stdout
         assert 'NATIVE_TERMINAL finished True' in result.stdout
         # This test process's own registry never saw that controller's host.
-        assert _get_default_runtime().native_lifecycle_snapshot() is None
+        assert _get_default_runtime().lifecycle_snapshot() is None
 
 @pytest.mark.parametrize('owner_bound', [False, True])
 def test_short_shutdown_retains_inflight_borrowed_and_held_owners(owner_bound: bool) -> None:
     """The timeout limits the caller while the native drain retains real work."""
     import c_two as cc
+    import c_two.owner
+    import c_two.observe
     from concurrent.futures import ThreadPoolExecutor
     from fastdb4py.payload import Payload, PayloadError
     from tests.integration.test_portable_payload_runtime import SPEC, build_payload, read_value
@@ -373,8 +379,8 @@ def test_short_shutdown_retains_inflight_borrowed_and_held_owners(owner_bound: b
     cc.shutdown()
     keepalive = None
     if owner_bound:
-        keepalive, receiver = cc.owner_control_pair()
-        cc.set_server(lifecycle=cc.LifecycleConfig.owner_bound(0), owner_control=receiver)
+        keepalive, receiver = cc.owner.owner_control_pair()
+        cc.set_server(lifecycle=cc.owner.LifecycleConfig.owner_bound(0), owner_control=receiver)
     resource = Resource()
     source = build_payload()
     held = None
@@ -385,7 +391,7 @@ def test_short_shutdown_retains_inflight_borrowed_and_held_owners(owner_bound: b
     serve_thread = None
     try:
         cc.register(PayloadService, resource, name='blocked-payload',
-                    input_lifetime={'blocked': cc.InputLifetime.BORROWED})
+                    input_lifetime={'blocked': 'borrowed'})
         registry = _get_default_runtime()
         if owner_bound:
             def run_serve():

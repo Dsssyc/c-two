@@ -28,7 +28,7 @@ C-Two 是面向分布式科学计算的资源 RPC 运行时。它把模拟器、
 
 **CRM 契约**声明可调用的方法以及 namespace、version；**resource** 是实现这些方法并持有状态的普通类；**client** 通过 `cc.connect(...)` 获得类型化代理。一个进程可以同时承载多个资源，并连接其他资源。
 
-**C-Two 0.10.1** 支持 Python 3.10+。普通调用无 Python 运行时依赖；FastDB 载荷使用 `c-two[fastdb]`（`fastdb4py==0.2.4`）。IPC 握手 14 把版本不匹配报告为结构化错误，Unix 端点改用带版本号默认目录的命名空间格式 3，Python 新增独立的 `cc.Runtime()` 实例与 `cc.server_credential()`。内存释放失败时由原持有者保留以便重试；已无法交还时保守放弃并计数。见 [0.10.0 更新说明](docs/releases/0.10.0.md)；0.10.1 让 `cc.serve()` 在标准输出编码不了其消息时也不退出（[说明](docs/releases/0.10.1.md)）。
+**C-Two 0.10.1** 支持 Python 3.10+。普通调用无 Python 运行时依赖；FastDB 载荷使用 `c-two[fastdb]`（`fastdb4py==0.2.4`）。IPC 握手 14 把版本不匹配报告为结构化错误，Unix 端点改用带版本号默认目录的命名空间格式 3，Python 新增独立的 `cc.Runtime()` 实例与 `cc.endpoint.server_credential()`。内存释放失败时由原持有者保留以便重试；已无法交还时保守放弃并计数。见 [0.10.0 更新说明](docs/releases/0.10.0.md)；0.10.1 让 `cc.serve()` 在标准输出编码不了其消息时也不退出（[说明](docs/releases/0.10.1.md)）。
 
 ## 特点
 
@@ -38,7 +38,7 @@ C-Two 是面向分布式科学计算的资源 RPC 运行时。它把模拟器、
 - **按契约路由**：客户端匹配路由名称、CRM 身份和契约哈希。Relay 发现选择经过验证的本机 IPC 路径或 HTTP 目标；`c3` 独立运行 relay，并支持 relay mesh。
 - **原生内存传输**：IPC 使用按需 buddy 池、独占共享内存、检查过的分块传输及文件溢出。通过预算和空闲回收控制大载荷的内存与文件用量。详见[内存策略](docs/memory-policy.md)。
 - **明确的载荷生命周期**：`cc.hold()` 保留响应租约，资源注册可选择借用输入；释放时先使 FastDB owner 和 checked view 失效，再释放传输存储。详见 [Python 载荷用法](docs/python-usage.md)。
-- **连接观察**：`cc.connection_events()` 汇总客户端和服务端物理 IPC 连接，一个可关闭的消费者替代逐连接阻塞等待；原因只描述连接事实，不证明进程已经退出。
+- **连接观察**：`cc.observe.connection_events()` 汇总客户端和服务端物理 IPC 连接，一个可关闭的消费者替代逐连接阻塞等待；原因只描述连接事实，不证明进程已经退出。
 - **资源生命周期管理**：资源采用 `Persistent` 或控制器持有的 `OwnerBound` 生命周期；原生 shutdown 排空工作，限定范围的端点维护清理已确认退出的端点。详见[生命周期指南](docs/local-endpoint-lifecycle.md)。
 - **统一 Rust core**：Python 与 Rust 共用路由、传输、内存、错误和生命周期机制。原生 c3 CLI 在 Linux、macOS、Windows x64 / ARM64 上提供 relay、契约工具和端点维护。
 
@@ -91,7 +91,7 @@ finally:
 
 运行 `python counter.py`。示例使用同进程调用；本地注册时保持 `C2_RELAY_ANCHOR_ADDRESS` 未设置。
 
-同机的其他进程将资源进程的 `cc.server_address()` 传给客户端的 `address` 参数。两端的完整用法见 [IPC 示例](examples/python/ipc_resource.py)。资源进程还可以在注册后取得 `credential = cc.server_credential()`，交给它的控制方供之后精确清理，见[生命周期指南](docs/local-endpoint-lifecycle.md)。
+同机的其他进程将资源进程的 `cc.server_address()` 传给客户端的 `address` 参数。两端的完整用法见 [IPC 示例](examples/python/ipc_resource.py)。资源进程还可以在注册后取得 `credential = cc.endpoint.server_credential()`，交给它的控制方供之后精确清理，见[生命周期指南](docs/local-endpoint-lifecycle.md)。
 
 `runtime = cc.Runtime()` 让应用分别拥有自己的 Python 配置、路由和原生会话。用 `runtime.set_*()` 配置后，可以调用 `runtime.start()` 等待空 Host 就绪，或用 `runtime.register()` 承载资源。模块函数继续使用默认 Runtime；`cc.serve()` 负责默认 Runtime 的进程信号处理，没有实例版。应用结束时调用 `runtime.shutdown()` 并检查结构化结果；若结果为 pending，再调用 shutdown 观察完成并换代。见[独立 Runtime 示例](examples/python/independent_runtime.py)及 [Python API 指南](docs/python-usage.md#independent-python-runtimes)。
 

@@ -15,7 +15,7 @@ from tests.fixtures import local_server
 
 import c_two as cc
 from c_two.config import settings
-from c_two.transport import ConcurrencyConfig, ConcurrencyMode
+from c_two.transport import ConcurrencyConfig
 from c_two.transport.registry import _get_default_runtime, _reset_default_runtime
 from c_two.transport.server.native import CRMSlot, NativeServerBridge
 from c_two.transport.wire import MethodTable

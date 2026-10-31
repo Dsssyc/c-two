@@ -17,7 +17,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from ...crm.bridge import ResourceBridge, normalize_bridge_map, wrap_resource
 from ...crm.contract import (
     CRMContract,
     crm_contract_identity,
@@ -28,11 +27,11 @@ from ...crm.meta import MethodAccess, get_method_access, get_shutdown_method
 from ...crm.payload_plan import PayloadPlanKind
 from ...error import ResourceAlreadyRegistered
 from ..input_lifetime import (
-    InputLifetime,
-    InputLifetimeLike,
+    _InputLifetime,
     normalize_input_lifetime_map,
     validate_input_lifetime_resource_contract,
 )
+from .._snapshots import LifecycleSnapshot, ShutdownOutcome
 from ..wire import MethodTable
 from .scheduler import ConcurrencyConfig, Scheduler
 from .reply import unpack_resource_result
@@ -69,7 +68,7 @@ class CRMSlot:
     scheduler: Scheduler
     methods: list[str]
     shutdown_method: str | None = None
-    input_lifetime: dict[str, InputLifetime] = field(default_factory=dict)
+    input_lifetime: dict[str, _InputLifetime] = field(default_factory=dict)
     _dispatch_table: dict[str, tuple[Any, MethodAccess, str]] = field(
         default_factory=dict, repr=False,
     )
@@ -82,7 +81,7 @@ class CRMSlot:
             if method is not None:
                 access = get_method_access(method)
                 lifetime = self.input_lifetime.get(name)
-                if lifetime is InputLifetime.BORROWED:
+                if lifetime == 'borrowed':
                     binding = getattr(method, '_input_payload_binding', None)
                     if (
                         getattr(binding, 'kind', None) is not PayloadPlanKind.FASTDB
@@ -177,15 +176,13 @@ class NativeServerBridge:
         concurrency: ConcurrencyConfig | None = None,
         *,
         name: str,
-        bridge: dict[str, ResourceBridge] | None = None,
-        input_lifetime: Mapping[str, InputLifetimeLike] | None = None,
+        input_lifetime: Mapping[str, _InputLifetime] | None = None,
     ) -> str:
         crm_ns, crm_name, crm_ver = self._extract_contract_identity(crm_class)
         if not isinstance(name, str):
             raise TypeError('name must be an explicit route name string')
         routing_name = name
         methods = self._discover_methods(crm_class)
-        method_bridge_map = normalize_bridge_map(bridge, method_names=methods)
         input_lifetime_map = normalize_input_lifetime_map(
             input_lifetime,
             method_names=methods,
@@ -194,10 +191,8 @@ class NativeServerBridge:
             crm_class,
             crm_instance,
             input_lifetime_map,
-            bridge=method_bridge_map,
         )
-        runtime_resource = wrap_resource(crm_instance, method_bridge_map)
-        instance = self._create_crm_instance(crm_class, runtime_resource)
+        instance = self._create_crm_instance(crm_class, crm_instance)
         cc_config = concurrency or ConcurrencyConfig()
         sd_method = get_shutdown_method(crm_class)
 
@@ -215,7 +210,7 @@ class NativeServerBridge:
         slot = CRMSlot(
             name=routing_name,
             crm_instance=instance,
-            direct_instance=runtime_resource,
+            direct_instance=crm_instance,
             crm_ns=crm_ns,
             crm_name=crm_name,
             crm_ver=crm_ver,
@@ -247,14 +242,14 @@ class NativeServerBridge:
                 raise ValueError(f'Name already registered: {routing_name!r}')
             from ...crm.descriptor import (
                 build_contract_descriptor,
-                contract_descriptor_diagnostics,
+                diagnostics,
             )
 
-            diagnostics = contract_descriptor_diagnostics(crm_class, methods)
+            portability_diagnostics = diagnostics(crm_class, methods)
             descriptor = build_contract_descriptor(
                 crm_class,
                 methods,
-                portable=not diagnostics,
+                portable=not portability_diagnostics,
             )
             descriptor_json = json.dumps(
                 descriptor,
@@ -269,7 +264,7 @@ class NativeServerBridge:
                     dispatcher,
                     methods,
                     access_map,
-                    cc_config.mode.value,
+                    cc_config.mode,
                     cc_config.max_pending,
                     cc_config.max_workers,
                     crm_ns,
@@ -369,7 +364,7 @@ class NativeServerBridge:
         """
         return bool(self._runtime_session.host_started)
 
-    def native_lifecycle_snapshot(self) -> dict[str, Any] | None:
+    def lifecycle_snapshot(self) -> LifecycleSnapshot | None:
         """Thin read-only Core lifecycle observation for the bridge.
 
         Reports the native policy and phase plus the separate listener,
@@ -379,7 +374,7 @@ class NativeServerBridge:
         """
         return self._runtime_session.native_lifecycle_snapshot()
 
-    def native_terminal_outcome(self) -> dict[str, Any] | None:
+    def shutdown_outcome(self) -> ShutdownOutcome | None:
         """Terminal native shutdown outcome, or ``None`` while not terminal.
 
         Repeated observation returns the same one outcome; observing never
@@ -390,7 +385,7 @@ class NativeServerBridge:
     def start(self) -> None:
         self._runtime_session.ensure_host_started()
 
-    def shutdown(self, *, timeout: float = 5.0) -> dict[str, Any]:
+    def shutdown(self, *, timeout: float = 5.0) -> ShutdownOutcome:
         outcome = dict(self._runtime_session.shutdown(
             route_names=None,
             relay_anchor_address=None,
@@ -466,10 +461,6 @@ class NativeServerBridge:
             logger.warning(
                 'Error invoking @on_shutdown for %s', slot.name, exc_info=True,
             )
-
-    def hold_stats(self) -> dict:
-        """Return retained runtime buffer tracking statistics."""
-        return dict(self._lease_tracker.stats())
 
     # ------------------------------------------------------------------
     # Dispatch callable factory

@@ -680,7 +680,7 @@ try:
         Echo,
         resource,
         name="package-candidate",
-        input_lifetime={"save_borrowed": cc.InputLifetime.BORROWED},
+        input_lifetime={"save_borrowed": "borrowed"},
     )
     time.sleep(0.2)
     address = cc.server_address()

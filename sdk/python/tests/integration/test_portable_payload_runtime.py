@@ -116,7 +116,7 @@ def test_direct_ipc_open_copy_hold_borrowed_invalidation_and_no_payload() -> Non
         Echo,
         resource,
         name="portable-owner",
-        input_lifetime={"save_borrowed": cc.InputLifetime.BORROWED},
+        input_lifetime={"save_borrowed": 'borrowed'},
     )
     time.sleep(0.2)
     address = cc.server_address()

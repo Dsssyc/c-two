@@ -177,8 +177,6 @@ class HeldResult(Generic[R]):
                 )
 
 
-Held = HeldResult
-
 
 def hold(method: Callable[P, R]) -> Callable[P, HeldResult[R]]:
     """Retain one remote response lease until the returned owner is released."""

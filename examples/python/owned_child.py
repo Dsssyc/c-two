@@ -1,6 +1,6 @@
 """Launch a dedicated Python resource with a private owner control receiver.
 
-The child explicitly calls cc.adopt_owner_stdin(), configures owner_bound with
+The child explicitly calls cc.owner.OwnerBootstrap.adopt_owner_stdin(), configures owner_bound with
 cc.set_server(), registers resources and calls cc.serve(). Its ordinary stdout
 and stderr remain inherited. This controller releases ownership on Enter and
 waits for the process through the opaque native handle.
@@ -11,12 +11,14 @@ import sys
 
 import c_two as cc
 
+import c_two.owner
+
 
 def main() -> None:
     if len(sys.argv) != 2:
         raise SystemExit('usage: owned_child.py RESOURCE_SCRIPT')
-    keepalive, receiver = cc.owner_control_pair()
-    child = cc.spawn_owned_child(receiver, sys.executable, [sys.argv[1]])
+    keepalive, receiver = cc.owner.owner_control_pair()
+    child = cc.owner.spawn_owned_child(receiver, sys.executable, [sys.argv[1]])
     try:
         print(f'owned resource started: {child.id}')
         input('Press Enter to release the owner. ')

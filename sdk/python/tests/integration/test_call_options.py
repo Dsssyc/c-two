@@ -13,6 +13,8 @@ from tests.fixtures import local_server
 from c_two._native import RuntimeSession
 
 import c_two as cc
+
+import c_two.observe
 from c_two.transport.registry import _get_default_runtime, _reset_default_runtime
 
 
@@ -217,7 +219,7 @@ def test_slot_capacity_rejects_before_pickle_and_releases_after_real_work(ipc_co
     try:
         with pytest.raises(cc.error.CallDeadlineExceeded):
             view.echo('active', timeout=0.2)
-        snapshot = cc.call_execution_snapshot()
+        snapshot = cc.observe.call_execution_snapshot()
         assert snapshot['max_operations'] == 1
         assert snapshot['used_operations'] == 1
         assert snapshot['used_retained_bytes'] > 0
@@ -229,9 +231,9 @@ def test_slot_capacity_rejects_before_pickle_and_releases_after_real_work(ipc_co
         assert SlowPickle.caller_threads == []
         assert resource.finished.wait(2)
         deadline = time.monotonic() + 2
-        while cc.call_execution_snapshot()['used_operations'] and time.monotonic() < deadline:
+        while cc.observe.call_execution_snapshot()['used_operations'] and time.monotonic() < deadline:
             time.sleep(0.01)
-        assert cc.call_execution_snapshot()['used_operations'] == 0
+        assert cc.observe.call_execution_snapshot()['used_operations'] == 0
         assert view.echo('after') == 'after'
     finally:
         cc.close(view)
@@ -248,7 +250,7 @@ def test_unknown_pickle_bytes_charged_before_native_handoff(ipc_connection):
             view.echo(SlowPickle())
         assert SlowPickle.caller_threads == [threading.get_ident()]
         assert resource.calls == 0
-        snapshot = cc.call_execution_snapshot()
+        snapshot = cc.observe.call_execution_snapshot()
         assert snapshot['used_operations'] == 0
         assert snapshot['used_retained_bytes'] == 0
     finally:
@@ -401,8 +403,8 @@ def test_real_known_fastdb_rejects_before_any_binary_copy(portable_connection, m
         with pytest.raises(cc.error.CallCapacityExceeded):
             invoke(view, source)
         assert calls == []
-        assert cc.call_execution_snapshot()['used_operations'] == 0
-        assert cc.call_execution_snapshot()['used_retained_bytes'] == 0
+        assert cc.observe.call_execution_snapshot()['used_operations'] == 0
+        assert cc.observe.call_execution_snapshot()['used_retained_bytes'] == 0
     finally:
         source.close()
         cc.close(view)
@@ -571,8 +573,8 @@ def test_zero_slots_rejects_both_entry_forms_without_reducer_or_resource(ipc_con
         assert failure.value.details['transport_phase'] == 'pre_dispatch'
         assert SlowPickle.caller_threads == []
         assert resource.calls == 0
-        assert cc.call_execution_snapshot()['used_operations'] == 0
-        assert cc.call_execution_snapshot()['used_retained_bytes'] == 0
+        assert cc.observe.call_execution_snapshot()['used_operations'] == 0
+        assert cc.observe.call_execution_snapshot()['used_retained_bytes'] == 0
     finally:
         cc.close(view)
 
@@ -601,8 +603,8 @@ def test_zero_slots_or_deadline_never_materializes_fastdb(portable_connection, m
         with pytest.raises(expected):
             invoke(view, source)
         assert calls == {'report': 0, 'copy': 0, 'resource': 0}
-        assert cc.call_execution_snapshot()['used_operations'] == 0
-        assert cc.call_execution_snapshot()['used_retained_bytes'] == 0
+        assert cc.observe.call_execution_snapshot()['used_operations'] == 0
+        assert cc.observe.call_execution_snapshot()['used_retained_bytes'] == 0
     finally:
         source.close()
         cc.close(view)
@@ -630,8 +632,8 @@ def test_report_or_invalid_owner_error_keeps_input_classification_and_zero_charg
             assert failure.value.details['fastdb_symbol']
         else:
             assert isinstance(failure.value.__cause__, ValueError)
-        assert cc.call_execution_snapshot()['used_operations'] == 0
-        assert cc.call_execution_snapshot()['used_retained_bytes'] == 0
+        assert cc.observe.call_execution_snapshot()['used_operations'] == 0
+        assert cc.observe.call_execution_snapshot()['used_retained_bytes'] == 0
     finally:
         source.close()
         cc.close(view)
@@ -646,8 +648,8 @@ def test_closed_view_is_call_resource_error_before_serializer(ipc_connection, in
         invoke(view, SlowPickle())
     assert SlowPickle.caller_threads == []
     assert resource.calls == 0
-    assert cc.call_execution_snapshot()['used_operations'] == 0
-    assert cc.call_execution_snapshot()['used_retained_bytes'] == 0
+    assert cc.observe.call_execution_snapshot()['used_operations'] == 0
+    assert cc.observe.call_execution_snapshot()['used_retained_bytes'] == 0
     assert connection.echo('after') == 'after'
 
 
@@ -660,27 +662,27 @@ def test_prepared_close_gc_and_invalid_buffer_refund_only_pre_dispatch(ipc_conne
         for explicit_close in [True, False]:
             prepared = view.client.begin_call('echo')
             prepared.charge_input(16)
-            assert cc.call_execution_snapshot()['used_operations'] == 1
-            assert cc.call_execution_snapshot()['used_retained_bytes'] == 16
+            assert cc.observe.call_execution_snapshot()['used_operations'] == 1
+            assert cc.observe.call_execution_snapshot()['used_retained_bytes'] == 16
             if explicit_close:
                 prepared.close()
             del prepared
             gc.collect()
-            assert cc.call_execution_snapshot()['used_operations'] == 0
-            assert cc.call_execution_snapshot()['used_retained_bytes'] == 0
+            assert cc.observe.call_execution_snapshot()['used_operations'] == 0
+            assert cc.observe.call_execution_snapshot()['used_retained_bytes'] == 0
 
         prepared = view.client.begin_call('echo')
         prepared.charge_input(16)
         with pytest.raises(TypeError):
             prepared.call(object())
-        assert cc.call_execution_snapshot()['used_operations'] == 0
-        assert cc.call_execution_snapshot()['used_retained_bytes'] == 0
+        assert cc.observe.call_execution_snapshot()['used_operations'] == 0
+        assert cc.observe.call_execution_snapshot()['used_retained_bytes'] == 0
         with pytest.raises(ValueError, match='consumed'):
             prepared.call(b'')
         del prepared
         gc.collect()
-        assert cc.call_execution_snapshot()['used_operations'] == 0
-        assert cc.call_execution_snapshot()['used_retained_bytes'] == 0
+        assert cc.observe.call_execution_snapshot()['used_operations'] == 0
+        assert cc.observe.call_execution_snapshot()['used_retained_bytes'] == 0
         assert resource.calls == 0
         assert connection.echo('after') == 'after'
     finally:

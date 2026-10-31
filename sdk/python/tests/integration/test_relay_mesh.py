@@ -17,6 +17,8 @@ import urllib.request
 import pytest
 
 import c_two as cc
+
+import c_two.endpoint
 from c_two.config.ipc import _resolve_server_ipc_config
 from c_two.config.settings import settings
 from c_two.crm.contract import crm_contract
@@ -71,7 +73,7 @@ def _register_body(name: str, server_id: str) -> dict[str, object]:
     cc.set_server(server_id=server_id)
     cc.register(MeshResource, MeshImpl(), name=name)
     address = cc.server_address()
-    actual_server_id = cc.server_id()
+    actual_server_id = cc.endpoint.server_id()
     assert address is not None
     assert actual_server_id == server_id
     server_instance_id = _server_instance_id_for(address)

@@ -10,6 +10,10 @@ import time
 import pytest
 
 import c_two as cc
+
+import c_two.owner
+
+import c_two.observe
 from c_two.config.settings import settings
 from c_two.transport.registry import _get_default_runtime
 
@@ -91,8 +95,8 @@ def test_transport_swap_failure_preserves_native_owner_for_retry(monkeypatch, fa
     from c_two.transport import registry as registry_module
 
     cc.shutdown()
-    keepalive, receiver = cc.owner_control_pair()
-    cc.set_server(lifecycle=cc.LifecycleConfig.owner_bound(0), owner_control=receiver)
+    keepalive, receiver = cc.owner.owner_control_pair()
+    cc.set_server(lifecycle=cc.owner.LifecycleConfig.owner_bound(0), owner_control=receiver)
     registry = _get_default_runtime()
     old = registry._runtime_session
     previous_threshold = settings._shm_threshold
@@ -149,7 +153,7 @@ def test_transport_swap_failure_preserves_native_owner_for_retry(monkeypatch, fa
         cc.register(Echo, resource, name='acceptance-owner')
         keepalive.close()
         deadline = time.monotonic() + 5
-        while cc.native_terminal_outcome() is None:
+        while cc.observe.shutdown_outcome() is None:
             assert time.monotonic() < deadline
             time.sleep(.01)
         outcome = cc.shutdown(timeout=5)
@@ -168,10 +172,10 @@ def test_transport_swap_failure_preserves_native_owner_for_retry(monkeypatch, fa
 
 
 def test_owned_child_wait_reaps_and_caches_exit_status():
-    keepalive, receiver = cc.owner_control_pair()
+    keepalive, receiver = cc.owner.owner_control_pair()
     try:
-        child = cc.spawn_owned_child(receiver, sys.executable, ['-c', 'raise SystemExit(7)'])
-        assert isinstance(child, cc.OwnedChild)
+        child = cc.owner.spawn_owned_child(receiver, sys.executable, ['-c', 'raise SystemExit(7)'])
+        assert isinstance(child, cc.owner.OwnedChild)
         assert child.id > 0
         assert child.wait(timeout=5) == 7
         assert child.poll() == 7
@@ -188,9 +192,9 @@ def test_owned_child_wait_reaps_and_caches_exit_status():
 
 
 def test_owned_child_timeout_kill_and_wait_release_the_gil():
-    keepalive, receiver = cc.owner_control_pair()
+    keepalive, receiver = cc.owner.owner_control_pair()
     try:
-        child = cc.spawn_owned_child(receiver, sys.executable, ['-c', 'import time; time.sleep(30)'])
+        child = cc.owner.spawn_owned_child(receiver, sys.executable, ['-c', 'import time; time.sleep(30)'])
         assert child.poll() is None
         with pytest.raises(TimeoutError):
             child.wait(timeout=.02)
@@ -214,10 +218,10 @@ def test_owned_child_timeout_kill_and_wait_release_the_gil():
 
 @pytest.mark.parametrize('release', ['close', 'drop'])
 def test_owned_child_released_handle_is_reaped_without_blocking(tmp_path, release):
-    keepalive, receiver = cc.owner_control_pair()
+    keepalive, receiver = cc.owner.owner_control_pair()
     marker = tmp_path / 'finished'
     script = 'import time,pathlib; time.sleep(.15); pathlib.Path(%r).write_text("done")' % str(marker)
-    child = cc.spawn_owned_child(receiver, sys.executable, ['-c', script])
+    child = cc.owner.spawn_owned_child(receiver, sys.executable, ['-c', script])
     pid = child.id
     started = time.monotonic()
     if release == 'close':
@@ -243,8 +247,8 @@ def test_owned_child_released_handle_is_reaped_without_blocking(tmp_path, releas
 
 def test_failed_native_lifecycle_handoff_keeps_both_capabilities_usable():
     from c_two._native import RuntimeSession
-    first_keepalive, first_receiver = cc.owner_control_pair()
-    second_keepalive, second_receiver = cc.owner_control_pair()
+    first_keepalive, first_receiver = cc.owner.owner_control_pair()
+    second_keepalive, second_receiver = cc.owner.owner_control_pair()
     first, second = RuntimeSession(), RuntimeSession()
     try:
         for session, receiver in [(first, first_receiver), (second, second_receiver)]:
@@ -270,10 +274,10 @@ def test_failed_native_lifecycle_handoff_keeps_both_capabilities_usable():
 
 
 def test_shared_reaper_observes_short_child_while_another_child_is_alive():
-    first_keepalive, first_receiver = cc.owner_control_pair()
-    second_keepalive, second_receiver = cc.owner_control_pair()
-    first = cc.spawn_owned_child(first_receiver, sys.executable, ['-c', 'import time; time.sleep(30)'])
-    second = cc.spawn_owned_child(second_receiver, sys.executable, ['-c', 'pass'])
+    first_keepalive, first_receiver = cc.owner.owner_control_pair()
+    second_keepalive, second_receiver = cc.owner.owner_control_pair()
+    first = cc.owner.spawn_owned_child(first_receiver, sys.executable, ['-c', 'import time; time.sleep(30)'])
+    second = cc.owner.spawn_owned_child(second_receiver, sys.executable, ['-c', 'pass'])
     try:
         assert second.wait(timeout=5) == 0
         assert first.poll() is None
@@ -289,7 +293,7 @@ def test_shared_reaper_observes_short_child_while_another_child_is_alive():
 
 def test_owner_bound_restart_refuses_reuse_and_retains_terminal_journal():
     from c_two._native import RuntimeSession
-    keepalive, receiver = cc.owner_control_pair()
+    keepalive, receiver = cc.owner.owner_control_pair()
     session = RuntimeSession()
     try:
         session.set_lifecycle_policy('owner_bound', 0)
@@ -324,3 +328,11 @@ def test_failed_persistent_restart_retains_terminal_journal(monkeypatch):
         assert session.native_terminal_outcome() is None
     finally:
         session.shutdown(route_names=[], timeout_seconds=5)
+
+
+def test_owner_bootstrap_uses_its_public_native_name():
+    from c_two import _native
+    from c_two.owner import OwnerBootstrap
+
+    assert OwnerBootstrap is _native.OwnerBootstrap
+    assert OwnerBootstrap.__name__ == 'OwnerBootstrap'

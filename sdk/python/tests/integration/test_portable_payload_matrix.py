@@ -10,6 +10,10 @@ from typing import Any, Iterator
 import pytest
 
 import c_two as cc
+
+import c_two.observe
+
+import c_two.contract
 from c_two.config.settings import settings
 from c_two.error import (
     ContractMismatch,
@@ -383,7 +387,7 @@ def test_route_disappearance_preserves_release_reference(
         assert address is not None
         endpoint = address if transport == "direct" else relay_url
         assert endpoint is not None
-        retained_ref = cc.export_contract_release_ref(PortableNoPayload)
+        retained_ref = cc.contract.release_ref(PortableNoPayload)
         proxy = cc.connect(
             PortableNoPayload,
             name=route_name,
@@ -403,7 +407,7 @@ def test_route_disappearance_preserves_release_reference(
             )
             with pytest.raises(expected_error):
                 proxy.ping()
-            assert cc.export_contract_release_ref(PortableNoPayload) == retained_ref
+            assert cc.contract.release_ref(PortableNoPayload) == retained_ref
             assert retained_route[0]
             assert retained_route[1] > 0
         finally:
@@ -505,12 +509,12 @@ def test_held_response_invalidates_before_relay_lease_release(
             with cc.hold(proxy.roundtrip)(source) as held:
                 retained = held.value
                 root, detached = inspect_record_payload(retained)
-                assert cc.hold_stats()["active_holds"] == 1
+                assert cc.observe.memory_stats()["holds"]["active_holds"] == 1
             assert root is not None
             assert detached is not None
             assert_view_invalidated(root)
             assert_record_detached(detached)
-            assert cc.hold_stats()["active_holds"] == 0
+            assert cc.observe.memory_stats()["holds"]["active_holds"] == 0
             resource.assert_lifetime()
         finally:
             for value in (root, detached, retained, source):
