@@ -427,12 +427,21 @@ mod tests {
         assert!(client.close_shared_bounded(STEP).await);
     }
 
-    #[tokio::test]
-    async fn watch_capacity_recovers_or_shutdown_drains() {
-        for shutdown_after_full in [false, true] {
-            let state = crate::relay::test_support::test_state_for_client();
+    struct WatchFixture {
+        state: Arc<RelayState>,
+        entry: RouteEntry,
+        endpoint: c2_config::LocalEndpoint,
+        server: Arc<c2_server::Server>,
+        server_task: Option<tokio::task::JoinHandle<()>>,
+        observer: tokio::task::JoinHandle<()>,
+        #[cfg(unix)]
+        _root: crate::relay::test_support::EndpointTestRoot,
+    }
+
+    impl WatchFixture {
+        async fn new() -> Self {
             let id = format!(
-                "watch_capacity_{}_{:x}",
+                "watch_transport_{}_{:x}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -440,7 +449,21 @@ mod tests {
                     .as_nanos()
             );
             let address = format!("ipc://{id}");
-            let endpoint = state.endpoint_context().endpoint(&address).unwrap();
+            #[cfg(unix)]
+            let root = crate::relay::test_support::EndpointTestRoot::new();
+            #[cfg(unix)]
+            let context = root.context();
+            #[cfg(windows)]
+            let context = c2_config::LocalEndpointContext::default_for_platform().unwrap();
+            let endpoint = context.endpoint(&address).unwrap();
+            let state = Arc::new(RelayState::new_with_context(
+                Arc::new(c2_config::RelayConfig {
+                    relay_id: "test-relay".into(),
+                    ..Default::default()
+                }),
+                Arc::new(crate::relay::test_support::NoopDisseminator),
+                context,
+            ));
             let mut config = c2_server::ServerIpcConfig::default();
             config.base.pool_enabled = false;
             config.base.pool_prewarm_segments = 0;
@@ -458,201 +481,223 @@ mod tests {
             crate::relay::test_support::register_echo_route(&server, ROUTE_NAME).await;
             let (uid, revision) = server.registered_route_identity(ROUTE_NAME).unwrap();
             let entry = route_entry(&id, &address, uid, revision);
-            let registered = test_commit_registration!(
-                &state,
-                entry.name.clone(),
-                id.clone(),
-                format!("{id}-instance"),
-                address,
-                entry.crm_ns.clone(),
-                entry.crm_name.clone(),
-                entry.crm_ver.clone(),
-                entry.abi_hash.clone(),
-                entry.signature_hash.clone(),
-                entry.max_payload_size,
-                entry.route_uid.clone(),
-                entry.route_revision,
-                None
-            );
             assert!(matches!(
-                registered,
+                test_commit_registration!(
+                    &state,
+                    entry.name.clone(),
+                    id.clone(),
+                    format!("{id}-instance"),
+                    address,
+                    entry.crm_ns.clone(),
+                    entry.crm_name.clone(),
+                    entry.crm_ver.clone(),
+                    entry.abi_hash.clone(),
+                    entry.signature_hash.clone(),
+                    entry.max_payload_size,
+                    entry.route_uid.clone(),
+                    entry.route_revision,
+                    None
+                ),
                 crate::relay::state::RegisterCommitResult::Registered { .. }
             ));
-            let running = server.clone();
-            let mut server_task = tokio::spawn(async move { running.run().await });
-            let mut reserved = Vec::new();
-            let domain = state.clients.clone();
-            let mut observer = tokio::spawn(async move { domain.run().await });
-            let mut shutdown = None;
-            let result = std::panic::AssertUnwindSafe(async {
-                server.wait_until_ready(STEP).await.unwrap();
-                // Real unpublished ManagedClients occupy the same bounded owner
-                // slots as connected and closing clients. No fake admission seam.
-                for _ in 0..1024 {
-                    reserved.push(
-                        state
-                            .clients
-                            .manage(|| {
-                                IpcClient::with_endpoint(
-                                    endpoint.clone(),
-                                    c2_config::ClientIpcConfig::default(),
-                                )
-                            })
-                            .unwrap(),
-                    );
+            let clients = state.clients.clone();
+            let observer = tokio::spawn(async move { clients.run().await });
+            Self {
+                state,
+                entry,
+                endpoint,
+                server,
+                server_task: None,
+                observer,
+                #[cfg(unix)]
+                _root: root,
+            }
+        }
+
+        async fn start_server(&mut self) {
+            let server = self.server.clone();
+            self.server_task = Some(tokio::spawn(async move { server.run().await.unwrap() }));
+            self.server.wait_until_ready(STEP).await.unwrap();
+        }
+
+        async fn observe_transport_failure(&self) {
+            // The server is not listening yet: the real control connection
+            // fails in this test's endpoint namespace, without an admission seam.
+            self.state.start_upstream_control(&self.entry);
+            wait_for_watch(|| {
+                self.state
+                    .upstream_control_watch_unavailable_for_route(&self.entry)
+                    .is_some()
+            })
+            .await;
+            let reason = self
+                .state
+                .upstream_control_watch_unavailable_for_route(&self.entry)
+                .unwrap();
+            assert!(reason.contains("control watch connect failed"), "{reason}");
+            assert_eq!(self.state.controls_snapshot_for_test(), (false, 1));
+            assert!(self.state.local_route(ROUTE_NAME).is_some());
+            assert!(
+                self.state
+                    .with_route_table(|rt| rt.list_tombstones().is_empty())
+            );
+        }
+
+        async fn finish(mut self) {
+            let controls = tokio::time::timeout(STEP, self.state.stop_upstream_controls()).await;
+            let clients = tokio::time::timeout(STEP, self.state.clients.shutdown()).await;
+            let observed = tokio::time::timeout(STEP, &mut self.observer).await;
+            if observed.is_err() {
+                self.observer.abort();
+                let _ = self.observer.await;
+            }
+            if let Some(mut task) = self.server_task {
+                let stopped = self.server.shutdown_and_wait(STEP).await;
+                let joined = tokio::time::timeout(STEP, &mut task).await;
+                if joined.is_err() {
+                    task.abort();
+                    let _ = task.await;
                 }
-                assert_eq!(state.clients.outstanding(), 1024);
-                assert!(state.clients.manage(|| panic!("capacity is full")).is_err());
-                state.start_upstream_control(&entry);
-                tokio::time::timeout(STEP, async {
-                    while state.controls_snapshot_for_test().1 != 0
-                        && state
-                            .upstream_control_watch_unavailable_for_route(&entry)
-                            .is_none()
-                    {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                })
-                .await
-                .expect("watcher did not observe full capacity");
-                let unavailable = state.upstream_control_watch_unavailable_for_route(&entry);
-                let controls = state.controls_snapshot_for_test();
+                assert!(stopped.is_ok(), "server did not stop: {stopped:?}");
                 assert!(
-                    unavailable.is_some(),
-                    "full capacity retains watch-unavailable reason"
+                    matches!(joined, Ok(Ok(()))),
+                    "server did not exit: {joined:?}"
                 );
-                assert_eq!(controls, (false, 1));
-                assert!(!state.clients.is_closed());
-                assert!(state.local_route(ROUTE_NAME).is_some());
-                assert_eq!(state.with_route_table(|rt| rt.list_tombstones().len()), 0);
+            }
+            assert!(controls.is_ok(), "control watcher did not stop");
+            assert!(clients.is_ok(), "native clients did not drain");
+            assert!(
+                matches!(observed, Ok(Ok(()))),
+                "client observer did not exit"
+            );
+            assert_eq!(self.state.clients.outstanding(), 0);
+            assert!(matches!(
+                c2_local::inspect_endpoint(&self.endpoint),
+                c2_local::EndpointInspection::Absent | c2_local::EndpointInspection::KernelManaged
+            ));
+        }
+    }
 
-                if shutdown_after_full {
-                    let domain = state.clients.clone();
-                    shutdown = Some(tokio::spawn(async move { domain.shutdown().await }));
-                    tokio::time::timeout(CONTROL_RETRY_DELAY * 3, async {
-                        while state.controls_snapshot_for_test().1 != 0 {
-                            tokio::time::sleep(Duration::from_millis(10)).await;
-                        }
-                    })
-                    .await
-                    .expect("closed lifecycle did not terminate the capacity retry");
-                    assert!(state.clients.is_closed());
-                    assert!(
-                        state
-                            .upstream_control_watch_unavailable_for_route(&entry)
-                            .is_none()
-                    );
-                    assert!(state.local_route(ROUTE_NAME).is_some());
-                    assert_eq!(state.clients.outstanding(), 1024);
-                    assert!(
-                        !shutdown.as_ref().unwrap().is_finished(),
-                        "shutdown must wait for unpublished owners"
-                    );
-                } else {
-                    drop(reserved.pop());
-                    let recovered = tokio::time::timeout(CONTROL_RETRY_DELAY * 3, async {
-                        while state.controls_snapshot_for_test() != (false, 1)
-                            || state.clients.outstanding() != 1024
-                            || state
-                                .upstream_control_watch_unavailable_for_route(&entry)
-                                .is_some()
-                        {
-                            tokio::time::sleep(Duration::from_millis(10)).await;
-                        }
-                    })
-                    .await;
-                    assert!(
-                        recovered.is_ok(),
-                        "capacity recovery must reconnect the original upstream watcher"
-                    );
+    async fn wait_for_watch(condition: impl Fn() -> bool) {
+        tokio::time::timeout(CONTROL_RETRY_DELAY * 3, async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("watcher did not reach the expected state");
+    }
 
-                    // Unavailability still requires a live data-plane check. A valid
-                    // contract/token must remain callable while the reason is set.
-                    drop(reserved.pop());
-                    tokio::time::timeout(STEP, async {
-                        while state.clients.outstanding() == 1024 {
-                            tokio::time::sleep(Duration::from_millis(10)).await;
-                        }
-                    })
-                    .await
-                    .unwrap();
-                    let key = owner_key_for_route(&entry).unwrap();
-                    state.mark_upstream_control_watch_unavailable(&key, "controlled watch absence");
-                    let (lease, binding) =
-                        tokio::time::timeout(STEP, state.acquire_upstream_for_route(&entry))
-                            .await
-                            .unwrap()
-                            .unwrap_or_else(|_| {
-                                panic!("live acquire must succeed while watch is unavailable")
-                            });
-                    assert_eq!(binding.route_uid(), entry.route_uid);
-                    assert_eq!(binding.route_revision(), entry.route_revision);
-                    let reply = tokio::time::timeout(
-                        STEP,
-                        lease.client().call_bound(&binding, "ping", &[]),
-                    )
+    #[tokio::test]
+    async fn watch_stops_retrying_after_client_lifecycle_closes() {
+        let fixture = WatchFixture::new().await;
+        let result = std::panic::AssertUnwindSafe(async {
+            fixture.observe_transport_failure().await;
+            tokio::time::timeout(CONTROL_RETRY_DELAY * 3, fixture.state.clients.shutdown())
+                .await
+                .expect("closed lifecycle did not drain the failed watch client");
+            wait_for_watch(|| fixture.state.controls_snapshot_for_test() == (false, 0)).await;
+            assert!(fixture.state.clients.is_closed());
+            assert!(fixture.state.local_route(ROUTE_NAME).is_some());
+            assert!(
+                fixture
+                    .state
+                    .upstream_control_watch_unavailable_for_route(&fixture.entry)
+                    .is_none()
+            );
+        })
+        .catch_unwind()
+        .await;
+        fixture.finish().await;
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[tokio::test]
+    async fn live_acquire_succeeds_with_transport_watch_unavailable() {
+        let mut fixture = WatchFixture::new().await;
+        let result = std::panic::AssertUnwindSafe(async {
+            fixture.observe_transport_failure().await;
+            // Stop the failed observer before bringing up the owner. Its real
+            // transport-error record remains, independent of the stopped task.
+            fixture.state.stop_upstream_controls().await;
+            fixture.start_server().await;
+            assert!(
+                fixture
+                    .state
+                    .upstream_control_watch_unavailable_for_route(&fixture.entry)
+                    .is_some()
+            );
+            let (lease, binding) = tokio::time::timeout(
+                STEP,
+                fixture.state.acquire_upstream_for_route(&fixture.entry),
+            )
+            .await
+            .unwrap()
+            .unwrap_or_else(|_| panic!("live acquire must succeed"));
+            assert_eq!(binding.route_uid(), fixture.entry.route_uid);
+            assert_eq!(binding.route_revision(), fixture.entry.route_revision);
+            let reply =
+                tokio::time::timeout(STEP, lease.client().call_bound(&binding, "ping", &[]))
                     .await
                     .unwrap()
                     .unwrap();
-                    assert_eq!(reply.into_bytes().unwrap(), b"echo");
-                    assert!(
-                        state
-                            .upstream_control_watch_unavailable_for_route(&entry)
-                            .is_some()
-                    );
-                    drop(lease);
-                    assert!(server.unregister_route(ROUTE_NAME).await);
-                    tokio::time::timeout(STEP, async {
-                        while state.local_route(ROUTE_NAME).is_some()
-                            || state.controls_snapshot_for_test().1 != 0
-                        {
-                            tokio::time::sleep(Duration::from_millis(10)).await;
-                        }
-                    })
-                    .await
-                    .expect("recovered watcher did not observe real upstream withdrawal");
-                    assert!(
-                        state
-                            .upstream_control_watch_unavailable_for_route(&entry)
-                            .is_none()
-                    );
-                    assert_eq!(state.with_route_table(|rt| rt.list_tombstones().len()), 1);
-                }
-            })
-            .catch_unwind()
-            .await;
+            assert_eq!(reply.into_bytes().unwrap(), b"echo");
+            assert!(
+                fixture
+                    .state
+                    .upstream_control_watch_unavailable_for_route(&fixture.entry)
+                    .is_some()
+            );
+            assert!(fixture.state.local_route(ROUTE_NAME).is_some());
+        })
+        .catch_unwind()
+        .await;
+        fixture.finish().await;
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
 
-            // Run cleanup on the baseline assertion failure as well as success.
-            drop(reserved);
-            let controls = tokio::time::timeout(STEP, state.stop_upstream_controls()).await;
-            let clients = tokio::time::timeout(STEP * 5, state.clients.shutdown()).await;
-            if let Some(shutdown) = shutdown {
-                tokio::time::timeout(STEP, shutdown).await.unwrap().unwrap();
-            }
-            let observed = tokio::time::timeout(STEP, &mut observer).await;
-            let stopped = server.shutdown_and_wait(STEP).await;
-            let joined = tokio::time::timeout(STEP, &mut server_task).await;
-            if observed.is_err() {
-                observer.abort();
-                let _ = observer.await;
-            }
-            if joined.is_err() {
-                server_task.abort();
-                let _ = server_task.await;
-            }
-            assert!(controls.is_ok());
-            assert!(clients.is_ok());
-            assert!(matches!(observed, Ok(Ok(()))));
-            assert_eq!(state.clients.outstanding(), 0);
-            assert!(stopped.is_ok());
-            assert!(matches!(joined, Ok(Ok(Ok(())))));
-            assert!(matches!(
-                c2_local::inspect_endpoint(&endpoint),
-                c2_local::EndpointInspection::Absent | c2_local::EndpointInspection::KernelManaged
-            ));
-            if let Err(panic) = result {
-                std::panic::resume_unwind(panic);
-            }
+    #[tokio::test]
+    async fn watch_recovers_after_transport_failure_and_observes_withdrawal() {
+        let mut fixture = WatchFixture::new().await;
+        let result = std::panic::AssertUnwindSafe(async {
+            fixture.observe_transport_failure().await;
+            fixture.start_server().await;
+            wait_for_watch(|| {
+                fixture.state.controls_snapshot_for_test() == (false, 1)
+                    && fixture
+                        .state
+                        .upstream_control_watch_unavailable_for_route(&fixture.entry)
+                        .is_none()
+            })
+            .await;
+            assert!(fixture.server.unregister_route(ROUTE_NAME).await);
+            wait_for_watch(|| {
+                fixture.state.local_route(ROUTE_NAME).is_none()
+                    && fixture.state.controls_snapshot_for_test() == (false, 0)
+            })
+            .await;
+            assert_eq!(
+                fixture
+                    .state
+                    .with_route_table(|rt| rt.list_tombstones().len()),
+                1
+            );
+            assert!(
+                fixture
+                    .state
+                    .upstream_control_watch_unavailable_for_route(&fixture.entry)
+                    .is_none()
+            );
+        })
+        .catch_unwind()
+        .await;
+        fixture.finish().await;
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
         }
     }
 }

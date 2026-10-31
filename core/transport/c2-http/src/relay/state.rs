@@ -2198,7 +2198,8 @@ mod tests {
         let old_token = Arc::new(());
         let token = Arc::new(());
         // Only the task/token bookkeeping is under test here; real control
-        // connections and owner drain are covered by the capacity regressions.
+        // connections are covered by upstream_control tests; owner drain by
+        // client_lifecycle tests.
         state.upstream_controls.write().tasks.insert(
             key.clone(),
             UpstreamControlTask::new(old_token.clone(), tokio::spawn(async {})),

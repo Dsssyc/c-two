@@ -1004,7 +1004,8 @@ impl<'a> RouteAuthority<'a> {
             .clients
             .manage(|| IpcClient::with_endpoint(endpoint, ClientIpcConfig::default()))
         else {
-            // Owner capacity is not evidence that the captured route is dead.
+            // Local lifecycle or client-construction failure is not evidence
+            // that the captured upstream owner is dead.
             return OwnerProbe::Stale;
         };
         match client.connect().await {
