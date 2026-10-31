@@ -212,7 +212,7 @@ The CLI embeds its banner at compile time from `cli/assets/banner_unicode.txt`:
 const BANNER: &str = include_str!("../assets/banner_unicode.txt");
 ```
 
-Regenerate the banner from `docs/images/logo_bw.png` with:
+Regenerate the banner from `docs/assets/logo_bw.png` with:
 
 ```bash
 uv run --python 3.11 --group banner tools/dev/generate_banner.py

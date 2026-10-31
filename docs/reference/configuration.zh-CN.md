@@ -53,7 +53,7 @@ Typed overrides 为 `BaseIPCOverrides`、`ServerIPCOverrides`、`ClientIPCOverri
 | 远程载荷分块大小 | `cc.set_transport_policy(remote_payload_chunk_size=...)` | `C2_REMOTE_PAYLOAD_CHUNK_SIZE` | 1 MiB |
 | 单个服务端 frame 限额 | `set_server(ipc_overrides={'max_frame_size': ...})` | `C2_IPC_MAX_FRAME_SIZE` | 2 GiB |
 | 单条逻辑载荷限额 | `set_server(ipc_overrides={'max_payload_size': ...})` | `C2_IPC_MAX_PAYLOAD_SIZE` | 16 GiB |
-| 每连接待处理请求 | `set_server(ipc_overrides={'max_pending_requests': ...})` | `C2_IPC_MAX_PENDING_REQUESTS` | 1,024 |
+| 整个服务端待处理请求 | `set_server(ipc_overrides={'max_pending_requests': ...})` | `C2_IPC_MAX_PENDING_REQUESTS` | 1,024 |
 | Resource 执行线程 | `set_server(ipc_overrides={'max_execution_workers': ...})` | `C2_IPC_MAX_EXECUTION_WORKERS` | 默认按 Host 并行度取 4–64；显式值必须为正，且不受 4–64 的限制 |
 
 显式 `address='ipc://...'` 连接独立于 relay 发现直接使用本地 IPC。Relay anchor 负责注册和发现，HTTP 调用使用解析结果中的目标 relay URL。远程分块大小控制 C-Two 载荷批次，不等同于 TCP 包或 HTTP frame 大小。
@@ -122,6 +122,8 @@ C2_RELAY_IDLE_TIMEOUT=60
 | 系统 HTTP proxy | — | `C2_RELAY_USE_PROXY` | `false` |
 | 反熵交换间隔 | — | `C2_RELAY_ANTI_ENTROPY_INTERVAL` | 60 秒 |
 
+`remote_payload_chunk_size` 是唯一的远程 body 分批策略，由 Rust 从传输策略覆盖值或 `C2_REMOTE_PAYLOAD_CHUNK_SIZE` 解析；默认 1 MiB，允许大于零且不超过 128 MiB。Relay HTTP 将其用于发出的请求 body 及已物化响应 body 的流式发送；`C2_IPC_CHUNK_SIZE` 独立控制 IPC 线格式分块与重组。远程配置值不指定 TCP packet 或 HTTP frame 的边界。
+
 Core relay-aware 客户端进行一次路由观察，随后至多进行一次派发前刷新；此上限固定，不通过 SDK 设置配置。
 
 预注册上游的语法为 `--upstream NAME=SERVER_ID@ADDRESS`，身份与 IPC handshake 一致。上游 budget 参数、mesh 和 dry-run 用法见 [c3 指南](../../cli/README.md)。
@@ -173,11 +175,15 @@ cc.endpoint.set_local_endpoint(root=str(ipc_dir))
 
 直连 IPC 默认无限等待；HTTP 的预算覆盖一个逻辑调用和其内的路由重取。`timeout=None` 显式无限，`0` 在派发前到期，负数和非有限值在入口拒绝。同进程同步调用只接受继承或无限策略。
 
-期限结束调用方等待，已派发的原生事务仍持有输入直到真正完成。有限调用的数量上限 `0` 拒绝所有新有限调用，字节预算 `0` 只拒绝正数输入；无限调用不受这两项准入限额约束。`cc.observe.call_execution_snapshot()` 查看当前及退休域的真实计费。示例与错误阶段见[调用期限指南](../releases/0.7.1.md#per-call-deadlines-for-remote-calls)。
+期限到达结束调用方等待，已经派发的原生事务仍可能继续完成传输，随后释放其保留的输入。单次调用期限到期不会撤销 relay 路由、发起 OwnerBound 关闭，也不会使已经取得的 held 响应属主失效。错误区分派发前到期与派发状态不确定；后者不能自动重放调用。
+
+有限调用的数量上限 `0` 拒绝所有新有限调用，字节预算 `0` 只拒绝正数输入；无限调用不受这两项准入限额约束。`cc.observe.call_execution_snapshot()` 查看当前及退休域的真实计费。示例与错误阶段见[调用期限指南](../releases/0.7.1.md#per-call-deadlines-for-remote-calls)。
 
 ## 并发与资源生命周期
 
 `@cc.read`、`@cc.write` 声明方法访问方式，未标注方法采用写访问。注册时的 `cc.ConcurrencyConfig` 设置路由 mode、`max_pending` 和 `max_workers`；Native route handle 同时约束同进程直调和远程派发。配置样例见 [Python SDK 指南](python-usage.zh-CN.md)。
+
+服务端 `max_pending_requests` 是所有连接共用的一个信号量，计算等待或使用执行容量的完整远程调用，不随连接数倍增。`max_execution_workers` 单独限制正在执行的远程回调。路由自己的 `max_pending` 和 `max_workers` 也约束同进程调用。机制见[执行准入](runtime-lifecycle.md#execution-admission)。
 
 `cc.owner.LifecycleConfig` 选择默认 `Persistent` 或显式 `OwnerBound`。后者使用控制器预先准备的私有 owner capability。`cc.shutdown(timeout=...)` 在取得 Python 实例锁后，用一个期限约束 Native owner/Core/pool 锁等待和本次关闭观察；Python 实例锁等待不计入该期限，已启动的原生收尾不会被等待超时取消；监听关闭、工作排空和 held lease 释放分别报告。完整接入方式见[生命周期指南](local-endpoint-lifecycle.md)。
 

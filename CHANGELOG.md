@@ -192,7 +192,7 @@ migration requirements and the release evidence.
 
 ### Validation status
 
-- [The source validation](docs/reports/canonical-local-endpoint-validation.md)
+- [The source validation](docs/acceptance/canonical-local-endpoint-validation.md)
   records Linux and Windows Server 2022/2025 gates, portable matrices and
   installed-wheel consumers. These are development artifacts, not published
   0.7 packages. The formal release retains its own source-bound candidate

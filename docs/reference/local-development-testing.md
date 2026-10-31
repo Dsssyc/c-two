@@ -54,7 +54,7 @@ Windows children also set `MSBUILDDISABLENODEREUSE=1` so completed CMake/MSBuild
 
 The initial implementation is verified on a Windows development machine. macOS command compatibility and the Unix backend have regression coverage, but actual macOS execution must be recorded separately; Windows results do not prove a macOS run.
 
-The initial Windows per-suite results and retained failure investigations are recorded in [the verification report](../reports/2026-10-10-local-test-sidecar-windows.md).
+The initial Windows per-suite results and retained failure investigations are recorded in [the verification report](../acceptance/2026-10-10-local-test-sidecar-windows.md).
 
 
 ## Review fixes: source identity and preparation failures

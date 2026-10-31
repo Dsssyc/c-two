@@ -2,7 +2,7 @@
 
 This page specifies RPC IPC handshake version 14, used since C-Two 0.10.0, and the boundary for future protocol changes.
 
-The preamble-free handshake 13 used by 0.9.x is incompatible. See the [design plan](../plans/2026-10-25-ipc-version-mismatch.md), [0.10.0 release notes](../releases/0.10.0.md), and [acceptance record](../reports/2026-10-26-ipc14-version-diagnostics-acceptance.md) for the implementation background, three-platform gates, mixed-version boundary, and latency evidence.
+The preamble-free handshake 13 used by 0.9.x is incompatible. See the [design plan](../acceptance/2026-10-25-ipc-version-mismatch.md), [0.10.0 release notes](../releases/0.10.0.md), and [acceptance record](../acceptance/2026-10-26-ipc14-version-diagnostics-acceptance.md) for the implementation background, three-platform gates, mixed-version boundary, and latency evidence.
 
 ## Scope
 

@@ -1,10 +1,10 @@
 # Unreleased
 
-The latest release is [C-Two 0.10.1](0.10.1.md) with the existing c3 0.6.0; its source, publication and cleanup evidence are in the [acceptance record](../reports/2026-10-30-0101-release-acceptance.md).
+The latest release is [C-Two 0.10.1](0.10.1.md) with the existing c3 0.6.0; its source, publication and cleanup evidence are in the [acceptance record](../acceptance/2026-10-30-0101-release-acceptance.md).
 
 ## Smaller public surface (breaking)
 
-The Python and Rust SDKs now keep only the everyday API at their roots. Everything else moves into four modules, grouped by who uses it. The reasons and measurements are in the [interface review](../plans/2026-10-31-api-surface-review.md). Update imports; no aliases or old paths remain. Protocol, ABI, SHM and storage formats are unchanged.
+The Python and Rust SDKs now keep only the everyday API at their roots. Everything else moves into four modules, grouped by who uses it. The reasons and measurements are in the [interface review](../design/2026-10-31-api-surface-review.md). Update imports; no aliases or old paths remain. Protocol, ABI, SHM and storage formats are unchanged.
 
 ### Python
 
@@ -52,7 +52,7 @@ Local macOS validation passed on the integrated candidate, with C-Two and FastDB
 
 ## Defect fixes and dead-code removal (breaking)
 
-These come from the [over-defense review](../plans/2026-10-31-over-defense-review.md) and its [batch plan](../plans/2026-10-31-defect-and-dead-code-batches.md).
+These come from the [over-defense review](../design/2026-10-31-over-defense-review.md) and its [batch plan](../design/2026-10-31-defect-and-dead-code-batches.md).
 
 ### Fixed
 

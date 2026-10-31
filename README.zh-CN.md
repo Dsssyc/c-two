@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/images/logo.png" width="150">
+  <img src="docs/assets/logo.png" width="150">
 </p>
 
 <h1 align="center">C-Two</h1>

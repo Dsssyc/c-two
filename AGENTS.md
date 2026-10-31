@@ -109,7 +109,7 @@ The language-neutral Cargo workspace is `core/`; the Python SDK owns its PyO3/ma
 | foundation | `c2-contract` | `c-two.contract.v2` validation, canonical descriptor hashing, release identity, and opaque nested-spec extraction |
 | foundation | `c2-codegen` | FastDB Core delegation plus deterministic multi-owner artifact composition and new-tree publication |
 | foundation | `c2-config` | Unified IPC and relay configuration structs/resolvers |
-| foundation | `c2-error` | Canonical error registry and `code:message` wire codec |
+| foundation | `c2-error` | Canonical error registry and versioned `C2E1` wire codec |
 | foundation | `c2-mem` | Buddy allocator, SHM regions, unified memory pool |
 | foundation | `c2-mem-ffi` | Native memory and endpoint ABI, including verified Windows connection transfer |
 | protocol | `c2-wire` | Wire protocol codec, frames, chunk assembler, chunk registry |
@@ -131,7 +131,7 @@ The language-neutral Cargo workspace is `core/`; the Python SDK owns its PyO3/ma
 - Python imports `c_two as cc`; Rust applications import the `c_two` facade and leave hidden `c_two::generated` seams to generated code.
 - CRM classes use plain names without an `I` prefix; resource implementations use domain names, with `{ContractName}Impl` allowed for generated code.
 
-The Phase 0B local candidate and its exact source provenance are recorded in the [local candidate evidence](docs/reports/2026-07-24-rust-sdk-portable-payload-local-release-candidate.md); current qualifications are in the [development guide](docs/reference/development.md#local-candidate-evidence-and-provenance).
+The Phase 0B local candidate and its exact source provenance are recorded in the [local candidate evidence](docs/acceptance/2026-07-24-rust-sdk-portable-payload-local-release-candidate.md); current qualifications are in the [development guide](docs/reference/development.md#local-candidate-evidence-and-provenance).
 
 ## Retired interfaces
 
@@ -193,7 +193,7 @@ Requires Python 3.10 or newer, including downstream Taichi stacks pinned to 3.10
 
 ## Agent Working Rules
 
-- Open work and pending decisions live only in `docs/backlog.md`. Read it before starting work and update it whenever an item's status changes; remove finished items and note them in the acceptance or release record. Plans and reviews keep the details; do not keep a second todo list elsewhere.
+- Open work and pending decisions live only in `docs/design/backlog.md`. Read it before starting work and update it whenever an item's status changes; remove finished items and note them in the acceptance or release record. Plans and reviews keep the details; do not keep a second todo list elsewhere.
 - Read the existing code before changing it.
 - Prefer `rg` and `rg --files` for repository searches.
 - Remove rebuildable artifacts as soon as later steps no longer need them, not only when a task finishes: Cargo target directories, `.venv` environments, native libraries, downloaded SDKs, dist bundles, wheels and package archives in validation directories and worktrees. Share one Cargo target directory per checkout, as CI does with `CARGO_TARGET_DIR=<checkout>/core/target`, instead of building a separate target for each workspace. Confirm that no active build, test or runtime still uses an artifact before removing it. Preserve source, Git state, test logs, receipts and explicitly retained deliverables; historical IPC directories and coordination files are not build-cleanup targets. Do not accumulate copies of build outputs across completed batches.

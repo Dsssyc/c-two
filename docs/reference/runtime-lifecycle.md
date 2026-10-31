@@ -34,6 +34,14 @@ Transport modes:
 - IPC (`ipc://`): Rust `c2-local` owns local streams (Unix UDS or Windows byte-mode Named Pipes), while `c2-mem` owns POSIX SHM or Windows named mappings. `c2-config::LocalEndpoint` derives the OS endpoint from the logical address; SDKs must use that authority. Remote IPC concurrency semantics and route capacity limits belong to Rust `c2-server`; Python only projects the native handle for same-process calls. The RPC IPC handshake is version 14 and opens with the permanent fixed 25-byte version preamble (see `docs/reference/ipc-handshake.md`): native identity checks precede the preamble, un-negotiated CALL/ordinary-CTRL frames are fenced until the final metadata ACK, a complete `VersionMismatch` is a typed terminal error with no route/HTTP fallback and no retry, and handshake-13-or-older peers (0.9.x and older wheels) are incompatible with no compatibility path.
 - HTTP (`http://`): relay-based cross-machine transport through Rust.
 
+## Execution admission
+
+An IPC server has one `max_pending_requests` semaphore shared by all accepted connections. It bounds complete remote CRM calls admitted for execution, counting active and queued work; `max_execution_workers` separately bounds callbacks actively executing across that server. Each route has its own native `max_pending` limit for active and queued calls and `max_workers` limit for active callbacks. Calls wait for execution capacity while pending capacity remains; exhaustion of pending capacity rejects a new call before its callback runs. Waiting for route or global execution capacity does not occupy a blocking callback thread.
+
+The route's read/write policy is shared by same-process calls and remote IPC calls. Reads may run together, writes are exclusive, and scheduler reservations behind a waiting writer cannot overtake it. This is the route scheduler's admission order; connection frame arrival order has no separate write-order barrier. Same-process calls consume the route limits but not the IPC server's remote execution thread budget. Connection teardown cancels remote calls still queued before callback execution and keeps active calls and their request owners in the drain observation. Incomplete chunk assemblies are bounded by the chunk registry and chunk-processing permits; they enter call admission only after a complete logical request has been assembled.
+
+Registration reserves a route before publishing it. The native commit gate keeps a relay-dependent reservation unavailable to direct IPC lookup and callback admission until relay publication succeeds; failure aborts the reservation through the route-close transaction and returns the structured rollback outcome. These admission and close decisions belong to Rust Core and `c2-server`, including the native handle projected to Python for direct calls.
+
 ## Connection deadlines
 
 Optional connection deadlines belong to Core. `cc.connect(..., timeout=...)` creates one native `ConnectAttempt` before SDK binding locks; the same absolute deadline covers singleton/registry/local-slot/relay override waits, pools, OS connection, handshake and live route/relay acquisition. SDKs project the attempt and never restart its budget, implement their own timer or leave a waiting thread after returning. Omitted/None retains existing phase guards; zero expires before transport. Connect expiry uses `CallDeadlineExceeded` with `operation=connect`, `transport_phase=pre_dispatch` and `stage`; it cannot execute or replay a business method. Preserve healthy shared clients on waiter expiry and isolate partial control writes.
@@ -64,7 +72,7 @@ Direct IPC `shutdown("ipc://...")` under `c_two.transport.client.util` is an adm
 
 - A failed-start result and later retirement outcome must be retained separately. Incomplete or failed cleanup must not be hidden by the startup exception; NativeSession observes the original transaction for that concrete Server, including terminal errors.
 
-- The historical [public Runtime acceptance record](../reports/2026-10-28-public-runtime-acceptance.md) covers its original acceptance scope and does not itself validate the later Runtime retirement scope.
+- The historical [public Runtime acceptance record](../acceptance/2026-10-28-public-runtime-acceptance.md) covers its original acceptance scope and does not itself validate the later Runtime retirement scope.
 
 ## Connection observations
 

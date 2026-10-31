@@ -53,7 +53,7 @@ Typed overrides are `BaseIPCOverrides`, `ServerIPCOverrides` and `ClientIPCOverr
 | Remote payload batch size | `cc.set_transport_policy(remote_payload_chunk_size=...)` | `C2_REMOTE_PAYLOAD_CHUNK_SIZE` | 1 MiB |
 | Server frame limit | `set_server(ipc_overrides={'max_frame_size': ...})` | `C2_IPC_MAX_FRAME_SIZE` | 2 GiB |
 | Logical payload limit | `set_server(ipc_overrides={'max_payload_size': ...})` | `C2_IPC_MAX_PAYLOAD_SIZE` | 16 GiB |
-| Pending requests per connection | `set_server(ipc_overrides={'max_pending_requests': ...})` | `C2_IPC_MAX_PENDING_REQUESTS` | 1,024 |
+| Pending requests across the server | `set_server(ipc_overrides={'max_pending_requests': ...})` | `C2_IPC_MAX_PENDING_REQUESTS` | 1,024 |
 | Resource execution threads | `set_server(ipc_overrides={'max_execution_workers': ...})` | `C2_IPC_MAX_EXECUTION_WORKERS` | Default uses host parallelism clamped to 4–64; explicit values must be positive and are not capped to 4–64 |
 
 An explicit `address='ipc://...'` uses local IPC independently of relay discovery. The relay anchor handles registration and discovery; HTTP calls use the relay URL selected by resolution. Remote batch size controls C-Two payload batches, without specifying TCP packets or HTTP frames.
@@ -122,6 +122,8 @@ C2_RELAY_IDLE_TIMEOUT=60
 | System HTTP proxy | — | `C2_RELAY_USE_PROXY` | `false` |
 | Anti-entropy interval | — | `C2_RELAY_ANTI_ENTROPY_INTERVAL` | 60 seconds |
 
+`remote_payload_chunk_size` is the single remote-body batching policy, resolved by Rust from the typed transport override or `C2_REMOTE_PAYLOAD_CHUNK_SIZE`. It defaults to 1 MiB and accepts positive values up to 128 MiB. Relay HTTP uses it for outbound request bodies and materialized response-body streaming; `C2_IPC_CHUNK_SIZE` independently controls IPC wire chunks and reassembly. The remote value does not specify TCP packets or HTTP frame boundaries.
+
 Core relay-aware clients make one route observation followed by at most one pre-dispatch refresh; this bound is fixed and is not configurable through SDK settings.
 
 Pre-register upstreams as `--upstream NAME=SERVER_ID@ADDRESS`; `SERVER_ID` must match the IPC handshake. See the [c3 guide](../../cli/README.md) for upstream budgets, mesh and dry-run options.
@@ -173,11 +175,15 @@ Expiration returns `CallDeadlineExceeded` with `operation=connect`, `transport_p
 
 Direct IPC waits indefinitely by default; an HTTP budget covers one logical call and its route reacquisition. `timeout=None` explicitly waits indefinitely; `0` expires before dispatch. Negative and non-finite values are rejected. Same-process synchronous calls accept inherited or unlimited waiting only.
 
-An expired deadline ends caller waiting while the dispatched native transaction retains input until actual completion. A zero finite-call count rejects finite calls; a zero byte budget rejects positive input. Unlimited calls are outside these two finite-call admission limits. `cc.observe.call_execution_snapshot()` observes active and retired domains. Examples and error phases are in the [deadline guide](../releases/0.7.1.md#per-call-deadlines-for-remote-calls).
+Expiry ends the caller's wait, while a dispatched native transaction may continue through transport completion and release its retained input afterward. A call deadline alone does not withdraw a relay route, initiate OwnerBound shutdown, or invalidate an already acquired held response owner. The deadline error distinguishes expiry before dispatch from an uncertain dispatched call; do not replay a call after the latter outcome.
+
+A zero finite-call count rejects finite calls; a zero byte budget rejects positive input. Unlimited calls are outside these two finite-call admission limits. `cc.observe.call_execution_snapshot()` observes active and retired domains. Examples and error phases are in the [deadline guide](../releases/0.7.1.md#per-call-deadlines-for-remote-calls).
 
 ## Concurrency and lifecycle
 
 `@cc.read` and `@cc.write` declare access semantics; writes are the default. Registration's `cc.ConcurrencyConfig` sets the route mode, `max_pending` and `max_workers`. The native route handle governs both same-process calls and remote dispatch. See the [Python SDK guide](python-usage.md).
+
+Server `max_pending_requests` uses one semaphore for all connections, counting complete remote calls awaiting or using execution capacity; it is not multiplied by the connection count. `max_execution_workers` caps active remote callbacks separately. The route's own `max_pending` and `max_workers` limits are shared with same-process calls. See [execution admission](runtime-lifecycle.md#execution-admission).
 
 `cc.owner.LifecycleConfig` selects default `Persistent` or explicit `OwnerBound`. OwnerBound uses a private receiver capability prepared by the controller before readiness. After acquiring the Python instance lock, `cc.shutdown(timeout=...)` uses one deadline for Native owner/Core/pool lock waits and drain observation. The instance-lock wait is outside that deadline; expiry does not cancel an already-started native drain. Listener closure, work drain and held leases are separate observations; see the [lifecycle guide](local-endpoint-lifecycle.md).
 

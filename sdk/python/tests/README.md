@@ -72,7 +72,7 @@ uv run --no-sync pytest tests/repo/test_portable_matrix_receipt.py -q
 cargo test --manifest-path core/Cargo.toml -p c2-ipc
 ```
 
-See the [0.7.4 publication record](../../../docs/reports/0.7.4-publication.md) and [FD regression record](../../../docs/reports/0.7.4-fd-leak-regression.md) for executed source-specific evidence.
+See the [0.7.4 publication record](../../../docs/acceptance/0.7.4-publication.md) and [FD regression record](../../../docs/acceptance/0.7.4-fd-leak-regression.md) for executed source-specific evidence.
 
 ## Benchmarks
 
