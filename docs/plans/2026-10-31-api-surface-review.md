@@ -36,10 +36,17 @@ Host 检索了本机已知的下游仓库，只读：
   - 执行线程 64（即上限），pending 256；
   - 载荷 32 MiB，帧 16 MiB。
   - 它还用 `memory_stats()[scope] is not None` 来判断某个角色是否已经开始 I/O、配置是否还能改（同文件 `:163`）。这说明 C-Two 没有直接回答这个问题的接口。
-- **Host 实验说明了它为什么要关掉池。** 实验在私有 IPC 根下进行，服务端回复 10 KB、100 KB 与 1 MB：
-  - 池开着时，第一个超过 4 KiB 的回复就让服务端建了一个完整的 256 MiB buddy 段，SHM 用量为 268,980,224 字节；
-  - 关掉池以后，每个超过 4 KiB 的回复各用一个 dedicated 段。
-  - 所以小消息用户只能二选一：要么背一个 256 MiB 的段，要么每条中等大小的消息都新建一个段。这是第三节"自适应段"建议的来由。
+- **轻量配置的来由。** 用户说明：池是为大载荷、高频的调用省去开辟内存的开销；hey-my-buddy 是智能体之间的文本通信，本来就不快，消息也有上限，用不上这份性能。Host 在私有 IPC 根下实测，条件是 macOS 27、同一进程里两个 Runtime 经 IPC 调用，取中位数：
+
+  | 路径 | 8 KB | 64 KB | 1 MB | SHM 账面峰值 | 进程 RSS 增量 |
+  | --- | --- | --- | --- | --- | --- |
+  | 开池（默认） | 82 µs | 92 µs | 317 µs | 256.5 MiB | 7.1 MiB |
+  | 关池（hey-my-buddy 现在的设置） | 85 µs | 98 µs | 395 µs | 1.0 MiB | 7.9 MiB |
+  | 全部内联（阈值设为 32 MiB） | 68 µs | 147 µs | 1442 µs | 0 | 8.4 MiB |
+
+  - 256 MiB 的段是稀疏的：开池以后，进程的 RSS 并没有多出 256 MiB，这个数只记在地址空间与预算账上。Windows 上它是否占用提交额度，没有验证。
+  - 关池对 hey-my-buddy 的代价很小，但也没有让它更轻。它真正需要的是上限：单条消息、帧与重组。
+  - SHM 与内联的交叉点在 8 KB 到 64 KB 之间，默认阈值 4 KiB 偏低。
 
 ## 依据
 
@@ -94,7 +101,8 @@ Python 的布局：
 
 ### 收敛方向
 
-- **共享内存段改为自适应。** 段从小开始、按需倍增，直到上限。这样小消息用户不再要么背一个 256 MiB 的段、要么每条消息新建一个段，`pool_enabled` 与段大小都不再需要调。段的几何信息在 SHM 头里，所以这一条并入单一属主的协议批（SHM 格式 4）。
+- **不再提供池的开关。** 实测开池不额外占内存，关掉只会变慢。初稿建议让共享内存段自适应大小；量过之后撤回，因为删掉开关这个更小的办法就够了。
+- **`shm_threshold` 改为常量。** 取值按三个平台实测的交叉点定。
 - **用户只表达意图。** 留下的设置是：单条消息上限、内存上限、文件溢出上限、端点根目录与 relay 锚点。帧、分块、重组的各项限制都从它们推导。
 - **定时器与调优常数改为固定常量。**
 
@@ -106,9 +114,10 @@ Python 的布局：
 | `max_payload_size` | 保留，作为唯一的单条消息上限 | hey-my-buddy 在用 |
 | 三个方向预算、`max_reassembly_bytes` | 合并为一个内存上限和一个文件溢出上限 | 用户关心的是总量，不是内部的四个格子 |
 | `max_frame_size`、`chunk_threshold_ratio`、`chunk_size`、`max_total_chunks`、重组段大小与段数 | 从单条消息上限与内存上限推导 | 都是协议内部机制；`max_total_chunks` 还有缺陷 B8 |
-| `pool_segment_size`、`max_pool_segments`、`pool_enabled`、预热段数、最少保留段数 | 自适应段之后删除；段数上限由内存上限推导 | 只是为了绕开固定段大小才需要 |
+| `pool_enabled`、预热段数、最少保留段数 | 删除 | 开池不额外占内存，关掉只会变慢（实测） |
+| `pool_segment_size`、`max_pool_segments` | 待定：由单条消息上限与内存上限推导，还是留给大数据用户调性能 | 等三个平台的基准再定 |
 | `pool_decay_seconds`、`chunk_gc_interval`、`chunk_assembler_timeout`、`C2_RELAY_ANTI_ENTROPY_INTERVAL`、`C2_REMOTE_PAYLOAD_CHUNK_SIZE`、`C2_RELAY_ROUTE_MAX_ATTEMPTS` | 固定常量 | 没有使用者，是调优常数 |
-| `shm_threshold` | 固定常量 | SHM 与内联的分界是测出来的性能常数 |
+| `shm_threshold` | 固定常量 | 交叉点在 8 KB 到 64 KB 之间（macOS 实测），按三个平台的基准定 |
 | `heartbeat_interval`、`heartbeat_timeout` | 随单一属主的详细设计定 | 本机 IPC 上对端死亡会有 EOF；心跳只剩"释放停住的对端占着的许可"这一用处 |
 | `max_pending_requests`（Server 级）、`max_execution_workers` | 待定：与路由级 `ConcurrencyConfig` 的 `max_pending` / `max_workers` 合并 | 同一件事分了两层；后者还有缺陷 H12，hey-my-buddy 设成了上限 64 |
 | `C2_CALL_MAX_OUTSTANDING`、`C2_CALL_RETAINED_INPUT_BUDGET_BYTES` | 待定：前者删除，后者并入内存上限 | 只有测试在用 |
@@ -181,7 +190,7 @@ T1 与 T2 改的文件互不重叠，可以并行。
 
 ### 之后的批次
 
-- **配置收敛：** 用户决定逐项表之后进行；自适应段并入单一属主的协议批。
+- **配置收敛：** 用户决定逐项表之后进行。
 - **AGENTS.md 重组：** 由 Host 在 T1、T2 合入后进行，以免同一段内容改两次。
 - **错误类型：** 协议批之后。
 - **决定 3 与第六节：** 等用户决定后，另开批次。
