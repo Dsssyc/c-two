@@ -14,7 +14,7 @@ The `c_two` root keeps:
 - `hold`, `HeldResult`
 - `register`, `connect`, `close`, `unregister`, `serve`, `shutdown`, `server_address`, `with_call_options`
 - `set_relay_anchor`, `set_server`, `set_client`, `set_transport_policy`, `set_call_execution_limits`
-- `Runtime`, `ConcurrencyConfig`, `error`
+- `Runtime`, `ConcurrencyConfig`, `error`, and the four modules below, so `import c_two as cc` reaches `cc.observe.memory_stats()` without another import
 
 Everything else moved:
 

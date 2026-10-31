@@ -47,7 +47,6 @@ save_ticket("current", control.recovery_ticket(timeout=1.0).export())
 
 ```python
 import c_two as cc
-import c_two.owner
 
 # 恢复控制器：已完成与原主机一致的 endpoint 配置。
 ticket = cc.owner.OwnerRecoveryTicket.from_bytes(load_ticket("current"))
@@ -81,7 +80,6 @@ Persistent 的直连 IPC admin shutdown 只在尚未尝试写入控制请求时�
 
 ```python
 import c_two as cc
-import c_two.endpoint
 
 cc.register(Grid, GridResource(), name="grid")
 credential = cc.endpoint.server_credential()  # Listener 已就绪；可交给控制器保存。

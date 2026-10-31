@@ -935,7 +935,6 @@ impl PyRuntimeSession {
         )?;
         dict.set_item("retired", retired_list)?;
         dict.set_item("holds", lease_stats_dict(py, &self.merged_lease_stats())?)?;
-        dict.set_item("budget_cells_note", MEMORY_ACCOUNTING_NOTE)?;
         Ok(dict)
     }
 
@@ -1900,11 +1899,6 @@ fn register_outcome_to_dict<'py>(
     dict.set_item("relay_registered", outcome.relay_registered)?;
     Ok(dict)
 }
-
-/// Human-readable reminder attached to the native snapshot: the budget cells
-/// are C-Two-owned accounting scopes, not process RSS.
-const MEMORY_ACCOUNTING_NOTE: &str =
-    "C-Two-owned IPC backing and live reassembly charges; not process RSS";
 
 fn call_execution_snapshot_dict<'py>(
     py: Python<'py>,

@@ -108,7 +108,6 @@ save_ticket("current", control.recovery_ticket(timeout=1.0).export())
 
 ```python
 import c_two as cc
-import c_two.owner
 
 # Recovering controller: the original host's endpoint context is configured.
 ticket = cc.owner.OwnerRecoveryTicket.from_bytes(load_ticket("current"))
@@ -142,7 +141,6 @@ After listener readiness, the host can call `cc.endpoint.server_credential() -> 
 
 ```python
 import c_two as cc
-import c_two.endpoint
 
 cc.register(Grid, GridResource(), name="grid")
 credential = cc.endpoint.server_credential()  # The listener is ready; pass this to the controller.

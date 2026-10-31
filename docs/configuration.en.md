@@ -147,7 +147,6 @@ macOS also rejects extended ACL allow entries that can change directory contents
 ```python
 from pathlib import Path
 import c_two as cc
-import c_two.endpoint
 
 ipc_dir = Path.home() / 'my-app' / 'ipc'
 ipc_dir.mkdir(parents=True, exist_ok=True, mode=0o700)

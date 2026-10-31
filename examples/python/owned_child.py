@@ -11,7 +11,6 @@ import sys
 
 import c_two as cc
 
-import c_two.owner
 
 
 def main() -> None:

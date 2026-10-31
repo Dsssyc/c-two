@@ -15,4 +15,5 @@ __all__ = [
     'ConnectionEvent', 'ConnectionEvents', 'ConnectionEventsLagged', 'memory_stats',
     'MemoryStats', 'MemoryScopeStats', 'MemoryCellStats', 'MemoryLimits',
     'call_execution_snapshot', 'lifecycle_snapshot', 'shutdown_outcome',
+    'CallExecutionSnapshot', 'LifecycleSnapshot', 'ShutdownOutcome',
 ]

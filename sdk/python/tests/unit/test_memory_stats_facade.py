@@ -100,7 +100,7 @@ def test_memory_stats_is_observable_without_freezing_an_unused_runtime() -> None
     second = cc.observe.memory_stats()
 
     assert isinstance(first, dict)
-    assert set(first) >= {'runtime_outgoing', 'server', 'retired', 'holds'}
+    assert set(first) == set(MemoryStats.__annotations__)
     # Observing an unused Runtime must not create or freeze a client domain.
     assert first['runtime_outgoing'] is None
     assert second['runtime_outgoing'] is None
@@ -120,6 +120,9 @@ def test_memory_stats_is_observable_without_freezing_an_unused_runtime() -> None
 
 
 def test_memory_stats_typed_shape_is_declared_for_the_public_facade() -> None:
+    from c_two import _native
+
+    assert set(_native.RuntimeSession().memory_stats()) == set(MemoryStats.__annotations__)
     # The typed facade is annotation-only, so this asserts the declared keys
     # stay aligned with the documented native shape.
     assert set(MemoryLimits.__annotations__) == {

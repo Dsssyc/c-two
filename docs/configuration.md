@@ -156,7 +156,6 @@ macOS 会额外拒绝允许修改目录内容、属性或权限的扩展 ACL 条
 ```python
 from pathlib import Path
 import c_two as cc
-import c_two.endpoint
 
 ipc_dir = Path.home() / 'my-app' / 'ipc'
 ipc_dir.mkdir(parents=True, exist_ok=True, mode=0o700)

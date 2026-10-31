@@ -458,9 +458,7 @@ class Runtime:
         The shm, file and reassembly budget cells are independent accounting
         scopes and must never be summed as physical memory usage.
         """
-        snapshot = dict(self._runtime_session.memory_stats())
-        del snapshot['budget_cells_note']
-        return snapshot
+        return dict(self._runtime_session.memory_stats())
 
     def call_execution_snapshot(self) -> CallExecutionSnapshot:
         return dict(self._runtime_session.call_execution_snapshot())
