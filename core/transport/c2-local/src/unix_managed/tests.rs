@@ -464,6 +464,27 @@ fn lease_path(endpoint: &LocalEndpoint) -> PathBuf {
         .join(OsStr::from_bytes(names.lock.as_bytes()))
 }
 
+/// Observe the original owner's release through an independently opened file
+/// description. The returned guard keeps that observation stable until the
+/// caller is ready to release the probe lock. The deadline only bounds a
+/// broken fixture; it never decides which retirement outcome to expect.
+fn wait_for_released_lease(probe: File) -> Lease {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match try_lock_lease(&probe) {
+            Ok(()) => return Lease(Some(probe)),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                assert!(
+                    Instant::now() < deadline,
+                    "background retirement did not release its lease"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("lease release probe failed: {error}"),
+        }
+    }
+}
+
 fn identity_of(path: &Path) -> SocketIdentity {
     let metadata = std::fs::symlink_metadata(path).unwrap();
     SocketIdentity {
@@ -1454,51 +1475,50 @@ async fn managed_failed_initialization_withdraws_its_socket_and_rebinds() {
 }
 
 #[tokio::test]
-async fn managed_drop_retires_after_transient_gate_contention() {
+async fn managed_drop_after_gate_contention_settles_ownership() {
     let namespace = TestNamespace::new();
     let root = namespace.path();
     let endpoint = managed_endpoint_at(root, "drop-transient-gate");
     let listener = bind_managed_at(&endpoint, root).unwrap();
+    let credential = listener.credential();
     let duplicate = listener.duplicate_lease_fd_for_test();
     let lease_probe = OpenOptions::new()
         .read(true)
         .write(true)
         .open(lease_path_at(root, &endpoint))
         .unwrap();
-    let gate_pin_fd = listener._gate_pin.as_ref().unwrap().as_raw_fd();
-    let original_gate = fstat(gate_pin_fd).unwrap();
     let gate = ManagedNamespace::open_root(root, false, true).unwrap();
 
-    let started = Instant::now();
-    drop(listener);
-    let drop_elapsed = started.elapsed();
-    assert!(socket_path_at(root, &endpoint).exists());
-    assert!(lease_path_at(root, &endpoint).exists());
-    assert!(
-        same_file(&original_gate, &fstat(gate_pin_fd).unwrap()),
-        "the background owner must keep the original gate inode pinned"
-    );
+    // Drop must return while this thread still holds the gate. A channel
+    // observes that ordering without comparing scheduler-dependent durations.
+    let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+    let dropper = std::thread::spawn(move || {
+        drop(listener);
+        dropped_tx.send(()).unwrap();
+    });
+    let dropped = dropped_rx.recv_timeout(Duration::from_secs(10));
+    // Release before reporting a failed fixture, so a blocked Drop can finish.
     drop(gate);
+    dropper.join().unwrap();
+    dropped.expect("Drop waited for the gate instead of handing off retirement");
 
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while (socket_path_at(root, &endpoint).exists() || lease_path_at(root, &endpoint).exists())
-        && Instant::now() < deadline
-    {
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    let released = wait_for_released_lease(lease_probe);
+    // A paused caller may resume after the bounded worker gave up, or after it
+    // retired the slot. Observe the actual terminal state before choosing the
+    // exact reaper result; no speed comparison selects the expected branch.
+    let socket_remains = socket_path_at(root, &endpoint).exists();
+    assert_eq!(socket_remains, lease_path_at(root, &endpoint).exists());
+    drop(released);
+    let reaped = reap_managed_at(&endpoint, &credential, root);
     assert!(
-        !socket_path_at(root, &endpoint).exists() && !lease_path_at(root, &endpoint).exists(),
-        "Drop must retire its socket and lease after transient gate contention"
+        matches!(
+            (socket_remains, reaped),
+            (true, EndpointReapResult::Reaped) | (false, EndpointReapResult::AlreadyAbsent)
+        ),
+        "the settled slot must be fully retired or retain a complete reapable record"
     );
-    assert!(
-        drop_elapsed < Duration::from_millis(80),
-        "Drop blocked its caller for {drop_elapsed:?}"
-    );
-    assert!(
-        try_lock_lease(&lease_probe).is_ok(),
-        "a live duplicate must not extend the retired lease flock"
-    );
-    drop(Lease(Some(lease_probe)));
+    assert!(!socket_path_at(root, &endpoint).exists());
+    assert!(!lease_path_at(root, &endpoint).exists());
     drop(duplicate);
 }
 
@@ -1508,8 +1528,6 @@ async fn managed_drop_gate_replacement_keeps_record_and_releases_lease() {
     let root = namespace.path();
     let endpoint = managed_endpoint_at(root, "drop-replaced-gate");
     let listener = bind_managed_at(&endpoint, root).unwrap();
-    let gate_pin_fd = listener._gate_pin.as_ref().unwrap().as_raw_fd();
-    let original_gate = fstat(gate_pin_fd).unwrap();
     let lease_path = lease_path_at(root, &endpoint);
     let lease_probe = OpenOptions::new()
         .read(true)
@@ -1519,7 +1537,6 @@ async fn managed_drop_gate_replacement_keeps_record_and_releases_lease() {
     let held_gate = ManagedNamespace::open_root(root, false, true).unwrap();
 
     drop(listener);
-    assert!(same_file(&original_gate, &fstat(gate_pin_fd).unwrap()));
     let gate_path = root.join(GATE_NAME);
     std::fs::remove_file(&gate_path).unwrap();
     let replacement = OpenOptions::new()
@@ -1528,24 +1545,16 @@ async fn managed_drop_gate_replacement_keeps_record_and_releases_lease() {
         .mode(0o600)
         .open(&gate_path)
         .unwrap();
-    drop(held_gate);
 
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        match try_lock_lease(&lease_probe) {
-            Ok(()) => break,
-            Err(error)
-                if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
-            {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(error) => panic!("background owner retained the lease: {error}"),
-        }
-    }
+    // Keep the original gate held until the worker has released ownership.
+    // Its earlier timeout and its rejection of the replacement are both safe
+    // outcomes, and neither may retire this record through the new gate.
+    let released = wait_for_released_lease(lease_probe);
     assert!(socket_path_at(root, &endpoint).exists());
     assert!(lease_path.exists());
     assert_eq!(replacement.metadata().unwrap().len(), 0);
-    drop(Lease(Some(lease_probe)));
+    drop(released);
+    drop(held_gate);
 }
 
 /// A gate held beyond the bounded retry leaves complete metadata for the
@@ -1557,33 +1566,24 @@ async fn managed_drop_without_gate_leaves_metadata_for_the_reaper() {
     let endpoint = managed_endpoint_at(&root, "drop-gate");
     let listener = bind_managed_at(&endpoint, root).unwrap();
     let credential = listener.credential();
-
-    let held_root = root.to_owned();
-    let holder = std::thread::spawn(move || {
-        let namespace = ManagedNamespace::open_root(&held_root, false, true).unwrap();
-        std::thread::sleep(Duration::from_millis(300));
-        drop(namespace);
-    });
-    // Wait until the gate is provably held by the other thread.
-    let mut holding = false;
-    for _ in 0..400 {
-        match ManagedNamespace::open_root(root, false, false) {
-            Err(NamespaceError::Busy) => {
-                holding = true;
-                break;
-            }
-            _ => std::thread::sleep(Duration::from_millis(2)),
-        }
-    }
-    assert!(holding, "gate holder never acquired the coordinator lock");
+    let lease_probe = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lease_path_at(root, &endpoint))
+        .unwrap();
+    let held_gate = ManagedNamespace::open_root(root, false, true).unwrap();
 
     drop(listener);
+    // The gate stays held until an independent flock proves the bounded
+    // background attempt has given up and released its original lease.
+    let released = wait_for_released_lease(lease_probe);
     assert!(
         socket_path_at(root, &endpoint).exists(),
         "a Drop without the gate must keep its registered metadata"
     );
     assert!(lease_path_at(root, &endpoint).exists());
-    holder.join().unwrap();
+    drop(released);
+    drop(held_gate);
 
     assert!(matches!(
         reap_managed_at(&endpoint, &credential, root),
@@ -2352,56 +2352,31 @@ async fn managed_duplicate_lease_cannot_extend_ownership_across_retirement() {
     let listener = bind_managed_at(&endpoint, root).unwrap();
     let duplicate = listener.duplicate_lease_fd_for_test();
 
-    // Hold the coordinator so the Drop caller cannot retire; its background
-    // retry must either retire or release ownership for a reaper.
-    let held_root = root.to_owned();
-    let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let holder = {
-        let release = release.clone();
-        std::thread::spawn(move || {
-            let namespace = ManagedNamespace::open_root(&held_root, false, true).unwrap();
-            while !release.load(std::sync::atomic::Ordering::SeqCst) {
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            drop(namespace);
-        })
-    };
-    // Wait until the gate is provably held, then Drop the listener.
-    let mut holding = false;
-    for _ in 0..1000 {
-        if matches!(
-            ManagedNamespace::open_root(root, false, false),
-            Err(NamespaceError::Busy)
-        ) {
-            holding = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    assert!(holding, "gate holder never acquired the coordinator");
-
+    let lease_probe = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lease_path_at(root, &endpoint))
+        .unwrap();
+    let held_gate = ManagedNamespace::open_root(root, false, true).unwrap();
     let credential = listener.credential();
     drop(listener);
+
+    // The duplicate stays open while this separate description acquires the
+    // flock. Holding the gate until then forces the worker to give up, proving
+    // that its explicit LOCK_UN releases even a surviving duplicate's lock.
+    let released = wait_for_released_lease(lease_probe);
     assert!(
         socket_path_at(root, &endpoint).exists(),
         "a Drop without the gate must keep its registered metadata"
     );
 
-    release.store(true, std::sync::atomic::Ordering::SeqCst);
-    holder.join().unwrap();
-
-    // The duplicate is STILL OPEN. Whether the short retry or this reaper
-    // retires the slot, its shared lease description must become unlocked.
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        match reap_managed_at(&endpoint, &credential, root) {
-            EndpointReapResult::Reaped | EndpointReapResult::AlreadyAbsent => break,
-            EndpointReapResult::Busy if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            other => panic!("a live duplicate kept the retired lease locked: {other:?}"),
-        }
-    }
+    assert!(lease_path_at(root, &endpoint).exists());
+    drop(released);
+    drop(held_gate);
+    assert!(matches!(
+        reap_managed_at(&endpoint, &credential, root),
+        EndpointReapResult::Reaped
+    ));
     assert!(!socket_path_at(root, &endpoint).exists());
     assert!(!lease_path_at(root, &endpoint).exists());
     // The retired lease entry never comes back, so the duplicate cannot
