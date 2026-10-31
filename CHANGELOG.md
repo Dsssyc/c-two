@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+See the [unreleased notes](docs/releases/unreleased.md).
+
+### Changed
+
+- Breaking: the Python `c_two` root and the Rust `c_two` crate root keep only the everyday API. Owner control, endpoint maintenance, diagnostics and contract tooling move to the `owner`, `endpoint`, `observe` and `contract` modules, and several of their names lose redundant prefixes. Snapshot and endpoint results are typed.
+- Breaking: Rust `direct_ipc_endpoint`, `ping_direct_ipc` and `shutdown_direct_ipc` take an optional endpoint context and replace the `*_with_context` functions.
+
+### Removed
+
+- `cc.Held`, `cc.hold_stats()`, the public `ConcurrencyMode` and `InputLifetime` enums (use string values), and the default namespace and version of `@cc.crm`.
+- Contract inference (`infer_crm_from_resource`, `c3 contract infer`) and the resource bridge (`cc.bridge`, `cc.ResourceBridge`, `register(bridge=...)`).
+
 ## [0.10.1] — companion c3 0.6.0
 
 Published 2026-10-30. See the [release notes](docs/releases/0.10.1.md).
