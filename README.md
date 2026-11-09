@@ -20,52 +20,77 @@
 
 ## What is C-Two?
 
-C-Two is an RPC framework for stateful resources, built for distributed scientific computation. It sits between message libraries such as ZeroMQ and service frameworks such as gRPC. Your objects keep their usual form, and C-Two carries calls to them across processes and machines; it also handles what a message library leaves to the application, including the resource's state, concurrent access to it and the outcome of each call. Clients use the same method interface for local and remote resources.
+C-Two lets other processes and machines call the methods of a stateful object as if it were local. It is built for distributed scientific computation, where such an object often holds a model, a grid or gigabytes of data that should stay where it is while many clients call it.
 
-A **CRM contract** declares the callable methods and their namespace/version. A **resource** is a plain class that implements those methods and holds state. A **client** uses `cc.connect(...)` to obtain a typed proxy. A process can host several resources and connect to other resources at the same time. The name stands for *CRM to Call* (Core Resource Model to Call): a stateful resource is called from other processes and machines through its CRM.
+The name C-Two comes from *CRM to Call* (Core Resource Model to Call): a stateful resource is called from other processes and machines through its CRM.
 
-**C-Two 0.10.1** supports Python 3.10+. Ordinary calls have no Python runtime dependencies; FastDB payloads use `c-two[fastdb]` (`fastdb4py==0.2.4`). IPC handshake 14 reports a version mismatch as a typed error, Unix endpoint namespaces use format 3 with versioned default directories, and Python adds independent `cc.Runtime()` instances and `cc.endpoint.server_credential()`. A failed memory release stays with its owner for retry, or is abandoned conservatively and counted when it can no longer be returned. See the [0.10.0 release notes](docs/releases/0.10.0.md); 0.10.1 keeps `cc.serve()` running when stdout cannot encode its messages ([notes](docs/releases/0.10.1.md)).
+A **CRM contract** is a class decorated with `@cc.crm(namespace=..., version=...)` that lists the methods that can be called remotely; their bodies are `...`. A **resource** is an ordinary object that implements those methods and holds the state; it is the object that calls reach. A resource is registered under a **route name** in a process, which is called its **Host**. A **client** calls `cc.connect(...)`, finds the resource by its route name or by its Host's address, and gets a proxy whose methods match the contract; calling a proxy method calls the resource. One process can host several resources and be a client of others at the same time.
+
+C-Two sits between message libraries such as ZeroMQ and service frameworks such as gRPC. A message library only delivers bytes, and how a call is put together and its result returned is left to the application; a service framework assumes that any instance can handle any request. C-Two carries each call to the one resource object that holds the state, and takes care of what follows from that: which object the call reaches, how concurrent calls share it, and what the caller learns when a call fails.
+
+This README describes the main branch. The latest release is C-Two 0.10.1 with c3 0.6.0; server streams, clients that follow a route name to a resource registered again, and the `cc.endpoint` and `cc.observe` modules are on main and come with the next release. The [unreleased notes](docs/releases/unreleased.md) list every change since 0.10.1, and the [0.10.0 notes](docs/releases/0.10.0.md) describe the released API.
 
 ## Why stateful RPC is different
 
-A stateless service can hand each request to any instance and keeps its state in an external store. In C-Two a route name stands for one resource's state, and a call goes to the resource registered under that name and may change its state. The table compares the two.
+Most RPC frameworks assume a stateless service: a service instance holds no state of its own, the state lives in a shared external store such as a database, and so any instance can handle any request. C-Two addresses the other case: the resource object maintains the state itself. The state may live in the object's memory or in files or databases behind it, which is the resource's choice and not the caller's concern, but every call that reads or changes that state must reach this object. The table compares the two.
 
 | | Stateless RPC services | C-Two resources |
 | --- | --- | --- |
-| Where a call goes | Any instance of the service; state is usually kept in an external store | The resource registered under the route name, which keeps the state; clients follow the name to its next registration, for example after a restart or on another machine, and the Host that serves it keeps the state continuous |
-| Concurrency | Requests are independent of each other | Methods are writes by default and run one at a time on a resource; methods marked `@cc.read` can run in parallel |
-| After a failure | Calls can be configured to be retried or hedged automatically | A call that may already have run is not retried or replayed automatically; Python and Rust errors report whether it may have run |
-| Shutdown | Usually a grace period, after which in-flight requests are cancelled | New calls are refused; unary calls already sent run to completion and deliver their results, and open server streams end between steps after the items already produced |
-| Large data | Each message is encoded whole in memory; large data is usually split by the application | A single call can carry arrays of several gigabytes; on one host they travel through shared memory, with chunking or file spill when needed, and the limits are configurable |
+| Where a call goes | Any instance of the service | The one resource object registered under the route name. If the resource is registered again, for example after a restart or on another machine, clients follow the route name there; C-Two does not move the state, so the Host that serves the name makes the new registration continue from the old state |
+| Concurrency | Requests are independent and can run at the same time | On one resource object, methods are writes by default and run one at a time; methods marked `@cc.read` can run in parallel |
+| After a failure | Calls are often retried or hedged automatically | Replaying a call can change the state a second time, so a call that may already have run is never retried or replayed automatically; the error says whether it may have run, and the caller decides what to do |
+| Shutdown | Usually a grace period, after which in-flight requests are cancelled | New calls are refused; calls already sent finish and deliver their results, so callers get their real outcome; open streams end between two items |
+| Large data | Each message is encoded whole in memory; large data is usually split by the application | One call can carry arrays of several gigabytes. On one machine they travel through shared memory, other paths take over when shared memory runs short, and memory use stays within limits you can set |
 
 ## Features
 
-- **Local and remote calls:** same-process calls pass Python objects directly; same-host IPC uses Unix domain sockets or Windows Named Pipes; cross-machine calls go through the HTTP relay. A route name has at most one live registration in a relay mesh; relay discovery resolves it to a verified local IPC path or an HTTP target, and explicit IPC connections work independently of relay discovery.
-- **State and concurrency:** resources keep their state between calls. `@cc.read` and `@cc.write` declare access semantics, with writes as the default. Native route scheduling enforces concurrency and pending-work limits across local and remote invocation.
-- **Payloads and memory:** `@cc.transfer(...)` binds FastDB `Payload` specifications, and ordinary Python values also work between Python peers. IPC moves large payloads through lazy buddy pools, dedicated shared memory, checked chunk transfer and file spill, within memory budgets. `cc.hold()` retains a response's local copy, and registration can select borrowed inputs; both keep only local copies, and release invalidates payload owners and checked views first. See [memory policy](docs/reference/memory-policy.md) and [Python payload usage](docs/reference/python-usage.md).
-- **Server streams:** a method marked `@cc.stream` returns zero or more items for one input. Python and Rust resources produce items one step at a time and hold the route permit only within a step; clients iterate, hold or close the stream. Streams work within one process, over IPC and, for Rust and Python clients, through a relay; generated TypeScript clients consume them over IPC and do not read them through a relay yet. See [Python server streams](docs/reference/python-usage.md#server-streams).
-- **Contracts across languages:** contract tooling validates portable descriptors and generates Python, Rust and TypeScript bindings. Clients match the route name, CRM identity and contract hashes. Python and Rust use the same Rust core for routing, transport, memory, errors and lifecycle.
-- **Relay, tools and lifecycle:** the native c3 CLI runs the relay and relay meshes, contract tools and endpoint maintenance on Linux, macOS and Windows x64 and ARM64. `cc.observe.connection_events()` aggregates outgoing and accepted physical IPC connections for one cancellable consumer; its reasons describe transport facts, not proof of process death. Native shutdown and route unregistration let unary calls already sent finish and end open server streams between their steps with `CallCancelled` after the items already produced; scoped endpoint maintenance cleans up confirmed exits. See [lifecycle integration](docs/reference/local-endpoint-lifecycle.md).
+### Local and remote calls
+
+Within one process, a call goes straight to the resource object without encoding. Between processes on one machine, calls use IPC over Unix domain sockets or Windows named pipes. Between machines, calls go through a relay over HTTP; a relay is a separate process, `c3 relay`, and several relays can form a relay mesh. A client can connect to a Host's address directly, which needs no relay, or give only a route name and let the relay find the Host that registered it. In a relay mesh, a route name has at most one live registration at a time, so looking up a name always finds the same resource.
+
+### Declared concurrency
+
+A contract's methods can declare how they access the state. Read-only methods are marked `@cc.read` and can run in parallel; the other methods are writes by default (or marked `@cc.write` explicitly) and run one at a time on one resource object. C-Two applies the same rules whether a call comes from the same process or from elsewhere, and limits how many calls may run or wait at once.
+
+### Large data
+
+A call's input and output, its payloads, can be large. Typed scientific data uses FastDB: `@cc.transfer(...)` names the FastDB specification of a method's input and output, and such payloads can pass between languages. For calls between Python processes only, ordinary Python values also work, encoded with pickle. On one machine, large payloads go through shared memory within memory budgets you can set. `cc.hold()` keeps a result in memory until you release it, so a large result can be read without copying it again. See the [memory policy](docs/reference/memory-policy.md) and [Python payloads](docs/reference/python-usage.md).
+
+### Server streams
+
+A method marked `@cc.stream` returns several items for one call. The resource produces them one at a time, and the client reads each item as it arrives and can stop early. Streams suit simulations that advance step by step, progress reports and results too large to return at once. They work within one process, over IPC and, for Python and Rust clients, through a relay; generated TypeScript clients read them over IPC only for now. The [Streams](#streams) section below shows an example.
+
+### Contracts across languages
+
+A CRM contract can be exported as a language-neutral descriptor, from which c3 generates Python, Rust and TypeScript bindings. When a client connects and calls, C-Two checks that the route name and the contract identity (the contract's namespace, name and version, with its ABI and signature hashes) match the resource's, so a client with a different contract cannot reach it. The Python and Rust SDKs share one Rust core, so routing, transport, memory, errors and lifecycle behave the same in both.
+
+### Tools and lifecycle
+
+c3 is C-Two's command-line tool for Linux, macOS and Windows x64 and ARM64. It runs relays and relay meshes, generates bindings and cleans up the endpoints that exited processes leave behind. An application can watch its IPC connections open and close through `cc.observe.connection_events()`. See the [lifecycle guide](docs/reference/local-endpoint-lifecycle.md).
 
 ## Install
 
+`pip` installs the latest release, 0.10.1:
+
 ```bash
 uv pip install c-two
-# For FastDB payloads:
+# With FastDB payloads (fastdb4py 0.2.4):
 uv pip install 'c-two[fastdb]'
 ```
 
-The same command works in Windows PowerShell. For c3 on Linux or macOS:
+The same commands work in Windows PowerShell. Without FastDB payloads, c-two depends on no other Python package.
+
+The relay and the contract tools are part of c3, a separate command-line program. On Linux or macOS:
 
 ```bash
 curl -fsSL https://github.com/world-in-progress/c-two/releases/download/c3-v0.6.0/c3-installer.sh | sh -s -- --version 0.6.0
 ```
 
-On Windows x64 or ARM64, use the [x64 executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.6.0/c3-x86_64-pc-windows-msvc.exe), [ARM64 executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.6.0/c3-aarch64-pc-windows-msvc.exe) or [PowerShell installer](https://github.com/world-in-progress/c-two/releases/download/c3-v0.6.0/c3-installer.ps1). Installation and checksum verification are in the [Windows guide](docs/reference/windows-native-usage.md#install-python-and-c3).
+On Windows x64 or ARM64, use the [x64 executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.6.0/c3-x86_64-pc-windows-msvc.exe), the [ARM64 executable](https://github.com/world-in-progress/c-two/releases/download/c3-v0.6.0/c3-aarch64-pc-windows-msvc.exe) or the [PowerShell installer](https://github.com/world-in-progress/c-two/releases/download/c3-v0.6.0/c3-installer.ps1); the [Windows guide](docs/reference/windows-native-usage.md#install-python-and-c3) explains installation and checksum verification.
 
-C3 0.6.0 pairs with C-Two 0.10.x. IPC handshake 14 cannot interoperate with 0.9.x peers (IPC 13), and Unix endpoint namespace format 3 uses new default directories, so upgrade the Python and Rust SDKs, c3 and Node consumers on one host together; stop old services before upgrading and restarting. C/FFI ABI 6 and SHM 3 keep their formats. See the [0.10.0 migration notes](docs/releases/0.10.0.md), the [handshake spec](docs/reference/ipc-handshake.md) and the [endpoint lifecycle guide](docs/reference/local-endpoint-lifecycle.md).
+Programs that call each other on one machine use the same IPC protocol, so the Python and Rust SDKs, c3 and Node clients on that machine must come from matching releases: C-Two 0.10.x goes with c3 0.6.0. To upgrade, stop the running services first, then upgrade them together. The [0.10.0 migration notes](docs/releases/0.10.0.md), the [handshake spec](docs/reference/ipc-handshake.md) and the [endpoint lifecycle guide](docs/reference/local-endpoint-lifecycle.md) have the details.
 
-Source builds need Rust 1.95 or newer; for builds and tests, see the [development guide](docs/reference/development.md).
+Building from source needs Rust 1.95 or newer; see the [development guide](docs/reference/development.md).
 
 ## Quickstart
 
@@ -94,19 +119,64 @@ finally:
     cc.shutdown()
 ```
 
-Run with `python counter.py`. The counter's `value` is kept in the resource between calls. This example uses the same-process path; keep `C2_RELAY_ANCHOR_ADDRESS` unset for local registration.
+Run `python counter.py`; it prints `3`. `@cc.crm` declares the contract `Counter`, and `CounterResource` implements it and keeps `value` between calls. `cc.register` registers a `CounterResource` object under the route name `counter` in the current process, and `cc.connect` returns a proxy for that name. Here the resource and the client share one process, so the call goes straight to the object. Finally, `cc.shutdown()` waits for the calls already sent to finish and then stops serving.
 
-For another process on the same host, pass the resource process's `cc.server_address()` as the client's `address`; the [IPC example](examples/python/ipc_resource.py) shows this connection. The resource process can also capture `credential = cc.endpoint.server_credential()` after registration and pass it to its controller for later exact cleanup, as described in the [lifecycle guide](docs/reference/local-endpoint-lifecycle.md#exact-cleanup-and-bounded-sweeps).
+C-Two reads a relay address from the environment variable `C2_RELAY_ANCHOR_ADDRESS`; leave it unset when you run this example, so that registration and connection stay local.
 
-`runtime = cc.Runtime()` creates an application-owned Python Runtime with its own configuration, routes and native session. Configure it through `runtime.set_*()`, then use `runtime.start()` for an empty Host readiness check or `runtime.register()` for resources. The module functions continue to use the default runtime; `cc.serve()` owns its process signal handling and has no instance equivalent. Call `runtime.shutdown()` and inspect its structured outcome when the application is done; if it returns pending, call shutdown again to observe completion and replace the session. See the [independent runtime example](examples/python/independent_runtime.py) and [Python API guide](docs/reference/python-usage.md#independent-python-runtime-instances).
+### From another process
 
-For relay routing, start `c3 relay --bind 0.0.0.0:8300`, set `cc.set_relay_anchor('http://relay-host:8300')` on both sides, then connect by name. The relay is a separate process. Explicit IPC addresses bypass relay discovery.
+To call a resource from another process on the same machine, the resource process keeps running with `cc.serve()` and gives the client the address that `cc.server_address()` returns: `cc.connect(Counter, name='counter', address=...)`. The [IPC resource](examples/python/ipc_resource.py) and [IPC client](examples/python/ipc_client.py) examples show both sides.
+
+### Streams
+
+A stream method is written as a generator in the resource, and each `yield` sends one item:
+
+```python
+from collections.abc import Iterator
+
+import c_two as cc
+
+@cc.crm(namespace='demo.heat', version='0.1.0')
+class HeatModel:
+    @cc.stream
+    def run(self, steps: int) -> Iterator[float]: ...
+
+class Rod:
+    def __init__(self):
+        self.temperature = 20.0
+
+    def run(self, steps: int) -> Iterator[float]:
+        for _ in range(steps):
+            self.temperature += 0.5
+            yield self.temperature
+
+cc.register(HeatModel, Rod(), name='rod')
+try:
+    with cc.connect(HeatModel, name='rod') as model:
+        stream = model.run(3)
+        for value in stream:
+            print(value)  # 20.5, then 21.0, then 21.5
+        print(stream.close())  # {'completed': True, 'complete_items': 3, 'error': None}
+finally:
+    cc.shutdown()
+```
+
+`close()` reports how the stream ended. If the client leaves the loop early and then calls `close()`, the items not yet produced are never produced; [stream.py](examples/python/stream.py) shows this case. The [Python guide](docs/reference/python-usage.md#server-streams) covers item encoding, holds and deadlines.
+
+### Across machines
+
+First start a relay with `c3 relay --bind 0.0.0.0:8300`, then call `cc.set_relay_anchor('http://relay-host:8300')` in both the resource process and the client process; after that, clients connect by name alone. The relay runs as its own process; a client that is given an IPC address connects directly without going through it. The [relay resource](examples/python/relay_resource.py) and [relay client](examples/python/relay_client.py) examples show both sides.
+
+### Separate Runtimes in one process
+
+A Runtime is the object through which C-Two manages a process's registrations, connections, configuration and shutdown. Module functions such as `cc.register` and `cc.connect` use the process's default Runtime; `cc.Runtime()` creates a separate Runtime with its own configuration, registrations and connections, which the application starts and shuts down itself. See the [independent Runtime example](examples/python/independent_runtime.py) and the [Python guide](docs/reference/python-usage.md#independent-python-runtime-instances).
 
 ## Examples and documentation
 
 | Topic | Guide |
 | --- | --- |
 | Local calls | [local.py](examples/python/local.py) |
+| Server streams | [stream.py](examples/python/stream.py) |
 | Direct IPC | [resource](examples/python/ipc_resource.py), [client](examples/python/ipc_client.py) |
 | Independent Python Runtime | [owned endpoint preflight](examples/python/independent_runtime.py) |
 | Relay | [resource](examples/python/relay_resource.py), [client](examples/python/relay_client.py), [mesh](examples/python/relay_mesh/README.md) |
